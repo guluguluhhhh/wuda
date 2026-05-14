@@ -101,50 +101,6 @@ __global__ void sum_kernel_vec4(const float* d_in,
     }
 }
 
-// Hardware Reduce: 无 stride，float4 加载，用 __reduce_add_sync 替代手动 warp reduce
-__global__ void sum_kernel_hw_reduce(const float* d_in,
-                                     float* d_out,
-                                     int N) {
-    int tid = threadIdx.x;
-    int warp = tid / WARP_SIZE;
-    int lane = tid & (WARP_SIZE - 1);
-
-    int global_tid = blockIdx.x * blockDim.x + tid;
-
-    int N4 = N / 4;
-    const float4* d_in4 = reinterpret_cast<const float4*>(d_in);
-
-    float val = 0.0f;
-    if (global_tid < N4) {
-        float4 v = d_in4[global_tid];
-        val = v.x + v.y + v.z + v.w;
-    }
-
-    int tail_idx = N4 * 4 + global_tid;
-    if (tail_idx < N) {
-        val += d_in[tail_idx];
-    }
-
-    // 硬件 warp reduce：一条指令完成，替代 5 次 shfl_down + fadd
-    float warp_sum = __reduce_add_sync(0xffffffff, val);
-
-    // block reduce: 只需要每个 warp 的 lane 0 参与
-    __shared__ float warp_sums[BLOCK_SIZE / WARP_SIZE];
-    if (lane == 0) {
-        warp_sums[warp] = warp_sum;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        float block_sum = (lane < BLOCK_SIZE / WARP_SIZE) ? warp_sums[lane] : 0.0f;
-        block_sum = __reduce_add_sync(0xffffffff, block_sum);
-
-        if (lane == 0) {
-            atomicAdd(d_out, block_sum);
-        }
-    }
-}
-
 // Stride loop + warp reduce + block reduce + atomicAdd
 __global__ void sum_kernel_stride(const float* d_in,
                            float* d_out,
@@ -254,7 +210,7 @@ float gpu_sum(const float* h_in, int N) {
 
     return h_out;
 }
-enum KernelType { NAIVE, NAIVE_VEC4, STRIDE, VEC4, HW_REDUCE };
+enum KernelType { NAIVE, NAIVE_VEC4, STRIDE, VEC4 };
 
 const char* kernel_name(KernelType k) {
     switch (k) {
@@ -262,7 +218,6 @@ const char* kernel_name(KernelType k) {
         case NAIVE_VEC4: return "Naive Vec4 (4 elem/thread)";
         case STRIDE:     return "Stride (N elem/thread)";
         case VEC4:       return "Vec4+Stride (float4 load)";
-        case HW_REDUCE:  return "HW Reduce (reduce_add_sync)";
     }
     return "";
 }
@@ -281,9 +236,6 @@ void launch_kernel(KernelType k, const float* d_in, float* d_out, int N, int gri
         case VEC4:
             sum_kernel_stride_vec4<<<grid, block>>>(d_in, d_out, N);
             break;
-        case HW_REDUCE:
-            sum_kernel_hw_reduce<<<grid, block>>>(d_in, d_out, N);
-            break;
     }
 }
 
@@ -291,7 +243,7 @@ int compute_grid(KernelType k, int N, int block) {
     if (k == NAIVE) {
         return (N + block - 1) / block;
     }
-    if (k == NAIVE_VEC4 || k == HW_REDUCE) {
+    if (k == NAIVE_VEC4) {
         return (N / 4 + block - 1) / block;
     }
     return std::min((N + block - 1) / block, 1024);
@@ -313,7 +265,7 @@ void test_performance() {
     };
     int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
 
-    KernelType kernels[] = { NAIVE, NAIVE_VEC4, STRIDE, VEC4, HW_REDUCE };
+    KernelType kernels[] = { NAIVE, NAIVE_VEC4, STRIDE, VEC4 };
     int num_kernels = sizeof(kernels) / sizeof(kernels[0]);
 
     for (int ki = 0; ki < num_kernels; ki++) {
