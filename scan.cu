@@ -203,6 +203,116 @@ void global_inclusive_scan_recursive(int* d_in, int* d_out, int N) {
     CUDA_CHECK(cudaFree(d_block_sums));
 }
 
+__global__ void single_pass_scan(const int* d_in, int* d_out, int N,
+                                 int* g_counter,
+                                 volatile int* g_status,
+                                 volatile int* g_partial,
+                                 volatile int* g_prefix) {
+    __shared__ int s_my_id;
+    __shared__ int s_prefix_sum;
+    __shared__ int warp_prefix_sums[BLOCK_SIZE / WARP_SIZE];
+
+    int tid = threadIdx.x;
+    int lane = tid & (WARP_SIZE - 1);
+    int warp = tid / WARP_SIZE;
+    
+    // 抢id，表示负责哪一块数据
+    if (tid == 0) {
+        s_my_id = atomicAdd(g_counter, 1);
+    }
+    __syncthreads();
+
+    int my_id = s_my_id;
+    int global_tid = my_id * blockDim.x + tid;
+
+    int val = (global_tid < N) ? d_in[global_tid] : 0;
+    int warp_sum;
+    val = warp_kogge_stone_inclusive_scan(val, warp_sum);
+    if (lane == 0) {
+        warp_prefix_sums[warp] = warp_sum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int ws = (lane < blockDim.x / WARP_SIZE) ? warp_prefix_sums[lane] : 0;
+        int dummy;
+        ws = warp_kogge_stone_inclusive_scan(ws, dummy);
+        if (lane < blockDim.x / WARP_SIZE) {
+            warp_prefix_sums[lane] = ws;
+        }
+    }
+    __syncthreads();
+    if (warp > 0) {
+        val += warp_prefix_sums[warp - 1];
+    }
+
+    if (global_tid == min(N - 1, (my_id + 1) * blockDim.x - 1)) {
+        // 发布block局部和：最后一个有效线程的 val 就是 block 的 inclusive 总和
+        g_partial[my_id] = val;
+        __threadfence();
+        g_status[my_id] = 1;
+
+        // lookback
+        int prefix_sum = 0;
+        if (my_id > 0) {
+            int look = my_id - 1;
+            while (look >= 0) {
+                int status;
+                do {
+                    status = g_status[look];
+                } while (status == 0);
+                __threadfence();   // 先看到 status，再读 value，避免读到旧值
+
+                if (status == 2) {
+                    prefix_sum += g_prefix[look];
+                    break;
+                } else {
+                    prefix_sum += g_partial[look];
+                    --look;
+                }
+            }
+        }
+        s_prefix_sum = prefix_sum;
+
+        g_prefix[my_id] = prefix_sum + val;
+        __threadfence();
+        g_status[my_id] = 2;
+    }
+    __syncthreads();
+
+    if (global_tid < N) {
+        d_out[global_tid] = val + s_prefix_sum;
+    }
+}
+
+// ============================================================================
+//  Single-Pass Scan 主机封装
+// ============================================================================
+void single_pass_inclusive_scan(const int* d_in, int* d_out, int N) {
+    if (N <= 0) return;
+    int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    int* d_counter;
+    int* d_status;
+    int* d_partial;
+    int* d_prefix;
+    CUDA_CHECK(cudaMalloc(&d_counter, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_status, num_blocks * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_partial, num_blocks * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_prefix, num_blocks * sizeof(int)));
+
+    CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_status, 0, num_blocks * sizeof(int)));
+
+    single_pass_scan<<<num_blocks, BLOCK_SIZE>>>(
+        d_in, d_out, N, d_counter, d_status, d_partial, d_prefix);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaFree(d_counter));
+    CUDA_CHECK(cudaFree(d_status));
+    CUDA_CHECK(cudaFree(d_partial));
+    CUDA_CHECK(cudaFree(d_prefix));
+}
+
 
 // ----------------------------------------------------------------------
 //  CPU 参考 inclusive scan
@@ -283,7 +393,54 @@ bool test_correctness() {
     delete[] h_out_gpu;
     CUDA_CHECK(cudaFree(d_in));
     CUDA_CHECK(cudaFree(d_out));
-    
+
+    return pass;
+}
+
+// ============================================================================
+//  Single-Pass 正确性测试
+// ============================================================================
+bool test_correctness_single_pass() {
+    printf("=== Correctness Test (Single-Pass) ===\n");
+
+    const int N = 123456789;
+    printf("Testing with N = %d\n", N);
+
+    int *h_in = new int[N];
+    int *h_out_cpu = new int[N];
+    int *h_out_gpu = new int[N];
+
+    srand(58);
+    for (int i = 0; i < N; i++) {
+        h_in[i] = rand() % 100;
+    }
+
+    cpu_inclusive_scan(h_in, h_out_cpu, N);
+
+    int *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_in, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, N * sizeof(int), cudaMemcpyHostToDevice));
+
+    single_pass_inclusive_scan(d_in, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out_gpu, d_out, N * sizeof(int), cudaMemcpyDeviceToHost));
+
+    bool pass = check_result(h_out_cpu, h_out_gpu, N);
+
+    if (pass) {
+        printf("✓ Correctness test PASSED\n\n");
+    } else {
+        printf("✗ Correctness test FAILED\n\n");
+    }
+
+    delete[] h_in;
+    delete[] h_out_cpu;
+    delete[] h_out_gpu;
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+
     return pass;
 }
 
@@ -397,6 +554,104 @@ void test_performance() {
 }
 
 // ============================================================================
+//  Single-Pass 性能测试
+// ============================================================================
+void test_performance_single_pass() {
+    printf("=== Performance Test (Single-Pass) ===\n");
+    printf("GPU: RTX 5090, Block Size: %d threads\n", BLOCK_SIZE);
+    printf("Strategy: Single-Pass Decoupled Lookback\n\n");
+
+    printf("┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐\n");
+    printf("│ %-12s │ %-10s │ %-8s │ %-12s │ %-12s │ %-12s │\n",
+           "Data Size", "Elements", "Blocks", "Time (ms)", "Bandwidth", "Throughput");
+    printf("│              │            │          │              │   (GB/s)     │ (Melem/s)    │\n");
+    printf("├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤\n");
+
+    int test_sizes[] = {
+        100000,
+        1000000,
+        10000000,
+        100000000,
+        500000000,
+        1000000000,
+        2000000000,
+    };
+    int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+
+    for (int t = 0; t < num_sizes; t++) {
+        int N = test_sizes[t];
+        int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        int *h_data = new int[N];
+        int *d_in, *d_out;
+        CUDA_CHECK(cudaMalloc(&d_in, N * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(int)));
+
+        for (int i = 0; i < N; i++) {
+            h_data[i] = rand() % 100;
+        }
+        CUDA_CHECK(cudaMemcpy(d_in, h_data, N * sizeof(int), cudaMemcpyHostToDevice));
+
+        // 预热
+        for (int i = 0; i < 10; i++) {
+            single_pass_inclusive_scan(d_in, d_out, N);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 计时
+        const int num_iter = (N <= 10000000) ? 100 : 10;
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < num_iter; i++) {
+            single_pass_inclusive_scan(d_in, d_out, N);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        float avg_ms = ms / num_iter;
+
+        float total_bytes = 2.0f * N * sizeof(int);
+        float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
+        float throughput = N / (avg_ms * 1000.0f);
+
+        char size_str[20];
+        if (N >= 1000000000) {
+            snprintf(size_str, sizeof(size_str), "%.1f GB", N * sizeof(int) / 1e9);
+        } else if (N >= 1000000) {
+            snprintf(size_str, sizeof(size_str), "%.0f MB", N * sizeof(int) / 1e6);
+        } else {
+            snprintf(size_str, sizeof(size_str), "%.0f KB", N * sizeof(int) / 1e3);
+        }
+
+        char bw_str[20];
+        if (bw_gb_s >= 1000.0f) {
+            snprintf(bw_str, sizeof(bw_str), "%.2f TB/s", bw_gb_s / 1000.0f);
+        } else {
+            snprintf(bw_str, sizeof(bw_str), "%.2f GB/s", bw_gb_s);
+        }
+
+        printf("│ %-12s │ %-10d │ %-8d │ %-12.3f │ %-12s │ %-12.2f │\n",
+               size_str, N, num_blocks, avg_ms, bw_str, throughput);
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        delete[] h_data;
+        CUDA_CHECK(cudaFree(d_in));
+        CUDA_CHECK(cudaFree(d_out));
+    }
+
+    printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
+
+    printf("\nNotes:\n");
+    printf("  • Bandwidth = (input + output) / kernel time\n");
+}
+
+// ============================================================================
 //  Main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -407,13 +662,19 @@ int main(int argc, char** argv) {
     
     // 正确性测试
     if (!test_correctness()) {
-        printf("Correctness test failed, aborting performance test.\n");
+        printf("Recursive correctness test failed, aborting.\n");
         return EXIT_FAILURE;
     }
-    
+    if (!test_correctness_single_pass()) {
+        printf("Single-pass correctness test failed, aborting.\n");
+        return EXIT_FAILURE;
+    }
+
     // 性能测试
     test_performance();
-    
+    printf("\n");
+    test_performance_single_pass();
+
     printf("\n✓ All tests completed.\n");
     return 0;
 }
