@@ -245,37 +245,64 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         val += warp_prefix_sums[warp - 1];
     }
 
-    if (global_tid == min(N - 1, (my_id + 1) * blockDim.x - 1)) {
-        // 发布block局部和：最后一个有效线程的 val 就是 block 的 inclusive 总和
-        g_partial[my_id] = val;
-        __threadfence();
-        g_status[my_id] = 1;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int block_total = warp_prefix_sums[num_warps - 1];
 
-        // lookback
+    // 最后一个warp：发布block局部和 + 32线程并行lookback
+    if (warp == num_warps - 1) {
+        if (lane == 0) {
+            g_partial[my_id] = block_total;
+            __threadfence();
+            g_status[my_id] = 1;
+        }
+
         int prefix_sum = 0;
         if (my_id > 0) {
-            int look = my_id - 1;
-            while (look >= 0) {
-                int status;
-                do {
-                    status = g_status[look];
-                } while (status == 0);
-                __threadfence();   // 先看到 status，再读 value，避免读到旧值
+            int look_base = my_id - 1;
+            bool done = false;
 
-                if (status == 2) {
-                    prefix_sum += g_prefix[look];
-                    break;
+            while (!done) {
+                int look_idx = look_base - lane;
+                int status, look_val;
+
+                if (look_idx >= 0) {
+                    do {
+                        status = g_status[look_idx];
+                    } while (status == 0);
+                    __threadfence();
+                    look_val = (status == 2) ? g_prefix[look_idx] : g_partial[look_idx];
                 } else {
-                    prefix_sum += g_partial[look];
-                    --look;
+                    status = 2;
+                    look_val = 0;
+                }
+
+                unsigned prefix_mask = __ballot_sync(0xffffffff, status == 2);
+
+                if (prefix_mask != 0) {
+                    int first_prefix_lane = __ffs(prefix_mask) - 1;
+                    int contribute = (lane <= first_prefix_lane) ? look_val : 0;
+                    for (int offset = 16; offset >= 1; offset >>= 1) {
+                        contribute += __shfl_down_sync(0xffffffff, contribute, offset);
+                    }
+                    if (lane == 0) prefix_sum += contribute;
+                    done = true;
+                } else {
+                    int contribute = look_val;
+                    for (int offset = 16; offset >= 1; offset >>= 1) {
+                        contribute += __shfl_down_sync(0xffffffff, contribute, offset);
+                    }
+                    if (lane == 0) prefix_sum += contribute;
+                    look_base -= WARP_SIZE;
                 }
             }
         }
-        s_prefix_sum = prefix_sum;
 
-        g_prefix[my_id] = prefix_sum + val;
-        __threadfence();
-        g_status[my_id] = 2;
+        if (lane == 0) {
+            s_prefix_sum = prefix_sum;
+            g_prefix[my_id] = prefix_sum + block_total;
+            __threadfence();
+            g_status[my_id] = 2;
+        }
     }
     __syncthreads();
 
