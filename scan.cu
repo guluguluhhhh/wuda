@@ -37,6 +37,7 @@ __device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
 
 #define BLOCK_SIZE 256
 #define WARP_SIZE 32
+#define ITEMS_PER_THREAD 8
 
 // ============================================================================
 // block内部前缀和scan_then_fan kernel
@@ -203,6 +204,8 @@ void global_inclusive_scan_recursive(int* d_in, int* d_out, int N) {
     CUDA_CHECK(cudaFree(d_block_sums));
 }
 
+#define TILE_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
+
 __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
                                  int* g_counter,
                                  volatile int* g_status,
@@ -211,27 +214,51 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     __shared__ int s_my_id;
     __shared__ int s_prefix_sum;
     __shared__ int warp_prefix_sums[BLOCK_SIZE / WARP_SIZE];
+    __shared__ int s_items[TILE_SIZE];
 
     int tid = threadIdx.x;
     int lane = tid & (WARP_SIZE - 1);
     int warp = tid / WARP_SIZE;
-    
-    // 抢id，表示负责哪一块数据
+
     if (tid == 0) {
         s_my_id = atomicAdd(g_counter, 1);
     }
     __syncthreads();
 
     int my_id = s_my_id;
-    int global_tid = my_id * blockDim.x + tid;
+    int block_base = my_id * TILE_SIZE;
 
-    int val = (global_tid < N) ? d_in[global_tid] : 0;
+    // Striped load: global → smem（coalesced）
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = block_base + tid + i * BLOCK_SIZE;
+        s_items[tid + i * BLOCK_SIZE] = (idx < N) ? d_in[idx] : 0;
+    }
+    __syncthreads();
+
+    // smem 转置: Striped → Blocked read to registers
+    int items[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        items[i] = s_items[tid * ITEMS_PER_THREAD + i];
+    }
+
+    // 线程内串行 inclusive scan
+    #pragma unroll
+    for (int i = 1; i < ITEMS_PER_THREAD; ++i) {
+        items[i] += items[i - 1];
+    }
+
+    // Block-level scan: 对每个线程的总和做 warp scan + warp间 scan
+    int thread_sum = items[ITEMS_PER_THREAD - 1];
     int warp_sum;
-    val = warp_kogge_stone_inclusive_scan(val, warp_sum);
+    int inclusive = warp_kogge_stone_inclusive_scan(thread_sum, warp_sum);
+
     if (lane == 0) {
         warp_prefix_sums[warp] = warp_sum;
     }
     __syncthreads();
+
     if (warp == 0) {
         int ws = (lane < blockDim.x / WARP_SIZE) ? warp_prefix_sums[lane] : 0;
         int dummy;
@@ -241,14 +268,23 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         }
     }
     __syncthreads();
+
+    // 该线程的 exclusive prefix = inclusive - 自身总和 + 前面所有 warp 的总和
+    int exclusive_prefix = inclusive - thread_sum;
     if (warp > 0) {
-        val += warp_prefix_sums[warp - 1];
+        exclusive_prefix += warp_prefix_sums[warp - 1];
     }
 
+    // 把 block 内 exclusive prefix 加回每个元素
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        items[i] += exclusive_prefix;
+    }
+
+    // 发布 block_total + 32线程并行 lookback
     int num_warps = blockDim.x / WARP_SIZE;
     int block_total = warp_prefix_sums[num_warps - 1];
 
-    // 最后一个warp：发布block局部和 + 32线程并行lookback
     if (warp == num_warps - 1) {
         if (lane == 0) {
             g_partial[my_id] = block_total;
@@ -306,8 +342,25 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     }
     __syncthreads();
 
-    if (global_tid < N) {
-        d_out[global_tid] = val + s_prefix_sum;
+    // 加上 lookback 得到的全局前缀
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        items[i] += s_prefix_sum;
+    }
+
+    // Blocked → smem → Striped store to global
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        s_items[tid * ITEMS_PER_THREAD + i] = items[i];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = block_base + tid + i * BLOCK_SIZE;
+        if (idx < N) {
+            d_out[idx] = s_items[tid + i * BLOCK_SIZE];
+        }
     }
 }
 
@@ -316,7 +369,8 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 // ============================================================================
 void single_pass_inclusive_scan(const int* d_in, int* d_out, int N) {
     if (N <= 0) return;
-    int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int tile_size = BLOCK_SIZE * ITEMS_PER_THREAD;
+    int num_blocks = (N + tile_size - 1) / tile_size;
 
     int* d_counter;
     int* d_status;
