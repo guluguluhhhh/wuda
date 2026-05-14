@@ -37,7 +37,7 @@ __device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
 
 #define BLOCK_SIZE 256
 #define WARP_SIZE 32
-#define ITEMS_PER_THREAD 8
+#define ITEMS_PER_THREAD 32
 
 // ============================================================================
 // block内部前缀和scan_then_fan kernel
@@ -228,11 +228,23 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     int my_id = s_my_id;
     int block_base = my_id * TILE_SIZE;
 
-    // Striped load: global → smem（coalesced）
-    #pragma unroll
-    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        int idx = block_base + tid + i * BLOCK_SIZE;
-        s_items[tid + i * BLOCK_SIZE] = (idx < N) ? d_in[idx] : 0;
+    // int4 向量化 load: global → smem
+    if (block_base + TILE_SIZE <= N) {
+        const int4* vec_in = (const int4*)(d_in + block_base);
+        #pragma unroll
+        for (int v = 0; v < ITEMS_PER_THREAD / 4; ++v) {
+            int4 data = vec_in[tid + v * BLOCK_SIZE];
+            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 0] = data.x;
+            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 1] = data.y;
+            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 2] = data.z;
+            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 3] = data.w;
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int idx = block_base + tid + i * BLOCK_SIZE;
+            s_items[tid + i * BLOCK_SIZE] = (idx < N) ? d_in[idx] : 0;
+        }
     }
     __syncthreads();
 
@@ -348,18 +360,31 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         items[i] += s_prefix_sum;
     }
 
-    // Blocked → smem → Striped store to global
+    // Blocked → smem → int4 向量化 store to global
     __syncthreads();
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         s_items[tid * ITEMS_PER_THREAD + i] = items[i];
     }
     __syncthreads();
-    #pragma unroll
-    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        int idx = block_base + tid + i * BLOCK_SIZE;
-        if (idx < N) {
-            d_out[idx] = s_items[tid + i * BLOCK_SIZE];
+    if (block_base + TILE_SIZE <= N) {
+        int4* vec_out = (int4*)(d_out + block_base);
+        #pragma unroll
+        for (int v = 0; v < ITEMS_PER_THREAD / 4; ++v) {
+            int4 data;
+            data.x = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 0];
+            data.y = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 1];
+            data.z = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 2];
+            data.w = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 3];
+            vec_out[tid + v * BLOCK_SIZE] = data;
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int idx = block_base + tid + i * BLOCK_SIZE;
+            if (idx < N) {
+                d_out[idx] = s_items[tid + i * BLOCK_SIZE];
+            }
         }
     }
 }
