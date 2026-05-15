@@ -205,6 +205,7 @@ void global_inclusive_scan_recursive(int* d_in, int* d_out, int N) {
 }
 
 #define TILE_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
+#define SMEM_STRIDE (ITEMS_PER_THREAD + 1)
 
 __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
                                  int* g_counter,
@@ -214,7 +215,7 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     __shared__ int s_my_id;
     __shared__ int s_prefix_sum;
     __shared__ int warp_prefix_sums[BLOCK_SIZE / WARP_SIZE];
-    __shared__ int s_items[TILE_SIZE];
+    __shared__ int s_items[BLOCK_SIZE * SMEM_STRIDE];
 
     int tid = threadIdx.x;
     int lane = tid & (WARP_SIZE - 1);
@@ -228,31 +229,34 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     int my_id = s_my_id;
     int block_base = my_id * TILE_SIZE;
 
-    // int4 向量化 load: global → smem
+    // int4 向量化 load: global → padded smem
     if (block_base + TILE_SIZE <= N) {
         const int4* vec_in = (const int4*)(d_in + block_base);
         #pragma unroll
         for (int v = 0; v < ITEMS_PER_THREAD / 4; ++v) {
             int4 data = vec_in[tid + v * BLOCK_SIZE];
-            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 0] = data.x;
-            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 1] = data.y;
-            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 2] = data.z;
-            s_items[v * 4 * BLOCK_SIZE + 4 * tid + 3] = data.w;
+            int p = v * 4 * BLOCK_SIZE + 4 * tid;
+            int pad = p / ITEMS_PER_THREAD;
+            s_items[p + pad + 0] = data.x;
+            s_items[p + pad + 1] = data.y;
+            s_items[p + pad + 2] = data.z;
+            s_items[p + pad + 3] = data.w;
         }
     } else {
         #pragma unroll
         for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
             int idx = block_base + tid + i * BLOCK_SIZE;
-            s_items[tid + i * BLOCK_SIZE] = (idx < N) ? d_in[idx] : 0;
+            int p = tid + i * BLOCK_SIZE;
+            s_items[p + p / ITEMS_PER_THREAD] = (idx < N) ? d_in[idx] : 0;
         }
     }
     __syncthreads();
 
-    // smem 转置: Striped → Blocked read to registers
+    // padded smem → Blocked read to registers（无 bank conflict）
     int items[ITEMS_PER_THREAD];
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        items[i] = s_items[tid * ITEMS_PER_THREAD + i];
+        items[i] = s_items[tid * SMEM_STRIDE + i];
     }
 
     // 线程内串行 inclusive scan
@@ -360,22 +364,24 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         items[i] += s_prefix_sum;
     }
 
-    // Blocked → smem → int4 向量化 store to global
+    // Blocked → padded smem → int4 向量化 store to global
     __syncthreads();
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        s_items[tid * ITEMS_PER_THREAD + i] = items[i];
+        s_items[tid * SMEM_STRIDE + i] = items[i];
     }
     __syncthreads();
     if (block_base + TILE_SIZE <= N) {
         int4* vec_out = (int4*)(d_out + block_base);
         #pragma unroll
         for (int v = 0; v < ITEMS_PER_THREAD / 4; ++v) {
+            int p = v * 4 * BLOCK_SIZE + 4 * tid;
+            int pad = p / ITEMS_PER_THREAD;
             int4 data;
-            data.x = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 0];
-            data.y = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 1];
-            data.z = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 2];
-            data.w = s_items[v * 4 * BLOCK_SIZE + 4 * tid + 3];
+            data.x = s_items[p + pad + 0];
+            data.y = s_items[p + pad + 1];
+            data.z = s_items[p + pad + 2];
+            data.w = s_items[p + pad + 3];
             vec_out[tid + v * BLOCK_SIZE] = data;
         }
     } else {
@@ -383,7 +389,8 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
             int idx = block_base + tid + i * BLOCK_SIZE;
             if (idx < N) {
-                d_out[idx] = s_items[tid + i * BLOCK_SIZE];
+                int p = tid + i * BLOCK_SIZE;
+                d_out[idx] = s_items[p + p / ITEMS_PER_THREAD];
             }
         }
     }
