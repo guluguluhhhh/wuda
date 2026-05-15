@@ -15,6 +15,13 @@
         }                                                   \
     } while (0)
 
+#define BLOCK_SIZE 256
+#define WARP_SIZE 32
+#define ITEMS_PER_THREAD 32
+
+#define TILE_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
+#define SMEM_STRIDE (ITEMS_PER_THREAD + 1)
+
 // ============================================================================
 // Warp内部前缀和Kogge-Stone inclusive scan kernel
 // ============================================================================
@@ -35,12 +42,37 @@ __device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
     return val;
 }
 
-#define BLOCK_SIZE 256
-#define WARP_SIZE 32
-#define ITEMS_PER_THREAD 32
+__device__ int block_exclusive_scan(int val, int& block_total) {
+    __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int warp = threadIdx.x / WARP_SIZE;
 
-#define TILE_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
-#define SMEM_STRIDE (ITEMS_PER_THREAD + 1)
+    int threads_sum;
+    int thread_inclusive = warp_kogge_stone_inclusive_scan(val, threads_sum);
+
+    if (lane == 0) {
+        warps[warp] = threads_sum;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int ws = (lane < BLOCK_SIZE / WARP_SIZE) ? warps[lane] : 0;
+        int dummy;
+        ws = warp_kogge_stone_inclusive_scan(ws, dummy);
+        if (lane < BLOCK_SIZE / WARP_SIZE) {
+            warps[lane] = ws;
+        }
+    }
+    __syncthreads();
+
+    block_total = warps[BLOCK_SIZE / WARP_SIZE - 1];
+
+    int exclusive = thread_inclusive - val;
+    if (warp > 0) {
+        exclusive += warps[warp - 1];
+    }
+    return exclusive;
+}
 
 __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
                                  int* g_counter,
@@ -49,7 +81,6 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
                                  volatile int* g_prefix) {
     __shared__ int s_my_id;
     __shared__ int s_prefix_sum;
-    __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
     __shared__ int s_items[BLOCK_SIZE * SMEM_STRIDE];
 
     int tid = threadIdx.x;
@@ -101,29 +132,8 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     }
 
     int items_sum = items[ITEMS_PER_THREAD - 1];
-    int threads_sum;
-    int thread_inclusive = warp_kogge_stone_inclusive_scan(items_sum, threads_sum);
-
-    if (lane == 0) {
-        warps[warp] = threads_sum;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        int ws = (lane < blockDim.x / WARP_SIZE) ? warps[lane] : 0;
-        int dummy;
-        ws = warp_kogge_stone_inclusive_scan(ws, dummy);
-        if (lane < blockDim.x / WARP_SIZE) {
-            warps[lane] = ws;
-        }
-    }
-    __syncthreads();
-
-    // 合并：当前线程的 exclusive prefix = warp 内前面线程 + 前面所有 warp
-    int exclusive_prefix = thread_inclusive - items_sum;
-    if (warp > 0) {
-        exclusive_prefix += warps[warp - 1];
-    }
+    int block_total;
+    int exclusive_prefix = block_exclusive_scan(items_sum, block_total);
 
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -132,7 +142,6 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 
     // 发布 block_total + 32线程并行 lookback
     int num_warps = blockDim.x / WARP_SIZE;
-    int block_total = warps[num_warps - 1];
 
     if (warp == num_warps - 1) {
         if (lane == 0) {
