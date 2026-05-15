@@ -214,7 +214,7 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
                                  volatile int* g_prefix) {
     __shared__ int s_my_id;
     __shared__ int s_prefix_sum;
-    __shared__ int warp_prefix_sums[BLOCK_SIZE / WARP_SIZE];
+    __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
     __shared__ int s_items[BLOCK_SIZE * SMEM_STRIDE];
 
     int tid = threadIdx.x;
@@ -265,33 +265,31 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
         items[i] += items[i - 1];
     }
 
-    // Block-level scan: 对每个线程的总和做 warp scan + warp间 scan
-    int thread_sum = items[ITEMS_PER_THREAD - 1];
-    int warp_sum;
-    int inclusive = warp_kogge_stone_inclusive_scan(thread_sum, warp_sum);
+    int items_sum = items[ITEMS_PER_THREAD - 1];
+    int threads_sum;
+    int thread_inclusive = warp_kogge_stone_inclusive_scan(items_sum, threads_sum);
 
     if (lane == 0) {
-        warp_prefix_sums[warp] = warp_sum;
+        warps[warp] = threads_sum;
     }
     __syncthreads();
 
     if (warp == 0) {
-        int ws = (lane < blockDim.x / WARP_SIZE) ? warp_prefix_sums[lane] : 0;
+        int ws = (lane < blockDim.x / WARP_SIZE) ? warps[lane] : 0;
         int dummy;
         ws = warp_kogge_stone_inclusive_scan(ws, dummy);
         if (lane < blockDim.x / WARP_SIZE) {
-            warp_prefix_sums[lane] = ws;
+            warps[lane] = ws;
         }
     }
     __syncthreads();
 
-    // 该线程的 exclusive prefix = inclusive - 自身总和 + 前面所有 warp 的总和
-    int exclusive_prefix = inclusive - thread_sum;
+    // 合并：当前线程的 exclusive prefix = warp 内前面线程 + 前面所有 warp
+    int exclusive_prefix = thread_inclusive - items_sum;
     if (warp > 0) {
-        exclusive_prefix += warp_prefix_sums[warp - 1];
+        exclusive_prefix += warps[warp - 1];
     }
 
-    // 把 block 内 exclusive prefix 加回每个元素
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         items[i] += exclusive_prefix;
@@ -299,7 +297,7 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 
     // 发布 block_total + 32线程并行 lookback
     int num_warps = blockDim.x / WARP_SIZE;
-    int block_total = warp_prefix_sums[num_warps - 1];
+    int block_total = warps[num_warps - 1];
 
     if (warp == num_warps - 1) {
         if (lane == 0) {
