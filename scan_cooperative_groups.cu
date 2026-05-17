@@ -20,6 +20,9 @@ namespace cg = cooperative_groups;
 
 #define BLOCK_SIZE 256
 #define WARP_SIZE 32
+#define ITEMS_PER_THREAD 32
+#define TILE_SIZE (BLOCK_SIZE * ITEMS_PER_THREAD)
+#define SMEM_STRIDE (ITEMS_PER_THREAD + 1)
 
 // ============================================================================
 // Warp inclusive scan (Kogge-Stone)
@@ -85,17 +88,62 @@ __global__ void grid_sync_scan(const int* d_in, int* d_out, int N,
     int tid = block.thread_rank();
     int num_blocks = gridDim.x;
 
-    // ===== Pass 1: 每个 block 处理 BLOCK_SIZE 个元素 =====
+    __shared__ int smem[BLOCK_SIZE * SMEM_STRIDE];
+
+    // ===== Pass 1: 每个 block 处理 TILE_SIZE 个元素 =====
     for (int bid = blockIdx.x; bid < num_blocks_total; bid += num_blocks) {
-        int idx = bid * BLOCK_SIZE + tid;
-        int val = (idx < N) ? d_in[idx] : 0;
+        int block_base = bid * TILE_SIZE;
 
-        int block_total;
-        int inclusive = block_inclusive_scan(block, warp, val, block_total);
-
-        if (idx < N) {
-            d_out[idx] = inclusive;
+        // Striped load: global → smem（合并访问）
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int gidx = block_base + tid + i * BLOCK_SIZE;
+            int p = tid + i * BLOCK_SIZE;
+            smem[p + p / ITEMS_PER_THREAD] = (gidx < N) ? d_in[gidx] : 0;
         }
+        block.sync();
+
+        // Blocked read: smem → registers
+        int items[ITEMS_PER_THREAD];
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            items[i] = smem[tid * SMEM_STRIDE + i];
+        }
+
+        // 线程内串行 inclusive scan
+        #pragma unroll
+        for (int i = 1; i < ITEMS_PER_THREAD; ++i) {
+            items[i] += items[i - 1];
+        }
+
+        // Block 级 scan
+        int items_sum = items[ITEMS_PER_THREAD - 1];
+        int block_total;
+        int block_inclusive = block_inclusive_scan(block, warp, items_sum, block_total);
+
+        // 加上 exclusive prefix
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            items[i] += block_inclusive - items_sum;
+        }
+
+        // Blocked write: registers → smem
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            smem[tid * SMEM_STRIDE + i] = items[i];
+        }
+        block.sync();
+
+        // Striped store: smem → global（合并访问）
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+            int gidx = block_base + tid + i * BLOCK_SIZE;
+            if (gidx < N) {
+                int p = tid + i * BLOCK_SIZE;
+                d_out[gidx] = smem[p + p / ITEMS_PER_THREAD];
+            }
+        }
+
         if (tid == 0) {
             block_sums[bid] = block_total;
         }
@@ -127,9 +175,13 @@ __global__ void grid_sync_scan(const int* d_in, int* d_out, int N,
     // ===== Pass 3: 每个 block 加上全局前缀 =====
     for (int bid = blockIdx.x; bid < num_blocks_total; bid += num_blocks) {
         if (bid > 0) {
-            int idx = bid * BLOCK_SIZE + tid;
-            if (idx < N) {
-                d_out[idx] += block_sums[bid - 1];
+            int prefix = block_sums[bid - 1];
+            #pragma unroll
+            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                int gidx = bid * TILE_SIZE + tid + i * BLOCK_SIZE;
+                if (gidx < N) {
+                    d_out[gidx] += prefix;
+                }
             }
         }
         block.sync();
@@ -149,7 +201,7 @@ void grid_sync_inclusive_scan(const int* d_in, int* d_out, int N) {
         &max_blocks_per_sm, grid_sync_scan, BLOCK_SIZE, 0));
     int max_blocks = max_blocks_per_sm * prop.multiProcessorCount;
 
-    int num_blocks_total = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int num_blocks_total = (N + TILE_SIZE - 1) / TILE_SIZE;
     int num_blocks = std::min(num_blocks_total, max_blocks);
 
     int* d_block_sums;
@@ -259,7 +311,7 @@ void test_performance() {
     int max_blocks = max_blocks_per_sm * prop.multiProcessorCount;
 
     printf("GPU: %s, Block Size: %d threads\n", prop.name, BLOCK_SIZE);
-    printf("Strategy: Grid-Sync Persistent Threads (CG)\n");
+    printf("Strategy: Grid-Sync Persistent Threads (CG), %d items/thread\n", ITEMS_PER_THREAD);
     printf("Max co-resident blocks: %d (max_per_sm=%d)\n\n", max_blocks, max_blocks_per_sm);
 
     printf("┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐\n");
@@ -281,7 +333,7 @@ void test_performance() {
 
     for (int t = 0; t < num_sizes; t++) {
         int N = test_sizes[t];
-        int num_tiles = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
 
         int *h_data = new int[N];
         int *d_in, *d_out;
