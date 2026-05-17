@@ -42,7 +42,7 @@ __device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
     return val;
 }
 
-__device__ int block_exclusive_scan(int val, int& block_total) {
+__device__ int block_inclusive_scan(int val, int& block_total) {
     __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
     int lane = threadIdx.x & (WARP_SIZE - 1);
     int warp = threadIdx.x / WARP_SIZE;
@@ -67,11 +67,11 @@ __device__ int block_exclusive_scan(int val, int& block_total) {
 
     block_total = warps[BLOCK_SIZE / WARP_SIZE - 1];
 
-    int exclusive = thread_inclusive - val;
+    int inclusive = thread_inclusive;
     if (warp > 0) {
-        exclusive += warps[warp - 1];
+        inclusive += warps[warp - 1];
     }
-    return exclusive;
+    return inclusive;
 }
 
 __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
@@ -133,11 +133,11 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 
     int items_sum = items[ITEMS_PER_THREAD - 1];
     int block_total;
-    int exclusive_prefix = block_exclusive_scan(items_sum, block_total);
+    int block_inclusive = block_inclusive_scan(items_sum, block_total);
 
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        items[i] += exclusive_prefix;
+        items[i] += block_inclusive - items_sum;
     }
 
     // 发布 block_total + 32线程并行 lookback
