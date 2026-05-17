@@ -1,9 +1,12 @@
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
 #include <algorithm>
+
+namespace cg = cooperative_groups;
 
 #define CUDA_CHECK(call)                                    \
     do {                                                    \
@@ -23,77 +26,74 @@
 #define SMEM_STRIDE (ITEMS_PER_THREAD + 1)
 
 // ============================================================================
-// Warp内部前缀和Kogge-Stone inclusive scan kernel
+// Warp内部前缀和Kogge-Stone inclusive scan
 // ============================================================================
-__device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
-    int lane_id = threadIdx.x & 31;
-    int mask = 0xffffffff;
-
-    // 步长：1，2，4，8，16
+__device__ int warp_kogge_stone_inclusive_scan(cg::thread_block_tile<32> warp,
+                                               int val, int& warp_sum) {
 #pragma unroll
     for (int offset = 1; offset <= 16; offset <<= 1) {
-        int other = __shfl_up_sync(mask, val, offset);
-        if (lane_id >= offset) {
+        int other = warp.shfl_up(val, offset);
+        if (warp.thread_rank() >= offset) {
             val += other;
         }
     }
 
-    warp_sum = __shfl_sync(mask, val, 31);
+    warp_sum = warp.shfl(val, 31);
     return val;
 }
 
-__device__ int block_exclusive_scan(int val, int& block_total) {
+// ============================================================================
+// Block exclusive scan: 输入每线程一个 val，返回 exclusive prefix + block_total
+// ============================================================================
+__device__ int block_exclusive_scan(cg::thread_block& block,
+                                     cg::thread_block_tile<32>& warp,
+                                     int val, int& block_total) {
     __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
-    int lane = threadIdx.x & (WARP_SIZE - 1);
-    int warp = threadIdx.x / WARP_SIZE;
 
     int threads_sum;
-    int thread_inclusive = warp_kogge_stone_inclusive_scan(val, threads_sum);
+    int thread_inclusive = warp_kogge_stone_inclusive_scan(warp, val, threads_sum);
 
-    if (lane == 0) {
-        warps[warp] = threads_sum;
+    if (warp.thread_rank() == 0) {
+        warps[warp.meta_group_rank()] = threads_sum;
     }
-    __syncthreads();
+    block.sync();
 
-    if (warp == 0) {
-        int ws = (lane < BLOCK_SIZE / WARP_SIZE) ? warps[lane] : 0;
+    if (warp.meta_group_rank() == 0) {
+        int ws = (warp.thread_rank() < warp.meta_group_size()) ?
+                  warps[warp.thread_rank()] : 0;
         int dummy;
-        ws = warp_kogge_stone_inclusive_scan(ws, dummy);
-        if (lane < BLOCK_SIZE / WARP_SIZE) {
-            warps[lane] = ws;
+        ws = warp_kogge_stone_inclusive_scan(warp, ws, dummy);
+        if (warp.thread_rank() < warp.meta_group_size()) {
+            warps[warp.thread_rank()] = ws;
         }
     }
-    __syncthreads();
+    block.sync();
 
-    block_total = warps[BLOCK_SIZE / WARP_SIZE - 1];
+    block_total = warps[warp.meta_group_size() - 1];
 
     int exclusive = thread_inclusive - val;
-    if (warp > 0) {
-        exclusive += warps[warp - 1];
+    if (warp.meta_group_rank() > 0) {
+        exclusive += warps[warp.meta_group_rank() - 1];
     }
     return exclusive;
 }
 
-__global__ void single_pass_scan(const int* d_in, int* d_out, int N,
-                                 int* g_counter,
-                                 volatile int* g_status,
-                                 volatile int* g_partial,
-                                 volatile int* g_prefix) {
-    __shared__ int s_my_id;
-    __shared__ int s_prefix_sum;
+// ============================================================================
+// Grid-sync scan: 三 pass 在一个 kernel 内完成
+// ============================================================================
+__global__ void grid_sync_scan(const int* d_in, int* d_out, int N,
+                                int* block_sums) {
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
     __shared__ int s_items[BLOCK_SIZE * SMEM_STRIDE];
 
-    int tid = threadIdx.x;
-    int lane = tid & (WARP_SIZE - 1);
-    int warp = tid / WARP_SIZE;
+    int tid = block.thread_rank();
+    int bid = blockIdx.x;
+    int block_base = bid * TILE_SIZE;
 
-    if (tid == 0) {
-        s_my_id = atomicAdd(g_counter, 1);
-    }
-    __syncthreads();
-
-    int my_id = s_my_id;
-    int block_base = my_id * TILE_SIZE;
+    // ===== Pass 1: 每个 block 做局部 inclusive scan =====
 
     // int4 向量化 load: global → padded smem
     if (block_base + TILE_SIZE <= N) {
@@ -116,9 +116,9 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
             s_items[p + p / ITEMS_PER_THREAD] = (idx < N) ? d_in[idx] : 0;
         }
     }
-    __syncthreads();
+    block.sync();
 
-    // padded smem → Blocked read to registers（无 bank conflict）
+    // padded smem → Blocked read to registers
     int items[ITEMS_PER_THREAD];
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -133,86 +133,64 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 
     int items_sum = items[ITEMS_PER_THREAD - 1];
     int block_total;
-    int exclusive_prefix = block_exclusive_scan(items_sum, block_total);
+    int exclusive_prefix = block_exclusive_scan(block, warp, items_sum, block_total);
 
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         items[i] += exclusive_prefix;
     }
 
-    // 发布 block_total + 32线程并行 lookback
-    int num_warps = blockDim.x / WARP_SIZE;
+    // 写出 block_total
+    if (tid == 0) {
+        block_sums[bid] = block_total;
+    }
 
-    if (warp == num_warps - 1) {
-        if (lane == 0) {
-            g_partial[my_id] = block_total;
-            __threadfence();
-            g_status[my_id] = 1;
+    // ===== 全局同步：等所有 block 完成 pass 1 =====
+    grid.sync();
+
+    // ===== Pass 2: block 0 对 block_sums 做 inclusive scan =====
+    int num_blocks = gridDim.x;
+    if (bid == 0) {
+        for (int base = 0; base < num_blocks; base += BLOCK_SIZE) {
+            int idx = base + tid;
+            int val = (idx < num_blocks) ? block_sums[idx] : 0;
+
+            int bt;
+            int exc = block_exclusive_scan(block, warp, val, bt);
+
+            if (idx < num_blocks) {
+                // inclusive = exclusive + val，再加上前面 chunk 的累计
+                block_sums[idx] = exc + val;
+            }
+            block.sync();
         }
-
-        int prefix_sum = 0;
-        if (my_id > 0) {
-            int look_base = my_id - 1;
-            bool done = false;
-
-            while (!done) {
-                int look_idx = look_base - lane;
-                int status, look_val;
-
-                if (look_idx >= 0) {
-                    do {
-                        status = g_status[look_idx];
-                    } while (status == 0);
-                    __threadfence();
-                    look_val = (status == 2) ? g_prefix[look_idx] : g_partial[look_idx];
-                } else {
-                    status = 2;
-                    look_val = 0;
-                }
-
-                unsigned prefix_mask = __ballot_sync(0xffffffff, status == 2);
-
-                if (prefix_mask != 0) {
-                    int first_prefix_lane = __ffs(prefix_mask) - 1;
-                    int contribute = (lane <= first_prefix_lane) ? look_val : 0;
-                    for (int offset = 16; offset >= 1; offset >>= 1) {
-                        contribute += __shfl_down_sync(0xffffffff, contribute, offset);
-                    }
-                    if (lane == 0) prefix_sum += contribute;
-                    done = true;
-                } else {
-                    int contribute = look_val;
-                    for (int offset = 16; offset >= 1; offset >>= 1) {
-                        contribute += __shfl_down_sync(0xffffffff, contribute, offset);
-                    }
-                    if (lane == 0) prefix_sum += contribute;
-                    look_base -= WARP_SIZE;
-                }
+        // 简化版：block 数不超过 BLOCK_SIZE 时一次搞定
+        // 超过时需要多轮，这里用串行 fallback
+        if (num_blocks > BLOCK_SIZE && tid == 0) {
+            for (int i = BLOCK_SIZE; i < num_blocks; i++) {
+                block_sums[i] += block_sums[i - 1];
             }
         }
-
-        if (lane == 0) {
-            s_prefix_sum = prefix_sum;
-            g_prefix[my_id] = prefix_sum + block_total;
-            __threadfence();
-            g_status[my_id] = 2;
-        }
     }
-    __syncthreads();
 
-    // 加上 lookback 得到的全局前缀
+    // ===== 全局同步：等 pass 2 完成 =====
+    grid.sync();
+
+    // ===== Pass 3: 每个 block 加上全局前缀 =====
+    int global_prefix = (bid > 0) ? block_sums[bid - 1] : 0;
+
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-        items[i] += s_prefix_sum;
+        items[i] += global_prefix;
     }
 
     // Blocked → padded smem → int4 向量化 store to global
-    __syncthreads();
+    block.sync();
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         s_items[tid * SMEM_STRIDE + i] = items[i];
     }
-    __syncthreads();
+    block.sync();
     if (block_base + TILE_SIZE <= N) {
         int4* vec_out = (int4*)(d_out + block_base);
         #pragma unroll
@@ -239,35 +217,41 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 }
 
 // ============================================================================
-//  Single-Pass Scan 主机封装
+//  主机封装
 // ============================================================================
-void single_pass_inclusive_scan(const int* d_in, int* d_out, int N) {
+void grid_sync_inclusive_scan(const int* d_in, int* d_out, int N) {
     if (N <= 0) return;
     int tile_size = BLOCK_SIZE * ITEMS_PER_THREAD;
-    int num_blocks = (N + tile_size - 1) / tile_size;
 
-    int* d_counter;
-    int* d_status;
-    int* d_partial;
-    int* d_prefix;
-    CUDA_CHECK(cudaMalloc(&d_counter, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_status, num_blocks * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_partial, num_blocks * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_prefix, num_blocks * sizeof(int)));
+    // 查询最大可同时驻留的 block 数
+    int max_blocks_per_sm = 0;
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, grid_sync_scan, BLOCK_SIZE, 0));
+    int max_blocks = max_blocks_per_sm * prop.multiProcessorCount;
 
-    CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_status, 0, num_blocks * sizeof(int)));
+    int needed_blocks = (N + tile_size - 1) / tile_size;
+    int num_blocks = std::min(needed_blocks, max_blocks);
 
-    single_pass_scan<<<num_blocks, BLOCK_SIZE>>>(
-        d_in, d_out, N, d_counter, d_status, d_partial, d_prefix);
+    // 如果 block 数受限，需要每个 block 处理多个 tile
+    if (num_blocks < needed_blocks) {
+        printf("Warning: need %d blocks but can only co-resident %d, "
+               "data too large for grid-sync approach\n", needed_blocks, num_blocks);
+        return;
+    }
+
+    int* d_block_sums;
+    CUDA_CHECK(cudaMalloc(&d_block_sums, num_blocks * sizeof(int)));
+
+    void* args[] = {(void*)&d_in, (void*)&d_out, (void*)&N, (void*)&d_block_sums};
+    CUDA_CHECK(cudaLaunchCooperativeKernel(
+        (void*)grid_sync_scan, num_blocks, BLOCK_SIZE, args));
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaFree(d_counter));
-    CUDA_CHECK(cudaFree(d_status));
-    CUDA_CHECK(cudaFree(d_partial));
-    CUDA_CHECK(cudaFree(d_prefix));
+    CUDA_CHECK(cudaFree(d_block_sums));
 }
-
 
 // ----------------------------------------------------------------------
 //  CPU 参考 inclusive scan
@@ -295,7 +279,7 @@ bool check_result(const int* cpu, const int* gpu, int N) {
         }
     }
     if (error_count > 0) {
-        fprintf(stderr, "Total errors: %d out of %d (%.4f%%)\n", 
+        fprintf(stderr, "Total errors: %d out of %d (%.4f%%)\n",
                 error_count, N, 100.0 * error_count / N);
         return false;
     }
@@ -303,12 +287,13 @@ bool check_result(const int* cpu, const int* gpu, int N) {
 }
 
 // ============================================================================
-//  Single-Pass 正确性测试
+//  正确性测试
 // ============================================================================
-bool test_correctness_single_pass() {
-    printf("=== Correctness Test (Single-Pass) ===\n");
+bool test_correctness() {
+    printf("=== Correctness Test (Grid-Sync CG) ===\n");
 
-    const int N = 123456789;
+    // grid-sync 能处理的数据量有限，用较小的 N 测试
+    const int N = 1000000;
     printf("Testing with N = %d\n", N);
 
     int *h_in = new int[N];
@@ -327,17 +312,16 @@ bool test_correctness_single_pass() {
     CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(d_in, h_in, N * sizeof(int), cudaMemcpyHostToDevice));
 
-    single_pass_inclusive_scan(d_in, d_out, N);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    grid_sync_inclusive_scan(d_in, d_out, N);
 
     CUDA_CHECK(cudaMemcpy(h_out_gpu, d_out, N * sizeof(int), cudaMemcpyDeviceToHost));
 
     bool pass = check_result(h_out_cpu, h_out_gpu, N);
 
     if (pass) {
-        printf("✓ Correctness test PASSED\n\n");
+        printf("PASSED\n\n");
     } else {
-        printf("✗ Correctness test FAILED\n\n");
+        printf("FAILED\n\n");
     }
 
     delete[] h_in;
@@ -350,59 +334,62 @@ bool test_correctness_single_pass() {
 }
 
 // ============================================================================
-//  Single-Pass 性能测试
+//  性能测试
 // ============================================================================
-void test_performance_single_pass() {
-    printf("=== Performance Test (Single-Pass) ===\n");
-    printf("GPU: RTX 5090, Block Size: %d threads\n", BLOCK_SIZE);
-    printf("Strategy: Single-Pass Decoupled Lookback\n\n");
+void test_performance() {
+    printf("=== Performance Test (Grid-Sync CG) ===\n");
 
-    printf("┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐\n");
-    printf("│ %-12s │ %-10s │ %-8s │ %-12s │ %-12s │ %-12s │\n",
-           "Data Size", "Elements", "Blocks", "Time (ms)", "Bandwidth", "Throughput");
-    printf("│              │            │          │              │   (GB/s)     │ (Melem/s)    │\n");
-    printf("├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤\n");
+    // 查询最大 block 数
+    int max_blocks_per_sm = 0;
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, grid_sync_scan, BLOCK_SIZE, 0));
+    int max_blocks = max_blocks_per_sm * prop.multiProcessorCount;
+    int max_elements = max_blocks * TILE_SIZE;
 
-    int test_sizes[] = {
-        100000,
-        1000000,
-        10000000,
-        100000000,
-        500000000,
-        1000000000,
-        2000000000,
-    };
+    printf("GPU: %s, %d SMs\n", prop.name, prop.multiProcessorCount);
+    printf("Max co-resident blocks: %d (max_per_sm=%d)\n", max_blocks, max_blocks_per_sm);
+    printf("Max elements with grid-sync: %d (~%.1f M)\n\n",
+           max_elements, max_elements / 1e6);
+
+    printf("%-14s %-12s %-10s %-14s %-14s\n",
+           "Data Size", "Elements", "Blocks", "Time (ms)", "Bandwidth");
+    printf("--------------------------------------------------------------\n");
+
+    int test_sizes[] = {100000, 1000000, 10000000, max_elements};
     int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
 
     for (int t = 0; t < num_sizes; t++) {
         int N = test_sizes[t];
-        int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int tile_size = BLOCK_SIZE * ITEMS_PER_THREAD;
+        int needed_blocks = (N + tile_size - 1) / tile_size;
+        if (needed_blocks > max_blocks) {
+            printf("%-14d %-12d SKIPPED (needs %d blocks > %d max)\n",
+                   N, N, needed_blocks, max_blocks);
+            continue;
+        }
 
-        int *h_data = new int[N];
         int *d_in, *d_out;
+        int *h_data = new int[N];
         CUDA_CHECK(cudaMalloc(&d_in, N * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_out, N * sizeof(int)));
 
-        for (int i = 0; i < N; i++) {
-            h_data[i] = rand() % 100;
-        }
+        for (int i = 0; i < N; i++) h_data[i] = rand() % 100;
         CUDA_CHECK(cudaMemcpy(d_in, h_data, N * sizeof(int), cudaMemcpyHostToDevice));
 
-        // 预热
         for (int i = 0; i < 10; i++) {
-            single_pass_inclusive_scan(d_in, d_out, N);
+            grid_sync_inclusive_scan(d_in, d_out, N);
         }
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 计时
-        const int num_iter = (N <= 10000000) ? 100 : 10;
+        const int num_iter = 100;
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
 
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < num_iter; i++) {
-            single_pass_inclusive_scan(d_in, d_out, N);
+            grid_sync_inclusive_scan(d_in, d_out, N);
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -410,29 +397,10 @@ void test_performance_single_pass() {
         float ms;
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
         float avg_ms = ms / num_iter;
+        float bw_gb = (2.0f * N * sizeof(int) / (avg_ms / 1000.0f)) / 1e9f;
 
-        float total_bytes = 2.0f * N * sizeof(int);
-        float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
-        float throughput = N / (avg_ms * 1000.0f);
-
-        char size_str[20];
-        if (N >= 1000000000) {
-            snprintf(size_str, sizeof(size_str), "%.1f GB", N * sizeof(int) / 1e9);
-        } else if (N >= 1000000) {
-            snprintf(size_str, sizeof(size_str), "%.0f MB", N * sizeof(int) / 1e6);
-        } else {
-            snprintf(size_str, sizeof(size_str), "%.0f KB", N * sizeof(int) / 1e3);
-        }
-
-        char bw_str[20];
-        if (bw_gb_s >= 1000.0f) {
-            snprintf(bw_str, sizeof(bw_str), "%.2f TB/s", bw_gb_s / 1000.0f);
-        } else {
-            snprintf(bw_str, sizeof(bw_str), "%.2f GB/s", bw_gb_s);
-        }
-
-        printf("│ %-12s │ %-10d │ %-8d │ %-12.3f │ %-12s │ %-12.2f │\n",
-               size_str, N, num_blocks, avg_ms, bw_str, throughput);
+        printf("%-14d %-12d %-10d %-14.3f %.2f GB/s\n",
+               N, N, needed_blocks, avg_ms, bw_gb);
 
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaEventDestroy(stop));
@@ -440,31 +408,21 @@ void test_performance_single_pass() {
         CUDA_CHECK(cudaFree(d_in));
         CUDA_CHECK(cudaFree(d_out));
     }
-
-    printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
-
-    printf("\nNotes:\n");
-    printf("  • Bandwidth = (input + output) / kernel time\n");
 }
 
 // ============================================================================
 //  Main
 // ============================================================================
-int main(int argc, char** argv) {
-    printf("╔══════════════════════════════════════════════════════╗\n");
-    printf("║   Global Inclusive Scan - Reduce-then-Scan          ║\n");
-    printf("║   Recursive Multi-level Implementation              ║\n");
-    printf("╚══════════════════════════════════════════════════════╝\n\n");
-    
-    if (!test_correctness_single_pass()) {
-        printf("Single-pass correctness test failed, aborting.\n");
+int main() {
+    printf("=== Cooperative Groups Grid-Sync Scan ===\n\n");
+
+    if (!test_correctness()) {
+        printf("Correctness test failed, aborting.\n");
         return EXIT_FAILURE;
     }
 
-    // 性能测试
-    test_performance_single_pass();
+    test_performance();
 
-    printf("\n✓ All tests completed.\n");
+    printf("\nDone.\n");
     return 0;
 }
-
