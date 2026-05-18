@@ -92,11 +92,12 @@ __global__ void radix_select_kernel(const unsigned int* data,
                                     int* d_output_idx) {
     __shared__ int smem[WARPS_PER_BLOCK];
     __shared__ bool is_last_block;
+    __shared__ unsigned int s_desired;
+    __shared__ unsigned int s_desired_mask;
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int val = (global_tid < n) ? data[global_tid] : 0;
 
-    // 线程局部变量，每轮结束从 state 刷新一次
     unsigned int desired = 0;
     unsigned int desired_mask = 0;
 
@@ -133,11 +134,16 @@ __global__ void radix_select_kernel(const unsigned int* data,
                 while (state->generation < RADIX_BITS - bit) {}
             }
         }
+
+        // thread 0 读一次 global，广播到 shared
+        if (threadIdx.x == 0) {
+            s_desired = state->desired;
+            s_desired_mask = state->desired_mask;
+        }
         __syncthreads();
 
-        // 所有线程刷新局部变量（每轮一次 volatile 读）
-        desired = state->desired;
-        desired_mask = state->desired_mask;
+        desired = s_desired;
+        desired_mask = s_desired_mask;
     }
 
     if (global_tid < n && val >= desired) {
