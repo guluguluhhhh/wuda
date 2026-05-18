@@ -29,33 +29,16 @@ __device__ int warp_reduce_sum(int val) {
 }
 
 // ============================================================
-// Warp 层：统计 warp 内满足条件且指定 bit 为 1 的线程数
+// Block 层：归约每个线程的局部计数，得到 block 总和
 // ============================================================
-__device__ int warp_count_bit(unsigned int val,
-                              unsigned int desired,
-                              unsigned int desired_mask,
-                              int bit) {
-    bool active = ((val & desired_mask) == desired);
-    bool has_bit = active && ((val >> bit) & 1);
-    unsigned int ballot = __ballot_sync(0xFFFFFFFF, has_bit);
-    return __popc(ballot);
-}
-
-// ============================================================
-// Block 层：内部调用 warp 层，归约得到 block 总 count
-// ============================================================
-__device__ int block_reduce_count(unsigned int val,
-                                  unsigned int desired,
-                                  unsigned int desired_mask,
-                                  int bit,
-                                  int* smem) {
+__device__ int block_reduce_sum(int val, int* smem) {
     int lane = threadIdx.x % WARP_SIZE;
     int warp = threadIdx.x / WARP_SIZE;
 
-    int warp_count = warp_count_bit(val, desired, desired_mask, bit);
+    val = warp_reduce_sum(val);
 
     if (lane == 0) {
-        smem[warp] = warp_count;
+        smem[warp] = val;
     }
     __syncthreads();
 
@@ -96,13 +79,20 @@ __global__ void radix_select_kernel(const unsigned int* data,
     __shared__ unsigned int s_desired_mask;
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int val = (global_tid < n) ? data[global_tid] : 0;
+    int stride = blockDim.x * gridDim.x;
 
     unsigned int desired = 0;
     unsigned int desired_mask = 0;
 
     for (int bit = RADIX_BITS - 1; bit >= 0; --bit) {
-        int block_count = block_reduce_count(val, desired, desired_mask, bit, smem);
+        int thread_count = 0;
+        for (int i = global_tid; i < n; i += stride) {
+            unsigned int val = data[i];
+            bool active = ((val & desired_mask) == desired);
+            thread_count += active && ((val >> bit) & 1);
+        }
+
+        int block_count = block_reduce_sum(thread_count, smem);
 
         if (threadIdx.x == 0) {
             atomicAdd((int*)&state->count, block_count);
@@ -146,13 +136,28 @@ __global__ void radix_select_kernel(const unsigned int* data,
         desired_mask = s_desired_mask;
     }
 
-    if (global_tid < n && val >= desired) {
-        int pos = atomicAdd((int*)&state->write_pos, 1);
-        if (pos < k) {
-            d_output[pos] = val;
-            d_output_idx[pos] = global_tid;
+    for (int i = global_tid; i < n; i += stride) {
+        unsigned int val = data[i];
+        if (val >= desired) {
+            int pos = atomicAdd((int*)&state->write_pos, 1);
+            if (pos < k) {
+                d_output[pos] = val;
+                d_output_idx[pos] = i;
+            }
         }
     }
+}
+
+// ============================================================
+// 查询硬件最大可驻留 block 数
+// ============================================================
+int get_max_grid_size() {
+    int max_blocks_per_sm;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, radix_select_kernel, BLOCK_SIZE, WARPS_PER_BLOCK * sizeof(int));
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    return max_blocks_per_sm * num_sms;
 }
 
 // ============================================================
@@ -166,7 +171,8 @@ void topk_radix_select(const unsigned int* d_data, int n, int k,
     CUDA_CHECK(cudaMalloc(&d_state, sizeof(RadixState)));
     CUDA_CHECK(cudaMemcpy(d_state, &init, sizeof(RadixState), cudaMemcpyHostToDevice));
 
-    int grid_size = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int max_grid = get_max_grid_size();
+    int grid_size = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, max_grid);
 
     radix_select_kernel<<<grid_size, BLOCK_SIZE>>>(
         d_data, n, k, d_state, d_output, d_output_idx);
@@ -225,34 +231,21 @@ bool check_result(const unsigned int* cpu_vals, const unsigned int* gpu_vals, in
 }
 
 // ============================================================
-// 查询硬件最大可驻留 block 数
-// ============================================================
-int get_max_grid_size() {
-    int max_blocks_per_sm;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, radix_select_kernel, BLOCK_SIZE, WARPS_PER_BLOCK * sizeof(int));
-    int num_sms;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
-    return max_blocks_per_sm * num_sms;
-}
-
-// ============================================================
 // 正确性测试
 // ============================================================
 bool test_correctness() {
     printf("=== Correctness Test (Radix Select TopK) ===\n");
 
     int max_grid = get_max_grid_size();
-    int max_n = max_grid * BLOCK_SIZE;
-    printf("  Hardware max concurrent blocks: %d, max N (no stride): %d\n\n", max_grid, max_n);
+    printf("  Hardware max concurrent blocks (grid cap): %d\n\n", max_grid);
 
     struct TestCase { int n; int k; };
     TestCase cases[] = {
         {1024, 5},
         {10000, 10},
         {100000, 100},
-        {max_n / 2, 256},
-        {max_n, 1000},
+        {1000000, 256},
+        {10000000, 1000},
     };
     int num_cases = sizeof(cases) / sizeof(cases[0]);
 
@@ -261,8 +254,8 @@ bool test_correctness() {
     for (int t = 0; t < num_cases; t++) {
         int n = cases[t].n;
         int k = cases[t].k;
-        if (n > max_n) continue;
-        printf("  N = %-10d  K = %-6d  Blocks = %-5d ... ", n, k, (n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        int grid = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, max_grid);
+        printf("  N = %-10d  K = %-6d  Grid = %-5d ... ", n, k, grid);
 
         unsigned int* h_data = new unsigned int[n];
         for (int i = 0; i < n; i++) h_data[i] = (unsigned int)rand();
@@ -309,12 +302,11 @@ void test_performance() {
     printf("=== Performance Test (Radix Select TopK) ===\n");
 
     int max_grid = get_max_grid_size();
-    int max_n = max_grid * BLOCK_SIZE;
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
 
-    printf("Block Size: %d threads, SMs: %d, Max concurrent blocks: %d, Max N: %d\n\n",
-           BLOCK_SIZE, num_sms, max_grid, max_n);
+    printf("Block Size: %d threads, SMs: %d, Grid cap: %d\n\n",
+           BLOCK_SIZE, num_sms, max_grid);
 
     printf("┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐\n");
     printf("│ %-12s │ %-10s │ %-8s │ %-12s │ %-12s │ %-12s │\n",
@@ -324,46 +316,52 @@ void test_performance() {
 
     struct TestCase { int n; int k; };
     TestCase cases[] = {
-        {1024,           5},
-        {10000,          10},
-        {100000,         100},
-        {max_n / 4,      256},
-        {max_n / 2,      512},
-        {max_n,          1000},
+        {100000000,      1000},
+        {500000000,      1000},
+        {1000000000,     1000},
+        {2000000000,     1000},
     };
     int num_cases = sizeof(cases) / sizeof(cases[0]);
 
     for (int t = 0; t < num_cases; t++) {
         int n = cases[t].n;
         int k = cases[t].k;
-        if (n > max_n) continue;
-        int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int num_blocks = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, max_grid);
 
         unsigned int* h_data = new unsigned int[n];
         for (int i = 0; i < n; i++) h_data[i] = (unsigned int)rand();
 
         unsigned int *d_data, *d_output;
         int* d_output_idx;
-        CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(unsigned int)));
+        RadixState* d_state;
+        CUDA_CHECK(cudaMalloc(&d_data, (size_t)n * sizeof(unsigned int)));
         CUDA_CHECK(cudaMalloc(&d_output, k * sizeof(unsigned int)));
         CUDA_CHECK(cudaMalloc(&d_output_idx, k * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(d_data, h_data, n * sizeof(unsigned int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_state, sizeof(RadixState)));
+        CUDA_CHECK(cudaMemcpy(d_data, h_data, (size_t)n * sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+        RadixState init = {};
+        init.remaining_k = k;
 
         // 预热
-        for (int i = 0; i < 10; i++) {
-            topk_radix_select(d_data, n, k, d_output, d_output_idx);
+        for (int i = 0; i < 5; i++) {
+            CUDA_CHECK(cudaMemcpy(d_state, &init, sizeof(RadixState), cudaMemcpyHostToDevice));
+            radix_select_kernel<<<num_blocks, BLOCK_SIZE>>>(
+                d_data, n, k, d_state, d_output, d_output_idx);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // 计时
-        const int num_iter = (n <= 100000) ? 100 : 50;
+        const int num_iter = (n <= 10000000) ? 50 : 10;
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
 
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < num_iter; i++) {
-            topk_radix_select(d_data, n, k, d_output, d_output_idx);
+            CUDA_CHECK(cudaMemcpy(d_state, &init, sizeof(RadixState), cudaMemcpyHostToDevice));
+            radix_select_kernel<<<num_blocks, BLOCK_SIZE>>>(
+                d_data, n, k, d_state, d_output, d_output_idx);
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
@@ -372,7 +370,7 @@ void test_performance() {
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
         float avg_ms = ms / num_iter;
 
-        // 带宽：每轮读 N 个 uint，共 32 轮 + 最后 gather 读一次
+        // stride 版本每轮重新读 N 个元素，共 32 轮 + 1 轮 gather
         float total_bytes = (float)n * sizeof(unsigned int) * 33.0f;
         float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
         float throughput = n / (avg_ms * 1000.0f);
@@ -402,6 +400,7 @@ void test_performance() {
         CUDA_CHECK(cudaFree(d_data));
         CUDA_CHECK(cudaFree(d_output));
         CUDA_CHECK(cudaFree(d_output_idx));
+        CUDA_CHECK(cudaFree(d_state));
     }
 
     printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
