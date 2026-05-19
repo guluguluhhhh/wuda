@@ -75,8 +75,6 @@ __global__ void radix_select_kernel(const unsigned int* data,
                                     int* d_output_idx) {
     __shared__ int smem[WARPS_PER_BLOCK];
     __shared__ bool is_last_block;
-    __shared__ unsigned int s_desired;
-    __shared__ unsigned int s_desired_mask;
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -125,15 +123,10 @@ __global__ void radix_select_kernel(const unsigned int* data,
             }
         }
 
-        // thread 0 读一次 global，广播到 shared
-        if (threadIdx.x == 0) {
-            s_desired = state->desired;
-            s_desired_mask = state->desired_mask;
-        }
         __syncthreads();
 
-        desired = s_desired;
-        desired_mask = s_desired_mask;
+        desired = state->desired;
+        desired_mask = state->desired_mask;
     }
 
     for (int i = global_tid; i < n; i += stride) {
