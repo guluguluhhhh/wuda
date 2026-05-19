@@ -1,7 +1,10 @@
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+
+namespace cg = cooperative_groups;
 
 #define CUDA_CHECK(call)                                    \
     do {                                                    \
@@ -52,12 +55,10 @@ __device__ int block_reduce_sum(int val, int* smem) {
 }
 
 // ============================================================
-// Block 间同步状态
+// Grid 级共享状态
 // ============================================================
 struct RadixState {
     int count;
-    int block_finished;
-    int generation;
     unsigned int desired;
     unsigned int desired_mask;
     int remaining_k;
@@ -65,16 +66,17 @@ struct RadixState {
 };
 
 // ============================================================
-// 单 Kernel：原子计数 + 最后一个 block 决策
+// 单 Kernel：cooperative groups grid.sync() 实现跨 block 同步
 // ============================================================
 __global__ void radix_select_kernel(const unsigned int* data,
                                     int n,
                                     int k,
-                                    volatile RadixState* state,
+                                    RadixState* state,
                                     unsigned int* d_output,
                                     int* d_output_idx) {
     __shared__ int smem[WARPS_PER_BLOCK];
-    __shared__ bool is_last_block;
+
+    cg::grid_group grid = cg::this_grid();
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -93,38 +95,25 @@ __global__ void radix_select_kernel(const unsigned int* data,
         int block_count = block_reduce_sum(thread_count, smem);
 
         if (threadIdx.x == 0) {
-            atomicAdd((int*)&state->count, block_count);
-            __threadfence();
-            int finished = atomicAdd((int*)&state->block_finished, 1);
-            is_last_block = (finished == gridDim.x - 1);
-        }
-        __syncthreads();
-
-        if (is_last_block) {
-            if (threadIdx.x == 0) {
-                int count = state->count;
-                int remaining_k = state->remaining_k;
-
-                if (count >= remaining_k) {
-                    state->desired = desired | (1U << bit);
-                } else {
-                    state->remaining_k = remaining_k - count;
-                }
-                state->desired_mask = desired_mask | (1U << bit);
-
-                atomicExch((int*)&state->count, 0);
-                atomicExch((int*)&state->block_finished, 0);
-                __threadfence();
-                atomicAdd((int*)&state->generation, 1);
-            }
-        } else {
-            // 用每个block的第一个线程自旋，配合后面的syncthreads，从而把整个block都hold住
-            if (threadIdx.x == 0) {
-                while (state->generation < RADIX_BITS - bit) {}
-            }
+            atomicAdd(&state->count, block_count);
         }
 
-        __syncthreads();
+        grid.sync();
+
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            int count = state->count;
+            int remaining_k = state->remaining_k;
+
+            if (count >= remaining_k) {
+                state->desired = desired | (1U << bit);
+            } else {
+                state->remaining_k = remaining_k - count;
+            }
+            state->desired_mask = desired_mask | (1U << bit);
+            state->count = 0;
+        }
+
+        grid.sync();
 
         desired = state->desired;
         desired_mask = state->desired_mask;
@@ -133,7 +122,7 @@ __global__ void radix_select_kernel(const unsigned int* data,
     for (int i = global_tid; i < n; i += stride) {
         unsigned int val = data[i];
         if (val >= desired) {
-            int pos = atomicAdd((int*)&state->write_pos, 1);
+            int pos = atomicAdd(&state->write_pos, 1);
             if (pos < k) {
                 d_output[pos] = val;
                 d_output_idx[pos] = i;
@@ -168,8 +157,10 @@ void topk_radix_select(const unsigned int* d_data, int n, int k,
     int max_grid = get_max_grid_size();
     int grid_size = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, max_grid);
 
-    radix_select_kernel<<<grid_size, BLOCK_SIZE>>>(
-        d_data, n, k, d_state, d_output, d_output_idx);
+    void* args[] = {(void*)&d_data, (void*)&n, (void*)&k,
+                    (void*)&d_state, (void*)&d_output, (void*)&d_output_idx};
+    CUDA_CHECK(cudaLaunchCooperativeKernel(
+        (void*)radix_select_kernel, dim3(grid_size), dim3(BLOCK_SIZE), args));
 
     CUDA_CHECK(cudaFree(d_state));
 }
@@ -337,11 +328,14 @@ void test_performance() {
         RadixState init = {};
         init.remaining_k = k;
 
+        void* args[] = {(void*)&d_data, (void*)&n, (void*)&k,
+                        (void*)&d_state, (void*)&d_output, (void*)&d_output_idx};
+
         // 预热
         for (int i = 0; i < 5; i++) {
             CUDA_CHECK(cudaMemcpy(d_state, &init, sizeof(RadixState), cudaMemcpyHostToDevice));
-            radix_select_kernel<<<num_blocks, BLOCK_SIZE>>>(
-                d_data, n, k, d_state, d_output, d_output_idx);
+            CUDA_CHECK(cudaLaunchCooperativeKernel(
+                (void*)radix_select_kernel, dim3(num_blocks), dim3(BLOCK_SIZE), args));
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -354,8 +348,8 @@ void test_performance() {
         CUDA_CHECK(cudaEventRecord(start));
         for (int i = 0; i < num_iter; i++) {
             CUDA_CHECK(cudaMemcpy(d_state, &init, sizeof(RadixState), cudaMemcpyHostToDevice));
-            radix_select_kernel<<<num_blocks, BLOCK_SIZE>>>(
-                d_data, n, k, d_state, d_output, d_output_idx);
+            CUDA_CHECK(cudaLaunchCooperativeKernel(
+                (void*)radix_select_kernel, dim3(num_blocks), dim3(BLOCK_SIZE), args));
         }
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
