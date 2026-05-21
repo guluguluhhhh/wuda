@@ -29,7 +29,7 @@ __device__ void warp_compare_swap(float &val, int stride) {
 }
 
 // 辅助：编译期计算最大的 2^k < n
-constexpr int largest_pow2_below(int n) {
+constexpr __host__ __device__ int largest_pow2_below(int n) {
     int h = 1;
     while (h < n) h <<= 1;
     return h >> 1;
@@ -122,3 +122,169 @@ __device__ void sort_odd(float vals[]) {
         }
     }
 }
+
+// 5. WarpSelect（Algorithm 3）
+//    K = top-k 数量（必须是 64 的倍数）
+//    T = 每个 lane 的 thread queue 大小
+template <int K, int T>
+struct WarpSelect {
+    float thread_queue[T];        // 升序 lane-stride（[T-1] 最大，用作门槛）
+    float warp_queue[K / 32];     // lane-stride，升序
+
+    __device__ void init() {
+        #pragma unroll
+        for (int i = 0; i < T; i++) thread_queue[i] = __FLT_MAX__;
+        #pragma unroll
+        for (int i = 0; i < K / 32; i++) warp_queue[i] = __FLT_MAX__;
+    }
+
+    __device__ void add(float val) {
+        bool inserted = (val < thread_queue[T - 1]);
+        if (inserted) {
+            thread_queue[T - 1] = val;
+            #pragma unroll
+            for (int i = T - 1; i > 0; i--) {
+                if (thread_queue[i] < thread_queue[i - 1]) {
+                    float tmp = thread_queue[i];
+                    thread_queue[i] = thread_queue[i - 1];
+                    thread_queue[i - 1] = tmp;
+                }
+            }
+        }
+
+        if (__any_sync(0xFFFFFFFF, inserted)) {
+            float warp_max = __shfl_sync(0xFFFFFFFF, warp_queue[K / 32 - 1], 31);
+            if (__any_sync(0xFFFFFFFF, thread_queue[T - 1] < warp_max)) {
+                restore();
+            }
+        }
+    }
+
+    __device__ void restore() {
+        sort_odd<32 * T>(thread_queue);
+        merge_odd<K, 32 * T>(warp_queue, thread_queue);
+    }
+
+    __device__ void finalize() { restore(); }
+
+    __device__ void write(float* out) {
+        int lane_id = threadIdx.x & 31;
+        #pragma unroll
+        for (int r = 0; r < K / 32; r++) {
+            out[r * 32 + lane_id] = warp_queue[r];
+        }
+    }
+};
+
+// ===== Kernel =====
+
+template <int K, int T>
+__global__ void topk_pass1(const float* __restrict__ input, int n,
+                           float* __restrict__ partial) {
+    __shared__ float smem[WARPS_PER_BLOCK * K];
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x & 31;
+    int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    WarpSelect<K, T> sel;
+    sel.init();
+
+    for (int i = global_tid; i < n; i += stride) {
+        sel.add(input[i]);
+    }
+    sel.finalize();
+
+    // block 级归约：各 warp 结果写入 shared memory
+    sel.write(smem + warp_id * K);
+    __syncthreads();
+
+    // warp 0 对 block 内所有 warp 的结果做二次选择
+    if (warp_id == 0) {
+        WarpSelect<K, T> block_sel;
+        block_sel.init();
+
+        for (int i = lane_id; i < WARPS_PER_BLOCK * K; i += 32) {
+            block_sel.add(smem[i]);
+        }
+        block_sel.finalize();
+        block_sel.write(partial + blockIdx.x * K);
+    }
+}
+
+template <int K, int T>
+__global__ void topk_pass2(const float* __restrict__ partial, int num_elements,
+                           float* __restrict__ output) {
+    int lane_id = threadIdx.x & 31;
+    WarpSelect<K, T> sel;
+    sel.init();
+
+    for (int i = lane_id; i < num_elements; i += 32) {
+        sel.add(partial[i]);
+    }
+    sel.finalize();
+    sel.write(output);
+}
+
+// ===== Host 接口 =====
+
+template <int K>
+void topk(const float* d_input, int n, float* d_output) {
+    constexpr int T = (K <= 64) ? 2 : (K <= 256) ? 4 : 8;
+    int num_blocks = min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, 128);
+
+    float* d_partial;
+    cudaMalloc(&d_partial, num_blocks * K * sizeof(float));
+
+    topk_pass1<K, T><<<num_blocks, BLOCK_SIZE>>>(d_input, n, d_partial);
+    topk_pass2<K, T><<<1, 32>>>(d_partial, num_blocks * K, d_output);
+
+    cudaFree(d_partial);
+}
+
+// ===== 测试 =====
+
+int main() {
+    const int N = 1000000;
+    constexpr int K = 64;
+
+    float* h_input = new float[N];
+    srand(42);
+    for (int i = 0; i < N; i++) h_input[i] = (float)rand() / RAND_MAX;
+
+    float *d_input, *d_output;
+    CUDA_CHECK(cudaMalloc(&d_input, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, K * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice));
+
+    topk<K>(d_input, N, d_output);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float h_output[K];
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, K * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // CPU 验证
+    std::sort(h_output, h_output + K);
+    float* h_sorted = new float[N];
+    memcpy(h_sorted, h_input, N * sizeof(float));
+    std::partial_sort(h_sorted, h_sorted + K, h_sorted + N);
+
+    printf("GPU top-%d vs CPU top-%d:\n", K, K);
+    bool pass = true;
+    for (int i = 0; i < K; i++) {
+        if (fabsf(h_output[i] - h_sorted[i]) > 1e-6f) {
+            printf("  MISMATCH at %d: GPU=%.6f CPU=%.6f\n", i, h_output[i], h_sorted[i]);
+            pass = false;
+        }
+    }
+    if (pass) printf("  PASS!\n");
+
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+    delete[] h_input;
+    delete[] h_sorted;
+    return 0;
+}
+
+
