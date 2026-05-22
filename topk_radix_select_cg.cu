@@ -19,7 +19,9 @@ namespace cg = cooperative_groups;
 constexpr int BLOCK_SIZE = 1024;
 constexpr int WARP_SIZE = 32;
 constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
-constexpr int RADIX_BITS = 32;
+constexpr int BITS_PER_PASS = 8;
+constexpr int NUM_BUCKETS = 1 << BITS_PER_PASS;
+constexpr int NUM_PASSES = 32 / BITS_PER_PASS;
 
 // ============================================================
 // Warp 层：warp 内 shuffle 归约求和
@@ -58,7 +60,7 @@ __device__ int block_reduce_sum(int val, int* smem) {
 // Grid 级共享状态
 // ============================================================
 struct RadixState {
-    int count;
+    int hist[NUM_BUCKETS];
     unsigned int desired;
     unsigned int desired_mask;
     int remaining_k;
@@ -74,7 +76,7 @@ __global__ void radix_select_kernel(const unsigned int* data,
                                     RadixState* state,
                                     unsigned int* d_output,
                                     int* d_output_idx) {
-    __shared__ int smem[WARPS_PER_BLOCK];
+    __shared__ int smem_hist[NUM_BUCKETS];
 
     cg::grid_group grid = cg::this_grid();
 
@@ -84,33 +86,48 @@ __global__ void radix_select_kernel(const unsigned int* data,
     unsigned int desired = 0;
     unsigned int desired_mask = 0;
 
-    for (int bit = RADIX_BITS - 1; bit >= 0; --bit) {
-        int thread_count = 0;
+    for (int pass = 0; pass < NUM_PASSES; ++pass) {
+        int shift = 32 - (pass + 1) * BITS_PER_PASS;
+
+        for (int i = threadIdx.x; i < NUM_BUCKETS; i += blockDim.x)
+            smem_hist[i] = 0;
+        __syncthreads();
+
         for (int i = global_tid; i < n; i += stride) {
             unsigned int val = data[i];
-            bool active = ((val & desired_mask) == desired);
-            thread_count += active && ((val >> bit) & 1);
+            if ((val & desired_mask) == desired) {
+                int digit = (val >> shift) & (NUM_BUCKETS - 1);
+                atomicAdd(&smem_hist[digit], 1);
+            }
         }
+        __syncthreads();
 
-        int block_count = block_reduce_sum(thread_count, smem);
-
-        if (threadIdx.x == 0) {
-            atomicAdd(&state->count, block_count);
+        if (threadIdx.x < NUM_BUCKETS) {
+            atomicAdd(&state->hist[threadIdx.x], smem_hist[threadIdx.x]);
         }
 
         grid.sync();
 
         if (blockIdx.x == 0 && threadIdx.x == 0) {
-            int count = state->count;
             int remaining_k = state->remaining_k;
+            int cumsum = 0;
+            int chosen_bucket = 0;
 
-            if (count >= remaining_k) {
-                state->desired = desired | (1U << bit);
-            } else {
-                state->remaining_k = remaining_k - count;
+            for (int b = NUM_BUCKETS - 1; b >= 0; --b) {
+                cumsum += state->hist[b];
+                if (cumsum >= remaining_k) {
+                    chosen_bucket = b;
+                    break;
+                }
             }
-            state->desired_mask = desired_mask | (1U << bit);
-            state->count = 0;
+
+            int count_above = cumsum - state->hist[chosen_bucket];
+            state->remaining_k = remaining_k - count_above;
+            state->desired = desired | ((unsigned int)chosen_bucket << shift);
+            state->desired_mask = desired_mask | (((unsigned int)(NUM_BUCKETS - 1)) << shift);
+
+            for (int b = 0; b < NUM_BUCKETS; b++)
+                state->hist[b] = 0;
         }
 
         grid.sync();
@@ -137,7 +154,7 @@ __global__ void radix_select_kernel(const unsigned int* data,
 int get_max_grid_size() {
     int max_blocks_per_sm;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_blocks_per_sm, radix_select_kernel, BLOCK_SIZE, WARPS_PER_BLOCK * sizeof(int));
+        &max_blocks_per_sm, radix_select_kernel, BLOCK_SIZE, NUM_BUCKETS * sizeof(int));
     int num_sms;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
     return max_blocks_per_sm * num_sms;
@@ -358,8 +375,7 @@ void test_performance() {
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
         float avg_ms = ms / num_iter;
 
-        // stride 版本每轮重新读 N 个元素，共 32 轮 + 1 轮 gather
-        float total_bytes = (float)n * sizeof(unsigned int) * 33.0f;
+        float total_bytes = (float)n * sizeof(unsigned int);
         float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
         float throughput = n / (avg_ms * 1000.0f);
 
@@ -393,7 +409,7 @@ void test_performance() {
 
     printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
     printf("\nNotes:\n");
-    printf("  • Bandwidth = N * 4B * 33 (32 radix rounds + 1 gather) / kernel time\n");
+    printf("  • Bandwidth = N * 4B (effective: input data size) / kernel time\n");
     printf("  • Throughput = N / kernel_time\n");
 }
 
