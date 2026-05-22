@@ -113,29 +113,36 @@ __device__ void sort_odd(float vals[]) {
         sort_odd<HALF>(vals + HALF / 32);
         merge_odd<HALF, HALF>(vals, vals + HALF / 32);
     } else if constexpr (LEN == 32) {
+        int lane_id = threadIdx.x & 31;
         #pragma unroll
-        for (int phase = 1; phase <= 16; phase <<= 1) {
+        for (int k = 2; k <= 32; k <<= 1) {
             #pragma unroll
-            for (int stride = phase; stride >= 1; stride >>= 1) {
-                warp_compare_swap(vals[0], stride);
+            for (int stride = k >> 1; stride >= 1; stride >>= 1) {
+                float other = __shfl_xor_sync(0xFFFFFFFF, vals[0], stride);
+                bool ascending = ((lane_id & k) == 0);
+                bool is_lower = ((lane_id & stride) == 0);
+                if (ascending == is_lower) vals[0] = fminf(vals[0], other);
+                else vals[0] = fmaxf(vals[0], other);
             }
         }
     }
 }
 
 // 5. WarpSelect（Algorithm 3）
-//    K = top-k 数量（必须是 64 的倍数）
+//    K = 实际 top-k 数量（任意正整数）
 //    T = 每个 lane 的 thread queue 大小
 template <int K, int T>
 struct WarpSelect {
-    float thread_queue[T];        // 升序 lane-stride（[T-1] 最大，用作门槛）
-    float warp_queue[K / 32];     // lane-stride，升序
+    static constexpr int K_PAD = ((K + 31) / 32) * 32;
+
+    float thread_queue[T];            // 升序 lane-stride（[T-1] 最大，用作门槛）
+    float warp_queue[K_PAD / 32];     // lane-stride，升序（多余位置保持 +∞）
 
     __device__ void init() {
         #pragma unroll
         for (int i = 0; i < T; i++) thread_queue[i] = __FLT_MAX__;
         #pragma unroll
-        for (int i = 0; i < K / 32; i++) warp_queue[i] = __FLT_MAX__;
+        for (int i = 0; i < K_PAD / 32; i++) warp_queue[i] = __FLT_MAX__;
     }
 
     __device__ void add(float val) {
@@ -153,7 +160,7 @@ struct WarpSelect {
         }
 
         if (__any_sync(0xFFFFFFFF, inserted)) {
-            float warp_max = __shfl_sync(0xFFFFFFFF, warp_queue[K / 32 - 1], 31);
+            float warp_max = __shfl_sync(0xFFFFFFFF, warp_queue[K_PAD / 32 - 1], 31);
             if (__any_sync(0xFFFFFFFF, thread_queue[T - 1] < warp_max)) {
                 restore();
             }
@@ -162,7 +169,7 @@ struct WarpSelect {
 
     __device__ void restore() {
         sort_odd<32 * T>(thread_queue);
-        merge_odd<K, 32 * T>(warp_queue, thread_queue);
+        merge_odd<K_PAD, 32 * T>(warp_queue, thread_queue);
     }
 
     __device__ void finalize() { restore(); }
@@ -170,8 +177,11 @@ struct WarpSelect {
     __device__ void write(float* out) {
         int lane_id = threadIdx.x & 31;
         #pragma unroll
-        for (int r = 0; r < K / 32; r++) {
-            out[r * 32 + lane_id] = warp_queue[r];
+        for (int r = 0; r < K_PAD / 32; r++) {
+            int idx = r * 32 + lane_id;
+            if (idx < K) {
+                out[idx] = warp_queue[r];
+            }
         }
     }
 };
@@ -191,8 +201,9 @@ __global__ void topk_pass1(const float* __restrict__ input, int n,
     WarpSelect<K, T> sel;
     sel.init();
 
-    for (int i = global_tid; i < n; i += stride) {
-        sel.add(input[i]);
+    for (int i = global_tid; i - lane_id < n; i += stride) {
+        float val = (i < n) ? input[i] : __FLT_MAX__;
+        sel.add(val);
     }
     sel.finalize();
 
@@ -243,48 +254,213 @@ void topk(const float* d_input, int n, float* d_output) {
     cudaFree(d_partial);
 }
 
-// ===== 测试 =====
+// ============================================================
+// 结果检查：GPU 输出的 k 个值排序后应与 CPU 一致
+// ============================================================
+template <int K>
+bool check_result(const float* h_data, int n, const float* gpu_vals) {
+    float* cpu_sorted = new float[n];
+    memcpy(cpu_sorted, h_data, n * sizeof(float));
+    std::partial_sort(cpu_sorted, cpu_sorted + K, cpu_sorted + n);
 
-int main() {
-    const int N = 1000000;
-    constexpr int K = 64;
+    float* gpu_sorted = new float[K];
+    memcpy(gpu_sorted, gpu_vals, K * sizeof(float));
+    std::sort(gpu_sorted, gpu_sorted + K);
 
-    float* h_input = new float[N];
-    srand(42);
-    for (int i = 0; i < N; i++) h_input[i] = (float)rand() / RAND_MAX;
-
-    float *d_input, *d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, K * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice));
-
-    topk<K>(d_input, N, d_output);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    float h_output[K];
-    CUDA_CHECK(cudaMemcpy(h_output, d_output, K * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // CPU 验证
-    std::sort(h_output, h_output + K);
-    float* h_sorted = new float[N];
-    memcpy(h_sorted, h_input, N * sizeof(float));
-    std::partial_sort(h_sorted, h_sorted + K, h_sorted + N);
-
-    printf("GPU top-%d vs CPU top-%d:\n", K, K);
-    bool pass = true;
+    int error_count = 0;
     for (int i = 0; i < K; i++) {
-        if (fabsf(h_output[i] - h_sorted[i]) > 1e-6f) {
-            printf("  MISMATCH at %d: GPU=%.6f CPU=%.6f\n", i, h_output[i], h_sorted[i]);
-            pass = false;
+        if (fabsf(cpu_sorted[i] - gpu_sorted[i]) > 1e-6f) {
+            if (error_count < 5) {
+                fprintf(stderr, "  Mismatch at rank %d: CPU = %.6f, GPU = %.6f\n",
+                        i, cpu_sorted[i], gpu_sorted[i]);
+            }
+            error_count++;
         }
     }
-    if (pass) printf("  PASS!\n");
 
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
-    delete[] h_input;
-    delete[] h_sorted;
-    return 0;
+    delete[] cpu_sorted;
+    delete[] gpu_sorted;
+
+    if (error_count > 0) {
+        fprintf(stderr, "  Total errors: %d out of %d\n", error_count, K);
+        return false;
+    }
+    return true;
 }
 
+// ============================================================
+// 正确性测试
+// ============================================================
+bool test_correctness() {
+    printf("=== Correctness Test (WarpSelect TopK) ===\n\n");
 
+    constexpr int K = 64;
+    struct TestCase { int n; };
+    TestCase cases[] = {
+        {1024},
+        {10000},
+        {100000},
+        {1000000},
+        {10000000},
+    };
+    int num_cases = sizeof(cases) / sizeof(cases[0]);
+
+    srand(42);
+
+    for (int t = 0; t < num_cases; t++) {
+        int n = cases[t].n;
+        int num_blocks = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, 128);
+        printf("  N = %-10d  K = %-6d  Blocks = %-5d ... ", n, K, num_blocks);
+
+        float* h_data = new float[n];
+        for (int i = 0; i < n; i++) h_data[i] = (float)rand() / RAND_MAX;
+
+        float *d_input, *d_output;
+        CUDA_CHECK(cudaMalloc(&d_input, (size_t)n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_output, K * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_input, h_data, (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
+
+        topk<K>(d_input, n, d_output);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float* h_gpu_vals = new float[K];
+        CUDA_CHECK(cudaMemcpy(h_gpu_vals, d_output, K * sizeof(float), cudaMemcpyDeviceToHost));
+
+        bool pass = check_result<K>(h_data, n, h_gpu_vals);
+        printf("%s\n", pass ? "PASSED" : "FAILED");
+
+        delete[] h_data;
+        delete[] h_gpu_vals;
+        CUDA_CHECK(cudaFree(d_input));
+        CUDA_CHECK(cudaFree(d_output));
+
+        if (!pass) return false;
+    }
+
+    printf("\n  All correctness tests PASSED\n\n");
+    return true;
+}
+
+// ============================================================
+// 性能测试
+// ============================================================
+void test_performance() {
+    printf("=== Performance Test (WarpSelect TopK) ===\n");
+
+    int num_sms;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    printf("Block Size: %d threads, SMs: %d, Grid cap: 128\n\n", BLOCK_SIZE, num_sms);
+
+    printf("┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐\n");
+    printf("│ %-12s │ %-10s │ %-8s │ %-12s │ %-12s │ %-12s │\n",
+           "Data Size", "Elements", "Blocks", "Time (ms)", "Bandwidth", "Throughput");
+    printf("│              │            │          │              │   (GB/s)     │ (Melem/s)    │\n");
+    printf("├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤\n");
+
+    constexpr int K = 64;
+    constexpr int T = 2;
+
+    struct TestCase { int n; };
+    TestCase cases[] = {
+        {100000000},
+        {500000000},
+        {1000000000},
+        {2000000000},
+    };
+    int num_cases = sizeof(cases) / sizeof(cases[0]);
+
+    for (int t = 0; t < num_cases; t++) {
+        int n = cases[t].n;
+        int num_blocks = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, 128);
+
+        float* h_data = new float[n];
+        for (int i = 0; i < n; i++) h_data[i] = (float)rand() / RAND_MAX;
+
+        float *d_input, *d_output, *d_partial;
+        CUDA_CHECK(cudaMalloc(&d_input, (size_t)n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_output, K * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_partial, num_blocks * K * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_input, h_data, (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
+
+        // 预热
+        for (int i = 0; i < 5; i++) {
+            topk_pass1<K, T><<<num_blocks, BLOCK_SIZE>>>(d_input, n, d_partial);
+            topk_pass2<K, T><<<1, 32>>>(d_partial, num_blocks * K, d_output);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // 计时
+        const int num_iter = (n <= 10000000) ? 50 : 10;
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < num_iter; i++) {
+            topk_pass1<K, T><<<num_blocks, BLOCK_SIZE>>>(d_input, n, d_partial);
+            topk_pass2<K, T><<<1, 32>>>(d_partial, num_blocks * K, d_output);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        float avg_ms = ms / num_iter;
+
+        // WarpSelect 只读一遍输入数据
+        float total_bytes = (float)n * sizeof(float);
+        float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
+        float throughput = n / (avg_ms * 1000.0f);
+
+        char size_str[20];
+        if (n >= 1000000000) {
+            snprintf(size_str, sizeof(size_str), "%.1f GB", n * 4.0 / 1e9);
+        } else if (n >= 1000000) {
+            snprintf(size_str, sizeof(size_str), "%.0f MB", n * 4.0 / 1e6);
+        } else {
+            snprintf(size_str, sizeof(size_str), "%.0f KB", n * 4.0 / 1e3);
+        }
+
+        char bw_str[20];
+        if (bw_gb_s >= 1000.0f) {
+            snprintf(bw_str, sizeof(bw_str), "%.2f TB/s", bw_gb_s / 1000.0f);
+        } else {
+            snprintf(bw_str, sizeof(bw_str), "%.2f GB/s", bw_gb_s);
+        }
+
+        printf("│ %-12s │ %-10d │ %-8d │ %-12.3f │ %-12s │ %-12.2f │\n",
+               size_str, n, num_blocks, avg_ms, bw_str, throughput);
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        delete[] h_data;
+        CUDA_CHECK(cudaFree(d_input));
+        CUDA_CHECK(cudaFree(d_output));
+        CUDA_CHECK(cudaFree(d_partial));
+    }
+
+    printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
+    printf("\nNotes:\n");
+    printf("  • Bandwidth = N * 4B (single pass over input) / kernel time\n");
+    printf("  • Throughput = N / kernel_time\n");
+}
+
+// ============================================================
+// Main
+// ============================================================
+int main() {
+    printf("╔══════════════════════════════════════════════════════╗\n");
+    printf("║   TopK via WarpSelect (Sorting Network)             ║\n");
+    printf("║   Two-Pass: Block Reduce + Final Warp               ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n\n");
+
+    if (!test_correctness()) {
+        printf("Correctness test failed, aborting.\n");
+        return EXIT_FAILURE;
+    }
+
+    test_performance();
+
+    printf("\n All tests completed.\n");
+    return 0;
+}

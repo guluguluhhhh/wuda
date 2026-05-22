@@ -364,8 +364,7 @@ void test_performance() {
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
         float avg_ms = ms / num_iter;
 
-        // stride 版本每轮重新读 N 个元素，共 32 轮 + 1 轮 gather
-        float total_bytes = (float)n * sizeof(unsigned int) * 33.0f;
+        float total_bytes = (float)n * sizeof(unsigned int);
         float bw_gb_s = (total_bytes / (avg_ms / 1000.0f)) / 1.0e9f;
         float throughput = n / (avg_ms * 1000.0f);
 
@@ -399,7 +398,7 @@ void test_performance() {
 
     printf("└──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘\n");
     printf("\nNotes:\n");
-    printf("  • Bandwidth = N * 4B * 33 (32 radix rounds + 1 gather) / kernel time\n");
+    printf("  • Bandwidth = N * 4B (effective: input data size) / kernel time\n");
     printf("  • Throughput = N / kernel_time\n");
 }
 
