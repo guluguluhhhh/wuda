@@ -418,3 +418,34 @@ int main(int argc, char** argv) {
     return 0;
 }
 
+// (base) root@autodl-container-9ce94bbb39-7afd8cfb:~/wuda# ./scan_basic 
+// ╔══════════════════════════════════════════════════════╗
+// ║   Global Inclusive Scan - Reduce-then-Scan          ║
+// ║   Recursive Multi-level Implementation              ║
+// ╚══════════════════════════════════════════════════════╝
+
+// === Correctness Test ===
+// Testing with N = 123456789
+// ✓ Correctness test PASSED
+
+// === Performance Test ===
+// GPU: RTX 5090, Block Size: 256 threads
+// Strategy: Reduce-then-Scan (Recursive)
+
+// ┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐
+// │ Data Size    │ Elements   │ Blocks   │ Time (ms)    │ Bandwidth    │ Throughput   │
+// │              │            │          │              │   (GB/s)     │ (Melem/s)    │
+// ├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤
+// │ 400 KB       │ 100000     │ 391      │ 0.032        │ 24.91 GB/s   │ 3113.73      │
+// │ 4 MB         │ 1000000    │ 3907     │ 0.169        │ 47.32 GB/s   │ 5914.48      │
+// │ 40 MB        │ 10000000   │ 39063    │ 0.202        │ 396.14 GB/s  │ 49517.73     │
+// │ 400 MB       │ 100000000  │ 390625   │ 1.294        │ 618.12 GB/s  │ 77265.61     │
+// │ 2000 MB      │ 500000000  │ 1953125  │ 5.567        │ 718.46 GB/s  │ 89807.62     │
+// │ 4.0 GB       │ 1000000000 │ 3906250  │ 11.009       │ 726.69 GB/s  │ 90836.84     │
+// │ 8.0 GB       │ 2000000000 │ 7812500  │ 21.437       │ 746.37 GB/s  │ 93295.78     │
+// └──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘
+
+// Notes:
+//   • Bandwidth = (input + output) / kernel time
+
+// ✓ All tests completed.

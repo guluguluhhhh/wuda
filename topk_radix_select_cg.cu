@@ -432,3 +432,38 @@ int main() {
     printf("\n All tests completed.\n");
     return 0;
 }
+
+// (base) root@autodl-container-9ce94bbb39-7afd8cfb:~/wuda# ./topk_radix_select_cg
+// ╔══════════════════════════════════════════════════════╗
+// ║   TopK via Radix Select (Single Kernel)             ║
+// ║   Last-Block Decision Pattern                       ║
+// ╚══════════════════════════════════════════════════════╝
+
+// === Correctness Test (Radix Select TopK) ===
+//   Hardware max concurrent blocks (grid cap): 170
+
+//   N = 1024        K = 5       Grid = 1     ... PASSED
+//   N = 10000       K = 10      Grid = 10    ... PASSED
+//   N = 100000      K = 100     Grid = 98    ... PASSED
+//   N = 1000000     K = 256     Grid = 170   ... PASSED
+//   N = 10000000    K = 1000    Grid = 170   ... PASSED
+//   All correctness tests PASSED
+
+// === Performance Test (Radix Select TopK) ===
+// Block Size: 1024 threads, SMs: 170, Grid cap: 170
+
+// ┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐
+// │ Data Size    │ Elements   │ Blocks   │ Time (ms)    │ Bandwidth    │ Throughput   │
+// │              │            │          │              │   (GB/s)     │ (Melem/s)    │
+// ├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤
+// │ 400 MB       │ 100000000  │ 170      │ 1.424        │ 280.98 GB/s  │ 70244.13     │
+// │ 2000 MB      │ 500000000  │ 170      │ 7.021        │ 284.87 GB/s  │ 71217.63     │
+// │ 4.0 GB       │ 1000000000 │ 170      │ 14.038       │ 284.94 GB/s  │ 71235.02     │
+// │ 8.0 GB       │ 2000000000 │ 170      │ 27.928       │ 286.45 GB/s  │ 71613.30     │
+// └──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘
+
+// Notes:
+//   • Bandwidth = N * 4B (effective: input data size) / kernel time
+//   • Throughput = N / kernel_time
+
+//  All tests completed.

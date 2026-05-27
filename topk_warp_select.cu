@@ -464,3 +464,39 @@ int main() {
     printf("\n All tests completed.\n");
     return 0;
 }
+
+
+// (base) root@autodl-container-9ce94bbb39-7afd8cfb:~/wuda# ./topk_warp_select 
+// ╔══════════════════════════════════════════════════════╗
+// ║   TopK via WarpSelect (Sorting Network)             ║
+// ║   Two-Pass: Block Reduce + Final Warp               ║
+// ╚══════════════════════════════════════════════════════╝
+
+// === Correctness Test (WarpSelect TopK) ===
+
+//   N = 1024        K = 64      Blocks = 1     ... PASSED
+//   N = 10000       K = 64      Blocks = 10    ... PASSED
+//   N = 100000      K = 64      Blocks = 98    ... PASSED
+//   N = 1000000     K = 64      Blocks = 128   ... PASSED
+//   N = 10000000    K = 64      Blocks = 128   ... PASSED
+
+//   All correctness tests PASSED
+
+// === Performance Test (WarpSelect TopK) ===
+// Block Size: 1024 threads, SMs: 170, Grid cap: 128
+
+// ┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐
+// │ Data Size    │ Elements   │ Blocks   │ Time (ms)    │ Bandwidth    │ Throughput   │
+// │              │            │          │              │   (GB/s)     │ (Melem/s)    │
+// ├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤
+// │ 400 MB       │ 100000000  │ 128      │ 0.418        │ 956.97 GB/s  │ 239243.61    │
+// │ 2000 MB      │ 500000000  │ 128      │ 1.610        │ 1.24 TB/s    │ 310600.38    │
+// │ 4.0 GB       │ 1000000000 │ 128      │ 3.086        │ 1.30 TB/s    │ 324030.62    │
+// │ 8.0 GB       │ 2000000000 │ 128      │ 6.024        │ 1.33 TB/s    │ 332031.06    │
+// └──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘
+
+// Notes:
+//   • Bandwidth = N * 4B (single pass over input) / kernel time
+//   • Throughput = N / kernel_time
+
+//  All tests completed.

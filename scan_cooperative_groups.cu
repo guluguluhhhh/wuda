@@ -424,3 +424,37 @@ int main(int argc, char** argv) {
     printf("\nAll tests completed.\n");
     return 0;
 }
+
+// (base) root@autodl-container-9ce94bbb39-7afd8cfb:~/wuda# ./scan_cg 
+// ╔══════════════════════════════════════════════════════╗
+// ║   Global Inclusive Scan - Grid-Sync Persistent CG   ║
+// ║   Cooperative Groups Implementation                 ║
+// ╚══════════════════════════════════════════════════════╝
+
+// === Correctness Test (Grid-Sync Persistent CG) ===
+// Testing with N = 123456789
+// Correctness test PASSED
+
+// === Performance Test (Grid-Sync Persistent CG) ===
+// GPU: NVIDIA GeForce RTX 5090, Block Size: 256 threads
+// Strategy: Grid-Sync Persistent Threads (CG), 32 items/thread
+// Max co-resident blocks: 340 (max_per_sm=2)
+
+// ┌──────────────┬────────────┬──────────┬──────────────┬──────────────┬──────────────┐
+// │ Data Size    │ Elements   │ Tiles    │ Time (ms)    │ Bandwidth    │ Throughput   │
+// │              │            │          │              │   (GB/s)     │ (Melem/s)    │
+// ├──────────────┼────────────┼──────────┼──────────────┼──────────────┼──────────────┤
+// │ 400 KB       │ 100000     │ 13       │ 0.774        │ 1.03 GB/s    │ 129.26       │
+// │ 4 MB         │ 1000000    │ 123      │ 0.924        │ 8.65 GB/s    │ 1081.81      │
+// │ 40 MB        │ 10000000   │ 1221     │ 1.003        │ 79.78 GB/s   │ 9972.72      │
+// │ 400 MB       │ 100000000  │ 12208    │ 2.374        │ 336.97 GB/s  │ 42121.02     │
+// │ 2000 MB      │ 500000000  │ 61036    │ 7.272        │ 550.03 GB/s  │ 68754.12     │
+// │ 4.0 GB       │ 1000000000 │ 122071   │ 13.511       │ 592.09 GB/s  │ 74011.18     │
+// │ 8.0 GB       │ 2000000000 │ 244141   │ 25.805       │ 620.04 GB/s  │ 77504.53     │
+// └──────────────┴────────────┴──────────┴──────────────┴──────────────┴──────────────┘
+
+// Notes:
+//   • Bandwidth = (input + output) / kernel time
+//   • Pass 3 adds extra read+write, actual memory traffic is ~3x
+
+// All tests completed.
