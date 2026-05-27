@@ -1,10 +1,13 @@
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <cstdio>
 #include <vector>
 #include <cmath>
 #include <numeric>
 #include <cstdlib>
 #include <algorithm>
+
+using namespace nvcuda;
 
 #define CUDA_CHECK(call)                                                    \
     do {                                                                    \
@@ -184,6 +187,83 @@ __global__ void sum_kernel_stride_vec4(const float* d_in,
 }
 
 
+// Tensor Core TF32: 两次矩阵乘求 sum
+//
+// 数据排成 16×16 矩阵 A（256 个 float）
+// 右乘一个全1矩阵再左乘一个全1矩阵得到sum
+constexpr int TF32_M = 16, TF32_N = 16, TF32_K = 8;
+constexpr int TF32_TILE = TF32_M * TF32_N; // 256 floats per tile
+
+__global__ void sum_kernel_tf32_two_wmma(const float* __restrict__ d_in,
+                                         float* __restrict__ d_out,
+                                         int N) {
+    constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+    // 每个 warp 需要 256 floats 临时空间存放中间矩阵 C
+    __shared__ float smem_c[WARPS_PER_BLOCK][TF32_M * TF32_N];
+
+    int tid = threadIdx.x;
+    int lane = tid & (WARP_SIZE - 1);
+    int warp_id = tid / WARP_SIZE;
+    int global_warp_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    int total_warps = gridDim.x * WARPS_PER_BLOCK;
+
+    // ==== Step 1: 右乘全1，累积行和 ====
+    // A[16×8] × Ones[8×16] → 累加到 C[16×16]
+    wmma::fragment<wmma::matrix_a, TF32_M, TF32_N, TF32_K,
+                   wmma::precision::tf32, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, TF32_M, TF32_N, TF32_K,
+                   wmma::precision::tf32, wmma::row_major> b_ones;
+    wmma::fragment<wmma::accumulator, TF32_M, TF32_N, TF32_K, float> c_frag;
+
+    wmma::fill_fragment(b_ones, 1.0f);
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int num_tiles = N / TF32_TILE;
+
+    for (int t = global_warp_id; t < num_tiles; t += total_warps) {
+        // 把 256 个连续 float 视为 16×16 row-major 矩阵，ld=16
+        const float* base = d_in + t * TF32_TILE;
+
+        // K=8：先加载左半部分（列 0-7），再加载右半部分（列 8-15）
+        wmma::load_matrix_sync(a_frag, base, 16);      // 列 0-7
+        wmma::mma_sync(c_frag, a_frag, b_ones, c_frag);
+
+        wmma::load_matrix_sync(a_frag, base + 8, 16);  // 列 8-15
+        wmma::mma_sync(c_frag, a_frag, b_ones, c_frag);
+    }
+
+    // 此时 c_frag[i][j] = 第 i 行在所有 tile 中的累计行和（每列值相同）
+
+    // ==== Step 2: 左乘全1，把 16 个行和归约为标量 ====
+    // D[16×16] = Ones[16×8] × C[8×16]
+    // K=8：需要 2 次覆盖 C 的 16 行（上 8 行 + 下 8 行）
+
+    // 先把 C 写到 shared memory（16×16 row-major）
+    wmma::store_matrix_sync(smem_c[warp_id], c_frag, 16, wmma::mem_row_major);
+
+    // 准备第二次乘法的 fragments
+    wmma::fragment<wmma::matrix_a, TF32_M, TF32_N, TF32_K,
+                   wmma::precision::tf32, wmma::row_major> a_ones;
+    wmma::fragment<wmma::matrix_b, TF32_M, TF32_N, TF32_K,
+                   wmma::precision::tf32, wmma::row_major> c_as_b;
+    wmma::fragment<wmma::accumulator, TF32_M, TF32_N, TF32_K, float> d_frag;
+
+    wmma::fill_fragment(a_ones, 1.0f);
+    wmma::fill_fragment(d_frag, 0.0f);
+
+    // 加载 C 的上半部分（行 0-7）作为 matrix_b [8×16]，ld=16
+    wmma::load_matrix_sync(c_as_b, smem_c[warp_id], 16);
+    wmma::mma_sync(d_frag, a_ones, c_as_b, d_frag);
+
+    // 加载 C 的下半部分（行 8-15）作为 matrix_b [8×16]，ld=16
+    wmma::load_matrix_sync(c_as_b, smem_c[warp_id] + 8 * 16, 16);
+    wmma::mma_sync(d_frag, a_ones, c_as_b, d_frag);
+
+    // d_frag 的每个元素都 = total_sum，直接取一个
+    if (lane == 0) {
+        atomicAdd(d_out, d_frag.x[0]);
+    }
+}
 
 // 原始 host 封装
 float gpu_sum(const float* h_in, int N) {
@@ -210,14 +290,15 @@ float gpu_sum(const float* h_in, int N) {
 
     return h_out;
 }
-enum KernelType { NAIVE, NAIVE_VEC4, STRIDE, VEC4 };
+enum KernelType { NAIVE, NAIVE_VEC4, STRIDE, VEC4, TENSOR_CORE };
 
 const char* kernel_name(KernelType k) {
     switch (k) {
-        case NAIVE:      return "Naive (1 elem/thread)";
-        case NAIVE_VEC4: return "Naive Vec4 (4 elem/thread)";
-        case STRIDE:     return "Stride (N elem/thread)";
-        case VEC4:       return "Vec4+Stride (float4 load)";
+        case NAIVE:       return "Naive (1 elem/thread)";
+        case NAIVE_VEC4:  return "Naive Vec4 (4 elem/thread)";
+        case STRIDE:      return "Stride (N elem/thread)";
+        case VEC4:        return "Vec4+Stride (float4 load)";
+        case TENSOR_CORE: return "TensorCore TF32 (2x WMMA)";
     }
     return "";
 }
@@ -236,6 +317,9 @@ void launch_kernel(KernelType k, const float* d_in, float* d_out, int N, int gri
         case VEC4:
             sum_kernel_stride_vec4<<<grid, block>>>(d_in, d_out, N);
             break;
+        case TENSOR_CORE:
+            sum_kernel_tf32_two_wmma<<<grid, block>>>(d_in, d_out, N);
+            break;
     }
 }
 
@@ -245,6 +329,12 @@ int compute_grid(KernelType k, int N, int block) {
     }
     if (k == NAIVE_VEC4) {
         return (N / 4 + block - 1) / block;
+    }
+    if (k == TENSOR_CORE) {
+        int warps_per_block = block / WARP_SIZE;
+        int num_tiles = N / TF32_TILE;
+        int needed_blocks = (num_tiles + warps_per_block - 1) / warps_per_block;
+        return std::min(needed_blocks, 1024);
     }
     return std::min((N + block - 1) / block, 1024);
 }
@@ -265,7 +355,7 @@ void test_performance() {
     };
     int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
 
-    KernelType kernels[] = { NAIVE, NAIVE_VEC4, STRIDE, VEC4 };
+    KernelType kernels[] = { NAIVE, NAIVE_VEC4, STRIDE, VEC4, TENSOR_CORE };
     int num_kernels = sizeof(kernels) / sizeof(kernels[0]);
 
     for (int ki = 0; ki < num_kernels; ki++) {
