@@ -13,8 +13,8 @@ __device__
 void block_mma_prelogue_f16(
     const __half* __restrict__ A, // [*, lda]
     __half* __restrict__ B,       // [M, ldb]
-    const int32_t lda,
-    const int32_t ldb
+    const int32_t lda,            // 源矩阵列数
+    const int32_t ldb             // 目的矩阵列数
 ) {
     const int32_t tid = threadIdx.x;
     constexpr int32_t VPT = 8;  // 8 个 fp16 = 16 字节
