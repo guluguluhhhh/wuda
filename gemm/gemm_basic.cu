@@ -31,9 +31,10 @@ void bmma_tn_f16(
     const int32_t strideB,
     const int32_t strideC
 ) {
-    __shared__ __half smem_A[BlockM * WarpK];
-    __shared__ __half smem_B[BlockN * WarpK];
-    __shared__ __half smem_C[BlockM * BlockN];
+    constexpr int32_t PAD = 8;
+    __shared__ __half smem_A[BlockM * (WarpK + PAD)];
+    __shared__ __half smem_B[BlockN * (WarpK + PAD)];
+    __shared__ __half smem_C[BlockM * (BlockN + PAD)];
 
     constexpr int32_t warp_size = 32;
     const int32_t tid = threadIdx.x;
@@ -46,15 +47,15 @@ void bmma_tn_f16(
     const int32_t K = strideA;
     for (int32_t k = 0; k < K; k += WarpK) {
         // 整 block 协同把 A, B 的 K 切片搬到 smem
-        block_mma_prelogue_f16<TPB, BlockM, WarpK>(A + k, smem_A, K, WarpK);
-        block_mma_prelogue_f16<TPB, BlockN, WarpK>(B + k, smem_B, K, WarpK);
+        block_mma_prelogue_f16<TPB, BlockM, WarpK>(A + k, smem_A, K, WarpK + PAD);
+        block_mma_prelogue_f16<TPB, BlockN, WarpK>(B + k, smem_B, K, WarpK + PAD);
         __syncthreads();
 
         wmma.forward(
-            smem_A + warp_tile_idx_m * WarpM * WarpK,
-            smem_B + warp_tile_idx_n * WarpN * WarpK,
-            WarpK,
-            WarpK
+            smem_A + warp_tile_idx_m * WarpM * (WarpK + PAD),
+            smem_B + warp_tile_idx_n * WarpN * (WarpK + PAD),
+            WarpK + PAD,
+            WarpK + PAD
         );
 
         __syncthreads();
@@ -63,12 +64,12 @@ void bmma_tn_f16(
 
     // 累加器 (fp32) → fp16 写到 smem_C，再整 block 合并写回 global
     wmma.stmatrix(
-        smem_C + warp_tile_idx_m * WarpM * BlockN + warp_tile_idx_n * WarpN,
-        BlockN
+        smem_C + warp_tile_idx_m * WarpM * (BlockN + PAD) + warp_tile_idx_n * WarpN,
+        BlockN + PAD
     );
     __syncthreads();
 
-    block_mma_eplogue_f16<TPB, BlockM, BlockN>(smem_C, C, BlockN, strideC);
+    block_mma_eplogue_f16<TPB, BlockM, BlockN>(smem_C, C, BlockN + PAD, strideC);
 }
 
 template<
