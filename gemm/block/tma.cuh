@@ -67,11 +67,12 @@ void cp_async_bulk_tensor_2d(
 // ============================================================
 // Host helper: 构造 [rows, cols] row-major tensor 的 2D tile descriptor
 //   box = [box_rows, box_cols]
-//   不开 swizzle, 不开 OOB fill
+//   swizzle: NONE / 32B / 64B / 128B
 // ============================================================
 inline CUtensorMap make_tma_2d_desc(
     const __half* gptr, int32_t rows, int32_t cols,
-    int32_t box_rows, int32_t box_cols
+    int32_t box_rows, int32_t box_cols,
+    CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE
 ) {
     CUtensorMap desc{};
     // TMA 维度顺序：[0] = 最快变化（列），[1] = 慢（行）
@@ -88,7 +89,7 @@ inline CUtensorMap make_tma_2d_desc(
         globalDim, globalStride,
         boxDim, elemStride,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_NONE,     // step 1: 不开 swizzle
+        swizzle,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     );

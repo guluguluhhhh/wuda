@@ -277,4 +277,128 @@ struct WarpHMMA_Trans_f16 {
     }
 };
 
+// ============================================================
+// WarpHMMA_f16_sw64
+//   与 WarpHMMA_f16 等价，但 smem 是 TMA SW64 swizzle 布局
+//   核心区别：ldmatrix 地址需用 atom_phys = atom_logical XOR (row & 3)
+//   要求：strideA == strideB == WarpK == 32 halves (= 64B = 4 atoms 一行)
+//          WarpM/WarpN 必须是 4 的倍数 (这样每 warp 起始 row mod 4 = 0)
+//   仍是 fp16 累加（mma.sync.m16n8k16.f16.f16.f16.f16）
+// ============================================================
+template<int32_t WarpM, int32_t WarpN, int32_t WarpK>
+struct WarpHMMA_f16_sw64 {
+    const static int32_t InstructionM = 16;
+    const static int32_t InstructionN = 16;
+    const static int32_t InstructionK = 16;
+    const static int32_t WarpTileM = WarpM / InstructionM;
+    const static int32_t WarpTileN = WarpN / InstructionN;
+
+    static_assert(WarpK == 32, "sw64: WarpK must == 32 (matches 64B swizzle row)");
+
+    uint32_t frag_A[WarpTileM][4];
+    uint32_t frag_B[WarpTileN][4];
+    uint32_t frag_C[WarpTileM][WarpTileN][4];
+
+    // SW64 atom swizzle: 周期 8 行, pairs of rows 共享 XOR mask
+    //   row 0,1 → XOR 0;  row 2,3 → XOR 1;  row 4,5 → XOR 2;  row 6,7 → XOR 3
+    //   对应 cute Swizzle<2, 4, 3>: offset ^= ((offset >> 7) & 3) << 4
+    static __device__ __forceinline__
+    int32_t sw_atom(int32_t atom_logical, int32_t row) {
+        return atom_logical ^ ((row >> 1) & 0x3);
+    }
+
+    // k_atom_off: 当前这次 ldmatrix 在 stage 内 K 维度的 atom 偏移
+    //   k=0  → k_atom_off=0   (atom_local=0 or 1)
+    //   k=16 → k_atom_off=2   (atom_local=2 or 3)
+    __device__ __forceinline__
+    void ldmatrix_sw(
+        const __half* __restrict__ A,
+        const __half* __restrict__ B,
+        const int32_t strideA,
+        const int32_t strideB,
+        const int32_t k_atom_off
+    ) {
+        const int32_t lane = threadIdx.x & 31;
+
+        const int32_t a_row_local  = lane & 15;
+        const int32_t a_atom_local = (lane >> 4) & 1;
+        #pragma unroll
+        for (int32_t m = 0; m < WarpTileM; ++m) {
+            int32_t row = m * InstructionM + a_row_local;
+            int32_t atom_phys = sw_atom(k_atom_off + a_atom_local, row);
+            ldmatrix_x4_b16(A + row * strideA + atom_phys * 8, frag_A[m]);
+        }
+
+        const int32_t b_row_local  = (lane & 7) + ((lane >> 4) << 3);
+        const int32_t b_atom_local = (lane >> 3) & 1;
+        #pragma unroll
+        for (int32_t n = 0; n < WarpTileN; ++n) {
+            int32_t row = n * InstructionN + b_row_local;
+            int32_t atom_phys = sw_atom(k_atom_off + b_atom_local, row);
+            ldmatrix_x4_b16(B + row * strideB + atom_phys * 8, frag_B[n]);
+        }
+    }
+
+    __device__ __forceinline__
+    void stmatrix(__half* C, const int32_t strideC) {
+        const int32_t lane = threadIdx.x & 31;
+        const int32_t row0 = lane >> 2;
+        const int32_t col0 = (lane & 3) << 1;
+        #pragma unroll
+        for (int32_t m = 0; m < WarpTileM; ++m) {
+            #pragma unroll
+            for (int32_t n = 0; n < WarpTileN; ++n) {
+                __half* dst = C + m * InstructionM * strideC + n * InstructionN;
+                *reinterpret_cast<uint32_t*>(dst +  row0      * strideC + col0    ) = frag_C[m][n][0];
+                *reinterpret_cast<uint32_t*>(dst + (row0 + 8) * strideC + col0    ) = frag_C[m][n][1];
+                *reinterpret_cast<uint32_t*>(dst +  row0      * strideC + col0 + 8) = frag_C[m][n][2];
+                *reinterpret_cast<uint32_t*>(dst + (row0 + 8) * strideC + col0 + 8) = frag_C[m][n][3];
+            }
+        }
+    }
+
+    __device__
+    void forward(
+        const __half* __restrict__ A, // smem stage base (swizzled)
+        const __half* __restrict__ B, // smem stage base (swizzled)
+        const int32_t strideA,        // = WarpK (32 halves)
+        const int32_t strideB         // = WarpK (32 halves)
+    ) {
+        constexpr int32_t Kiters = WarpK / InstructionK;
+        #pragma unroll
+        for (int32_t k = 0; k < Kiters; ++k) {
+            // k=0 → k_atom_off=0; k=1 → k_atom_off=2 (16 halves = 2 atoms)
+            int32_t k_atom_off = k * (InstructionK / 8);
+            ldmatrix_sw(A, B, strideA, strideB, k_atom_off);
+
+            #pragma unroll
+            for (int32_t m = 0; m < WarpTileM; ++m) {
+                #pragma unroll
+                for (int32_t n = 0; n < WarpTileN; ++n) {
+                    mma_m16n8k16_f16f16(
+                        &frag_C[m][n][0], frag_A[m], &frag_B[n][0], &frag_C[m][n][0]
+                    );
+                    mma_m16n8k16_f16f16(
+                        &frag_C[m][n][2], frag_A[m], &frag_B[n][2], &frag_C[m][n][2]
+                    );
+                }
+            }
+        }
+    }
+
+    __device__ __forceinline__
+    void zero() {
+        #pragma unroll
+        for (int32_t m = 0; m < WarpTileM; ++m) {
+            #pragma unroll
+            for (int32_t n = 0; n < WarpTileN; ++n) {
+                #pragma unroll
+                for (int32_t i = 0; i < 4; ++i) {
+                    frag_C[m][n][i] = 0u;
+                }
+            }
+        }
+    }
+};
+
 } // namespace ptx

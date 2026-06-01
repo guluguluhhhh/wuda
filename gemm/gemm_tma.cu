@@ -81,7 +81,7 @@ void device_mma_tn_f16_tma(
     const int32_t warp_tile_idx_m  = warp_id / WarpCountN;
     const int32_t warp_tile_idx_n  = warp_id % WarpCountN;
 
-    ptx::WarpHMMA_f16<WarpM, WarpN, WarpK> wmma;
+    ptx::WarpHMMA_f16_sw64<WarpM, WarpN, WarpK> wmma;
     wmma.zero();
 
     uint32_t phase[Kstage] = {0};
@@ -173,8 +173,11 @@ void gemm_tma_f16(
     // 构造 TMA descriptor
     // A: [M, K] row-major, box=[BlockM, WarpK]
     // B: [N, K] row-major, box=[BlockN, WarpK]  (TN layout)
-    CUtensorMap desc_A = make_tma_2d_desc(A, M, K, BlockM, WarpK);
-    CUtensorMap desc_B = make_tma_2d_desc(B, N, K, BlockN, WarpK);
+    // SW64: 4 atoms × 16B 一行, atom_phys = atom_logical XOR (row & 3)
+    CUtensorMap desc_A = make_tma_2d_desc(A, M, K, BlockM, WarpK,
+                                          CU_TENSOR_MAP_SWIZZLE_64B);
+    CUtensorMap desc_B = make_tma_2d_desc(B, N, K, BlockN, WarpK,
+                                          CU_TENSOR_MAP_SWIZZLE_64B);
 
     // grid swizzle
     const int32_t grid_m = M / BlockM;
