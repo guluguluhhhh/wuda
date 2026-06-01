@@ -27,9 +27,17 @@ void bmma_tn_f16_db(
 ) {
     constexpr int32_t PAD = 8;
     constexpr int32_t S = WarpK + PAD;
-    __shared__ __half smem_A[Kstage * BlockM * S];
-    __shared__ __half smem_B[Kstage * BlockN * S];
-    __shared__ __half smem_C[BlockM * BlockN];
+
+    // smem 布局：mainloop 用 A/B，epilogue 用 C，生命期不重叠 → 别名
+    constexpr int32_t mainloop_elems = Kstage * BlockM * S + Kstage * BlockN * S;
+    constexpr int32_t epilogue_elems = BlockM * BlockN;
+    constexpr int32_t smem_elems     = mainloop_elems > epilogue_elems
+                                       ? mainloop_elems : epilogue_elems;
+    __shared__ __half smem_storage[smem_elems];
+
+    __half* smem_A = smem_storage;
+    __half* smem_B = smem_storage + Kstage * BlockM * S;
+    __half* smem_C = smem_storage;  // 别名：epilogue 时复用 mainloop 缓冲
 
     Async_BlockMMA_GmemToSmem_f16<TPB, 8, BlockM, BlockN, WarpK, Kstage, PAD> g2s;
 
@@ -70,6 +78,9 @@ void bmma_tn_f16_db(
         load_kidx++;
         if (++mma_kidx == t_tile_max) break;
     }
+
+    // smem_C 别名 smem_A：等所有 warp 都读完 smem_A/B 才能开始覆写
+    __syncthreads();
 
     wmma.stmatrix(
         smem_C + warp_tile_idx_m * WarpM * BlockN + warp_tile_idx_n * WarpN,
@@ -120,10 +131,10 @@ void gemm3_f16(
     constexpr int32_t TPB = 128;
 
     constexpr int32_t BlockM = 128;
-    constexpr int32_t BlockN = 64;
+    constexpr int32_t BlockN = 128;
 
     constexpr int32_t WarpM = 64;
-    constexpr int32_t WarpN = 32;
+    constexpr int32_t WarpN = 64;
     constexpr int32_t WarpK = 32;
     constexpr int32_t Kstage = 2;
 
