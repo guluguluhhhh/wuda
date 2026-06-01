@@ -1,4 +1,5 @@
 #include "gemm_basic.cu"
+#include "gemm_double_buffering.cu"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -106,11 +107,13 @@ void test_performance(const char* name,
     printf("--------------------------------------------------------\n");
 
     const int sizes[][3] = {
+        {128,  128,  128},
+        {256,  256,  256},
+        {512,  512,  512},
         {1024, 1024, 1024},
         {2048, 2048, 2048},
         {4096, 4096, 4096},
         {8192, 8192, 8192},
-        {16384, 16384, 16384},
     };
     const int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
     const int warmup = 10;
@@ -183,6 +186,7 @@ int main() {
 
     GemmKernel kernels[] = {
         {"gemm_basic (wmma)", gemm2_f16},
+        {"gemm_double_buf (cp.async)", gemm3_f16},
     };
     const int num_kernels = sizeof(kernels) / sizeof(kernels[0]);
 
