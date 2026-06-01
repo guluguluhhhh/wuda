@@ -23,6 +23,14 @@ void mbarrier_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
                  :: "r"(addr), "r"(bytes));
 }
 
+// 纯 arrive (不带 expect_tx)，consumer 用完 smem 后通知 producer
+__device__ __forceinline__
+void mbarrier_arrive(uint64_t* bar) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n"
+                 :: "r"(addr));
+}
+
 // 等待 phase 翻转（即一次"完整 barrier"完成）
 __device__ __forceinline__
 void mbarrier_wait(uint64_t* bar, uint32_t phase) {

@@ -11,7 +11,7 @@
 // ============================================================
 // device kernel: TMA + mbarrier 版本
 //   单线程发起 TMA bulk tensor copy, mbarrier 同步
-//   warp 消费侧仍用 ptx::WarpHMMA_f16 (sm_120 没有 wgmma)
+//   warp 消费侧用 ptx::WarpHMMA_f16_sw64 (sm_120 没有 wgmma)
 // ============================================================
 template<
     int32_t TPB, int32_t BlockM, int32_t BlockN,
@@ -26,7 +26,6 @@ void device_mma_tn_f16_tma(
     __half *C,
     const int32_t M, const int32_t N, const int32_t K
 ) {
-    // 一段 mainloop 用 (A+B)，epilogue 用 C，生命期错开 → 联合
     constexpr int32_t stage_A_elems = BlockM * WarpK;
     constexpr int32_t stage_B_elems = BlockN * WarpK;
     constexpr int32_t mainloop_elems = Kstage * (stage_A_elems + stage_B_elems);
@@ -41,13 +40,11 @@ void device_mma_tn_f16_tma(
     __half* smem_B = smem_storage + Kstage * stage_A_elems;
     __half* smem_C = smem_storage;  // 别名
 
-    // ---- block-level swizzle (与现有 kernel 保持一致) ----
     const int32_t bx = blockIdx.z * gridDim.x + blockIdx.x;
     const int32_t by = blockIdx.y;
 
-    // ---- 初始化 mbarrier ----
     if (threadIdx.x < Kstage) {
-        mbarrier_init(&mbar[threadIdx.x], 1);   // 每周期 1 次 arrive_expect_tx
+        mbarrier_init(&mbar[threadIdx.x], 1);
     }
     __syncthreads();
 
@@ -55,7 +52,7 @@ void device_mma_tn_f16_tma(
     constexpr int32_t bytes_per_stage =
         (stage_A_elems + stage_B_elems) * sizeof(__half);
 
-    // ---- Prologue: 预发 Kstage 次 TMA ----
+    // Prologue
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int32_t s = 0; s < Kstage; ++s) {
@@ -63,19 +60,16 @@ void device_mma_tn_f16_tma(
                 mbarrier_arrive_expect_tx(&mbar[s], bytes_per_stage);
                 cp_async_bulk_tensor_2d(
                     smem_A + s * stage_A_elems, &desc_A,
-                    /*coord0=k*/ s * WarpK, /*coord1=m*/ by * BlockM,
-                    &mbar[s]
+                    s * WarpK, by * BlockM, &mbar[s]
                 );
                 cp_async_bulk_tensor_2d(
                     smem_B + s * stage_B_elems, &desc_B,
-                    /*coord0=k*/ s * WarpK, /*coord1=n*/ bx * BlockN,
-                    &mbar[s]
+                    s * WarpK, bx * BlockN, &mbar[s]
                 );
             }
         }
     }
 
-    // ---- warp 计算 setup ----
     constexpr int32_t warp_size = 32;
     const int32_t warp_id          = threadIdx.x / warp_size;
     const int32_t warp_tile_idx_m  = warp_id / WarpCountN;
@@ -86,24 +80,20 @@ void device_mma_tn_f16_tma(
 
     uint32_t phase[Kstage] = {0};
 
-    // ---- Main loop ----
     for (int32_t k = 0; k < t_tile_max; ++k) {
         const int32_t stage = k % Kstage;
 
         mbarrier_wait(&mbar[stage], phase[stage]);
         phase[stage] ^= 1u;
 
-        // mma: 此 stage 的 smem 已就绪
         wmma.forward(
             smem_A + stage * stage_A_elems + warp_tile_idx_m * WarpM * WarpK,
             smem_B + stage * stage_B_elems + warp_tile_idx_n * WarpN * WarpK,
             WarpK, WarpK
         );
 
-        // 等所有 warp 读完 smem，才能让 TMA 覆写此 stage
         __syncthreads();
 
-        // 预取下一拍 K 到当前 stage 槽
         const int32_t next_k = k + Kstage;
         if (next_k < t_tile_max && threadIdx.x == 0) {
             mbarrier_arrive_expect_tx(&mbar[stage], bytes_per_stage);
@@ -118,8 +108,6 @@ void device_mma_tn_f16_tma(
         }
     }
 
-    // ---- Epilogue: 复用 smem_A 的物理内存为 smem_C ----
-    // main loop 内最后一次 __syncthreads 已保证 mma 全部完成
     wmma.stmatrix(
         smem_C + warp_tile_idx_m * WarpM * BlockN + warp_tile_idx_n * WarpN,
         BlockN
