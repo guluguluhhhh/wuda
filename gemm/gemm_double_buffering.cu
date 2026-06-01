@@ -29,7 +29,7 @@ void bmma_tn_f16_db(
     constexpr int32_t S = WarpK + PAD;
     __shared__ __half smem_A[Kstage * BlockM * S];
     __shared__ __half smem_B[Kstage * BlockN * S];
-    __shared__ __half smem_C[BlockM * (BlockN + PAD)];
+    __shared__ __half smem_C[BlockM * BlockN];
 
     Async_BlockMMA_GmemToSmem_f16<TPB, 8, BlockM, BlockN, WarpK, Kstage, PAD> g2s;
 
@@ -72,12 +72,12 @@ void bmma_tn_f16_db(
     }
 
     wmma.stmatrix(
-        smem_C + warp_tile_idx_m * WarpM * (BlockN + PAD) + warp_tile_idx_n * WarpN,
-        BlockN + PAD
+        smem_C + warp_tile_idx_m * WarpM * BlockN + warp_tile_idx_n * WarpN,
+        BlockN
     );
     __syncthreads();
 
-    block_mma_eplogue_f16<TPB, BlockM, BlockN>(smem_C, C, BlockN + PAD, strideC);
+    block_mma_eplogue_f16<TPB, BlockM, BlockN>(smem_C, C, BlockN, strideC);
 }
 
 template<
@@ -113,17 +113,17 @@ void gemm3_f16(
     __half* C,
     int32_t M, int32_t N, int32_t K
 ) {
-    constexpr int32_t TPB = 256;
+    constexpr int32_t TPB = 128;
 
-    constexpr int32_t BlockM = 64;
+    constexpr int32_t BlockM = 128;
     constexpr int32_t BlockN = 64;
 
-    constexpr int32_t WarpM = 16;
+    constexpr int32_t WarpM = 64;
     constexpr int32_t WarpN = 32;
     constexpr int32_t WarpK = 32;
     constexpr int32_t Kstage = 2;
 
-    constexpr int32_t WarpCountM = 4;
+    constexpr int32_t WarpCountM = 2;
     constexpr int32_t WarpCountN = 2;
 
     static_assert(TPB / WarpCountM / WarpCountN == 32);
