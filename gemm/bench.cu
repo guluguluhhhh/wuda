@@ -1,5 +1,6 @@
 #include "gemm_basic.cu"
 #include "gemm_double_buffering.cu"
+#include "gemm_tma.cu"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -245,6 +246,7 @@ int main() {
         {"cuBLAS", gemm_cublas_f16},
         {"basic",  gemm2_f16},
         {"db+big_tile", gemm3_f16},
+        {"tma", gemm_tma_f16},
     };
     const int num_kernels = sizeof(kernels) / sizeof(kernels[0]);
 
