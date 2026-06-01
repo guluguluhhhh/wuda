@@ -95,14 +95,18 @@ void device_mma_tn_f16_db(
     const int32_t N,
     const int32_t K
 ) {
+    // block swizzle: 让相邻 block 访问相邻 B 列，提高 L2 命中率
+    const int bx = blockIdx.z * gridDim.x + blockIdx.x;
+    const int by = blockIdx.y;
+
     bmma_tn_f16_db<
         TPB, BlockM, BlockN,
         WarpM, WarpN, WarpK,
         WarpCountM, WarpCountN, Kstage
     >(
-        A + blockIdx.x * BlockM * K,
-        B + blockIdx.y * BlockN * K,
-        C + blockIdx.x * BlockM * N + blockIdx.y * BlockN,
+        A + by * BlockM * K,
+        B + bx * BlockN * K,
+        C + by * BlockM * N + bx * BlockN,
         K, K, N
     );
 }
@@ -136,7 +140,14 @@ void gemm3_f16(
         return;
     }
 
-    const dim3 grid{(unsigned)(M / BlockM), (unsigned)(N / BlockN), 1};
+    const int grid_m = M / BlockM;
+    const int grid_n = N / BlockN;
+    // swizzle: N 方向按 swizzle_stride 分段，每段内的 block 访问相邻 B 列
+    const int swizzle_stride = (N >= 2048) ? N / (2 * BlockN) : grid_n;
+    const int n_swizzle = (grid_n + swizzle_stride - 1) / swizzle_stride;
+    const dim3 grid{(unsigned)((grid_n + n_swizzle - 1) / n_swizzle),
+                    (unsigned)grid_m,
+                    (unsigned)n_swizzle};
 
     device_mma_tn_f16_db<
         TPB, BlockM, BlockN,
