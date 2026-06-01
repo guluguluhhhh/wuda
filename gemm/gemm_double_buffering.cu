@@ -1,4 +1,4 @@
-#include "warp/mma.cuh"
+#include "warp/mma_ptx.cuh"
 #include "block/copy.cuh"
 #include "block/eplogue.cuh"
 
@@ -37,7 +37,7 @@ void bmma_tn_f16_db(
     const int32_t warp_id = threadIdx.x / warp_size;
     const int32_t warp_tile_idx_m = warp_id / WarpCountN;
     const int32_t warp_tile_idx_n = warp_id % WarpCountN;
-    WarpHMMA_f16<WarpM, WarpN, WarpK> wmma;
+    ptx::WarpHMMA_f16<WarpM, WarpN, WarpK> wmma;
     wmma.zero();
 
     const int32_t K = strideA;
