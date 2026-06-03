@@ -28,3 +28,40 @@ void block_mma_prelogue_f16(
         *reinterpret_cast<uint4*>(B + m * ldb + n) = v;
     }
 }
+
+// ============================================================
+// block_mma_prelogue_f16_f32
+//   fp16 -> fp32: 整 block 协同读 A[*, lda] fp16, 逐元素转 fp32 写到 B[M, N]
+//   B 假设连续 (stride = N), 用于 FA1 从 HBM 加载 O 段做 fp32 在线累加
+//   读: VPT=4 个 half = 8B (uint2)
+//   写: VPT=4 个 float = 16B (uint4)
+// ============================================================
+template<int32_t TPB, int32_t M, int32_t N>
+__device__
+void block_mma_prelogue_f16_f32(
+    const __half* __restrict__ A, // [*, lda]
+    float* __restrict__ B,        // [M, N]  (连续)
+    const int32_t lda
+) {
+    const int32_t tid = threadIdx.x;
+    constexpr int32_t VPT = 4;
+    __half local16[VPT];
+    float  local32[VPT];
+
+    static_assert(N % VPT == 0, "N must be a multiple of 4");
+    for (int32_t i = tid * VPT; i < M * N; i += TPB * VPT) {
+        const int32_t m = i / N;
+        const int32_t n = i % N;
+
+        *reinterpret_cast<uint2*>(local16) =
+            *reinterpret_cast<const uint2*>(A + m * lda + n);
+
+        #pragma unroll
+        for (int32_t j = 0; j < VPT; j++) {
+            local32[j] = __half2float(local16[j]);
+        }
+
+        *reinterpret_cast<uint4*>(B + i) =
+            *reinterpret_cast<const uint4*>(local32);
+    }
+}

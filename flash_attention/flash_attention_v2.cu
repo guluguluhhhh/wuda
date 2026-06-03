@@ -9,7 +9,7 @@
 #include <cmath>
 
 // ============================================================
-// bflash_attention_basic_f16
+// FlashAttention v2
 //   一个 block 完成 O 上 [Br, D] 行块的 FlashAttention-2 计算
 //   Q: [Br, D] / K, V: [N, D] / O: [Br, D]   (指针已偏移到本 block)
 //
@@ -24,7 +24,7 @@ template<
     int32_t WarpCountM
 >
 __device__
-void bflash_attention_basic_f16(
+void bflash_attention_v2_f16(
     const __half* Q,
     const __half* K,
     const __half* V,
@@ -32,8 +32,6 @@ void bflash_attention_basic_f16(
     const int32_t N
 ) {
     constexpr int32_t WarpM = Br / WarpCountM;
-    static_assert(TPB == WarpCountM * 32);
-    static_assert(WarpM == 16, "WarpM 固定 16 (= wmma m16n16k16 的 M)");
 
     // ---------- 静态 shared memory (Br=Bc=32, D=64 时 ~22KB) ----------
     __shared__ __half smem_Q [Br * D];           // Q tile
@@ -161,7 +159,7 @@ template<
     int32_t WarpCountM
 >
 __global__
-void device_flash_attention_basic_f16(
+void device_flash_attention_v2_f16(
     const __half* Q,
     const __half* K,
     const __half* V,
@@ -171,7 +169,7 @@ void device_flash_attention_basic_f16(
     const int32_t q_tile_id = blockIdx.x;
     const int32_t bh_offset = blockIdx.y * N * D;
 
-    bflash_attention_basic_f16<TPB, Br, Bc, D, WarpCountM>(
+    bflash_attention_v2_f16<TPB, Br, Bc, D, WarpCountM>(
         Q + bh_offset + q_tile_id * Br * D,
         K + bh_offset,
         V + bh_offset,
@@ -185,7 +183,7 @@ void device_flash_attention_basic_f16(
 //   Q, K, V, O: [B, H, N, D] row-major fp16 (device 指针)
 //   仅支持 D=64; N 必须是 Br 与 Bc 的整数倍
 // ============================================================
-void flash_attention_basic_f16(
+void flash_attention_v2_f16(
     const __half* Q,
     const __half* K,
     const __half* V,
@@ -193,22 +191,22 @@ void flash_attention_basic_f16(
     int32_t B, int32_t H, int32_t N, int32_t D
 ) {
     constexpr int32_t Br = 32;
-    constexpr int32_t Bc = 32;
-    constexpr int32_t WarpCountM = 2;
+    constexpr int32_t Bc = 64;
+    constexpr int32_t WarpCountM = 2;   // WarpM = Br/WarpCountM = 16
     constexpr int32_t TPB = WarpCountM * 32;
     constexpr int32_t kD = 64;
 
     if (D != kD) {
-        fprintf(stderr, "flash_attention_basic_f16: only D=%d supported (got %d)\n", kD, D);
+        fprintf(stderr, "flash_attention_v2_f16: only D=%d supported (got %d)\n", kD, D);
         return;
     }
     if (N % Br != 0 || N % Bc != 0) {
-        fprintf(stderr, "flash_attention_basic_f16: N=%d must be multiple of Br=%d and Bc=%d\n",
+        fprintf(stderr, "flash_attention_v2_f16: N=%d must be multiple of Br=%d and Bc=%d\n",
                 N, Br, Bc);
         return;
     }
 
     const dim3 grid{(unsigned)(N / Br), (unsigned)(B * H), 1};
-    device_flash_attention_basic_f16<TPB, Br, Bc, kD, WarpCountM>
+    device_flash_attention_v2_f16<TPB, Br, Bc, kD, WarpCountM>
         <<<grid, TPB>>>(Q, K, V, O, N);
 }

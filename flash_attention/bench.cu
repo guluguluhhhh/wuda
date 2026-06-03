@@ -1,4 +1,5 @@
-#include "flash_attention_basic.cu"
+#include "flash_attention_v1.cu"
+#include "flash_attention_v2.cu"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -71,11 +72,17 @@ void cpu_attention_f16(
 }
 
 // ============================================================
-// 正确性测试
+// 正确性测试 (跑多个 kernel)
 // ============================================================
-bool test_correctness() {
-    printf("=== Correctness: flash_attention_basic ===\n");
+typedef void (*fa_fn_t)(const __half*, const __half*, const __half*, __half*,
+                        int32_t, int32_t, int32_t, int32_t);
 
+struct FAKernel {
+    const char* name;
+    fa_fn_t     fn;
+};
+
+bool test_correctness(FAKernel* kernels, int n_kernels) {
     const int B = 2, H = 2, N = 128, D = 64;
     const size_t size = (size_t)B * H * N * D;
 
@@ -103,40 +110,46 @@ bool test_correctness() {
     CUDA_CHECK(cudaMemcpy(d_K, h_K, size * sizeof(__half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_V, h_V, size * sizeof(__half), cudaMemcpyHostToDevice));
 
-    flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_O_gpu, d_O, size * sizeof(__half), cudaMemcpyDeviceToHost));
+    bool all_pass = true;
+    for (int ki = 0; ki < n_kernels; ki++) {
+        printf("=== Correctness: %s ===\n", kernels[ki].name);
 
-    int errors = 0;
-    float max_err = 0.0f;
-    for (size_t i = 0; i < size; i++) {
-        float a = __half2float(h_O_cpu[i]);
-        float b = __half2float(h_O_gpu[i]);
-        float e = fabsf(a - b);
-        if (e > max_err) max_err = e;
-        if (e > 5e-3f) {
-            if (errors < 5) {
-                fprintf(stderr, "  mismatch idx=%zu cpu=%.6f gpu=%.6f diff=%.6f\n",
-                        i, a, b, e);
+        kernels[ki].fn(d_Q, d_K, d_V, d_O, B, H, N, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_O_gpu, d_O, size * sizeof(__half), cudaMemcpyDeviceToHost));
+
+        int errors = 0;
+        float max_err = 0.0f;
+        for (size_t i = 0; i < size; i++) {
+            float a = __half2float(h_O_cpu[i]);
+            float b = __half2float(h_O_gpu[i]);
+            float e = fabsf(a - b);
+            if (e > max_err) max_err = e;
+            if (e > 5e-3f) {
+                if (errors < 5) {
+                    fprintf(stderr, "  mismatch idx=%zu cpu=%.6f gpu=%.6f diff=%.6f\n",
+                            i, a, b, e);
+                }
+                errors++;
             }
-            errors++;
         }
-    }
 
-    bool pass = (errors == 0);
-    printf("  %s (max_err=%.6f, total=%zu)\n\n",
-           pass ? "PASSED" : "FAILED", max_err, size);
+        bool pass = (errors == 0);
+        printf("  %s (max_err=%.6f, total=%zu)\n\n",
+               pass ? "PASSED" : "FAILED", max_err, size);
+        all_pass = all_pass && pass;
+    }
 
     free(h_Q); free(h_K); free(h_V); free(h_O_cpu); free(h_O_gpu);
     CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K));
     CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O));
-    return pass;
+    return all_pass;
 }
 
 // ============================================================
-// 性能扫描 (B, H 固定, N 扫)
+// 性能扫描 (B, H 固定, N 扫, 多 kernel 并排对比)
 // ============================================================
-void test_performance() {
+void test_performance(FAKernel* kernels, int n_kernels) {
     const int B = 1, H = 8, D = 64;
     const int warmup = 2, repeats = 10;
     const int sleep_us = 100000;
@@ -144,7 +157,6 @@ void test_performance() {
     const int N_list[] = {512, 1024, 2048, 4096, 8192};
     const int n_cases = sizeof(N_list) / sizeof(int);
 
-    // 预分配最大显存
     const int Nmax = N_list[n_cases - 1];
     const size_t size_max = (size_t)B * H * Nmax * D;
 
@@ -165,38 +177,43 @@ void test_performance() {
 
     printf("=== Performance: B=%d H=%d D=%d, warmup=%d iters=%d ===\n",
            B, H, D, warmup, repeats);
-    printf("%-8s %12s %12s\n", "N", "time(ms)", "TFLOPS");
-    for (int i = 0; i < 38; i++) printf("-");
+    printf("%-8s", "N");
+    for (int ki = 0; ki < n_kernels; ki++) printf(" %20s", kernels[ki].name);
+    printf("\n");
+    for (int i = 0; i < 8 + n_kernels * 21; i++) printf("-");
     printf("\n");
 
     for (int ci = 0; ci < n_cases; ci++) {
         int N = N_list[ci];
+        printf("%-8d", N);
 
-        for (int i = 0; i < warmup; i++)
-            flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        for (int ki = 0; ki < n_kernels; ki++) {
+            for (int i = 0; i < warmup; i++)
+                kernels[ki].fn(d_Q, d_K, d_V, d_O, B, H, N, D);
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        cudaEvent_t s, e;
-        cudaEventCreate(&s); cudaEventCreate(&e);
-        cudaEventRecord(s);
-        for (int i = 0; i < repeats; i++)
-            flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
-        cudaEventRecord(e);
-        cudaEventSynchronize(e);
+            cudaEvent_t s, e;
+            cudaEventCreate(&s); cudaEventCreate(&e);
+            cudaEventRecord(s);
+            for (int i = 0; i < repeats; i++)
+                kernels[ki].fn(d_Q, d_K, d_V, d_O, B, H, N, D);
+            cudaEventRecord(e);
+            cudaEventSynchronize(e);
 
-        float ms = 0;
-        cudaEventElapsedTime(&ms, s, e);
-        float avg_ms = ms / repeats;
+            float ms = 0;
+            cudaEventElapsedTime(&ms, s, e);
+            float avg_ms = ms / repeats;
 
-        // FA FLOPs ≈ 4 * B * H * N^2 * D (两次 N^2*D 的 matmul)
-        double flops = 4.0 * B * H * (double)N * N * D;
-        double tflops = flops / (avg_ms * 1e-3) / 1e12;
+            double flops  = 4.0 * B * H * (double)N * N * D;
+            double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-        printf("%-8d %12.4f %12.2f\n", N, avg_ms, tflops);
+            printf(" %10.4fms %6.1fT", avg_ms, tflops);
 
-        cudaEventDestroy(s); cudaEventDestroy(e);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        usleep(sleep_us);
+            cudaEventDestroy(s); cudaEventDestroy(e);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            usleep(sleep_us);
+        }
+        printf("\n");
     }
 
     CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K));
@@ -204,11 +221,17 @@ void test_performance() {
 }
 
 int main() {
-    if (!test_correctness()) {
+    FAKernel kernels[] = {
+        {"fa_v1", flash_attention_v1_f16},
+        {"fa_v2", flash_attention_v2_f16},
+    };
+    const int n_kernels = sizeof(kernels) / sizeof(kernels[0]);
+
+    if (!test_correctness(kernels, n_kernels)) {
         printf("FAILED\n");
         return 1;
     }
-    test_performance();
+    test_performance(kernels, n_kernels);
     printf("\nDone.\n");
     return 0;
 }
