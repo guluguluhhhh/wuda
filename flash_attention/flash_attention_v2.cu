@@ -33,10 +33,10 @@ void bflash_attention_v2_f16(
 ) {
     constexpr int32_t WarpM = Br / WarpCountM;
 
-    // ---------- 静态 shared memory (Br=Bc=32, D=64 时 ~22KB) ----------
+    // ---------- 静态 shared memory ----------
+    // K, V 生命周期不重叠 (K 用完才 load V), 合用一块 buffer
     __shared__ __half smem_Q [Br * D];           // Q tile
-    __shared__ __half smem_K [Bc * D];           // K tile
-    __shared__ __half smem_V [Bc * D];           // V tile
+    __shared__ __half smem_KV[Bc * D];           // K / V 共用
     __shared__ __half smem_SP[Br * Bc];          // S/P 共用 (softmax 原地覆盖)
     __shared__ float  smem_O [Br * D];           // 在线累加 O (fp32 保精度)
     __shared__ float  smem_m [Br];
@@ -70,14 +70,14 @@ void bflash_attention_v2_f16(
     // 外层循环: 逐段扫 KV
     for (int32_t t = 0; t < Tc; t++) {
         // gmem → smem: K tile
-        block_mma_prelogue_f16<TPB, Bc, D>(K + t * Bc * D, smem_K, D, D);
+        block_mma_prelogue_f16<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, D);
         __syncthreads();
 
         // S = Q @ K^T   (TN: K row-major 作为 col_major B 加载即 K^T)
         {
             WarpHMMA_f16<WarpM, Bc, D> wmma_qk;
             wmma_qk.zero();
-            wmma_qk.forward(warp_Q_smem, smem_K, D, D);
+            wmma_qk.forward(warp_Q_smem, smem_KV, D, D);
             wmma_qk.stmatrix(warp_SP_smem, Bc);   // 输出 fp16 到 smem_SP
         }
         __syncthreads();
@@ -123,15 +123,15 @@ void bflash_attention_v2_f16(
         }
         __syncthreads();
 
-        // gmem → smem: V tile
-        block_mma_prelogue_f16<TPB, Bc, D>(V + t * Bc * D, smem_V, D, D);
+        // gmem → smem: V tile (复用 K 的 buffer)
+        block_mma_prelogue_f16<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, D);
         __syncthreads();
 
         // O += P @ V   (NN: P, V 都 row_major)
         {
             WarpHMMA_NN_f16<WarpM, D, Bc> wmma_pv;
             wmma_pv.load_C(warp_O_smem, D);                  // 装入已 rescale 的 O
-            wmma_pv.forward(warp_SP_smem, smem_V, Bc, D);    // 累加 P @ V
+            wmma_pv.forward(warp_SP_smem, smem_KV, Bc, D);   // 累加 P @ V
             wmma_pv.store_C_f32(warp_O_smem, D);             // 存回 fp32 smem
         }
         __syncthreads();
@@ -191,7 +191,7 @@ void flash_attention_v2_f16(
     int32_t B, int32_t H, int32_t N, int32_t D
 ) {
     constexpr int32_t Br = 32;
-    constexpr int32_t Bc = 64;
+    constexpr int32_t Bc = 128;
     constexpr int32_t WarpCountM = 2;   // WarpM = Br/WarpCountM = 16
     constexpr int32_t TPB = WarpCountM * 32;
     constexpr int32_t kD = 64;
