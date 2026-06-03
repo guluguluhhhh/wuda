@@ -1,0 +1,214 @@
+#include "flash_attention_basic.cu"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cmath>
+#include <unistd.h>
+
+#define CUDA_CHECK(call)                                              \
+    do {                                                              \
+        cudaError_t err = call;                                       \
+        if (err != cudaSuccess) {                                     \
+            fprintf(stderr, "CUDA Error at %s:%d - %s\n",             \
+                    __FILE__, __LINE__, cudaGetErrorString(err));     \
+            exit(EXIT_FAILURE);                                       \
+        }                                                             \
+    } while (0)
+
+// ============================================================
+// CPU 参考实现 (naive O(N^2 d) attention with safe softmax)
+//   Q, K, V, O: [B, H, N, D] row-major fp16
+// ============================================================
+void cpu_attention_f16(
+    const __half* Q, const __half* K, const __half* V, __half* O,
+    int32_t B, int32_t H, int32_t N, int32_t D
+) {
+    const float scale = 1.0f / sqrtf((float)D);
+    float* scores = (float*)malloc(sizeof(float) * N);
+
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            const __half* q_h = Q + ((size_t)b * H + h) * N * D;
+            const __half* k_h = K + ((size_t)b * H + h) * N * D;
+            const __half* v_h = V + ((size_t)b * H + h) * N * D;
+            __half*       o_h = O + ((size_t)b * H + h) * N * D;
+
+            for (int i = 0; i < N; i++) {
+                // 1) scores[j] = Q[i] · K[j] * scale, 求 max
+                float max_s = -INFINITY;
+                for (int j = 0; j < N; j++) {
+                    float s = 0.0f;
+                    for (int k = 0; k < D; k++) {
+                        s += __half2float(q_h[i * D + k]) * __half2float(k_h[j * D + k]);
+                    }
+                    s *= scale;
+                    scores[j] = s;
+                    if (s > max_s) max_s = s;
+                }
+                // 2) P[j] = exp(scores[j] - max_s), 求 sum
+                float sum = 0.0f;
+                for (int j = 0; j < N; j++) {
+                    scores[j] = expf(scores[j] - max_s);
+                    sum += scores[j];
+                }
+                float inv_sum = 1.0f / sum;
+                // 3) O[i, k] = Σ_j P[j] * V[j, k]
+                for (int k = 0; k < D; k++) {
+                    float acc = 0.0f;
+                    for (int j = 0; j < N; j++) {
+                        acc += scores[j] * inv_sum * __half2float(v_h[j * D + k]);
+                    }
+                    o_h[i * D + k] = __float2half(acc);
+                }
+            }
+        }
+    }
+
+    free(scores);
+}
+
+// ============================================================
+// 正确性测试
+// ============================================================
+bool test_correctness() {
+    printf("=== Correctness: flash_attention_basic ===\n");
+
+    const int B = 2, H = 2, N = 128, D = 64;
+    const size_t size = (size_t)B * H * N * D;
+
+    __half* h_Q = (__half*)malloc(size * sizeof(__half));
+    __half* h_K = (__half*)malloc(size * sizeof(__half));
+    __half* h_V = (__half*)malloc(size * sizeof(__half));
+    __half* h_O_cpu = (__half*)malloc(size * sizeof(__half));
+    __half* h_O_gpu = (__half*)malloc(size * sizeof(__half));
+
+    srand(42);
+    for (size_t i = 0; i < size; i++) {
+        h_Q[i] = __float2half((float)(rand() % 21 - 10) * 0.05f);
+        h_K[i] = __float2half((float)(rand() % 21 - 10) * 0.05f);
+        h_V[i] = __float2half((float)(rand() % 21 - 10) * 0.05f);
+    }
+
+    cpu_attention_f16(h_Q, h_K, h_V, h_O_cpu, B, H, N, D);
+
+    __half *d_Q, *d_K, *d_V, *d_O;
+    CUDA_CHECK(cudaMalloc(&d_Q, size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_K, size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_V, size * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_O, size * sizeof(__half)));
+    CUDA_CHECK(cudaMemcpy(d_Q, h_Q, size * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K, h_K, size * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V, h_V, size * sizeof(__half), cudaMemcpyHostToDevice));
+
+    flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_O_gpu, d_O, size * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    int errors = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < size; i++) {
+        float a = __half2float(h_O_cpu[i]);
+        float b = __half2float(h_O_gpu[i]);
+        float e = fabsf(a - b);
+        if (e > max_err) max_err = e;
+        if (e > 5e-3f) {
+            if (errors < 5) {
+                fprintf(stderr, "  mismatch idx=%zu cpu=%.6f gpu=%.6f diff=%.6f\n",
+                        i, a, b, e);
+            }
+            errors++;
+        }
+    }
+
+    bool pass = (errors == 0);
+    printf("  %s (max_err=%.6f, total=%zu)\n\n",
+           pass ? "PASSED" : "FAILED", max_err, size);
+
+    free(h_Q); free(h_K); free(h_V); free(h_O_cpu); free(h_O_gpu);
+    CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O));
+    return pass;
+}
+
+// ============================================================
+// 性能扫描 (B, H 固定, N 扫)
+// ============================================================
+void test_performance() {
+    const int B = 1, H = 8, D = 64;
+    const int warmup = 2, repeats = 10;
+    const int sleep_us = 100000;
+
+    const int N_list[] = {512, 1024, 2048, 4096, 8192};
+    const int n_cases = sizeof(N_list) / sizeof(int);
+
+    // 预分配最大显存
+    const int Nmax = N_list[n_cases - 1];
+    const size_t size_max = (size_t)B * H * Nmax * D;
+
+    __half *d_Q, *d_K, *d_V, *d_O;
+    CUDA_CHECK(cudaMalloc(&d_Q, size_max * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_K, size_max * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_V, size_max * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_O, size_max * sizeof(__half)));
+
+    __half* h_buf = (__half*)malloc(size_max * sizeof(__half));
+    srand(42);
+    for (size_t i = 0; i < size_max; i++)
+        h_buf[i] = __float2half((float)(rand() % 21 - 10) * 0.05f);
+    CUDA_CHECK(cudaMemcpy(d_Q, h_buf, size_max * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_K, h_buf, size_max * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V, h_buf, size_max * sizeof(__half), cudaMemcpyHostToDevice));
+    free(h_buf);
+
+    printf("=== Performance: B=%d H=%d D=%d, warmup=%d iters=%d ===\n",
+           B, H, D, warmup, repeats);
+    printf("%-8s %12s %12s\n", "N", "time(ms)", "TFLOPS");
+    for (int i = 0; i < 38; i++) printf("-");
+    printf("\n");
+
+    for (int ci = 0; ci < n_cases; ci++) {
+        int N = N_list[ci];
+
+        for (int i = 0; i < warmup; i++)
+            flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaEvent_t s, e;
+        cudaEventCreate(&s); cudaEventCreate(&e);
+        cudaEventRecord(s);
+        for (int i = 0; i < repeats; i++)
+            flash_attention_basic_f16(d_Q, d_K, d_V, d_O, B, H, N, D);
+        cudaEventRecord(e);
+        cudaEventSynchronize(e);
+
+        float ms = 0;
+        cudaEventElapsedTime(&ms, s, e);
+        float avg_ms = ms / repeats;
+
+        // FA FLOPs ≈ 4 * B * H * N^2 * D (两次 N^2*D 的 matmul)
+        double flops = 4.0 * B * H * (double)N * N * D;
+        double tflops = flops / (avg_ms * 1e-3) / 1e12;
+
+        printf("%-8d %12.4f %12.2f\n", N, avg_ms, tflops);
+
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        usleep(sleep_us);
+    }
+
+    CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O));
+}
+
+int main() {
+    if (!test_correctness()) {
+        printf("FAILED\n");
+        return 1;
+    }
+    test_performance();
+    printf("\nDone.\n");
+    return 0;
+}
