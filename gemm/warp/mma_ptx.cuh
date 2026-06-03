@@ -237,6 +237,29 @@ struct WarpHMMA_Trans_f16 {
         }
     }
 
+    // 从 fp16 smem 加载到 frag_C (stmatrix 的逆操作)
+    __device__ __forceinline__
+    void load_C(
+        const __half* C,
+        const int32_t strideC
+    ) {
+        const int32_t lane = threadIdx.x & 31;
+        const int32_t row0 = lane >> 2;
+        const int32_t col0 = (lane & 3) << 1;
+
+        #pragma unroll
+        for (int32_t m = 0; m < WarpTileM; ++m) {
+            #pragma unroll
+            for (int32_t n = 0; n < WarpTileN; ++n) {
+                const __half* src = C + m * InstructionM * strideC + n * InstructionN;
+                frag_C[m][n][0] = *reinterpret_cast<const uint32_t*>(src +  row0      * strideC + col0    );
+                frag_C[m][n][1] = *reinterpret_cast<const uint32_t*>(src + (row0 + 8) * strideC + col0    );
+                frag_C[m][n][2] = *reinterpret_cast<const uint32_t*>(src +  row0      * strideC + col0 + 8);
+                frag_C[m][n][3] = *reinterpret_cast<const uint32_t*>(src + (row0 + 8) * strideC + col0 + 8);
+            }
+        }
+    }
+
     __device__
     void forward(
         const __half* __restrict__ A, // smem [*, strideA]

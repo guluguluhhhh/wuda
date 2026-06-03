@@ -1,5 +1,6 @@
 #include "flash_attention_v1.cu"
 #include "flash_attention_v2.cu"
+#include "flash_attention_performance.cu"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -222,8 +223,9 @@ void test_performance(FAKernel* kernels, int n_kernels) {
 
 int main() {
     FAKernel kernels[] = {
-        {"fa_v1", flash_attention_v1_f16},
-        {"fa_v2", flash_attention_v2_f16},
+        {"fa_v1",   flash_attention_v1_f16},
+        {"fa_v2",   flash_attention_v2_f16},
+        {"fa_perf", flash_attention_perf_f16},
     };
     const int n_kernels = sizeof(kernels) / sizeof(kernels[0]);
 
