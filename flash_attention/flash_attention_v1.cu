@@ -225,7 +225,7 @@ void flash_attention_v1_f16(
     constexpr int32_t Bc = 32;
     constexpr int32_t WarpCountM = 2;
     constexpr int32_t TPB = WarpCountM * 32;
-    constexpr int32_t kD = 64;
+    constexpr int32_t kD = 128;
 
     if (D != kD) {
         fprintf(stderr, "flash_attention_v1_f16: only D=%d supported (got %d)\n", kD, D);

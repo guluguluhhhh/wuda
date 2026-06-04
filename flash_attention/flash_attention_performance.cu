@@ -148,11 +148,13 @@ void bflash_attention_perf_f16(
     // Q 常驻 frag_Q 寄存器, O 常驻 mma_pv.frag_C — 都不落 smem
     // smem_KV: Q 初始化 / K tile / V tile 依次复用 (生命周期不重叠)
     // smem_SP: tile 内 S/P, 末尾复用为 O 写回的 staging
-    __shared__ __half smem_KV   [Bc * D];
-    __shared__ __align__(16) __half smem_SP[Br * Bc];   // LDS.128 要求 16B 对齐
-    __shared__ float  smem_m    [Br];
-    __shared__ float  smem_l    [Br];
-    __shared__ float  smem_alpha[Br];
+    // m/l/alpha 走 dynamic smem: static 部分恰好 = 48KB 上限, 把 3*Br float 挤出去
+    __shared__ __half smem_KV[Bc * D];
+    __shared__ __half smem_SP[Br * Bc];
+    extern __shared__ float smem_dyn[];
+    float* smem_m     = smem_dyn;
+    float* smem_l     = smem_dyn + Br;
+    float* smem_alpha = smem_dyn + 2 * Br;
 
     const int32_t tid     = threadIdx.x;
     const int32_t warp_id = tid / 32;
@@ -290,7 +292,7 @@ void flash_attention_perf_f16(
     constexpr int32_t Bc = 128;
     constexpr int32_t WarpCountM = 4;   // WarpM = Br/WarpCountM = 16
     constexpr int32_t TPB = WarpCountM * 32;
-    constexpr int32_t kD = 64;
+    constexpr int32_t kD = 128;
 
     if (D != kD) {
         fprintf(stderr, "flash_attention_perf_f16: only D=%d supported (got %d)\n", kD, D);
@@ -303,6 +305,12 @@ void flash_attention_perf_f16(
     }
 
     const dim3 grid{(unsigned)(N / Br), (unsigned)(B * H), 1};
-    device_flash_attention_perf_f16<TPB, Br, Bc, kD, WarpCountM>
-        <<<grid, TPB>>>(Q, K, V, O, N);
+    const size_t smem_dyn_bytes = 3 * Br * sizeof(float);   // m + l + alpha
+
+    // static smem 已压在 48KB 上限, 默认 dynamic max = 0 → 必须 opt-in
+    auto kernel = device_flash_attention_perf_f16<TPB, Br, Bc, kD, WarpCountM>;
+    cudaFuncSetAttribute(kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dyn_bytes);
+
+    kernel<<<grid, TPB, smem_dyn_bytes>>>(Q, K, V, O, N);
 }

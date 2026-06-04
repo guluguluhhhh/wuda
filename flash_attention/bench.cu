@@ -84,7 +84,7 @@ struct FAKernel {
 };
 
 bool test_correctness(FAKernel* kernels, int n_kernels) {
-    const int B = 2, H = 32, N = 128, D = 64;
+    const int B = 2, H = 32, N = 128, D = 128;
     const size_t size = (size_t)B * H * N * D;
 
     __half* h_Q = (__half*)malloc(size * sizeof(__half));
@@ -151,7 +151,7 @@ bool test_correctness(FAKernel* kernels, int n_kernels) {
 // 性能扫描 (B, H 固定, N 扫, 多 kernel 并排对比)
 // ============================================================
 void test_performance(FAKernel* kernels, int n_kernels) {
-    const int B = 1, H = 32, D = 64;
+    const int B = 1, H = 32, D = 128;
     const int warmup = 2, repeats = 10;
     const int sleep_us = 100000;
 

@@ -191,10 +191,10 @@ void flash_attention_v2_f16(
     int32_t B, int32_t H, int32_t N, int32_t D
 ) {
     constexpr int32_t Br = 32;
-    constexpr int32_t Bc = 128;
+    constexpr int32_t Bc = 64;
     constexpr int32_t WarpCountM = 2;   // WarpM = Br/WarpCountM = 16
     constexpr int32_t TPB = WarpCountM * 32;
-    constexpr int32_t kD = 64;
+    constexpr int32_t kD = 128;
 
     if (D != kD) {
         fprintf(stderr, "flash_attention_v2_f16: only D=%d supported (got %d)\n", kD, D);
