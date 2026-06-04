@@ -121,12 +121,12 @@ void bflash_attention_perf_f16(
     constexpr int32_t WarpM = Br / WarpCountM;
 
     // ---------- 静态 shared memory ----------
-    // K, V 生命周期不重叠 (K 用完才 load V), 合用一块 buffer
+    // smem_Q 已删: Q 只在初始化时借用 smem_KV staging, 之后一直在 frag_Q 寄存器
     // smem_O 已删: O 一直留在 mma_pv.frag_C 累加器寄存器里
-    // smem_SP 末尾会被复用为最终 O 写回 gmem 的 staging
-    __shared__ __half smem_Q    [Br * D];        // Q tile
-    __shared__ __half smem_KV   [Bc * D];        // K / V 共用
-    __shared__ __half smem_SP   [Br * Bc];       // S/P 共用 + 末尾 O staging
+    // smem_KV: Q 初始化 / K tile / V tile 三者依次复用 (生命周期不重叠)
+    // smem_SP: tile 内 S/P, 末尾再复用为最终 O 写回 gmem 的 staging
+    __shared__ __half smem_KV   [Bc * D];        // Q init / K / V
+    __shared__ __half smem_SP   [Br * Bc];       // S/P + 末尾 O staging
     __shared__ float  smem_m    [Br];
     __shared__ float  smem_l    [Br];
     __shared__ float  smem_alpha[Br];            // 每行 α, 给 frag_C rescale 用
@@ -135,16 +135,16 @@ void bflash_attention_perf_f16(
     const int32_t warp_id = tid / 32;
     const int32_t lane_id = tid % 32;
 
-    // 各 warp 在 smem 上的行起点
-    __half* warp_Q_smem  = smem_Q  + warp_id * WarpM * D;
+    // 各 warp 在 smem 上的行起点 (Q 借 smem_KV 的前 Br*D 段)
+    __half* warp_Q_smem  = smem_KV + warp_id * WarpM * D;
     __half* warp_SP_smem = smem_SP + warp_id * WarpM * Bc;
 
     // 持久的 O 累加器 (frag_C 跨 t 循环保留, frag_A/B 是 forward 内的临时)
     ptx::WarpHMMA_Trans_f16<WarpM, D, Bc> mma_pv;
     mma_pv.zero();
 
-    // Load Q gmem → smem (一次)
-    block_mma_prelogue_f16<TPB, Br, D>(Q, smem_Q, D, D);
+    // Load Q gmem → smem_KV 前段 (一次性)
+    block_mma_prelogue_f16<TPB, Br, D>(Q, smem_KV, D, D);
 
     // 初始化 m=-inf, l=0
     for (int32_t i = tid; i < Br; i += TPB) {
@@ -152,6 +152,12 @@ void bflash_attention_perf_f16(
         smem_l[i] = 0.0f;
     }
     __syncthreads();
+
+    // Q 一次性 ldmatrix 到 per-lane 持久寄存器, 后续 smem_KV 就可以被 K/V 覆写
+    using QK_mma_t = ptx::WarpHMMA_f16<WarpM, Bc, D>;
+    typename QK_mma_t::FragAFull frag_Q;
+    QK_mma_t::load_full_A(warp_Q_smem, D, frag_Q);
+    __syncthreads();   // 等所有 warp 把自己的 Q 读完, 才能让 K 覆写 smem_KV
 
     const float scale = 1.0f / sqrtf((float)D);
     const int32_t Tc = N / Bc;
@@ -163,10 +169,11 @@ void bflash_attention_perf_f16(
         __syncthreads();
 
         // S = Q @ K^T   (TN: K row-major 作为 col_major B 加载即 K^T)
+        //   Q 在 frag_Q 寄存器里, mma 只 load K, 不再读 smem_Q
         {
-            ptx::WarpHMMA_f16<WarpM, Bc, D> mma_qk;
+            QK_mma_t mma_qk;
             mma_qk.zero();
-            mma_qk.forward(warp_Q_smem, smem_KV, D, D);
+            mma_qk.forward_with_A(frag_Q, smem_KV, D);
             mma_qk.stmatrix(warp_SP_smem, Bc);   // 输出 fp16 到 smem_SP
         }
         __syncthreads();

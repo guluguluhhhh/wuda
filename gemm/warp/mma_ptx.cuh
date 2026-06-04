@@ -54,6 +54,7 @@ struct WarpHMMA_f16 {
     const static int32_t InstructionK = 16;
     const static int32_t WarpTileM = WarpM / InstructionM;
     const static int32_t WarpTileN = WarpN / InstructionN;
+    const static int32_t KIters    = WarpK / InstructionK;
 
     // A: 每个 lane 持 8 个 half (= 4 uint32) 覆盖 16x16
     uint32_t frag_A[WarpTileM][4];
@@ -61,6 +62,10 @@ struct WarpHMMA_f16 {
     uint32_t frag_B[WarpTileN][4];
     // C: 每个 lane 持 4 个 uint32 = 8 个 half (= 两条 m16n8 累加器拼成 m16n16)
     uint32_t frag_C[WarpTileM][WarpTileN][4];
+
+    // 跨 t 循环持久的 A (= Q) 在外面提前 load 一次, 类型如下
+    //   frag_A_full[ki][m][i]: KIters × WarpTileM × 4 uint32 per lane
+    using FragAFull = uint32_t[KIters][WarpTileM][4];
 
     __device__ __forceinline__
     void ldmatrix(
@@ -94,6 +99,45 @@ struct WarpHMMA_f16 {
                 B + (n * InstructionN + b_row) * strideB + b_col,
                 frag_B[n]
             );
+        }
+    }
+
+    // 只加载 B, 给"A 已在 reg 里"的场景用
+    __device__ __forceinline__
+    void ldmatrix_B_only(const __half* __restrict__ B, const int32_t strideB) {
+        const int32_t lane = threadIdx.x & 31;
+        const int32_t b_row = (lane & 7) + ((lane >> 4) << 3);
+        const int32_t b_col = ((lane >> 3) & 1) << 3;
+        #pragma unroll
+        for (int32_t n = 0; n < WarpTileN; ++n) {
+            ldmatrix_x4_b16(
+                B + (n * InstructionN + b_row) * strideB + b_col,
+                frag_B[n]
+            );
+        }
+    }
+
+    // 把整个 A (跨所有 KIters) 从 smem 一次性 load 到外部 frag (类型 FragAFull)
+    //   后续每个 t 循环不再重复读 smem_A, 直接喂给 forward_with_A
+    __device__ __forceinline__
+    static void load_full_A(
+        const __half* __restrict__ A,
+        const int32_t strideA,
+        FragAFull& frag
+    ) {
+        const int32_t lane = threadIdx.x & 31;
+        const int32_t a_row = lane & 15;
+        const int32_t a_col = (lane >> 4) << 3;
+        #pragma unroll
+        for (int32_t ki = 0; ki < KIters; ++ki) {
+            #pragma unroll
+            for (int32_t m = 0; m < WarpTileM; ++m) {
+                ldmatrix_x4_b16(
+                    A + (m * InstructionM + a_row) * strideA
+                      + a_col + ki * InstructionK,
+                    frag[ki][m]
+                );
+            }
         }
     }
 
@@ -144,6 +188,32 @@ struct WarpHMMA_f16 {
                     // 第 2 条 m16n8: 用 B[2..3], 累加到 C[2..3]
                     mma_m16n8k16_f16f16(
                         &frag_C[m][n][2], frag_A[m], &frag_B[n][2], &frag_C[m][n][2]
+                    );
+                }
+            }
+        }
+    }
+
+    // A 来自外部 (已在 reg 里), 每 k-iter 只 load B
+    __device__
+    void forward_with_A(
+        const FragAFull& extA,
+        const __half* __restrict__ B,
+        const int32_t strideB
+    ) {
+        #pragma unroll
+        for (int32_t ki = 0; ki < KIters; ++ki) {
+            ldmatrix_B_only(B + ki * InstructionK, strideB);
+
+            #pragma unroll
+            for (int32_t m = 0; m < WarpTileM; ++m) {
+                #pragma unroll
+                for (int32_t n = 0; n < WarpTileN; ++n) {
+                    mma_m16n8k16_f16f16(
+                        &frag_C[m][n][0], extA[ki][m], &frag_B[n][0], &frag_C[m][n][0]
+                    );
+                    mma_m16n8k16_f16f16(
+                        &frag_C[m][n][2], extA[ki][m], &frag_B[n][2], &frag_C[m][n][2]
                     );
                 }
             }
