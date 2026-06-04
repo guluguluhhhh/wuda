@@ -8,15 +8,6 @@
 #include <cstdio>
 #include <cmath>
 
-// ============================================================
-// 在 frag_C 寄存器上 rescale O (O 不落 smem)
-//   frag_C[m][n][i] 布局 (per lane, m16n16 双 m16n8 拼接):
-//     [0,2] → 上半行 (rows row0 = lane>>2, range 0..7)
-//     [1,3] → 下半行 (rows row0+8,         range 8..15)
-//   每 lane 只需 2 个 factor (上/下半行各一个)
-// ============================================================
-
-// half2 *= half2 (packed in uint32)
 __device__ __forceinline__
 uint32_t hmul2_pack(uint32_t v, __half2 a) {
     __half2 h = *reinterpret_cast<__half2*>(&v);
@@ -24,6 +15,10 @@ uint32_t hmul2_pack(uint32_t v, __half2 a) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// frag_C[m][n][i] per-lane 布局 (m16n16 = 双 m16n8 拼接):
+//   [0,2] → 上半行 (row0 = lane>>2, 范围 0..7)
+//   [1,3] → 下半行 (row0 + 8,       范围 8..15)
+// 每 lane 只需 2 个 factor (上/下半行各一个)
 template<int32_t WarpTileM, int32_t WarpTileN>
 __device__ __forceinline__
 void rescale_frag_O(
@@ -41,12 +36,8 @@ void rescale_frag_O(
     }
 }
 
-// ============================================================
-// Warp 内一行的在线 softmax (不动 O, O 在累加器寄存器里由外面 rescale)
-//   全 32 lane 协作处理一行, 每 lane 各拿 Bc/32 个 P
-//   m, l 入参 m_old/l_old, 返回 m_new/l_new (所有 lane 同值)
-//   函数返回 α = exp(m_old - m_new), 供外面写入 smem_alpha
-// ============================================================
+// Warp 内一行的在线 softmax: 32 lane 协作一行, 不动 O
+// 返回 α = exp(m_old - m_new), 由外部用来 rescale frag_C
 template<int32_t Bc>
 __device__ __forceinline__
 float warp_online_softmax_row(
@@ -62,7 +53,7 @@ float warp_online_softmax_row(
     const float m_old = m;
     const float l_old = l;
 
-    // (a) 行最大 — 暂存缩放后的值, 避免 (b) 里再 load 一次
+    // 行最大 — 缓存 scaled, 避免下一遍再读 smem
     float scaled[BcPerLane];
     float m_tile = -INFINITY;
     #pragma unroll
@@ -76,7 +67,6 @@ float warp_online_softmax_row(
     }
     const float m_new = fmaxf(m_old, m_tile);
 
-    // (b) P = exp(scaled - m_new), 行和
     float l_tile = 0.0f;
     #pragma unroll
     for (int32_t i = 0; i < BcPerLane; i++) {
@@ -95,16 +85,9 @@ float warp_online_softmax_row(
     return alpha;
 }
 
-// ============================================================
-// FlashAttention v2
-//   一个 block 完成 O 上 [Br, D] 行块的 FlashAttention-2 计算
-//   Q: [Br, D] / K, V: [N, D] / O: [Br, D]   (指针已偏移到本 block)
-//
-//   切分:
-//     TPB = WarpCountM * 32, 沿 Br 切 WarpCountM 个 warp
-//     每 warp 负责 WarpM = Br/WarpCountM 行 (这里 WarpM=16)
-//     KV 在 warp 间共享 (split-Q)
-// ============================================================
+// FlashAttention-2: 一个 block 算 O 的 [Br, D] 行块
+//   Q: [Br, D] / K,V: [N, D] / O: [Br, D]  (指针已偏移到本 block)
+//   沿 Br 切 WarpCountM 个 warp (split-Q), KV 在 warp 间共享
 template<
     int32_t TPB,
     int32_t Br, int32_t Bc, int32_t D,
@@ -120,65 +103,58 @@ void bflash_attention_perf_f16(
 ) {
     constexpr int32_t WarpM = Br / WarpCountM;
 
-    // ---------- 静态 shared memory ----------
-    // smem_Q 已删: Q 只在初始化时借用 smem_KV staging, 之后一直在 frag_Q 寄存器
-    // smem_O 已删: O 一直留在 mma_pv.frag_C 累加器寄存器里
-    // smem_KV: Q 初始化 / K tile / V tile 三者依次复用 (生命周期不重叠)
-    // smem_SP: tile 内 S/P, 末尾再复用为最终 O 写回 gmem 的 staging
-    __shared__ __half smem_KV   [Bc * D];        // Q init / K / V
-    __shared__ __half smem_SP   [Br * Bc];       // S/P + 末尾 O staging
+    // Q 常驻 frag_Q 寄存器, O 常驻 mma_pv.frag_C — 都不落 smem
+    // smem_KV: Q 初始化 / K tile / V tile 依次复用 (生命周期不重叠)
+    // smem_SP: tile 内 S/P, 末尾复用为 O 写回的 staging
+    __shared__ __half smem_KV   [Bc * D];
+    __shared__ __half smem_SP   [Br * Bc];
     __shared__ float  smem_m    [Br];
     __shared__ float  smem_l    [Br];
-    __shared__ float  smem_alpha[Br];            // 每行 α, 给 frag_C rescale 用
+    __shared__ float  smem_alpha[Br];
 
     const int32_t tid     = threadIdx.x;
     const int32_t warp_id = tid / 32;
     const int32_t lane_id = tid % 32;
 
-    // 各 warp 在 smem 上的行起点 (Q 借 smem_KV 的前 Br*D 段)
+    // Q 借用 smem_KV 前 Br*D 段做 staging
     __half* warp_Q_smem  = smem_KV + warp_id * WarpM * D;
     __half* warp_SP_smem = smem_SP + warp_id * WarpM * Bc;
 
-    // 持久的 O 累加器 (frag_C 跨 t 循环保留, frag_A/B 是 forward 内的临时)
+    // 持久的 O 累加器, 跨 t 循环保留
     ptx::WarpHMMA_Trans_f16<WarpM, D, Bc> mma_pv;
     mma_pv.zero();
 
-    // Load Q gmem → smem_KV 前段 (一次性)
     block_mma_prelogue_f16<TPB, Br, D>(Q, smem_KV, D, D);
 
-    // 初始化 m=-inf, l=0
     for (int32_t i = tid; i < Br; i += TPB) {
         smem_m[i] = -INFINITY;
         smem_l[i] = 0.0f;
     }
     __syncthreads();
 
-    // Q 一次性 ldmatrix 到 per-lane 持久寄存器, 后续 smem_KV 就可以被 K/V 覆写
+    // Q ldmatrix 进 per-lane 寄存器, 之后 smem_KV 就可以被 K/V 覆写
     using QK_mma_t = ptx::WarpHMMA_f16<WarpM, Bc, D>;
     typename QK_mma_t::FragAFull frag_Q;
     QK_mma_t::load_full_A(warp_Q_smem, D, frag_Q);
-    __syncthreads();   // 等所有 warp 把自己的 Q 读完, 才能让 K 覆写 smem_KV
+    __syncthreads();   // 等所有 warp 读完 Q, 才能让 K 覆写 smem_KV
 
     const float scale = 1.0f / sqrtf((float)D);
     const int32_t Tc = N / Bc;
 
-    // 外层循环: 逐段扫 KV
     for (int32_t t = 0; t < Tc; t++) {
-        // gmem → smem: K tile
         block_mma_prelogue_f16<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, D);
         __syncthreads();
 
-        // S = Q @ K^T   (TN: K row-major 作为 col_major B 加载即 K^T)
-        //   Q 在 frag_Q 寄存器里, mma 只 load K, 不再读 smem_Q
+        // S = Q @ K^T   (TN: K row-major 当 col_major B 加载即 K^T)
         {
             QK_mma_t mma_qk;
             mma_qk.zero();
             mma_qk.forward_with_A(frag_Q, smem_KV, D);
-            mma_qk.stmatrix(warp_SP_smem, Bc);   // 输出 fp16 到 smem_SP
+            mma_qk.stmatrix(warp_SP_smem, Bc);
         }
         __syncthreads();
 
-        // Online safe softmax (per row) — 收 α 不动 O
+        // 在线 softmax: 每行算 α, 不动 O
         #pragma unroll
         for (int32_t r = 0; r < WarpM; r++) {
             const int32_t row = warp_id * WarpM + r;
@@ -195,7 +171,7 @@ void bflash_attention_perf_f16(
         }
         __syncwarp();   // 等本 warp 的 lane 0 把 α 写齐
 
-        // 按行 α rescale 累加器寄存器里的 O (lane 各持有 2 行: 上半/下半)
+        // 按行 α rescale frag_C (每 lane 持上/下半各一行)
         {
             const int32_t r_upper = warp_id * WarpM + (lane_id >> 2);
             const int32_t r_lower = r_upper + 8;
@@ -205,16 +181,16 @@ void bflash_attention_perf_f16(
         }
         __syncthreads();
 
-        // gmem → smem: V tile (复用 K 的 buffer)
+        // V tile 复用 K 的 smem buffer
         block_mma_prelogue_f16<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, D);
         __syncthreads();
 
-        // O += P @ V   (NN: P, V 都 row_major) — frag_C 持久累加, 无 smem 往返
+        // O += P @ V, frag_C 持久累加
         mma_pv.forward(warp_SP_smem, smem_KV, Bc, D);
         __syncthreads();
     }
 
-    // 归一化 1/l — 直接在 frag_C 上做, 同样上/下半行各一个 factor
+    // 1/l 归一化, 同样在 frag_C 上做
     {
         const int32_t r_upper = warp_id * WarpM + (lane_id >> 2);
         const int32_t r_lower = r_upper + 8;
@@ -223,7 +199,7 @@ void bflash_attention_perf_f16(
         rescale_frag_O(mma_pv.frag_C, inv_upper, inv_lower);
     }
 
-    // frag_C → smem (复用 smem_SP, stride=D, 每 warp 写 WarpM 行连续段) → gmem
+    // frag_C → smem_SP staging → gmem
     __half* warp_O_smem_out = smem_SP + warp_id * WarpM * D;
     mma_pv.stmatrix(warp_O_smem_out, D);
     __syncthreads();
@@ -256,11 +232,8 @@ void device_flash_attention_perf_f16(
     );
 }
 
-// ============================================================
-// Host launcher
-//   Q, K, V, O: [B, H, N, D] row-major fp16 (device 指针)
-//   仅支持 D=64; N 必须是 Br 与 Bc 的整数倍
-// ============================================================
+// Q, K, V, O: [B, H, N, D] row-major fp16 (device 指针)
+// 仅支持 D=64; N 必须是 Br 与 Bc 的整数倍
 void flash_attention_perf_f16(
     const __half* Q,
     const __half* K,
