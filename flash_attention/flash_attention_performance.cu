@@ -268,9 +268,9 @@ void flash_attention_perf_f16(
     __half* O,
     int32_t B, int32_t H, int32_t N, int32_t D
 ) {
-    constexpr int32_t Br = 32;
+    constexpr int32_t Br = 64;
     constexpr int32_t Bc = 128;
-    constexpr int32_t WarpCountM = 2;   // WarpM = Br/WarpCountM = 16
+    constexpr int32_t WarpCountM = 4;   // WarpM = Br/WarpCountM = 16
     constexpr int32_t TPB = WarpCountM * 32;
     constexpr int32_t kD = 64;
 
