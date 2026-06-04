@@ -9,6 +9,75 @@
 #include <cmath>
 
 // ============================================================
+// Warp内一行的在线 softmax + O rescale
+//   全 32 lane 协作处理一行, 每 lane 各拿 Bc/32 个 P + D/32 个 O
+//   m, l 入参为 m_old/l_old, 返回时所有 lane 持有 m_new/l_new
+// ============================================================
+template<int32_t Bc, int32_t D>
+__device__ __forceinline__
+void warp_online_softmax_row(
+    __half* __restrict__ sp_row,   // [Bc] in: S,  out: P
+    __half* __restrict__ o_row,    // [D]  in-place rescale by α
+    const float scale,
+    const int32_t lane_id,
+    float& m,                      // in: m_old, out: m_new
+    float& l                       // in: l_old, out: l_new
+) {
+    constexpr int32_t BcPerLane = Bc / 32;
+    static_assert(Bc % 32 == 0, "Bc must be multiple of 32");
+
+    const float m_old = m;
+    const float l_old = l;
+
+    // (a) 行最大 — 暂存缩放后的值, 避免 (b) 里再 load 一次
+    float scaled[BcPerLane];
+    float m_tile = -INFINITY;
+    #pragma unroll
+    for (int32_t i = 0; i < BcPerLane; i++) {
+        scaled[i] = __half2float(sp_row[i * 32 + lane_id]) * scale;
+        m_tile = fmaxf(m_tile, scaled[i]);
+    }
+    #pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1) {
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
+    }
+    const float m_new = fmaxf(m_old, m_tile);
+
+    // (b) P = exp(scaled - m_new), 行和
+    float l_tile = 0.0f;
+    #pragma unroll
+    for (int32_t i = 0; i < BcPerLane; i++) {
+        const float p = expf(scaled[i] - m_new);
+        sp_row[i * 32 + lane_id] = __float2half(p);
+        l_tile += p;
+    }
+    #pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1) {
+        l_tile += __shfl_xor_sync(0xffffffff, l_tile, off);
+    }
+
+    // (c) α = exp(m_old - m_new), rescale O
+    const float alpha = expf(m_old - m_new);
+    warp_rescale_row<D>(o_row, alpha, lane_id);
+
+    m = m_new;
+    l = alpha * l_old + l_tile;
+}
+
+// 全 warp 协作: 一行 O 标量 rescale
+template<int32_t D>
+__device__ __forceinline__
+void warp_rescale_row(__half* o_row, const float factor, const int32_t lane_id) {
+    constexpr int32_t DPerLane = D / 32;
+    static_assert(D % 32 == 0, "D must be multiple of 32");
+    #pragma unroll
+    for (int32_t i = 0; i < DPerLane; i++) {
+        const int32_t k = i * 32 + lane_id;
+        o_row[k] = __float2half(__half2float(o_row[k]) * factor);
+    }
+}
+
+// ============================================================
 // FlashAttention v2
 //   一个 block 完成 O 上 [Br, D] 行块的 FlashAttention-2 计算
 //   Q: [Br, D] / K, V: [N, D] / O: [Br, D]   (指针已偏移到本 block)
@@ -82,44 +151,21 @@ void bflash_attention_perf_f16(
         }
         __syncthreads();
 
-        // Online safe softmax (per row)
-        //      每 warp 16 行, lane 0..15 各处理一行 (lane 16..31 空转)
-        if (lane_id < WarpM) {
-            const int32_t row = warp_id * WarpM + lane_id;
-            __half* sp_row = smem_SP + row * Bc;        // 读 S, 写 P (同 buffer)
-            __half* o_row  = smem_O  + row * D;
-
-            const float m_old = smem_m[row];
-            const float l_old = smem_l[row];
-
-            // (a) 本 tile 行最大
-            float m_tile = -INFINITY;
-            #pragma unroll
-            for (int32_t j = 0; j < Bc; j++) {
-                const float v = __half2float(sp_row[j]) * scale;
-                if (v > m_tile) m_tile = v;
+        // Online safe softmax (per row) — 全 warp 协作每行
+        #pragma unroll
+        for (int32_t r = 0; r < WarpM; r++) {
+            const int32_t row = warp_id * WarpM + r;
+            float m = smem_m[row];
+            float l = smem_l[row];
+            warp_online_softmax_row<Bc, D>(
+                smem_SP + row * Bc,
+                smem_O  + row * D,
+                scale, lane_id, m, l
+            );
+            if (lane_id == 0) {
+                smem_m[row] = m;
+                smem_l[row] = l;
             }
-            const float m_new = fmaxf(m_old, m_tile);
-
-            // (b) P = exp(S*scale - m_new), 同时累加行和
-            float l_tile = 0.0f;
-            #pragma unroll
-            for (int32_t j = 0; j < Bc; j++) {
-                const float p = expf(__half2float(sp_row[j]) * scale - m_new);
-                sp_row[j] = __float2half(p);
-                l_tile += p;
-            }
-
-            // (c) α = exp(m_old - m_new), 修旧 O (fp16 → fp32 算 → fp16)
-            const float alpha = expf(m_old - m_new);
-            #pragma unroll
-            for (int32_t k = 0; k < D; k++) {
-                o_row[k] = __float2half(__half2float(o_row[k]) * alpha);
-            }
-
-            // (d) 更新 m, l
-            smem_m[row] = m_new;
-            smem_l[row] = alpha * l_old + l_tile;
         }
         __syncthreads();
 
@@ -137,15 +183,11 @@ void bflash_attention_perf_f16(
         __syncthreads();
     }
 
-    // 归一化 1/l
-    if (lane_id < WarpM) {
-        const int32_t row = warp_id * WarpM + lane_id;
-        __half* o_row = smem_O + row * D;
-        const float inv_l = 1.0f / smem_l[row];
-        #pragma unroll
-        for (int32_t k = 0; k < D; k++) {
-            o_row[k] = __float2half(__half2float(o_row[k]) * inv_l);
-        }
+    // 归一化 1/l — 全 warp 协作每行
+    #pragma unroll
+    for (int32_t r = 0; r < WarpM; r++) {
+        const int32_t row = warp_id * WarpM + r;
+        warp_rescale_row<D>(smem_O + row * D, 1.0f / smem_l[row], lane_id);
     }
     __syncthreads();
 
