@@ -36,50 +36,92 @@ void rescale_frag_O(
     }
 }
 
-// Warp 内一行的在线 softmax: 32 lane 协作一行, 不动 O
-// 返回 α = exp(m_old - m_new), 由外部用来 rescale frag_C
+// 16-lane threadgroup 在线 softmax: 一个 warp 同时算两行
+// 每 lane 用 LDS.128 / STS.128 一次吃 8 fp16, reduction 限制在 off ≤ 8 自治
+// 内部用 exp2f, 把 log2e 折进 scale 省一条 FMUL
 template<int32_t Bc>
 __device__ __forceinline__
-float warp_online_softmax_row(
-    __half* __restrict__ sp_row,   // [Bc] in: S,  out: P
+float warp_online_softmax_2rows(
+    __half* __restrict__ sp_row_base,   // 起始指向 row_base, 下一行 = +Bc
     const float scale,
     const int32_t lane_id,
-    float& m,                      // in: m_old, out: m_new
-    float& l                       // in: l_old, out: l_new
+    float& m,                           // in: m_old (本 TG 行), out: m_new
+    float& l                            // in: l_old (本 TG 行), out: l_new
 ) {
-    constexpr int32_t BcPerLane = Bc / 32;
-    static_assert(Bc % 32 == 0, "Bc must be multiple of 32");
+    constexpr int32_t kElemsPerLane = 8;
+    constexpr int32_t kLanesPerRow  = Bc / kElemsPerLane;
+    static_assert(kLanesPerRow == 16, "softmax_2rows: Bc 必须 = 128 (16 lane × 8 fp16)");
+
+    const int32_t tg_id   = lane_id >> 4;   // 0 / 1
+    const int32_t tg_lane = lane_id & 15;   // 0..15
+
+    constexpr float LOG2E = 1.4426950408889634f;
+    const float scale_log2e = scale * LOG2E;
+
+    __half* my_row = sp_row_base + tg_id * Bc;
+
+    // LDS.128 — 1 条指令读 8 fp16
+    uint4 packed = *reinterpret_cast<const uint4*>(my_row + tg_lane * kElemsPerLane);
+    float2 f01 = __half22float2(*reinterpret_cast<__half2*>(&packed.x));
+    float2 f23 = __half22float2(*reinterpret_cast<__half2*>(&packed.y));
+    float2 f45 = __half22float2(*reinterpret_cast<__half2*>(&packed.z));
+    float2 f67 = __half22float2(*reinterpret_cast<__half2*>(&packed.w));
+
+    float scaled[8] = {
+        f01.x * scale_log2e, f01.y * scale_log2e,
+        f23.x * scale_log2e, f23.y * scale_log2e,
+        f45.x * scale_log2e, f45.y * scale_log2e,
+        f67.x * scale_log2e, f67.y * scale_log2e,
+    };
+
+    // 树形 local max (chain 深度 3 而非 8)
+    float m_tile = fmaxf(
+        fmaxf(fmaxf(scaled[0], scaled[1]), fmaxf(scaled[2], scaled[3])),
+        fmaxf(fmaxf(scaled[4], scaled[5]), fmaxf(scaled[6], scaled[7]))
+    );
+
+    // 16-lane butterfly: off ≤ 8 → 两 TG 自治, 不跨 lane 16 边界
+    #pragma unroll
+    for (int32_t off = 8; off > 0; off >>= 1) {
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
+    }
 
     const float m_old = m;
     const float l_old = l;
-
-    // 行最大 — 缓存 scaled, 避免下一遍再读 smem
-    float scaled[BcPerLane];
-    float m_tile = -INFINITY;
-    #pragma unroll
-    for (int32_t i = 0; i < BcPerLane; i++) {
-        scaled[i] = __half2float(sp_row[i * 32 + lane_id]) * scale;
-        m_tile = fmaxf(m_tile, scaled[i]);
-    }
-    #pragma unroll
-    for (int32_t off = 16; off > 0; off >>= 1) {
-        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
-    }
     const float m_new = fmaxf(m_old, m_tile);
 
-    float l_tile = 0.0f;
+    // pass2: exp2f (折了 log2e) — 单条 MUFU.EX2
+    float p[8];
     #pragma unroll
-    for (int32_t i = 0; i < BcPerLane; i++) {
-        const float p = expf(scaled[i] - m_new);
-        sp_row[i * 32 + lane_id] = __float2half(p);
-        l_tile += p;
+    for (int32_t i = 0; i < 8; i++) {
+        p[i] = exp2f(scaled[i] - m_new);
     }
+
+    // 树形 local sum (chain 深度 3)
+    float l_tile = ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+
+    // STS.128 写回 P (与下面 SHFL 走不同 pipe, 可并行)
+    {
+        __half2 hp0 = __floats2half2_rn(p[0], p[1]);
+        __half2 hp1 = __floats2half2_rn(p[2], p[3]);
+        __half2 hp2 = __floats2half2_rn(p[4], p[5]);
+        __half2 hp3 = __floats2half2_rn(p[6], p[7]);
+        uint4 packed_p;
+        packed_p.x = *reinterpret_cast<uint32_t*>(&hp0);
+        packed_p.y = *reinterpret_cast<uint32_t*>(&hp1);
+        packed_p.z = *reinterpret_cast<uint32_t*>(&hp2);
+        packed_p.w = *reinterpret_cast<uint32_t*>(&hp3);
+        *reinterpret_cast<uint4*>(my_row + tg_lane * kElemsPerLane) = packed_p;
+    }
+
+    // α 提前发射: 走 SFU pipe, 与下面 SHFL (MIO) 并行
+    const float alpha = exp2f(m_old - m_new);
+
     #pragma unroll
-    for (int32_t off = 16; off > 0; off >>= 1) {
+    for (int32_t off = 8; off > 0; off >>= 1) {
         l_tile += __shfl_xor_sync(0xffffffff, l_tile, off);
     }
 
-    const float alpha = expf(m_old - m_new);
     m = m_new;
     l = alpha * l_old + l_tile;
     return alpha;
@@ -107,7 +149,7 @@ void bflash_attention_perf_f16(
     // smem_KV: Q 初始化 / K tile / V tile 依次复用 (生命周期不重叠)
     // smem_SP: tile 内 S/P, 末尾复用为 O 写回的 staging
     __shared__ __half smem_KV   [Bc * D];
-    __shared__ __half smem_SP   [Br * Bc];
+    __shared__ __align__(16) __half smem_SP[Br * Bc];   // LDS.128 要求 16B 对齐
     __shared__ float  smem_m    [Br];
     __shared__ float  smem_l    [Br];
     __shared__ float  smem_alpha[Br];
@@ -154,22 +196,25 @@ void bflash_attention_perf_f16(
         }
         __syncthreads();
 
-        // 在线 softmax: 每行算 α, 不动 O
+        // 在线 softmax: 一个 warp 同时算 2 行 (TG 0 → row+0, TG 1 → row+1)
+        static_assert(WarpM % 2 == 0, "WarpM must be even for 2-row softmax");
+        const int32_t tg_id = lane_id >> 4;
         #pragma unroll
-        for (int32_t r = 0; r < WarpM; r++) {
-            const int32_t row = warp_id * WarpM + r;
-            float m = smem_m[row];
-            float l = smem_l[row];
-            const float alpha = warp_online_softmax_row<Bc>(
-                smem_SP + row * Bc, scale, lane_id, m, l
+        for (int32_t rr = 0; rr < WarpM / 2; rr++) {
+            const int32_t row_base = warp_id * WarpM + rr * 2;
+            const int32_t my_row   = row_base + tg_id;
+            float m = smem_m[my_row];
+            float l = smem_l[my_row];
+            const float alpha = warp_online_softmax_2rows<Bc>(
+                smem_SP + row_base * Bc, scale, lane_id, m, l
             );
-            if (lane_id == 0) {
-                smem_m[row] = m;
-                smem_l[row] = l;
-                smem_alpha[row] = alpha;
+            if ((lane_id & 15) == 0) {   // lane 0 / lane 16 各写自己 TG 的行
+                smem_m[my_row] = m;
+                smem_l[my_row] = l;
+                smem_alpha[my_row] = alpha;
             }
         }
-        __syncwarp();   // 等本 warp 的 lane 0 把 α 写齐
+        __syncwarp();   // 等 lane 0 / lane 16 把 α 写齐
 
         // 按行 α rescale frag_C (每 lane 持上/下半各一行)
         {
