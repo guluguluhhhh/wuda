@@ -42,7 +42,8 @@ void rescale_frag_O(
 template<int32_t Bc>
 __device__ __forceinline__
 float warp_online_softmax_2rows(
-    __half* __restrict__ sp_row_base,   // 起始指向 row_base, 下一行 = +Bc
+    __half* __restrict__ sp_row_base,   // 起始指向 row_base, 下一行 = +sp_stride
+    const int32_t sp_stride,            // smem 行 stride (= Bc + PAD)
     const float scale,
     const int32_t lane_id,
     float& m,                           // in: m_old (本 TG 行), out: m_new
@@ -58,7 +59,7 @@ float warp_online_softmax_2rows(
     constexpr float LOG2E = 1.4426950408889634f;
     const float scale_log2e = scale * LOG2E;
 
-    __half* my_row = sp_row_base + tg_id * Bc;
+    __half* my_row = sp_row_base + tg_id * sp_stride;
 
     // LDS.128 — 1 条指令读 8 fp16
     uint4 packed = *reinterpret_cast<const uint4*>(my_row + tg_lane * kElemsPerLane);
@@ -156,18 +157,26 @@ void bflash_attention_perf_f16(
     constexpr int32_t WarpN_pv           = D  / WarpCountN;
     constexpr int32_t RowsPerWarpSoftmax = Br / WarpCount;
 
+    // Padding: 每行加 8 fp16 消除 bank conflict (stride 从 128 的 32-bank 倍数 → 136)
+    constexpr int32_t PAD       = 8;
+    constexpr int32_t KV_STRIDE = D  + PAD;   // smem_KV 行 stride = 136
+    constexpr int32_t SP_STRIDE = Bc + PAD;   // smem_SP 行 stride = 136
+
     static_assert(TPB == WarpCount * 32,         "TPB must be 32 * WarpCountM * WarpCountN");
     static_assert(WarpM == 16,                   "WarpM must be 16 (rescale_frag_O 约束 WarpTileM=1)");
     static_assert(WarpN_qk % 16 == 0,            "WarpN_qk must be multiple of 16 (mma N)");
     static_assert(WarpN_pv % 16 == 0,            "WarpN_pv must be multiple of 16 (mma N)");
     static_assert(RowsPerWarpSoftmax % 2 == 0,   "softmax_2rows 要求每 warp 行数为偶");
+    static_assert(KV_STRIDE % 8 == 0,            "KV_STRIDE must be 16B aligned (ldmatrix)");
 
-    __shared__ __half smem_KV[Bc * D];
-    __shared__ __half smem_SP[Br * Bc];
-    extern __shared__ float smem_dyn[];
-    float* smem_m     = smem_dyn;
-    float* smem_l     = smem_dyn + Br;
-    float* smem_alpha = smem_dyn + 2 * Br;
+    // smem_KV: static (34KB, < 48KB 上限)
+    // smem_SP + m/l/alpha: dynamic (需 opt-in)
+    __shared__ __half smem_KV[Bc * KV_STRIDE];
+    extern __shared__ char smem_dyn_raw[];
+    __half* smem_SP   = reinterpret_cast<__half*>(smem_dyn_raw);
+    float*  smem_m    = reinterpret_cast<float*>(smem_dyn_raw + Br * SP_STRIDE * sizeof(__half));
+    float*  smem_l    = smem_m + Br;
+    float*  smem_alpha = smem_l + Br;
 
     const int32_t tid     = threadIdx.x;
     const int32_t warp_id = tid / 32;
@@ -176,18 +185,19 @@ void bflash_attention_perf_f16(
     const int32_t warp_m_id = warp_id / WarpCountN;
     const int32_t warp_n_id = warp_id % WarpCountN;
 
-    // 同 M-group 的 N-warps 共享 Q rows
-    __half* warp_Q_smem = smem_KV + warp_m_id * WarpM * D;
-    // QK 写 S 的 [WarpM, WarpN_qk] slice (含列偏移)
-    __half* qk_S_out    = smem_SP + warp_m_id * WarpM * Bc + warp_n_id * WarpN_qk;
-    // PV 读 P 整行 (cols 全 Bc)
-    __half* pv_P_in     = smem_SP + warp_m_id * WarpM * Bc;
+    // 同 M-group 的 N-warps 共享 Q rows (stride = KV_STRIDE)
+    __half* warp_Q_smem = smem_KV + warp_m_id * WarpM * KV_STRIDE;
+    // QK 写 S (stride = SP_STRIDE)
+    __half* qk_S_out    = smem_SP + warp_m_id * WarpM * SP_STRIDE + warp_n_id * WarpN_qk;
+    // PV 读 P 整行 (stride = SP_STRIDE)
+    __half* pv_P_in     = smem_SP + warp_m_id * WarpM * SP_STRIDE;
 
     // 持久 O 累加器: 每 warp [WarpM, WarpN_pv] slice
     ptx::WarpHMMA_Trans_f16<WarpM, WarpN_pv, Bc> mma_pv;
     mma_pv.zero();
 
-    block_mma_prelogue_f16_async<TPB, Br, D>(Q, smem_KV, D, D);
+    // Q load: gmem stride=D, smem stride=KV_STRIDE
+    block_mma_prelogue_f16_async<TPB, Br, D>(Q, smem_KV, D, KV_STRIDE);
 
     for (int32_t i = tid; i < Br; i += TPB) {
         smem_m[i] = -INFINITY;
@@ -196,33 +206,34 @@ void bflash_attention_perf_f16(
     cp_async_wait_group<0>();
     __syncthreads();
 
-    // Q 持久化 (M-group 内 N-warps 各自重复 ldmatrix 同一份, register 重复但 smem 是 broadcast)
+    // Q 持久化 (stride = KV_STRIDE)
     using QK_mma_t = ptx::WarpHMMA_f16<WarpM, WarpN_qk, D>;
     typename QK_mma_t::FragAFull frag_Q;
-    QK_mma_t::load_full_A(warp_Q_smem, D, frag_Q);
-    __syncthreads();   // 等所有 warp 读完 Q, 才能让 K 覆写 smem_KV
+    QK_mma_t::load_full_A(warp_Q_smem, KV_STRIDE, frag_Q);
+    __syncthreads();
 
     const float scale = 1.0f / sqrtf((float)D);
     const int32_t Tc = N / Bc;
 
     for (int32_t t = 0; t < Tc; t++) {
-        block_mma_prelogue_f16_async<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, D);
+        // K load: gmem stride=D, smem stride=KV_STRIDE
+        block_mma_prelogue_f16_async<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, KV_STRIDE);
         cp_async_wait_group<0>();
         __syncthreads();
 
-        // S = Q @ K^T   (TN: K row-major 当 col_major B), warp_n_id 切 K 的 Bc 行
+        // S = Q @ K^T, K in smem with stride KV_STRIDE
         {
             QK_mma_t mma_qk;
             mma_qk.zero();
-            mma_qk.forward_with_A(frag_Q, smem_KV + warp_n_id * WarpN_qk * D, D);
-            mma_qk.stmatrix(qk_S_out, Bc);
+            mma_qk.forward_with_A(frag_Q, smem_KV + warp_n_id * WarpN_qk * KV_STRIDE, KV_STRIDE);
+            mma_qk.stmatrix(qk_S_out, SP_STRIDE);
         }
         __syncthreads();
 
-        // V async load START — smem_KV 在 QK GEMM 后已无人读, 与 softmax+rescale 重叠
-        block_mma_prelogue_f16_async<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, D);
+        // V async load: gmem stride=D, smem stride=KV_STRIDE
+        block_mma_prelogue_f16_async<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, KV_STRIDE);
 
-        // 在线 softmax: 行平均分给 WarpCount 个 warp (只碰 smem_SP, 不碰 smem_KV)
+        // 在线 softmax (smem_SP stride = SP_STRIDE)
         const int32_t tg_id = lane_id >> 4;
         #pragma unroll
         for (int32_t rr = 0; rr < RowsPerWarpSoftmax / 2; rr++) {
@@ -231,7 +242,7 @@ void bflash_attention_perf_f16(
             float m = smem_m[my_row];
             float l = smem_l[my_row];
             const float alpha = warp_online_softmax_2rows<Bc>(
-                smem_SP + row_base * Bc, scale, lane_id, m, l
+                smem_SP + row_base * SP_STRIDE, SP_STRIDE, scale, lane_id, m, l
             );
             if ((lane_id & 15) == 0) {
                 smem_m[my_row] = m;
@@ -239,9 +250,9 @@ void bflash_attention_perf_f16(
                 smem_alpha[my_row] = alpha;
             }
         }
-        __syncthreads();   // 全 block 等 α 写齐 (M-group 内 N-warps 都要读)
+        __syncthreads();
 
-        // 按行 α rescale frag_C (只碰寄存器 + 读 smem_alpha, 不碰 smem_KV)
+        // rescale frag_C
         {
             const int32_t r_upper = warp_m_id * WarpM + (lane_id >> 2);
             const int32_t r_lower = r_upper + 8;
@@ -250,12 +261,12 @@ void bflash_attention_perf_f16(
             rescale_frag_O(mma_pv.frag_C, a_upper, a_lower);
         }
 
-        // V async load WAIT — softmax + rescale 期间 V 数据已在后台传输
+        // V wait
         cp_async_wait_group<0>();
         __syncthreads();
 
-        // O += P @ V   (NN), warp_n_id 切 V 的 D 列 (ldb=D 不变)
-        mma_pv.forward(pv_P_in, smem_KV + warp_n_id * WarpN_pv, Bc, D);
+        // O += P @ V, P stride=SP_STRIDE, V stride=KV_STRIDE
+        mma_pv.forward(pv_P_in, smem_KV + warp_n_id * WarpN_pv, SP_STRIDE, KV_STRIDE);
         __syncthreads();
     }
 
@@ -268,7 +279,7 @@ void bflash_attention_perf_f16(
         rescale_frag_O(mma_pv.frag_C, inv_upper, inv_lower);
     }
 
-    // frag_C → smem_SP staging → gmem (每 warp 写 [WarpM, WarpN_pv] slice, stride D)
+    // frag_C → smem_SP staging → gmem (O staging 用 stride=D, 不需要 padding)
     __half* warp_O_smem_out = smem_SP + warp_m_id * WarpM * D + warp_n_id * WarpN_pv;
     mma_pv.stmatrix(warp_O_smem_out, D);
     __syncthreads();
@@ -328,9 +339,13 @@ void flash_attention_perf_f16(
     }
 
     const dim3 grid{(unsigned)(N / Br), (unsigned)(B * H), 1};
-    const size_t smem_dyn_bytes = 3 * Br * sizeof(float);   // m + l + alpha
 
-    // static smem 已压在 48KB 上限, 默认 dynamic max = 0 → 必须 opt-in
+    // dynamic smem = smem_SP (padded) + m + l + alpha
+    constexpr int32_t PAD = 8;
+    constexpr int32_t SP_STRIDE = Bc + PAD;
+    const size_t smem_dyn_bytes = Br * SP_STRIDE * sizeof(__half)    // smem_SP
+                                + 3 * Br * sizeof(float);            // m + l + alpha
+
     auto kernel = device_flash_attention_perf_f16<TPB, Br, Bc, kD, WarpCountM, WarpCountN>;
     cudaFuncSetAttribute(kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dyn_bytes);
