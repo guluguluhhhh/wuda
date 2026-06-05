@@ -36,12 +36,13 @@ void rescale_frag_O(
     }
 }
 
-// 16-lane threadgroup 在线 softmax: 一个 warp 同时算两行
-// 每 lane 用 LDS.128 / STS.128 一次吃 8 fp16, reduction 限制在 off ≤ 8 自治
-// 内部用 exp2f, 把 log2e 折进 scale 省一条 FMUL
+// 泛化在线 softmax: 一个 warp 同时算 32/kLanesPerRow 行
+//   Bc=128 → 16 lane/row, 2 rows/warp
+//   Bc=64  →  8 lane/row, 4 rows/warp
+// 每 lane 始终用 LDS.128 / STS.128 吃 8 fp16, reduction 范围 = kLanesPerRow
 template<int32_t Bc>
 __device__ __forceinline__
-float warp_online_softmax_2rows(
+float warp_online_softmax(
     __half* __restrict__ sp_row_base,   // 起始指向 row_base, 下一行 = +sp_stride
     const int32_t sp_stride,            // smem 行 stride (= Bc + PAD)
     const float scale,
@@ -51,17 +52,19 @@ float warp_online_softmax_2rows(
 ) {
     constexpr int32_t kElemsPerLane = 8;
     constexpr int32_t kLanesPerRow  = Bc / kElemsPerLane;
-    static_assert(kLanesPerRow == 16, "softmax_2rows: Bc 必须 = 128 (16 lane × 8 fp16)");
+    constexpr int32_t kRowsPerWarp  = 32 / kLanesPerRow;
+    static_assert(Bc % kElemsPerLane == 0, "Bc must be multiple of 8");
+    static_assert(32 % kLanesPerRow == 0,  "kLanesPerRow must divide 32");
 
-    const int32_t tg_id   = lane_id >> 4;   // 0 / 1
-    const int32_t tg_lane = lane_id & 15;   // 0..15
+    const int32_t tg_id   = lane_id / kLanesPerRow;   // 0..kRowsPerWarp-1
+    const int32_t tg_lane = lane_id % kLanesPerRow;   // 0..kLanesPerRow-1
 
     constexpr float LOG2E = 1.4426950408889634f;
     const float scale_log2e = scale * LOG2E;
 
     __half* my_row = sp_row_base + tg_id * sp_stride;
 
-    // LDS.128 — 1 条指令读 8 fp16
+    // LDS.128 — 每 lane 8 fp16
     uint4 packed = *reinterpret_cast<const uint4*>(my_row + tg_lane * kElemsPerLane);
     float2 f01 = __half22float2(*reinterpret_cast<__half2*>(&packed.x));
     float2 f23 = __half22float2(*reinterpret_cast<__half2*>(&packed.y));
@@ -75,15 +78,15 @@ float warp_online_softmax_2rows(
         f67.x * scale_log2e, f67.y * scale_log2e,
     };
 
-    // 树形 local max (chain 深度 3 而非 8)
+    // 树形 local max
     float m_tile = fmaxf(
         fmaxf(fmaxf(scaled[0], scaled[1]), fmaxf(scaled[2], scaled[3])),
         fmaxf(fmaxf(scaled[4], scaled[5]), fmaxf(scaled[6], scaled[7]))
     );
 
-    // 16-lane butterfly: off ≤ 8 → 两 TG 自治, 不跨 lane 16 边界
+    // kLanesPerRow-lane butterfly (off ≤ kLanesPerRow/2 → TG 自治)
     #pragma unroll
-    for (int32_t off = 8; off > 0; off >>= 1) {
+    for (int32_t off = kLanesPerRow / 2; off > 0; off >>= 1) {
         m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
     }
 
@@ -91,17 +94,15 @@ float warp_online_softmax_2rows(
     const float l_old = l;
     const float m_new = fmaxf(m_old, m_tile);
 
-    // pass2: exp2f (折了 log2e) — 单条 MUFU.EX2
     float p[8];
     #pragma unroll
     for (int32_t i = 0; i < 8; i++) {
         p[i] = exp2f(scaled[i] - m_new);
     }
 
-    // 树形 local sum (chain 深度 3)
     float l_tile = ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
 
-    // STS.128 写回 P (与下面 SHFL 走不同 pipe, 可并行)
+    // STS.128
     {
         __half2 hp0 = __floats2half2_rn(p[0], p[1]);
         __half2 hp1 = __floats2half2_rn(p[2], p[3]);
@@ -115,11 +116,10 @@ float warp_online_softmax_2rows(
         *reinterpret_cast<uint4*>(my_row + tg_lane * kElemsPerLane) = packed_p;
     }
 
-    // α 提前发射: 走 SFU pipe, 与下面 SHFL (MIO) 并行
     const float alpha = exp2f(m_old - m_new);
 
     #pragma unroll
-    for (int32_t off = 8; off > 0; off >>= 1) {
+    for (int32_t off = kLanesPerRow / 2; off > 0; off >>= 1) {
         l_tile += __shfl_xor_sync(0xffffffff, l_tile, off);
     }
 
@@ -134,10 +134,6 @@ float warp_online_softmax_2rows(
 //       K 行切 (row-major K): ptr += warp_n_id * WarpN_qk * D
 //   PV: 每 warp 算 O 的 [WarpM, WarpN_pv = D /WarpCountN] slice
 //       V 列切 (row-major V): ptr += warp_n_id * WarpN_pv  (ldb=D 不变)
-//   Softmax 在 stmatrix 后做, smem_SP 已含整行, 任一 warp 都能读
-//     行分布: Br/WarpCount 行/warp (调小到 4 行/warp 时仍 > 0 即可)
-//   收益: warp 数 ×WarpCountN → TLP 翻倍, frag_C/frag_C_qk 减半
-//   代价: 同 M-group 的 warp frag_Q 重复 (相同 Q rows 多份 register)
 template<
     int32_t TPB,
     int32_t Br, int32_t Bc, int32_t D,
@@ -166,15 +162,16 @@ void bflash_attention_perf_f16(
     static_assert(WarpM == 16,                   "WarpM must be 16 (rescale_frag_O 约束 WarpTileM=1)");
     static_assert(WarpN_qk % 16 == 0,            "WarpN_qk must be multiple of 16 (mma N)");
     static_assert(WarpN_pv % 16 == 0,            "WarpN_pv must be multiple of 16 (mma N)");
-    static_assert(RowsPerWarpSoftmax % 2 == 0,   "softmax_2rows 要求每 warp 行数为偶");
+    static_assert(RowsPerWarpSoftmax % (32 / (Bc / 8)) == 0,  "RowsPerWarpSoftmax 须整除 kRowsPerCall");
     static_assert(KV_STRIDE % 8 == 0,            "KV_STRIDE must be 16B aligned (ldmatrix)");
 
-    // smem_KV: static (34KB, < 48KB 上限)
-    // smem_SP + m/l/alpha: dynamic (需 opt-in)
+    // smem_SP 要同时容纳 S/P [Br, Bc] 和末尾 O staging [Br, D]
+    constexpr int32_t SP_ELEMS = Br * (SP_STRIDE > D ? SP_STRIDE : D);
+
     __shared__ __half smem_KV[Bc * KV_STRIDE];
     extern __shared__ char smem_dyn_raw[];
     __half* smem_SP   = reinterpret_cast<__half*>(smem_dyn_raw);
-    float*  smem_m    = reinterpret_cast<float*>(smem_dyn_raw + Br * SP_STRIDE * sizeof(__half));
+    float*  smem_m    = reinterpret_cast<float*>(smem_dyn_raw + SP_ELEMS * sizeof(__half));
     float*  smem_l    = smem_m + Br;
     float*  smem_alpha = smem_l + Br;
 
@@ -234,17 +231,19 @@ void bflash_attention_perf_f16(
         block_mma_prelogue_f16_async<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, KV_STRIDE);
 
         // 在线 softmax (smem_SP stride = SP_STRIDE)
-        const int32_t tg_id = lane_id >> 4;
+        constexpr int32_t kLanesPerRow = Bc / 8;
+        constexpr int32_t kRowsPerCall = 32 / kLanesPerRow;
+        const int32_t sm_tg_id = lane_id / kLanesPerRow;
         #pragma unroll
-        for (int32_t rr = 0; rr < RowsPerWarpSoftmax / 2; rr++) {
-            const int32_t row_base = warp_id * RowsPerWarpSoftmax + rr * 2;
-            const int32_t my_row   = row_base + tg_id;
+        for (int32_t rr = 0; rr < RowsPerWarpSoftmax / kRowsPerCall; rr++) {
+            const int32_t row_base = warp_id * RowsPerWarpSoftmax + rr * kRowsPerCall;
+            const int32_t my_row   = row_base + sm_tg_id;
             float m = smem_m[my_row];
             float l = smem_l[my_row];
-            const float alpha = warp_online_softmax_2rows<Bc>(
+            const float alpha = warp_online_softmax<Bc>(
                 smem_SP + row_base * SP_STRIDE, SP_STRIDE, scale, lane_id, m, l
             );
-            if ((lane_id & 15) == 0) {
+            if (lane_id % kLanesPerRow == 0) {
                 smem_m[my_row] = m;
                 smem_l[my_row] = l;
                 smem_alpha[my_row] = alpha;
@@ -322,7 +321,7 @@ void flash_attention_perf_f16(
     int32_t B, int32_t H, int32_t N, int32_t D
 ) {
     constexpr int32_t Br = 64;
-    constexpr int32_t Bc = 128;
+    constexpr int32_t Bc = 64;    // 缩 Bc: 27KB/block → 可放 2 blocks/SM
     constexpr int32_t WarpCountM = 4;   // WarpM = 16 (rescale_frag_O 约束)
     constexpr int32_t WarpCountN = 2;   // 切 Bc / D, 8 warp/block 提 TLP
     constexpr int32_t TPB = WarpCountM * WarpCountN * 32;
@@ -343,7 +342,9 @@ void flash_attention_perf_f16(
     // dynamic smem = smem_SP (padded) + m + l + alpha
     constexpr int32_t PAD = 8;
     constexpr int32_t SP_STRIDE = Bc + PAD;
-    const size_t smem_dyn_bytes = Br * SP_STRIDE * sizeof(__half)    // smem_SP
+    // smem_SP 须容纳 max(S/P [Br, SP_STRIDE], O staging [Br, D])
+    constexpr int32_t SP_ELEMS = Br * (SP_STRIDE > kD ? SP_STRIDE : kD);
+    const size_t smem_dyn_bytes = SP_ELEMS * sizeof(__half)          // smem_SP
                                 + 3 * Br * sizeof(float);            // m + l + alpha
 
     auto kernel = device_flash_attention_perf_f16<TPB, Br, Bc, kD, WarpCountM, WarpCountN>;
