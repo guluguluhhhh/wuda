@@ -187,12 +187,13 @@ void bflash_attention_perf_f16(
     ptx::WarpHMMA_Trans_f16<WarpM, WarpN_pv, Bc> mma_pv;
     mma_pv.zero();
 
-    block_mma_prelogue_f16<TPB, Br, D>(Q, smem_KV, D, D);
+    block_mma_prelogue_f16_async<TPB, Br, D>(Q, smem_KV, D, D);
 
     for (int32_t i = tid; i < Br; i += TPB) {
         smem_m[i] = -INFINITY;
         smem_l[i] = 0.0f;
     }
+    cp_async_wait_group<0>();
     __syncthreads();
 
     // Q 持久化 (M-group 内 N-warps 各自重复 ldmatrix 同一份, register 重复但 smem 是 broadcast)
@@ -205,7 +206,8 @@ void bflash_attention_perf_f16(
     const int32_t Tc = N / Bc;
 
     for (int32_t t = 0; t < Tc; t++) {
-        block_mma_prelogue_f16<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, D);
+        block_mma_prelogue_f16_async<TPB, Bc, D>(K + t * Bc * D, smem_KV, D, D);
+        cp_async_wait_group<0>();
         __syncthreads();
 
         // S = Q @ K^T   (TN: K row-major 当 col_major B), warp_n_id 切 K 的 Bc 行
@@ -217,7 +219,10 @@ void bflash_attention_perf_f16(
         }
         __syncthreads();
 
-        // 在线 softmax: 行平均分给 WarpCount 个 warp
+        // V async load START — smem_KV 在 QK GEMM 后已无人读, 与 softmax+rescale 重叠
+        block_mma_prelogue_f16_async<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, D);
+
+        // 在线 softmax: 行平均分给 WarpCount 个 warp (只碰 smem_SP, 不碰 smem_KV)
         const int32_t tg_id = lane_id >> 4;
         #pragma unroll
         for (int32_t rr = 0; rr < RowsPerWarpSoftmax / 2; rr++) {
@@ -236,7 +241,7 @@ void bflash_attention_perf_f16(
         }
         __syncthreads();   // 全 block 等 α 写齐 (M-group 内 N-warps 都要读)
 
-        // 按行 α rescale frag_C (lane 在自己 warp 的 M-tile 内)
+        // 按行 α rescale frag_C (只碰寄存器 + 读 smem_alpha, 不碰 smem_KV)
         {
             const int32_t r_upper = warp_m_id * WarpM + (lane_id >> 2);
             const int32_t r_lower = r_upper + 8;
@@ -244,9 +249,9 @@ void bflash_attention_perf_f16(
             const __half2 a_lower = __float2half2_rn(smem_alpha[r_lower]);
             rescale_frag_O(mma_pv.frag_C, a_upper, a_lower);
         }
-        __syncthreads();
 
-        block_mma_prelogue_f16<TPB, Bc, D>(V + t * Bc * D, smem_KV, D, D);
+        // V async load WAIT — softmax + rescale 期间 V 数据已在后台传输
+        cp_async_wait_group<0>();
         __syncthreads();
 
         // O += P @ V   (NN), warp_n_id 切 V 的 D 列 (ldb=D 不变)

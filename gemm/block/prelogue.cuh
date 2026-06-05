@@ -1,5 +1,6 @@
 #pragma once
 
+#include "copy.cuh"
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -27,6 +28,34 @@ void block_mma_prelogue_f16(
         uint4 v = *reinterpret_cast<const uint4*>(A + m * lda + n);
         *reinterpret_cast<uint4*>(B + m * ldb + n) = v;
     }
+}
+
+// ============================================================
+// block_mma_prelogue_f16_async
+//   cp.async 版本: GMEM → SMEM 绕过寄存器 (SM80+, 旧架构自动 fallback)
+//   异步拷贝, 调用者需在读 smem 前 cp_async_wait_group<0>() + __syncthreads()
+// ============================================================
+template<int32_t TPB, int32_t M, int32_t N>
+__device__
+void block_mma_prelogue_f16_async(
+    const __half* __restrict__ A,
+    __half* __restrict__ B,
+    const int32_t lda,
+    const int32_t ldb
+) {
+    const int32_t tid = threadIdx.x;
+    constexpr int32_t VPT = 8;
+
+    static_assert(N % VPT == 0, "N must be a multiple of 8");
+    for (int32_t i = tid * VPT; i < M * N; i += TPB * VPT) {
+        const int32_t m = i / N;
+        const int32_t n = i % N;
+        cp_async<sizeof(__half) * VPT>(
+            A + m * lda + n,
+            B + m * ldb + n
+        );
+    }
+    cp_async_commit();
 }
 
 // ============================================================
