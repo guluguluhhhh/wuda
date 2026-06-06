@@ -38,7 +38,7 @@ grid = ceil(N/4 / 256)    // block 数降为 1/4
 
 `reinterpret_cast<const float4*>` 做 128-bit 对齐加载，一条 LDG.128 指令读 16B，warp 一次发 32 × 16B = 512B，减少访存指令数 4 倍。
 
-### 3. Stride — Grid-stride loop
+### 3. Stride — Grid_stride loop
 
 ```
 grid = min(ceil(N/256), 1024)    // 设置 block 数上限 1024

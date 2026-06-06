@@ -42,7 +42,7 @@ __device__ int warp_kogge_stone_inclusive_scan(int val, int& warp_sum) {
     return val;
 }
 
-__device__ int block_inclusive_scan(int val, int& block_total) {
+__device__ int block_inclusive_scan(int val, int& block_sum) {
     __shared__ int warps[BLOCK_SIZE / WARP_SIZE];
     int lane = threadIdx.x & (WARP_SIZE - 1);
     int warp = threadIdx.x / WARP_SIZE;
@@ -65,7 +65,7 @@ __device__ int block_inclusive_scan(int val, int& block_total) {
     }
     __syncthreads();
 
-    block_total = warps[BLOCK_SIZE / WARP_SIZE - 1];
+    block_sum = warps[BLOCK_SIZE / WARP_SIZE - 1];
 
     int inclusive = thread_inclusive;
     if (warp > 0) {
@@ -132,20 +132,20 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
     }
 
     int items_sum = items[ITEMS_PER_THREAD - 1];
-    int block_total;
-    int block_inclusive = block_inclusive_scan(items_sum, block_total);
+    int block_sum;
+    int block_inclusive = block_inclusive_scan(items_sum, block_sum);
 
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         items[i] += block_inclusive - items_sum;
     }
 
-    // 发布 block_total + 32线程并行 lookback
+    // 发布 block_sum + 32线程并行 lookback
     int num_warps = blockDim.x / WARP_SIZE;
 
     if (warp == num_warps - 1) {
         if (lane == 0) {
-            g_partial[my_id] = block_total;
+            g_partial[my_id] = block_sum;
             __threadfence();
             g_status[my_id] = 1;
         }
@@ -193,7 +193,7 @@ __global__ void single_pass_scan(const int* d_in, int* d_out, int N,
 
         if (lane == 0) {
             s_prefix_sum = prefix_sum;
-            g_prefix[my_id] = prefix_sum + block_total;
+            g_prefix[my_id] = prefix_sum + block_sum;
             __threadfence();
             g_status[my_id] = 2;
         }
