@@ -60,3 +60,20 @@ block 间同步采用 **Last Block 决策模式**：
 ### 分析
 
 有效带宽 ~330 GB/s（峰值 18%），但实际 4 轮各扫描一遍全部数据（条件过滤无法跳过读取），有效读取量约 4×N×4B。修正后实际带宽约 1.3 TB/s，接近峰值的 73%。
+
+---
+
+## topk_radix_select_cg — Cooperative Groups 版本
+
+原版 block 间同步逻辑：每个 block 计数完后 `atomicAdd(&block_finished, 1)`，最后一个完成的 block 检测到自己是 last block，负责决策并递增 `generation`；其他 block 用 `while (generation < ...)` 忙等（`generation` 是全局计数器，记录已完成几轮 pass，本质是手写的屏障信号）。需要手写 `block_finished` 计数、last block 判断、`generation` 轮询，逻辑分散且容易出错。
+
+CG 版本直接用 `grid.sync()` 替代整套同步逻辑：所有 block 计数完 → `grid.sync()` → block 0 决策 → `grid.sync()` → 进入下一轮。不需要 `block_finished`、`generation` 字段，代码更直观。
+
+### 性能对比（RTX 5090, K=1000, N=2G）
+
+| 版本 | Time | 带宽 |
+|---|---|---|
+| radix_select | 24.125 ms | 332 GB/s |
+| radix_select_cg | 27.928 ms | 286 GB/s |
+
+CG 版本略慢约 16%。但 radix select 本身就需要全局同步（所有 block 计数完才能决策），`grid.sync()` 替代的正是这个全局屏障，和手写 last block 模式做的是同一件事，所以性能损失不大。与 scan 不同（scan 只有前向依赖，不需要全局屏障），topk 的全局同步是算法固有需求，CG 在这类场景下是合理的选择。
