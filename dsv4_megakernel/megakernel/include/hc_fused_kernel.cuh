@@ -2,7 +2,6 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <cute/tensor.hpp>
 #include <float.h>
 
 // ============================================================
@@ -12,11 +11,11 @@
 // ============================================================
 
 constexpr int HC_DEFAULT = 4;
-constexpr int D_DEFAULT = 1792;
+constexpr int DIM_DEFAULT = 7168;        // model hidden_size (= output collapsed dim)
 constexpr int N_OUT_DEFAULT = 24;
 constexpr int BLOCK_SIZE_DEFAULT = 1024;
 constexpr int SINKHORN_DEFAULT = 20;
-constexpr int HC_D = HC_DEFAULT * D_DEFAULT;  // 7168
+constexpr int HC_DIM = HC_DEFAULT * DIM_DEFAULT;  // 28672 (flat input / GEMV K dim)
 
 // ---- Device utilities ----
 

@@ -10,18 +10,17 @@ import torch.nn.functional as F
 # Config
 # ============================================================
 HC = 4
-D = 1792
-HIDDEN_SIZE = HC * D  # 7168
+DIM = 7168           # model hidden_size
+HC_DIM = HC * DIM    # 28672 (flat input size / GEMV K dim)
 N_OUT = (2 + HC) * HC  # 24
 HC_EPS = 1e-6
 RMS_NORM_EPS = 1e-6
 SINKHORN_ITERS = 20
 
-# BW = B×S × bytes_per_pos / latency
-# weight(bf16): 24*7168*2B=336KB, input(bf16): 7168*2B=14KB, output(bf16): 1792*2B=3.5KB
-# + pre/post/comb: ~100B, base/scale: ~100B
-BYTES_PER_POS = N_OUT * HIDDEN_SIZE * 2 + HIDDEN_SIZE * 2 + D * 2 + \
-               (HC + HC + HC * HC) * 4 + N_OUT * 4 + 3 * 4  # ~354 KB
+# BW = B*S * bytes_per_pos / latency
+# weight(bf16): 24*28672*2B=1344KB, input(bf16): 28672*2B=56KB, output(bf16): 7168*2B=14KB
+BYTES_PER_POS = N_OUT * HC_DIM * 2 + HC_DIM * 2 + DIM * 2 + \
+               (HC + HC + HC * HC) * 4 + N_OUT * 4 + 3 * 4  # ~1.38 MB
 HBM_PEAK_GBS = 8000
 
 
@@ -32,7 +31,7 @@ def hc_reference(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
                  hc_eps=HC_EPS, rms_norm_eps=RMS_NORM_EPS, sinkhorn_iters=SINKHORN_ITERS):
     dtype = hidden_states.dtype
     hs = hidden_states.unsqueeze(0).unsqueeze(0)  # [1,1,HC,D]
-    x = hs.reshape(1, 1, HC * D).float()
+    x = hs.reshape(1, 1, HC * DIM).float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_norm_eps)
     mix = F.linear(x, attn_hc_fn.float()) * rsqrt
 
@@ -65,13 +64,10 @@ def load_cuda_module():
         cuda_flags.append(f'-gencode=arch=compute_{cap[0]*10+cap[1]},code=sm_{cap[0]*10+cap[1]}')
     except:
         cuda_flags.append('-gencode=arch=compute_100,code=sm_100')
-    # CUTLASS/CuTe headers (git clone)
-    cutlass_include = '/home/admin/workspace/aop_lab/app_source/jinhua/dsv4_megakernel/cutlass/include'
-
     return load(
         name='hc_fused',
         sources=[os.path.join(this_dir, 'kernels', 'hc_fused_kernel.cu')],
-        extra_include_paths=[os.path.join(this_dir, 'include'), cutlass_include],
+        extra_include_paths=[os.path.join(this_dir, 'include')],
         extra_cuda_cflags=cuda_flags, verbose=True,
     )
 
@@ -86,8 +82,8 @@ def test_correctness(module):
     torch.manual_seed(42)
     device = 'cuda'
 
-    hidden_states = torch.randn(HC, D, device=device, dtype=torch.bfloat16)
-    attn_hc_fn = torch.randn(N_OUT, HC * D, device=device, dtype=torch.bfloat16) * 0.01
+    hidden_states = torch.randn(HC, DIM, device=device, dtype=torch.bfloat16)
+    attn_hc_fn = torch.randn(N_OUT, HC * DIM, device=device, dtype=torch.bfloat16) * 0.01
     attn_hc_base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
     attn_hc_scale = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=torch.float32)
 
@@ -129,7 +125,7 @@ def benchmark(module, warmup=100, iters=500):
     device = 'cuda'
     torch.manual_seed(42)
 
-    attn_hc_fn = torch.randn(N_OUT, HC * D, device=device, dtype=torch.bfloat16) * 0.01
+    attn_hc_fn = torch.randn(N_OUT, HC * DIM, device=device, dtype=torch.bfloat16) * 0.01
     attn_hc_base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
     attn_hc_scale = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=torch.float32)
 
@@ -139,7 +135,7 @@ def benchmark(module, warmup=100, iters=500):
     print("-" * 65)
 
     for num_pos in batch_sizes:
-        hs = torch.randn(num_pos, HC, D, device=device, dtype=torch.bfloat16)
+        hs = torch.randn(num_pos, HC, DIM, device=device, dtype=torch.bfloat16)
         for _ in range(warmup):
             module.hc_fused_forward_full(hs, attn_hc_fn, attn_hc_base, attn_hc_scale, HC_EPS, RMS_NORM_EPS)
         torch.cuda.synchronize()
@@ -170,8 +166,8 @@ def profile_kernel(module, num_pos=64, gpu_clock_mhz=2100):
     device = 'cuda'
     torch.manual_seed(42)
 
-    hs = torch.randn(num_pos, HC, D, device=device, dtype=torch.bfloat16)
-    w = torch.randn(N_OUT, HC * D, device=device, dtype=torch.bfloat16) * 0.01
+    hs = torch.randn(num_pos, HC, DIM, device=device, dtype=torch.bfloat16)
+    w = torch.randn(N_OUT, HC * DIM, device=device, dtype=torch.bfloat16) * 0.01
     base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
     scale = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=torch.float32)
 
@@ -255,7 +251,7 @@ if __name__ == '__main__':
     if not torch.cuda.is_available():
         print("CUDA not available."); sys.exit(0)
 
-    print(f"Config: HC={HC}, D={D}, hidden_size={HIDDEN_SIZE}, N_OUT={N_OUT}")
+    print(f"Config: HC={HC}, DIM={DIM}, HC_DIM={HC_DIM}, N_OUT={N_OUT}")
     print(f"        Sinkhorn={SINKHORN_ITERS}, block=1024, grid=2*SM")
     print(f"        Device: {torch.cuda.get_device_name()}")
     cap = torch.cuda.get_device_capability()

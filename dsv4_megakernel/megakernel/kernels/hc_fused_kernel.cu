@@ -1,8 +1,9 @@
 // ============================================================
-// DeepSeek-V4 HC Fused Kernel (CuTe C++ version)
+// DeepSeek-V4 HC Fused Kernel
 // Fuses: RMSNorm(no weight) + GEMV + Activation + Sinkhorn + Collapse
-// Input: bf16, Weight: bf16 (transposed [HC_D, N_OUT]), Output: bf16
-// Uses CuTe for tensor layout + vectorized copy
+// Input: bf16 [num_pos, HC*DIM] = [num_pos, 28672]
+// Weight: bf16 [N_OUT, HC*DIM] = [24, 28672] (transposed to [28672, 24])
+// Output: bf16 [num_pos, DIM] = [num_pos, 7168]
 // Launch: block=1024, grid=2*SM, grid-stride loop
 // ============================================================
 
@@ -10,25 +11,23 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../include/hc_fused_kernel.cuh"
 
-using namespace cute;
-
-template <int HC, int D, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
+template <int HC, int DIM, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
 __global__ void __launch_bounds__(1024)
 hc_fused_kernel(
-    const __nv_bfloat16* __restrict__ hidden_states,  // [num_pos, HC*D] bf16
-    const __nv_bfloat16* __restrict__ attn_hc_fn_t,   // [HC*D, N_OUT] bf16 transposed
+    const __nv_bfloat16* __restrict__ hidden_states,  // [num_pos, HC*DIM] bf16
+    const __nv_bfloat16* __restrict__ attn_hc_fn,     // [N_OUT, HC*DIM] bf16 row-major
     const float* __restrict__ attn_hc_base,           // [N_OUT] fp32
     const float* __restrict__ attn_hc_scale,          // [3] fp32
     float hc_eps,
     float rms_norm_eps,
     int num_positions,
-    __nv_bfloat16* __restrict__ collapsed_out,        // [num_pos, D] bf16
+    __nv_bfloat16* __restrict__ collapsed_out,        // [num_pos, DIM] bf16
     float* __restrict__ pre_out,                      // [num_pos, HC]
     float* __restrict__ post_out,                     // [num_pos, HC]
     float* __restrict__ comb_out                      // [num_pos, HC*HC]
 ) {
-    constexpr int HC_D_TOTAL = HC * D;                // 7168
-    constexpr int ELEMS_PER_THR = HC_D_TOTAL / BLOCK_SIZE;  // 7
+    constexpr int HC_DIM_TOTAL = HC * DIM;            // 28672
+    constexpr int ELEMS_PER_THR = HC_DIM_TOTAL / BLOCK_SIZE;  // 28
     constexpr int NUM_WARPS = BLOCK_SIZE / 32;        // 32
 
     const int tid = threadIdx.x;
@@ -38,8 +37,8 @@ hc_fused_kernel(
     for (int pos_idx = blockIdx.x; pos_idx < num_positions; pos_idx += gridDim.x) {
 
     // Per-position pointers
-    const __nv_bfloat16* hs_ptr = hidden_states + pos_idx * HC_D_TOTAL;
-    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * D;
+    const __nv_bfloat16* hs_ptr = hidden_states + pos_idx * HC_DIM_TOTAL;
+    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * DIM;
     float* pre_ptr = pre_out + pos_idx * HC;
     float* post_ptr = post_out + pos_idx * HC;
     float* comb_ptr = comb_out + pos_idx * HC * HC;
@@ -54,11 +53,8 @@ hc_fused_kernel(
     float* comb_smem = post_smem + HC;
 
     // ================================================================
-    // Phase 1: Load bf16 input via CuTe → fp32, RMSNorm (no weight)
+    // Phase 1: Load bf16 input [HC_DIM_TOTAL=28672] → fp32, RMSNorm
     // ================================================================
-
-    // CuTe: 1D global tensor [HC_D_TOTAL] bf16
-    auto gX = make_tensor(make_gmem_ptr(hs_ptr), make_shape(Int<HC_D_TOTAL>{}));
 
     float orig_vals[ELEMS_PER_THR];
     float norm_vals[ELEMS_PER_THR];
@@ -67,17 +63,16 @@ hc_fused_kernel(
     float sq_sum = 0.0f;
     #pragma unroll
     for (int i = 0; i < ELEMS_PER_THR; i++) {
-        float v = bf16_to_float(gX(base_idx + i));  // CuTe tensor indexing
+        float v = bf16_to_float(hs_ptr[base_idx + i]);
         orig_vals[i] = v;
         sq_sum += v * v;
     }
 
-    // Block reduce for RMSNorm
     float total_sq = block_reduce_sum<NUM_WARPS>(sq_sum, reduce_smem, tid);
 
     __shared__ float rms_scale;
     if (tid == 0) {
-        rms_scale = rsqrtf(total_sq / (float)HC_D_TOTAL + rms_norm_eps);
+        rms_scale = rsqrtf(total_sq / (float)HC_DIM_TOTAL + rms_norm_eps);
     }
     __syncthreads();
 
@@ -88,42 +83,20 @@ hc_fused_kernel(
     }
 
     // ================================================================
-    // Phase 2: GEMV using CuTe layout for vectorized weight access
-    // Weight transposed: [HC_D, N_OUT] = [7168, 24] row-major
+    // Phase 2: GEMV  y[24] = W[24, 28672] @ x[28672]
+    // W stored row-major [N_OUT, HC_DIM_TOTAL]. Simple scalar load.
     // ================================================================
-
-    // CuTe: 2D weight tensor [K, N]
-    auto gW = make_tensor(
-        make_gmem_ptr(attn_hc_fn_t),
-        make_layout(make_shape(Int<HC_D_TOTAL>{}, Int<N_OUT>{}),
-                    make_stride(Int<N_OUT>{}, Int<1>{}))  // row k: 24 contiguous bf16
-    );
 
     float acc[N_OUT];
     #pragma unroll
     for (int n = 0; n < N_OUT; n++) acc[n] = 0.0f;
 
-    // For each K position this thread owns, load 24 weights and FMA
     #pragma unroll
-    for (int i = 0; i < ELEMS_PER_THR; i++) {
-        int k = base_idx + i;
-        float x = norm_vals[i];
-
-        // CuTe: &gW(k, 0) gives the address of row k, load 24 bf16 via int4
-        const int4* w_vec = reinterpret_cast<const int4*>(&gW(k, Int<0>{}));
-        int4 v0 = w_vec[0], v1 = w_vec[1], v2 = w_vec[2];
-
-        __nv_bfloat162* p0 = reinterpret_cast<__nv_bfloat162*>(&v0);
-        __nv_bfloat162* p1 = reinterpret_cast<__nv_bfloat162*>(&v1);
-        __nv_bfloat162* p2 = reinterpret_cast<__nv_bfloat162*>(&v2);
+    for (int n = 0; n < N_OUT; n++) {
+        const __nv_bfloat16* w_row = attn_hc_fn + n * HC_DIM_TOTAL + base_idx;
         #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            acc[j*2]     += x * __bfloat162float(__low2bfloat16(p0[j]));
-            acc[j*2+1]   += x * __bfloat162float(__high2bfloat16(p0[j]));
-            acc[8+j*2]   += x * __bfloat162float(__low2bfloat16(p1[j]));
-            acc[8+j*2+1] += x * __bfloat162float(__high2bfloat16(p1[j]));
-            acc[16+j*2]  += x * __bfloat162float(__low2bfloat16(p2[j]));
-            acc[16+j*2+1]+= x * __bfloat162float(__high2bfloat16(p2[j]));
+        for (int i = 0; i < ELEMS_PER_THR; i++) {
+            acc[n] += norm_vals[i] * bf16_to_float(w_row[i]);
         }
     }
 
@@ -211,19 +184,25 @@ hc_fused_kernel(
     if (tid < HC * HC) { comb_ptr[tid] = comb_smem[tid]; }
 
     // ================================================================
-    // Phase 5: Collapse via CuTe (output vectorized store)
+    // Phase 5: Collapse  collapsed[d] = sum_h(pre[h] * x[h*DIM + d])
+    // Thread mapping: thread i holds flat[i*28..(i+1)*28-1]
+    //   h = flat_idx / DIM,  d = flat_idx % DIM
+    // Use smem[DIM] to accumulate across HC channels.
     // ================================================================
     constexpr int THREADS_PER_HC = BLOCK_SIZE / HC;  // 256
-    int h_idx = tid / THREADS_PER_HC;
-    int local_tid = tid % THREADS_PER_HC;
+    int h_idx = tid / THREADS_PER_HC;                // 0..3
+    int local_tid = tid % THREADS_PER_HC;            // 0..255
     float pre_h = pre_smem[h_idx];
     __syncthreads();
 
+    // Reuse smem as collapse buffer [DIM] = 7168 floats
     float* col_buf = smem;
     float local_contrib[ELEMS_PER_THR];
     #pragma unroll
     for (int i = 0; i < ELEMS_PER_THR; i++) local_contrib[i] = pre_h * orig_vals[i];
 
+    // Each HC channel's threads cover DIM elements (256 threads * 28 elems = 7168 = DIM)
+    // d position = local_tid * ELEMS_PER_THR + i
     if (h_idx == 0) {
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_THR; i++) col_buf[local_tid * ELEMS_PER_THR + i] = local_contrib[i];
@@ -238,15 +217,13 @@ hc_fused_kernel(
         __syncthreads();
     }
 
-    // CuTe: vectorized bf16 store for output
-    // Define output tensor and partition
-    auto gOut = make_tensor(make_gmem_ptr(col_ptr), make_shape(Int<D>{}));
-    constexpr int OUT_PER_THR = (D + BLOCK_SIZE - 1) / BLOCK_SIZE;  // 2
+    // Write output [DIM] as bf16
+    constexpr int OUT_PER_THR = (DIM + BLOCK_SIZE - 1) / BLOCK_SIZE;  // 7
     #pragma unroll
     for (int i = 0; i < OUT_PER_THR; i++) {
         int idx = tid * OUT_PER_THR + i;
-        if (idx < D) {
-            gOut(idx) = float_to_bf16(col_buf[idx]);
+        if (idx < DIM) {
+            col_ptr[idx] = float_to_bf16(col_buf[idx]);
         }
     }
 
@@ -254,22 +231,22 @@ hc_fused_kernel(
 }
 
 // ============================================================
-// Profiled kernel (clock64 instrumentation per phase)
+// Profiled kernel (clock64 per phase)
 // ============================================================
-template <int HC, int D, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
+template <int HC, int DIM, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
 __global__ void __launch_bounds__(1024)
 hc_fused_kernel_profiled(
     const __nv_bfloat16* __restrict__ hidden_states,
-    const __nv_bfloat16* __restrict__ attn_hc_fn_t,
+    const __nv_bfloat16* __restrict__ attn_hc_fn,
     const float* __restrict__ attn_hc_base,
     const float* __restrict__ attn_hc_scale,
     float hc_eps, float rms_norm_eps, int num_positions,
     __nv_bfloat16* __restrict__ collapsed_out,
     float* __restrict__ pre_out, float* __restrict__ post_out, float* __restrict__ comb_out,
-    int64_t* __restrict__ timing_buf  // [grid_size, 10]
+    int64_t* __restrict__ timing_buf
 ) {
-    constexpr int HC_D_TOTAL = HC * D;
-    constexpr int ELEMS_PER_THR = HC_D_TOTAL / BLOCK_SIZE;
+    constexpr int HC_DIM_TOTAL = HC * DIM;
+    constexpr int ELEMS_PER_THR = HC_DIM_TOTAL / BLOCK_SIZE;
     constexpr int NUM_WARPS = BLOCK_SIZE / 32;
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -279,8 +256,8 @@ hc_fused_kernel_profiled(
 
     int64_t* my_t = timing_buf + blockIdx.x * 10;
     int64_t t0, t1;
-    const __nv_bfloat16* hs_ptr = hidden_states + pos_idx * HC_D_TOTAL;
-    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * D;
+    const __nv_bfloat16* hs_ptr = hidden_states + pos_idx * HC_DIM_TOTAL;
+    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * DIM;
     float* pre_ptr = pre_out + pos_idx * HC;
     float* post_ptr = post_out + pos_idx * HC;
     float* comb_ptr = comb_out + pos_idx * HC * HC;
@@ -292,41 +269,29 @@ hc_fused_kernel_profiled(
     float* post_smem = pre_smem + HC;
     float* comb_smem = post_smem + HC;
 
-    // Phase 1: RMSNorm
-    if (tid==0) t0 = clock64();
-    auto gX = make_tensor(make_gmem_ptr(hs_ptr), make_shape(Int<HC_D_TOTAL>{}));
+    // Phase 1
+    if (tid==0) t0=clock64();
     float orig_vals[ELEMS_PER_THR], norm_vals[ELEMS_PER_THR];
     int base_idx = tid * ELEMS_PER_THR;
     float sq_sum = 0.0f;
-    for (int i=0;i<ELEMS_PER_THR;i++){float v=bf16_to_float(gX(base_idx+i));orig_vals[i]=v;sq_sum+=v*v;}
+    for(int i=0;i<ELEMS_PER_THR;i++){float v=bf16_to_float(hs_ptr[base_idx+i]);orig_vals[i]=v;sq_sum+=v*v;}
     float total_sq = block_reduce_sum<NUM_WARPS>(sq_sum, reduce_smem, tid);
     __shared__ float rms_scale;
-    if (tid==0) rms_scale = rsqrtf(total_sq/(float)HC_D_TOTAL + rms_norm_eps);
+    if(tid==0) rms_scale=rsqrtf(total_sq/(float)HC_DIM_TOTAL+rms_norm_eps);
     __syncthreads();
-    float scale = rms_scale;
-    for (int i=0;i<ELEMS_PER_THR;i++) norm_vals[i]=orig_vals[i]*scale;
-    if (tid==0){t1=clock64();my_t[0]=t0;my_t[1]=t1;}
+    float scale=rms_scale;
+    for(int i=0;i<ELEMS_PER_THR;i++) norm_vals[i]=orig_vals[i]*scale;
+    if(tid==0){t1=clock64();my_t[0]=t0;my_t[1]=t1;}
     __syncthreads();
 
-    // Phase 2: GEMV
-    if (tid==0) t0 = clock64();
-    auto gW = make_tensor(make_gmem_ptr(attn_hc_fn_t),
-        make_layout(make_shape(Int<HC_D_TOTAL>{},Int<N_OUT>{}),make_stride(Int<N_OUT>{},Int<1>{})));
+    // Phase 2
+    if(tid==0) t0=clock64();
     float acc[N_OUT]; for(int n=0;n<N_OUT;n++)acc[n]=0.0f;
-    for(int i=0;i<ELEMS_PER_THR;i++){
-        int k=base_idx+i;float x=norm_vals[i];
-        const int4* wv=reinterpret_cast<const int4*>(&gW(k,Int<0>{}));
-        int4 v0=wv[0],v1=wv[1],v2=wv[2];
-        __nv_bfloat162* p0=reinterpret_cast<__nv_bfloat162*>(&v0);
-        __nv_bfloat162* p1=reinterpret_cast<__nv_bfloat162*>(&v1);
-        __nv_bfloat162* p2=reinterpret_cast<__nv_bfloat162*>(&v2);
-        for(int j=0;j<4;j++){
-            acc[j*2]+=x*__bfloat162float(__low2bfloat16(p0[j]));acc[j*2+1]+=x*__bfloat162float(__high2bfloat16(p0[j]));
-            acc[8+j*2]+=x*__bfloat162float(__low2bfloat16(p1[j]));acc[8+j*2+1]+=x*__bfloat162float(__high2bfloat16(p1[j]));
-            acc[16+j*2]+=x*__bfloat162float(__low2bfloat16(p2[j]));acc[16+j*2+1]+=x*__bfloat162float(__high2bfloat16(p2[j]));
-        }
+    for(int n=0;n<N_OUT;n++){
+        const __nv_bfloat16* w_row=attn_hc_fn+n*HC_DIM_TOTAL+base_idx;
+        for(int i=0;i<ELEMS_PER_THR;i++) acc[n]+=norm_vals[i]*bf16_to_float(w_row[i]);
     }
-    for(int n=0;n<N_OUT;n++)acc[n]=warp_reduce_sum(acc[n]);
+    for(int n=0;n<N_OUT;n++) acc[n]=warp_reduce_sum(acc[n]);
     if(lane_id==0){for(int n=0;n<N_OUT;n++)gemv_smem[warp_id*N_OUT+n]=acc[n];}
     __syncthreads();
     if(tid<N_OUT){float s=0;for(int w=0;w<NUM_WARPS;w++)s+=gemv_smem[w*N_OUT+tid];mix_smem[tid]=s;}
@@ -334,7 +299,7 @@ hc_fused_kernel_profiled(
     if(tid==0){t1=clock64();my_t[2]=t0;my_t[3]=t1;}
     __syncthreads();
 
-    // Phase 3: Activation
+    // Phase 3
     if(tid==0) t0=clock64();
     __shared__ float sp,spo,sc;
     if(tid==0){sp=attn_hc_scale[0];spo=attn_hc_scale[1];sc=attn_hc_scale[2];}
@@ -346,7 +311,7 @@ hc_fused_kernel_profiled(
     if(tid==0){t1=clock64();my_t[4]=t0;my_t[5]=t1;}
     __syncthreads();
 
-    // Phase 4: Sinkhorn
+    // Phase 4
     if(tid==0) t0=clock64();
     if(tid==0){
         for(int r=0;r<HC;r++){float mx=comb_smem[r*HC];for(int c=1;c<HC;c++)mx=fmaxf(mx,comb_smem[r*HC+c]);
@@ -362,7 +327,7 @@ hc_fused_kernel_profiled(
     if(tid<HC){pre_ptr[tid]=pre_smem[tid];post_ptr[tid]=post_smem[tid];}
     if(tid<HC*HC)comb_ptr[tid]=comb_smem[tid];
 
-    // Phase 5: Collapse
+    // Phase 5
     if(tid==0) t0=clock64();
     constexpr int TPH=BLOCK_SIZE/HC;
     int h_idx=tid/TPH,local_tid=tid%TPH;
@@ -373,24 +338,23 @@ hc_fused_kernel_profiled(
     if(h_idx==0){for(int i=0;i<ELEMS_PER_THR;i++)col_buf[local_tid*ELEMS_PER_THR+i]=lc[i];}
     __syncthreads();
     for(int g=1;g<HC;g++){if(h_idx==g){for(int i=0;i<ELEMS_PER_THR;i++)col_buf[local_tid*ELEMS_PER_THR+i]+=lc[i];}__syncthreads();}
-    auto gOut=make_tensor(make_gmem_ptr(col_ptr),make_shape(Int<D>{}));
-    constexpr int OPT=(D+BLOCK_SIZE-1)/BLOCK_SIZE;
-    for(int i=0;i<OPT;i++){int idx=tid*OPT+i;if(idx<D)gOut(idx)=float_to_bf16(col_buf[idx]);}
+    constexpr int OPT=(DIM+BLOCK_SIZE-1)/BLOCK_SIZE;
+    for(int i=0;i<OPT;i++){int idx=tid*OPT+i;if(idx<DIM)col_ptr[idx]=float_to_bf16(col_buf[idx]);}
     if(tid==0){t1=clock64();my_t[8]=t0;my_t[9]=t1;}
 }
 
 void hc_fused_launch_profiled(
-    const __nv_bfloat16* hs, const __nv_bfloat16* w_t,
+    const __nv_bfloat16* hs, const __nv_bfloat16* w,
     const float* base, const float* scale,
     float hc_eps, float rms_eps, int num_pos,
     __nv_bfloat16* col_out, float* pre_out, float* post_out, float* comb_out,
     int64_t* timing_buf, cudaStream_t stream
 ) {
     constexpr int BLOCK = BLOCK_SIZE_DEFAULT;
-    int grid_size = min(2 * get_num_sms(), num_pos);
-    int smem_size = D_DEFAULT * sizeof(float);
-    hc_fused_kernel_profiled<HC_DEFAULT,D_DEFAULT,N_OUT_DEFAULT,BLOCK,SINKHORN_DEFAULT>
-        <<<grid_size,BLOCK,smem_size,stream>>>(hs,w_t,base,scale,hc_eps,rms_eps,num_pos,col_out,pre_out,post_out,comb_out,timing_buf);
+    int grid_size = std::min(2 * get_num_sms(), num_pos);
+    int smem_size = DIM_DEFAULT * sizeof(float);
+    hc_fused_kernel_profiled<HC_DEFAULT,DIM_DEFAULT,N_OUT_DEFAULT,BLOCK,SINKHORN_DEFAULT>
+        <<<grid_size,BLOCK,smem_size,stream>>>(hs,w,base,scale,hc_eps,rms_eps,num_pos,col_out,pre_out,post_out,comb_out,timing_buf);
 }
 
 // ============================================================
@@ -398,7 +362,7 @@ void hc_fused_launch_profiled(
 // ============================================================
 void hc_fused_launch(
     const __nv_bfloat16* hidden_states,
-    const __nv_bfloat16* attn_hc_fn_t,
+    const __nv_bfloat16* attn_hc_fn,
     const float* attn_hc_base,
     const float* attn_hc_scale,
     float hc_eps, float rms_norm_eps,
@@ -410,11 +374,12 @@ void hc_fused_launch(
     constexpr int BLOCK = BLOCK_SIZE_DEFAULT;
     int num_sms = get_num_sms();
     int grid_size = min(2 * num_sms, num_positions);
-    int smem_size = D_DEFAULT * sizeof(float);
+    // smem: max(Phase1-4 scratch, Phase5 collapse buf [DIM=7168 floats])
+    int smem_size = DIM_DEFAULT * sizeof(float);
 
-    hc_fused_kernel<HC_DEFAULT, D_DEFAULT, N_OUT_DEFAULT, BLOCK, SINKHORN_DEFAULT>
+    hc_fused_kernel<HC_DEFAULT, DIM_DEFAULT, N_OUT_DEFAULT, BLOCK, SINKHORN_DEFAULT>
         <<<grid_size, BLOCK, smem_size, stream>>>(
-        hidden_states, attn_hc_fn_t, attn_hc_base, attn_hc_scale,
+        hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
         hc_eps, rms_norm_eps, num_positions,
         collapsed_out, pre_out, post_out, comb_out
     );
@@ -424,8 +389,8 @@ void hc_fused_launch(
 // PyTorch binding
 // ============================================================
 std::vector<torch::Tensor> hc_fused_forward_full(
-    torch::Tensor hidden_states,    // [num_pos, HC, D] or [HC, D] bf16
-    torch::Tensor attn_hc_fn,       // [N_OUT, HC*D] bf16 (transposed internally)
+    torch::Tensor hidden_states,    // [num_pos, HC, DIM] or [HC, DIM] bf16
+    torch::Tensor attn_hc_fn,       // [N_OUT, HC*DIM] = [24, 28672] bf16
     torch::Tensor attn_hc_base,     // [N_OUT] fp32
     torch::Tensor attn_hc_scale,    // [3] fp32
     double hc_eps,
@@ -434,24 +399,21 @@ std::vector<torch::Tensor> hc_fused_forward_full(
     TORCH_CHECK(hidden_states.is_cuda() && hidden_states.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(attn_hc_fn.scalar_type() == torch::kBFloat16);
 
-    const int HC = HC_DEFAULT, D = D_DEFAULT;
-    auto hs_flat = hidden_states.contiguous().view({-1, HC * D});
+    const int HC = HC_DEFAULT, DIM = DIM_DEFAULT;
+    auto hs_flat = hidden_states.contiguous().view({-1, HC * DIM});
     int num_pos = hs_flat.size(0);
-
-    // Transpose weight for vectorized access: [N_OUT, HC*D] → [HC*D, N_OUT]
-    auto attn_hc_fn_t = attn_hc_fn.contiguous().t().contiguous();
 
     auto opts_bf16 = torch::TensorOptions().device(hidden_states.device()).dtype(torch::kBFloat16);
     auto opts_fp32 = torch::TensorOptions().device(hidden_states.device()).dtype(torch::kFloat32);
 
-    auto collapsed = torch::empty({num_pos, D}, opts_bf16);
+    auto collapsed = torch::empty({num_pos, DIM}, opts_bf16);
     auto pre = torch::empty({num_pos, HC}, opts_fp32);
     auto post = torch::empty({num_pos, HC}, opts_fp32);
     auto comb = torch::empty({num_pos, HC, HC}, opts_fp32);
 
     hc_fused_launch(
         reinterpret_cast<const __nv_bfloat16*>(hs_flat.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(attn_hc_fn_t.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(attn_hc_fn.contiguous().data_ptr<at::BFloat16>()),
         attn_hc_base.contiguous().data_ptr<float>(),
         attn_hc_scale.contiguous().data_ptr<float>(),
         (float)hc_eps, (float)rms_norm_eps, num_pos,
@@ -466,22 +428,21 @@ std::vector<torch::Tensor> hc_fused_forward_full(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_fused_forward_full", &hc_fused_forward_full,
-          "HC fused forward (CuTe C++, bf16, transposed weight)");
+          "HC fused forward (bf16, row-major weight)");
     m.def("hc_fused_forward_profiled", [](torch::Tensor hs, torch::Tensor w,
           torch::Tensor base, torch::Tensor scale, double eps, double rms_eps) {
         TORCH_CHECK(hs.is_cuda() && hs.scalar_type() == torch::kBFloat16);
-        const int HC = HC_DEFAULT, D = D_DEFAULT;
-        auto hs_flat = hs.contiguous().view({-1, HC * D});
+        const int HC = HC_DEFAULT, DIM = DIM_DEFAULT;
+        auto hs_flat = hs.contiguous().view({-1, HC * DIM});
         int num_pos = hs_flat.size(0);
-        auto w_t = w.contiguous().t().contiguous();
         int num_sms = get_num_sms();
-        int grid_size = min(2 * num_sms, num_pos);
+        int grid_size = std::min(2 * num_sms, num_pos);
 
         auto opts_bf16 = torch::TensorOptions().device(hs.device()).dtype(torch::kBFloat16);
         auto opts_fp32 = torch::TensorOptions().device(hs.device()).dtype(torch::kFloat32);
         auto opts_i64 = torch::TensorOptions().device(hs.device()).dtype(torch::kInt64);
 
-        auto collapsed = torch::empty({num_pos, D}, opts_bf16);
+        auto collapsed = torch::empty({num_pos, DIM}, opts_bf16);
         auto pre = torch::empty({num_pos, HC}, opts_fp32);
         auto post = torch::empty({num_pos, HC}, opts_fp32);
         auto comb = torch::empty({num_pos, HC, HC}, opts_fp32);
@@ -489,13 +450,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
         hc_fused_launch_profiled(
             reinterpret_cast<const __nv_bfloat16*>(hs_flat.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(w_t.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(w.contiguous().data_ptr<at::BFloat16>()),
             base.contiguous().data_ptr<float>(), scale.contiguous().data_ptr<float>(),
             (float)eps, (float)rms_eps, num_pos,
             reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr<at::BFloat16>()),
             pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
             timing.data_ptr<int64_t>(), at::cuda::getCurrentCUDAStream()
         );
-        return timing;  // [grid_size, 10]
+        return timing;
     }, "HC fused profiled (returns timing buffer)");
 }
