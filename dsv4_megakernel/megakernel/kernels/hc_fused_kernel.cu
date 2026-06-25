@@ -15,7 +15,7 @@ template <int HC, int DIM, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
 __global__ void __launch_bounds__(1024)
 hc_fused_kernel(
     const __nv_bfloat16* __restrict__ hidden_states,  // [num_pos, HC*DIM] bf16
-    const __nv_bfloat16* __restrict__ attn_hc_fn,     // [N_OUT, HC*DIM] bf16 row-major
+    const __nv_bfloat16* __restrict__ attn_hc_fn_t,    // [HC*DIM, N_OUT] bf16 TRANSPOSED
     const float* __restrict__ attn_hc_base,           // [N_OUT] fp32
     const float* __restrict__ attn_hc_scale,          // [3] fp32
     float hc_eps,
@@ -84,7 +84,8 @@ hc_fused_kernel(
 
     // ================================================================
     // Phase 2: GEMV  y[24] = W[24, 28672] @ x[28672]
-    // W stored row-major [N_OUT, HC_DIM_TOTAL]. Simple scalar load.
+    // Weight TRANSPOSED: [HC_DIM_TOTAL, N_OUT] = [28672, 24]
+    // Each K position has 24 contiguous bf16 = 48B = 3 x int4
     // ================================================================
 
     float acc[N_OUT];
@@ -92,11 +93,24 @@ hc_fused_kernel(
     for (int n = 0; n < N_OUT; n++) acc[n] = 0.0f;
 
     #pragma unroll
-    for (int n = 0; n < N_OUT; n++) {
-        const __nv_bfloat16* w_row = attn_hc_fn + n * HC_DIM_TOTAL + base_idx;
+    for (int i = 0; i < ELEMS_PER_THR; i++) {
+        int k = base_idx + i;
+        float x = norm_vals[i];
+        // Load 24 bf16 from W_t[k * N_OUT .. k * N_OUT + 23] via 3 x int4
+        const int4* w_vec = reinterpret_cast<const int4*>(attn_hc_fn_t + k * N_OUT);
+        int4 v0 = w_vec[0], v1 = w_vec[1], v2 = w_vec[2];
+
+        __nv_bfloat162* p0 = reinterpret_cast<__nv_bfloat162*>(&v0);
+        __nv_bfloat162* p1 = reinterpret_cast<__nv_bfloat162*>(&v1);
+        __nv_bfloat162* p2 = reinterpret_cast<__nv_bfloat162*>(&v2);
         #pragma unroll
-        for (int i = 0; i < ELEMS_PER_THR; i++) {
-            acc[n] += norm_vals[i] * bf16_to_float(w_row[i]);
+        for (int j = 0; j < 4; j++) {
+            acc[j*2]     += x * __bfloat162float(__low2bfloat16(p0[j]));
+            acc[j*2+1]   += x * __bfloat162float(__high2bfloat16(p0[j]));
+            acc[8+j*2]   += x * __bfloat162float(__low2bfloat16(p1[j]));
+            acc[8+j*2+1] += x * __bfloat162float(__high2bfloat16(p1[j]));
+            acc[16+j*2]  += x * __bfloat162float(__low2bfloat16(p2[j]));
+            acc[16+j*2+1]+= x * __bfloat162float(__high2bfloat16(p2[j]));
         }
     }
 
@@ -237,7 +251,7 @@ template <int HC, int DIM, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
 __global__ void __launch_bounds__(1024)
 hc_fused_kernel_profiled(
     const __nv_bfloat16* __restrict__ hidden_states,
-    const __nv_bfloat16* __restrict__ attn_hc_fn,
+    const __nv_bfloat16* __restrict__ attn_hc_fn_t,
     const float* __restrict__ attn_hc_base,
     const float* __restrict__ attn_hc_scale,
     float hc_eps, float rms_norm_eps, int num_positions,
@@ -287,9 +301,18 @@ hc_fused_kernel_profiled(
     // Phase 2
     if(tid==0) t0=clock64();
     float acc[N_OUT]; for(int n=0;n<N_OUT;n++)acc[n]=0.0f;
-    for(int n=0;n<N_OUT;n++){
-        const __nv_bfloat16* w_row=attn_hc_fn+n*HC_DIM_TOTAL+base_idx;
-        for(int i=0;i<ELEMS_PER_THR;i++) acc[n]+=norm_vals[i]*bf16_to_float(w_row[i]);
+    for(int i=0;i<ELEMS_PER_THR;i++){
+        int k=base_idx+i; float x=norm_vals[i];
+        const int4* wv=reinterpret_cast<const int4*>(attn_hc_fn_t+k*N_OUT);
+        int4 v0=wv[0],v1=wv[1],v2=wv[2];
+        __nv_bfloat162* p0=reinterpret_cast<__nv_bfloat162*>(&v0);
+        __nv_bfloat162* p1=reinterpret_cast<__nv_bfloat162*>(&v1);
+        __nv_bfloat162* p2=reinterpret_cast<__nv_bfloat162*>(&v2);
+        for(int j=0;j<4;j++){
+            acc[j*2]+=x*__bfloat162float(__low2bfloat16(p0[j]));acc[j*2+1]+=x*__bfloat162float(__high2bfloat16(p0[j]));
+            acc[8+j*2]+=x*__bfloat162float(__low2bfloat16(p1[j]));acc[8+j*2+1]+=x*__bfloat162float(__high2bfloat16(p1[j]));
+            acc[16+j*2]+=x*__bfloat162float(__low2bfloat16(p2[j]));acc[16+j*2+1]+=x*__bfloat162float(__high2bfloat16(p2[j]));
+        }
     }
     for(int n=0;n<N_OUT;n++) acc[n]=warp_reduce_sum(acc[n]);
     if(lane_id==0){for(int n=0;n<N_OUT;n++)gemv_smem[warp_id*N_OUT+n]=acc[n];}
@@ -362,7 +385,7 @@ void hc_fused_launch_profiled(
 // ============================================================
 void hc_fused_launch(
     const __nv_bfloat16* hidden_states,
-    const __nv_bfloat16* attn_hc_fn,
+    const __nv_bfloat16* attn_hc_fn_t,
     const float* attn_hc_base,
     const float* attn_hc_scale,
     float hc_eps, float rms_norm_eps,
@@ -374,12 +397,11 @@ void hc_fused_launch(
     constexpr int BLOCK = BLOCK_SIZE_DEFAULT;
     int num_sms = get_num_sms();
     int grid_size = min(2 * num_sms, num_positions);
-    // smem: max(Phase1-4 scratch, Phase5 collapse buf [DIM=7168 floats])
     int smem_size = DIM_DEFAULT * sizeof(float);
 
     hc_fused_kernel<HC_DEFAULT, DIM_DEFAULT, N_OUT_DEFAULT, BLOCK, SINKHORN_DEFAULT>
         <<<grid_size, BLOCK, smem_size, stream>>>(
-        hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
+        hidden_states, attn_hc_fn_t, attn_hc_base, attn_hc_scale,
         hc_eps, rms_norm_eps, num_positions,
         collapsed_out, pre_out, post_out, comb_out
     );
@@ -413,7 +435,7 @@ std::vector<torch::Tensor> hc_fused_forward_full(
 
     hc_fused_launch(
         reinterpret_cast<const __nv_bfloat16*>(hs_flat.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(attn_hc_fn.contiguous().data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(attn_hc_fn.contiguous().t().contiguous().data_ptr<at::BFloat16>()),
         attn_hc_base.contiguous().data_ptr<float>(),
         attn_hc_scale.contiguous().data_ptr<float>(),
         (float)hc_eps, (float)rms_norm_eps, num_pos,
@@ -450,7 +472,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
         hc_fused_launch_profiled(
             reinterpret_cast<const __nv_bfloat16*>(hs_flat.data_ptr<at::BFloat16>()),
-            reinterpret_cast<const __nv_bfloat16*>(w.contiguous().data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(w.contiguous().t().contiguous().data_ptr<at::BFloat16>()),
             base.contiguous().data_ptr<float>(), scale.contiguous().data_ptr<float>(),
             (float)eps, (float)rms_eps, num_pos,
             reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr<at::BFloat16>()),
