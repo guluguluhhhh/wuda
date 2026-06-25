@@ -65,10 +65,13 @@ def load_cuda_module():
         cuda_flags.append(f'-gencode=arch=compute_{cap[0]*10+cap[1]},code=sm_{cap[0]*10+cap[1]}')
     except:
         cuda_flags.append('-gencode=arch=compute_100,code=sm_100')
+    # CUTLASS/CuTe headers (git clone)
+    cutlass_include = '/home/admin/workspace/aop_lab/app_source/jinhua/dsv4_megakernel/cutlass/include'
+
     return load(
         name='hc_fused',
         sources=[os.path.join(this_dir, 'kernels', 'hc_fused_kernel.cu')],
-        extra_include_paths=[os.path.join(this_dir, 'include')],
+        extra_include_paths=[os.path.join(this_dir, 'include'), cutlass_include],
         extra_cuda_cflags=cuda_flags, verbose=True,
     )
 
@@ -159,10 +162,94 @@ def benchmark(module, warmup=100, iters=500):
 
 
 # ============================================================
+# Intra-Kernel Profiling + Chrome Trace export
+# ============================================================
+def profile_kernel(module, num_pos=64, gpu_clock_mhz=2100):
+    """Run profiled kernel and export Chrome Trace JSON."""
+    import json
+    device = 'cuda'
+    torch.manual_seed(42)
+
+    hs = torch.randn(num_pos, HC, D, device=device, dtype=torch.bfloat16)
+    w = torch.randn(N_OUT, HC * D, device=device, dtype=torch.bfloat16) * 0.01
+    base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
+    scale = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=torch.float32)
+
+    # Warmup
+    for _ in range(10):
+        module.hc_fused_forward_profiled(hs, w, base, scale, HC_EPS, RMS_NORM_EPS)
+    torch.cuda.synchronize()
+
+    # Profile run
+    timing = module.hc_fused_forward_profiled(hs, w, base, scale, HC_EPS, RMS_NORM_EPS)
+    torch.cuda.synchronize()
+
+    # timing: [grid_size, 10] int64 = 5 phases x (start, end)
+    timing_cpu = timing.cpu().numpy()
+    phase_names = ["RMSNorm", "GEMV", "Activation", "Sinkhorn", "Collapse"]
+
+    print("\n" + "=" * 60)
+    print(f"Intra-Kernel Profile (num_pos={num_pos}, GPU clock={gpu_clock_mhz} MHz)")
+    print("=" * 60)
+
+    # Print per-block timing for first few blocks
+    print(f"\n{'Block':<8}", end="")
+    for name in phase_names:
+        print(f"{name:<12}", end="")
+    print("Total")
+    print("-" * 75)
+
+    # Each block's clock is independent (per-SM), so use per-block relative time
+    # Place blocks sequentially with a small gap for visual clarity
+    BLOCK_GAP_US = 2.0  # gap between blocks in trace
+
+    chrome_events = []
+    for bid in range(min(timing_cpu.shape[0], 8)):  # first 8 blocks
+        row = timing_cpu[bid]
+        if row[0] == 0 and row[1] == 0:
+            continue  # unused block
+        block_base = row[0]
+        block_offset = 0  # all blocks aligned to same start
+
+        print(f"{bid:<8}", end="")
+        total_cycles = 0
+        for p in range(5):
+            start_clk = row[p*2]
+            end_clk = row[p*2 + 1]
+            cycles = end_clk - start_clk
+            us = cycles / gpu_clock_mhz
+            total_cycles += cycles
+            print(f"{us:>8.1f} us  ", end="")
+
+            # Chrome trace event (per-block relative + visual offset)
+            chrome_events.append({
+                "name": phase_names[p],
+                "cat": "kernel",
+                "ph": "X",
+                "ts": float(start_clk - block_base) / gpu_clock_mhz + block_offset,
+                "dur": float(cycles) / gpu_clock_mhz,
+                "pid": 0,
+                "tid": bid,
+                "args": {"block": bid, "phase": p, "cycles": int(cycles)}
+            })
+        print(f"{total_cycles / gpu_clock_mhz:>8.1f} us")
+
+    # Export Chrome Trace
+    trace_file = "hc_kernel_trace.json"
+    with open(trace_file, 'w') as f:
+        json.dump({"traceEvents": chrome_events}, f)
+    print(f"\nChrome Trace exported: {trace_file}")
+    print(f"Open with: https://ui.perfetto.dev or chrome://tracing")
+
+
+# ============================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', action='store_true')
     parser.add_argument('--skip-correctness', action='store_true')
+    parser.add_argument('--profile', action='store_true', help='Run intra-kernel profiling')
+    parser.add_argument('--profile-positions', type=int, default=64)
+    parser.add_argument('--gpu-clock-mhz', type=int, default=2100, help='GPU clock freq in MHz')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -178,7 +265,9 @@ if __name__ == '__main__':
     module = load_cuda_module()
     print("Done!\n")
 
-    if not args.skip_correctness:
+    if not args.skip_correctness and not args.profile:
         if not test_correctness(module): sys.exit(1)
     if args.benchmark:
         benchmark(module)
+    if args.profile:
+        profile_kernel(module, args.profile_positions, args.gpu_clock_mhz)
