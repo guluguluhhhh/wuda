@@ -252,7 +252,8 @@ if __name__ == '__main__':
         print("CUDA not available."); sys.exit(0)
 
     print(f"Config: HC={HC}, DIM={DIM}, HC_DIM={HC_DIM}, N_OUT={N_OUT}")
-    print(f"        Sinkhorn={SINKHORN_ITERS}, block=1024, grid=2*SM")
+    print(f"        Sinkhorn={SINKHORN_ITERS}, block=1024, cluster=2 blocks, grid=2*SM clusters")
+    print(f"        Launch: cudaLaunchKernelEx + cluster_dim(2,1,1)")
     print(f"        Device: {torch.cuda.get_device_name()}")
     cap = torch.cuda.get_device_capability()
     print(f"        Compute: sm_{cap[0]*10+cap[1]}\n")
