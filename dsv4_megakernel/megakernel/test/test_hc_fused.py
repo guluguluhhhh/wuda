@@ -58,6 +58,7 @@ def hc_reference(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
 def load_cuda_module():
     from torch.utils.cpp_extension import load
     this_dir = os.path.dirname(os.path.abspath(__file__))
+    proj_dir = os.path.dirname(this_dir)  # megakernel/
     cuda_flags = ['-O3', '--use_fast_math', '-std=c++17', '--expt-relaxed-constexpr', '-lineinfo']
     try:
         cap = torch.cuda.get_device_capability()
@@ -66,8 +67,8 @@ def load_cuda_module():
         cuda_flags.append('-gencode=arch=compute_100,code=sm_100')
     return load(
         name='hc_fused',
-        sources=[os.path.join(this_dir, 'kernels', 'hc_fused_kernel.cu')],
-        extra_include_paths=[os.path.join(this_dir, 'include')],
+        sources=[os.path.join(proj_dir, 'kernels', 'hc_fused_kernel.cu')],
+        extra_include_paths=[os.path.join(proj_dir, 'include')],
         extra_cuda_cflags=cuda_flags, verbose=True,
     )
 

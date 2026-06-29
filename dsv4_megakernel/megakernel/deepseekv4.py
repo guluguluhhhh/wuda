@@ -95,7 +95,7 @@ def deepseek_v4_decoder_layer_forward_single_function(
     # 3. q_a_proj -> q_a_norm
     # =========================
     # batched gemm: [batch, seqlen, dim] * [dim, q_lora_rank]
-    q_residual = F.linear(x, q_a_proj_weight)   # [B, S, q_lora_rank]
+    q_residual = F.linear(x, q_a_proj_weight)   # [B, S, q_lora_rank], [7168→1536]
     q_residual_f = q_residual.float()
     q_residual_f = q_residual_f * torch.rsqrt(q_residual_f.square().mean(-1, keepdim=True) + rms_norm_eps)
     q_residual = q_residual_f.to(dtype) * q_a_norm_weight
@@ -103,7 +103,7 @@ def deepseek_v4_decoder_layer_forward_single_function(
     # =========================
     # 4. q_b_proj -> reshape -> q_b_norm
     # =========================
-    q = F.linear(q_residual, q_b_proj_weight)   # [B, S, H*Hd]
+    q = F.linear(q_residual, q_b_proj_weight)   # [B, S, H*Hd], [1536→65536]
     q = q.view(B, S, num_heads, head_dim).transpose(1, 2)   # [B, H, S, Hd]
     qf = q.float()
     q = (qf * torch.rsqrt(qf.square().mean(-1, keepdim=True) + rms_norm_eps)).to(dtype)
