@@ -159,7 +159,7 @@ if __name__ == '__main__':
     print("=" * 60)
     device = 'cuda'
     K, N = D, N_QA + 512  # merged N = 2048
-    batch_sizes = [128, 256, 512, 1024, 2048, 4096]
+    batch_sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
     print(f"  K={K}, N={N} (merged wq_a[1536] + wkv[512])")
     print(f"  {'M':<8} {'Latency(us)':<12} {'TFLOPS':<10} {'BW(GB/s)':<10} {'HBM%':<8}")
