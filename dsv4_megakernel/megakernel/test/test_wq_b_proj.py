@@ -19,19 +19,19 @@ def load_module(skip_norm=False):
     proj_dir = os.path.dirname(this_dir)
     cutlass_dir = os.path.join(proj_dir, '..', 'cutlass', 'include')
 
+    cap = torch.cuda.get_device_capability()
+    sm = cap[0] * 10 + cap[1]
+    assert sm >= 90, f'TMA requires sm_90+, got sm_{sm}'
+
     cuda_flags = [
         '-O3', '-std=c++17',
         '--expt-relaxed-constexpr',
         '-lineinfo',
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
+        f'-gencode=arch=compute_{sm},code=sm_{sm}',
     ]
     if skip_norm:
         cuda_flags.append('-DSKIP_NORM')
-    try:
-        cap = torch.cuda.get_device_capability()
-        cuda_flags.append(f'-gencode=arch=compute_{cap[0]*10+cap[1]},code=sm_{cap[0]*10+cap[1]}')
-    except:
-        cuda_flags.append('-gencode=arch=compute_80,code=sm_80')
 
     name = 'wq_b_proj_nonorm' if skip_norm else 'wq_b_proj'
     return load(
@@ -39,6 +39,7 @@ def load_module(skip_norm=False):
         sources=[os.path.join(proj_dir, 'kernels', 'wq_b_proj_gemm.cu')],
         extra_include_paths=[os.path.join(proj_dir, 'include'), cutlass_dir],
         extra_cuda_cflags=cuda_flags,
+        extra_ldflags=['-lcuda'],  # driver API for cuTensorMapEncodeTiled
         verbose=True,
     )
 
@@ -175,8 +176,18 @@ if __name__ == '__main__':
     print(f"Compute: sm_{cap[0]*10+cap[1]}")
 
     if args.skip_norm:
-        print("[MODE] SKIP_NORM: measuring pure GEMM latency (output not normalized)")
+        print("[MODE] SKIP_NORM: pure GEMM correctness + latency")
         module = load_module(skip_norm=True)
+        # Quick correctness check (no norm)
+        device = 'cuda'
+        M = 32
+        x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
+        w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
+        rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
+        ref = (x.float() @ w.float().t()).reshape(M, NUM_HEADS, HEAD_DIM).to(torch.bfloat16)
+        out = module.wq_b_proj_gemm(x, w, rms_w, 1e-6)
+        cos = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
+        print(f"  SKIP_NORM cos_sim: {cos:.8f} ({'PASS' if cos > 0.99 else 'FAIL'})")
         benchmark(module)
     else:
         module = load_module(skip_norm=False)
