@@ -116,7 +116,7 @@ def test_with_nontrivial_weight(module, M=32):
     return passed
 
 
-def benchmark(module):
+def benchmark(module, skip_norm=False):
     print("\n" + "=" * 60)
     print("Benchmark: wq_b_proj_gemm latency sweep")
     print("=" * 60)
@@ -129,20 +129,25 @@ def benchmark(module):
     weight_bytes = N_TOTAL * K_DIM * 2  # 65536 * 1536 * 2 = 192 MB
 
     batch_sizes = [32, 64, 96, 128, 192, 256]
-    print(f"  K={K_DIM}, N={N_TOTAL} (128 heads × 512 dim)")
+    print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
     print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
-    print(f"  {'M':<8} {'Latency(us)':<12} {'TFLOPS':<10} {'BW(GB/s)':<10}")
-    print("  " + "-" * 48)
+
+    if skip_norm:
+        # cuBLAS comparison: pure GEMM only
+        print(f"  {'M':<6} {'Ours(us)':<10} {'cuBLAS(us)':<12} {'Ratio':<8} {'Ours BW':<10} {'cuBLAS BW':<10}")
+        print("  " + "-" * 62)
+        w_t = w.t().contiguous()
+    else:
+        print(f"  {'M':<6} {'Latency(us)':<12} {'TFLOPS':<10} {'BW(GB/s)':<10}")
+        print("  " + "-" * 48)
 
     for M in batch_sizes:
         x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
 
-        # Warmup
+        # --- Our kernel ---
         for _ in range(20):
             module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
         torch.cuda.synchronize()
-
-        # Benchmark
         iters = 100
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -151,14 +156,29 @@ def benchmark(module):
             module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
         end.record()
         torch.cuda.synchronize()
-        elapsed_us = start.elapsed_time(end) / iters * 1000
+        ours_us = start.elapsed_time(end) / iters * 1000
 
         flops = 2 * M * N_TOTAL * K_DIM
-        tflops = flops / (elapsed_us * 1e-6) / 1e12
-        # BW: weight(192MB) + input(M*1536*2) + output(M*128*512*2)
+        tflops = flops / (ours_us * 1e-6) / 1e12
         bytes_total = weight_bytes + M * K_DIM * 2 + M * NUM_HEADS * HEAD_DIM * 2
-        bw_gbs = bytes_total / (elapsed_us * 1e-6) / 1e9
-        print(f"  {M:<8} {elapsed_us:<12.1f} {tflops:<10.2f} {bw_gbs:<10.1f}")
+        bw_gbs = bytes_total / (ours_us * 1e-6) / 1e9
+
+        if skip_norm:
+            # --- cuBLAS GEMM only (torch.mm) ---
+            for _ in range(20):
+                torch.mm(x, w_t)
+            torch.cuda.synchronize()
+            start.record()
+            for _ in range(iters):
+                torch.mm(x, w_t)
+            end.record()
+            torch.cuda.synchronize()
+            cublas_us = start.elapsed_time(end) / iters * 1000
+            ratio = ours_us / cublas_us
+            cublas_bw = bytes_total / (cublas_us * 1e-6) / 1e9
+            print(f"  {M:<6} {ours_us:<10.1f} {cublas_us:<12.1f} {ratio:<8.2f} {bw_gbs:<10.1f} {cublas_bw:<10.1f}")
+        else:
+            print(f"  {M:<6} {ours_us:<12.1f} {tflops:<10.2f} {bw_gbs:<10.1f}")
 
 
 if __name__ == '__main__':
@@ -188,14 +208,14 @@ if __name__ == '__main__':
         out = module.wq_b_proj_gemm(x, w, rms_w, 1e-6)
         cos = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
         print(f"  SKIP_NORM cos_sim: {cos:.8f} ({'PASS' if cos > 0.99 else 'FAIL'})")
-        benchmark(module)
+        benchmark(module, skip_norm=True)
     else:
         module = load_module(skip_norm=False)
         ok1 = test_correctness(module, M=32)
         ok2 = test_correctness(module, M=64)
         ok3 = test_correctness(module, M=128)
         ok4 = test_with_nontrivial_weight(module, M=96)
-        benchmark(module)
+        benchmark(module, skip_norm=False)
         print("\n" + "=" * 60)
         print(f"Summary: {'ALL PASS' if (ok1 and ok2 and ok3 and ok4) else 'SOME FAILED'}")
         print("=" * 60)

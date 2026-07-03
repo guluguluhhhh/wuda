@@ -1,9 +1,7 @@
 // ============================================================
 // DeepSeek-V4 Phase 3: wq_b Projection + Per-Head RMSNorm
-// Phase 2: TMA + SWIZZLE_64B + PTX mma.sync.m16n8k16
-// BM=32, BN=512, WarpK=32, 128 threads (4 warps)
-// WarpCountM=1, WarpCountN=4, B tile 2×256 TMA
-// A: ldmatrix.x4, B: scalar loads (guaranteed correct)
+// BW-optimized: 256 threads (8 warps), STAGES=4, TMA SWIZZLE_64B
+// All warps share load+compute, ldmatrix.x4 for A and B
 // ============================================================
 
 #include <torch/extension.h>
@@ -15,21 +13,16 @@
 // ============================================================
 // Configuration
 // ============================================================
-constexpr int BM = 32;
 constexpr int BN = 512;
-constexpr int WARPK = 32;        // 32 bf16 = 64 bytes = one SWIZZLE_64B row
-constexpr int STAGES = 2;
-constexpr int NUM_THREADS = 128;  // 4 warps
-constexpr int NUM_WARPS = 4;
+constexpr int WARPK = 32;
+constexpr int STAGES = 4;
+constexpr int NUM_THREADS = 256;
+constexpr int NUM_WARPS = 8;
+constexpr int WARP_COUNT_N = 8;
+constexpr int WARP_N = BN / WARP_COUNT_N;  // 64
+constexpr int WARP_TILE_N = WARP_N / 16;   // 4
 
-constexpr int WARP_COUNT_M = 1;
-constexpr int WARP_COUNT_N = 4;
-constexpr int WARP_M = BM;                       // 32
-constexpr int WARP_N = BN / WARP_COUNT_N;        // 128
-constexpr int WARP_TILE_M = WARP_M / 16;         // 2
-constexpr int WARP_TILE_N = WARP_N / 16;         // 8
-
-constexpr int TMA_B_ROWS = 256;  // TMA outer dim limit
+constexpr int TMA_B_ROWS = 256;
 
 constexpr int NUM_HEADS = 128;
 constexpr int HEAD_DIM = 512;
@@ -37,13 +30,9 @@ constexpr int K_DIM = 1536;
 constexpr int N_TOTAL = NUM_HEADS * HEAD_DIM;
 constexpr int NUM_K_TILES = K_DIM / WARPK;  // 48
 
-constexpr int SMEM_A_STAGE = BM * WARPK;     // 1024 elements
-constexpr int SMEM_B_STAGE = BN * WARPK;     // 16384 elements
-constexpr int MBAR_REGION = 128;             // bytes
-
-constexpr int BYTES_A = BM * WARPK * 2;                  // 2048
-constexpr int BYTES_B_HALF = TMA_B_ROWS * WARPK * 2;     // 16384
-constexpr int BYTES_PER_STAGE = BYTES_A + 2 * BYTES_B_HALF; // 34816
+constexpr int SMEM_B_STAGE = BN * WARPK;    // 16384 elements
+constexpr int MBAR_REGION = 128;
+constexpr int BYTES_B_HALF = TMA_B_ROWS * WARPK * 2;  // 16384
 
 // ============================================================
 // PTX: mbarrier + TMA (sm_90+)
@@ -150,8 +139,9 @@ __device__ __forceinline__ float group4_reduce(float val) {
 }
 
 // ============================================================
-// Kernel
+// Kernel (templated on BM)
 // ============================================================
+template <int BM>
 __global__ void __launch_bounds__(NUM_THREADS)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,
@@ -160,27 +150,37 @@ wq_b_proj_kernel(
     __nv_bfloat16* __restrict__ gOut,
     float eps, int M
 ) {
+    constexpr int SMEM_A_STAGE = BM * WARPK;
+    constexpr int WARP_TILE_M = BM / 16;
+    constexpr int BYTES_A = BM * WARPK * 2;
+    constexpr int BYTES_PER_STAGE = BYTES_A + 2 * BYTES_B_HALF;
+
     const int head_idx = blockIdx.x;
     const int m_block  = blockIdx.y;
     const int warp_id  = threadIdx.x / 32;
     const int lane_id  = threadIdx.x % 32;
-    const int group_id = lane_id / 4;      // 0-7
-    const int tid_in_grp = lane_id % 4;    // 0-3
+    const int group_id = lane_id / 4;
+    const int tid_in_grp = lane_id % 4;
 
     // ================================================================
     // Shared memory: data FIRST (128B aligned), mbar at end
-    // TMA swizzle uses absolute smem address → data must start at 128B boundary
     // ================================================================
     extern __shared__ char smem_raw[];
-    __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // starts at 0
+    __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* smem_B = smem_A + STAGES * SMEM_A_STAGE;
-    // mbar after all data (data size = STAGES*(SMEM_A_STAGE+SMEM_B_STAGE)*2 bytes)
     uint64_t* mbar = reinterpret_cast<uint64_t*>(
         smem_raw + STAGES * (SMEM_A_STAGE + SMEM_B_STAGE) * sizeof(__nv_bfloat16));
 
-    // ================================================================
+    // Init mbarrier
+    if (threadIdx.x < STAGES) mbar_init(&mbar[threadIdx.x], 1);
+    __syncthreads();
+
+    const int32_t tma_A_row = m_block * BM;
+    const int32_t tma_B_row_lo = head_idx * HEAD_DIM;
+    const int32_t tma_B_row_hi = tma_B_row_lo + TMA_B_ROWS;
+    const int warp_n_start = warp_id * WARP_N;
+
     // Accumulator
-    // ================================================================
     float frag_C[WARP_TILE_M][WARP_TILE_N][8];
     #pragma unroll
     for (int m = 0; m < WARP_TILE_M; ++m)
@@ -189,16 +189,6 @@ wq_b_proj_kernel(
             #pragma unroll
             for (int f = 0; f < 8; ++f)
                 frag_C[m][n][f] = 0.0f;
-
-    // ================================================================
-    // Init mbarrier
-    // ================================================================
-    if (threadIdx.x < STAGES) mbar_init(&mbar[threadIdx.x], 1);
-    __syncthreads();
-
-    const int32_t tma_A_row = m_block * BM;
-    const int32_t tma_B_row_lo = head_idx * HEAD_DIM;
-    const int32_t tma_B_row_hi = tma_B_row_lo + TMA_B_ROWS;
 
     // ================================================================
     // Prologue
@@ -222,7 +212,6 @@ wq_b_proj_kernel(
     // GEMM mainloop
     // ================================================================
     uint32_t phase[STAGES] = {};
-    const int warp_n_start = warp_id * WARP_N;
 
     for (int kt = 0; kt < NUM_K_TILES; ++kt) {
         const int stg = kt % STAGES;
@@ -308,7 +297,7 @@ wq_b_proj_kernel(
     }
 
     // ================================================================
-    // Epilogue: Fused RMSNorm
+    // Epilogue: Fused RMSNorm (inside M-loop)
     // ================================================================
 #ifndef SKIP_NORM
     // Step 1: partial sq_sum per row
@@ -347,8 +336,9 @@ wq_b_proj_kernel(
     // Step 4: aggregate + rsqrt
     float* scale = warp_sq + BM * NUM_WARPS;
     if (threadIdx.x < BM) {
-        float total = warp_sq[threadIdx.x * NUM_WARPS]     + warp_sq[threadIdx.x * NUM_WARPS + 1]
-                    + warp_sq[threadIdx.x * NUM_WARPS + 2] + warp_sq[threadIdx.x * NUM_WARPS + 3];
+        float total = 0.0f;
+        for (int w = 0; w < NUM_WARPS; ++w)
+            total += warp_sq[threadIdx.x * NUM_WARPS + w];
         scale[threadIdx.x] = rsqrtf(total / (float)HEAD_DIM + eps);
     }
     __syncthreads();
@@ -441,16 +431,20 @@ torch::Tensor wq_b_proj_gemm(
     auto w_ptr = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
     auto out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
 
-    CUtensorMap desc_A = make_tma_desc_bf16(x_ptr, M, K_DIM, BM, WARPK);
     CUtensorMap desc_B = make_tma_desc_bf16(w_ptr, N_TOTAL, K_DIM, TMA_B_ROWS, WARPK);
 
-    dim3 grid(NUM_HEADS, M / BM);
+    // Persistent kernel: grid = NUM_HEADS (128 blocks), M-loop inside kernel
+    constexpr int BM = 32;
+    constexpr int SMEM_A_STAGE = BM * WARPK;
+    CUtensorMap desc_A = make_tma_desc_bf16(x_ptr, M, K_DIM, BM, WARPK);
+
+    dim3 grid(NUM_HEADS, M / BM);  // parallel M-blocks
     dim3 block(NUM_THREADS);
     int smem = STAGES * (SMEM_A_STAGE + SMEM_B_STAGE) * (int)sizeof(__nv_bfloat16) + MBAR_REGION;
 
-    cudaFuncSetAttribute(wq_b_proj_kernel,
+    cudaFuncSetAttribute(wq_b_proj_kernel<BM>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    wq_b_proj_kernel<<<grid, block, smem, stream>>>(
+    wq_b_proj_kernel<BM><<<grid, block, smem, stream>>>(
         desc_A, desc_B, rms_w.data_ptr<float>(), out_ptr, (float)eps, M);
 
     auto err = cudaGetLastError();
