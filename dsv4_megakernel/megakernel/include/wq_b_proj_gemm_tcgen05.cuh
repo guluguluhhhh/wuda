@@ -1,12 +1,19 @@
 #pragma once
 // ============================================================
 // wq_b_proj_gemm_tcgen05.cuh
-// tcgen05 BF16 GEMM — Header
-// Uses same CUTLASS components as DeepGEMM (minimal subset)
+// tcgen05 BF16 GEMM — Header (SWAP-AB variant)
+// Aligned with DeepGEMM sm100_bf16_gemm.cuh + sm100_store_cd_swap_ab.cuh
 //
-// Target: M=32~256, K=1536, N=65536, BF16, 2SM MMA, Cluster=(2,1,1)
-// Dependencies: cutlass/arch/barrier.h, cute/arch/mma_sm100_desc.hpp,
-//               cute/arch/copy_sm90_tma.hpp, cute/arch/copy_sm100_tma.hpp
+// Target: M=32~256 (32-aligned), K=1536, N=65536, BF16 -> FP32 output
+// swap_ab=1, 2SM MMA (cta_group::2), Cluster=(1,2,1) -> cluster_n=2,
+// kIsMulticastOnA=true, Persistent, Warp-Specialized.
+//
+// Rationale (from NCU profile of the previous non-swap kernel):
+//   the previous kernel was Tensor-pipe / latency bound (DRAM only ~41%,
+//   Tensor pipe 66% top, occupancy 12%) because UMMA_M=256 x UMMA_N=256
+//   wasted 4~8x tensor work on padded M rows. swap_ab puts N on the 256
+//   axis and M (=UMMA_N) on the small axis, so tensor work drops to the
+//   real M and the kernel becomes HBM-bound like DeepGEMM.
 // ============================================================
 
 #include <cuda.h>
@@ -24,139 +31,142 @@
 // ======================== Configuration ========================
 namespace wq_b {
 
-// Tile dimensions (cluster-level)
-// DeepGEMM heuristic for M<=32: BLOCK_M=32, for M<=64: BLOCK_M=64, else: 128
-// We use BLOCK_M=64 as default (covers M=32~64 with padding)
-static constexpr int BLOCK_M = 64;
-static constexpr int BLOCK_N = 256;
-static constexpr int BLOCK_K = 64;
+// ---- Problem dimensions (fixed for wq_b projection) ----
+static constexpr int K_DIM    = 1536;
+static constexpr int N_TOTAL  = 65536;  // 128 heads x 512 dim
+static constexpr int BLOCK_K  = 64;
+static constexpr int NUM_K_TILES = K_DIM / BLOCK_K; // 24
 
-// Cluster: (2,1,1) → 2SM MMA, multicast on A (along M)
-static constexpr int CLUSTER_M = 2;
-static constexpr int CLUSTER_N = 1;
+// ---- Cluster / multicast (swap-AB: cluster_n = 2) ----
+// DeepGEMM mapping: kNumMulticast = cluster_size, kIsMulticastOnA = (cluster_n > 1)
+static constexpr int CLUSTER_SIZE  = 2;
+static constexpr int NUM_MULTICAST = CLUSTER_SIZE; // 2
+static constexpr bool IS_MULTICAST_ON_A = true;    // cluster_n = 2
 
-// Per-CTA load dimensions
-// DeepGEMM: kIsMulticastOnA = (cluster_n > 1) = false for cluster=(2,1,1)
-// So multicast is on B side (cluster_m splits N)
-static constexpr bool IS_MULTICAST_ON_A = false;  // cluster_n == 1
-static constexpr int LOAD_BLOCK_M = BLOCK_M;                                        // 64 (full, no split)
-static constexpr int LOAD_BLOCK_N = BLOCK_N / (IS_MULTICAST_ON_A ? 1 : CLUSTER_M);  // 256/2 = 128
+// ---- MMA instruction shape (2SM) ----
+// UMMA_M = LAYOUT_AD_M(128) * kNumMulticast(2) = 256  (along problem-N)
+// UMMA_N = BLOCK_M = M                                 (along problem-M, per-kernel template)
+static constexpr int LAYOUT_AD_M = 128;
+static constexpr int UMMA_M = LAYOUT_AD_M * NUM_MULTICAST; // 256
+static constexpr int UMMA_K = 16;                          // BF16: 16 elements
 
-// MMA instruction shape (2SM: LAYOUT_AD_M=128 × kNumMulticast=2 = 256)
-static constexpr int UMMA_M = 256;
-static constexpr int UMMA_N = BLOCK_N;  // 256
-static constexpr int UMMA_K = 16;       // BF16: 16 elements = 32 bytes
+// ---- N tiling ----
+// Each 2SM cluster produces UMMA_M = 256 columns of N (128 per CTA).
+static constexpr int BLOCK_N        = 128;          // per-CTA weight rows (N)
+static constexpr int CLUSTER_BLOCK_N = BLOCK_N * NUM_MULTICAST; // 256 (per-cluster N tile)
+static constexpr int LOAD_BLOCK_N   = BLOCK_N;      // 128 (weight rows loaded per CTA)
+static constexpr int NUM_N_TILES    = N_TOTAL / CLUSTER_BLOCK_N; // 65536/256 = 256
 
-// Layout: both A and B are K-major
+// ---- Layout: both A(activation) and B(weight) are K-major ----
 static constexpr auto MAJOR_A = cute::UMMA::Major::K;
 static constexpr auto MAJOR_B = cute::UMMA::Major::K;
 
-// Swizzle: 128B (= BLOCK_K * sizeof(bf16) = 64*2 = 128)
-static constexpr int SWIZZLE_A = 128;    // bytes
-static constexpr int SWIZZLE_B = 128;    // bytes
+// ---- Swizzle (128B) ----
+static constexpr int SWIZZLE_A  = 128;   // bytes (K-major, BLOCK_K*2 = 128)
+static constexpr int SWIZZLE_B  = 128;   // bytes
 static constexpr int SWIZZLE_CD = 128;   // bytes
 
-// Pipeline (DeepGEMM: auto-calculated from SMEM capacity)
-// smem_per_stage = LOAD_BLOCK_M*BK*2 + LOAD_BLOCK_N*BK*2 = 64*64*2 + 128*64*2 = 8192+16384 = 24576
-// smem_available ≈ 228KB - CD - barriers ≈ 220KB
-// max_stages = 220KB / 24KB ≈ 9 → use 8 (conservative)
-static constexpr int NUM_STAGES = 8;
-static constexpr int NUM_EPI_STAGES = 2; // TMEM double buffer
+// ---- Pipeline ----
+static constexpr int NUM_EPI_STAGES      = 2;  // TMEM accumulator double buffer
 static constexpr int NUM_TMA_STORE_STAGES = 2;
 
-// Threads: 128 non-epilogue + 128 epilogue = 256
-static constexpr int TPB = 256;
+// ---- Threads: 128 non-epilogue + 128 epilogue = 256 ----
+static constexpr int TPB                 = 256;
 static constexpr int NUM_NON_EPI_THREADS = 128;
-static constexpr int NUM_EPI_THREADS = 128;
+static constexpr int NUM_EPI_THREADS     = 128;
+// swap-AB uses a full warpgroup (128 threads / 4 warps) for the store
+static constexpr int NUM_STORE_THREADS   = 128;
 
-// Epilogue store tile (DeepGEMM L79: store_block_n = kSwizzleCDMode / sizeof(cd_dtype_t))
-static constexpr int STORE_BLOCK_M = BLOCK_M;                        // 64
-static constexpr int STORE_BLOCK_N = SWIZZLE_CD / (int)sizeof(float); // 128/4 = 32
-static constexpr int NUM_STORE_THREADS = STORE_BLOCK_M;               // 64 (warps 4-5)
+// ---- Epilogue store tile (swap-AB, DeepGEMM sm100.hpp L157-158) ----
+// store_block_m = umma_step_n = 16 ; store_block_n = block_n = 128
+static constexpr int STORE_BLOCK_M      = 16;                          // M-rows per store stage
+static constexpr int STORE_BLOCK_N      = BLOCK_N;                     // 128 (N cols in smem tile)
+static constexpr int STORE_BLOCK_N_ATOM = SWIZZLE_CD / (int)sizeof(float); // 128/4 = 32 (TMA store atom on N)
 
-// SMEM sizes per stage (bytes)
-static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(nv_bfloat16); // 64*64*2 = 8192
-static constexpr int SMEM_B_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(nv_bfloat16); // 128*64*2 = 16384
-static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(float); // 64*32*4 = 8192
-static constexpr int SMEM_CD_TOTAL = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES;          // 16384
+// ---- Per-stage SMEM for weight B (constant); A depends on M ----
+static constexpr int SMEM_B_PER_STAGE  = LOAD_BLOCK_N * BLOCK_K * sizeof(nv_bfloat16); // 128*64*2 = 16384
+static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(float); // 16*128*4 = 8192
+static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES;      // 16384
 
-// Total TMA bytes per K-tile per multicast group
-static constexpr int TMA_BYTES_PER_STAGE = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE; // 40960
+// SMEM capacity budget (SM100)
+static constexpr int SMEM_CAPACITY = 232448;
 
-// TMEM columns: 2 epilogue stages × UMMA_N
-static constexpr int NUM_TMEM_COLS = NUM_EPI_STAGES * UMMA_N; // 512
+// Round up to the next power of two (tcgen05.alloc requires a power-of-2 column count).
+static constexpr int ceil_pow2(int v) {
+    int p = 32;
+    while (p < v) p <<= 1;
+    return p;
+}
 
-// Problem dimensions (fixed for wq_b projection)
-static constexpr int K_DIM = 1536;
-static constexpr int N_TOTAL = 65536;  // 128 heads × 512 dim
-static constexpr int NUM_K_TILES = K_DIM / BLOCK_K; // 24
+// ---- Compile-time helpers parameterised on M ----
+// LOAD_BLOCK_M: activation rows loaded per CTA (split across the 2 CTAs on M).
+template <int M_> struct SwapDims {
+    static constexpr int BLOCK_M          = M_;              // = problem M (single M block)
+    static constexpr int UMMA_N           = M_;              // MMA-N = problem M
+    static constexpr int LOAD_BLOCK_M     = M_ / NUM_MULTICAST; // M/2 per CTA
+    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
+    static constexpr int SMEM_PER_STAGE   = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE;
+    // Allocate kNumEpilogueStages * UMMA_N columns, rounded up to a power of two for
+    // tcgen05.alloc. The MMA/epilogue still address stages at accum_stage * UMMA_N.
+    static constexpr int NUM_TMEM_COLS    = ceil_pow2(NUM_EPI_STAGES * UMMA_N);
 
-// Multicast
-static constexpr int NUM_MULTICAST = CLUSTER_M;  // 2
+    // Solve number of stages fitting the SMEM budget.
+    // Overhead: smem_cd + barriers(full+empty per stage, tmem full/empty) + tmem_ptr.
+    // Barrier bytes conservatively budgeted for up to 16 stages (8B each).
+    static constexpr int SMEM_BARRIERS = (16 * 2 + NUM_EPI_STAGES * 2) * 8; // <= actual for <=16 stages
+    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8;
+    static constexpr int STAGES_RAW    = (SMEM_CAPACITY - SMEM_OVERHEAD) / SMEM_PER_STAGE;
+    static constexpr int NUM_STAGES    = STAGES_RAW > 12 ? 12 : STAGES_RAW;
+};
 
 } // namespace wq_b
 
 // ======================== Descriptor Helpers ========================
-// Directly from DeepGEMM mma/sm100.cuh, simplified for our fixed config
 namespace mma_desc {
 
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-// Make SMEM descriptor using CUTLASS SmemDescriptor bitfield
-// (from DeepGEMM: deep_gemm/mma/sm100.cuh::make_smem_desc + make_umma_desc)
+// K-major 128B-swizzle SMEM descriptor (DeepGEMM mma/sm100.cuh::make_umma_desc, K-major branch).
+// For K-major the SBO depends only on BLOCK_K (num_non_contiguous = 128/16 = 8), so the same
+// construction works for both the weight tile (128 rows) and the activation tile (M/2 rows).
 __device__ __forceinline__
 cute::UMMA::SmemDescriptor make_smem_desc_k_major(void* smem_ptr) {
-    // Aligned with DeepGEMM mma/sm100.cuh::make_smem_desc
     cute::UMMA::SmemDescriptor desc;
-
-    // Set the version for SM100
-    desc.version_ = 1;
-
-    // Legacy mode
-    desc.lbo_mode_ = 0;
-
-    // Layout type: SWIZZLE_128B = 2
+    desc.version_     = 1;
+    desc.lbo_mode_    = 0;
     desc.layout_type_ = static_cast<uint8_t>(cute::UMMA::LayoutType::SWIZZLE_128B);
-
-    // Start address
     const auto uint_ptr = cute::cast_smem_ptr_to_uint(smem_ptr);
     desc.start_address_ = static_cast<uint16_t>(uint_ptr >> 4);
-
-    // For K-major with 128B swizzle:
-    //   num_non_contiguous = 128 / atom_base = 128 / 16 = 8
-    //   SBO = num_non_contiguous * BLOCK_K * sizeof(bf16) = 8 * 64 * 2 = 1024
-    //   LBO = 0 (only 1 K-atom)
+    // num_non_contiguous(8) * BLOCK_K(64) * sizeof(bf16)(2) = 1024
     constexpr uint32_t SBO = 8 * wq_b::BLOCK_K * sizeof(nv_bfloat16); // 1024
-    desc.stride_byte_offset_ = SBO >> 4;   // 64
+    desc.stride_byte_offset_  = SBO >> 4;  // 64
     desc.leading_byte_offset_ = 0;
-
-    // Base offset
-    desc.base_offset_ = 0;
-
+    desc.base_offset_         = 0;
     return desc;
 }
 
-// Advance descriptor's .lo for the next stage (offset by stage_bytes / 16)
+// Advance descriptor .lo by a whole pipeline stage (offset = stage_bytes / 16).
 __device__ __forceinline__
 uint32_t advance_desc_lo_for_stage(uint32_t base_lo, uint32_t stage_idx, uint32_t stage_bytes) {
     return base_lo + stage_idx * (stage_bytes / 16);
 }
 
-// Advance descriptor's .lo for K-step within a stage
-// For K-major: stride_k = 1 element → sizeof(bf16) bytes per step
-// Each UMMA_K = 16 elements → 32 bytes → 32/16 = 2 units
+// Advance descriptor .lo by one UMMA_K step within a stage.
+// K-major, stride_k = 1 element; UMMA_K=16 elems -> 32 bytes -> 32/16 = 2 units.
 __device__ __forceinline__
 uint32_t advance_desc_lo_for_k(uint32_t base_lo, uint32_t k_idx) {
     return base_lo + k_idx * (wq_b::UMMA_K * sizeof(nv_bfloat16) / 16); // k_idx * 2
 }
 
-// Make instruction descriptor for 2SM BF16 GEMM
-// From DeepGEMM: cute::UMMA::make_instr_desc<bf16, bf16, float, 256, 256, K, K>()
+// Runtime instruction descriptor for 2SM BF16 GEMM, templated on UMMA_N.
+// swap-AB: make_instr_desc<bf16, bf16, float, UMMA_M, UMMA_N, MajorB, MajorA>()
+// (both operands K-major here so the major order is symmetric).
+template <int UMMA_N_T>
 __device__ __forceinline__
 uint64_t make_runtime_instr_desc() {
     auto idesc = cute::UMMA::make_instr_desc<
         cutlass::bfloat16_t, cutlass::bfloat16_t, float,
-        wq_b::UMMA_M, wq_b::UMMA_N,
+        wq_b::UMMA_M, UMMA_N_T,
         cute::UMMA::Major::K, cute::UMMA::Major::K>();
     return cute::UMMA::make_runtime_instr_desc(idesc);
 }
@@ -164,10 +174,9 @@ uint64_t make_runtime_instr_desc() {
 } // namespace mma_desc
 
 // ======================== PTX Wrappers ========================
-// Only for instructions not covered by CUTLASS headers
 namespace ptx {
 
-// tcgen05.mma.cta_group::2.kind::f16 (from DeepGEMM ptx/tcgen05.cuh)
+// tcgen05.mma.cta_group::2.kind::f16 (DeepGEMM ptx/tcgen05.cuh SM100_MMA_F16BF16_2x1SM_SS)
 __device__ __forceinline__ void tcgen05_mma_2sm(
     uint32_t tmem_addr, uint64_t a_desc, uint64_t b_desc,
     uint64_t runtime_idesc, uint32_t accum) {
@@ -179,27 +188,25 @@ __device__ __forceinline__ void tcgen05_mma_2sm(
            "r"(static_cast<uint32_t>(runtime_idesc >> 32)), "r"(accum));
 }
 
-// TMEM allocation for 2SM (from DeepGEMM, same as cute::TMEM::Allocator2Sm)
+// TMEM alloc/dealloc for 2SM
 __device__ __forceinline__ void tcgen05_alloc_2sm(uint32_t smem_addr, uint32_t num_cols) {
     asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
         :: "r"(smem_addr), "r"(num_cols));
 }
-
 __device__ __forceinline__ void tcgen05_dealloc_2sm(uint32_t taddr, uint32_t num_cols) {
     asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;"
         :: "r"(taddr), "r"(num_cols));
 }
 
-// Fences (from DeepGEMM ptx/tcgen05.cuh)
+// Fences
 __device__ __forceinline__ void tcgen05_fence_before_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;");
 }
-
 __device__ __forceinline__ void tcgen05_fence_after_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
-// umma_arrive for 2SM multicast (from cutlass::arch)
+// umma_arrive for 2SM multicast (tcgen05.commit)
 __device__ __forceinline__ void umma_arrive_multicast_2sm(uint64_t* bar, uint16_t mask) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     if (cute::elect_one_sync()) {
@@ -209,7 +216,7 @@ __device__ __forceinline__ void umma_arrive_multicast_2sm(uint64_t* bar, uint16_
     }
 }
 
-// TMEM load: 32dp32b4x (FP32, 4 values per lane)
+// TMEM load: 32dp32b, x4 (4 FP32 per lane)  [kept for reference]
 __device__ __forceinline__ void tmem_load_32dp32b4x(
     uint32_t tmem_addr, uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
     asm volatile(
@@ -217,23 +224,34 @@ __device__ __forceinline__ void tmem_load_32dp32b4x(
         : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3) : "r"(tmem_addr));
 }
 
+// TMEM load: 32dp32b, x8 (8 FP32 per lane) — used by the swap-AB FP32 store
+__device__ __forceinline__ void tmem_load_32dp32b8x(
+    uint32_t tmem_addr,
+    uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3,
+    uint32_t& v4, uint32_t& v5, uint32_t& v6, uint32_t& v7) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3),
+          "=r"(v4), "=r"(v5), "=r"(v6), "=r"(v7)
+        : "r"(tmem_addr));
+}
+
 __device__ __forceinline__ void tmem_load_fence() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-// Store 4×32-bit to shared memory
+// Store a single 32-bit word to shared memory
+__device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile("st.shared.u32 [%0], %1;" :: "r"(addr), "r"(v) : "memory");
+}
+
+// Store 4x32-bit to shared memory
 __device__ __forceinline__ void st_shared_v4(void* ptr, uint32_t v0, uint32_t v1,
                                               uint32_t v2, uint32_t v3) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
         :: "r"(addr), "r"(v0), "r"(v1), "r"(v2), "r"(v3) : "memory");
-}
-
-// BF16 pack (2 floats → 1 uint32 packed bf16x2)
-__device__ __forceinline__ uint32_t bf16x2_pack(float a, float b) {
-    uint32_t result;
-    asm volatile("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(result) : "f"(a), "f"(b));
-    return result;
 }
 
 // Cluster utilities
@@ -242,18 +260,15 @@ __device__ __forceinline__ uint32_t block_rank_in_cluster() {
     asm volatile("mov.u32 %0, %cluster_ctarank;" : "=r"(rank));
     return rank;
 }
-
 __device__ __forceinline__ void cluster_sync() {
     cute::cluster_arrive_relaxed();
     cute::cluster_wait();
 }
-
 __device__ __forceinline__ uint32_t get_lane_idx() {
     uint32_t lane;
     asm volatile("mov.u32 %0, %laneid;" : "=r"(lane));
     return lane;
 }
-
 __device__ __forceinline__ bool elect_one_sync() {
     uint32_t pred;
     asm volatile("{\n\t.reg .pred p;\n\t"
@@ -265,14 +280,13 @@ __device__ __forceinline__ bool elect_one_sync() {
 } // namespace ptx
 
 // ======================== TMA Copy Helpers ========================
-// Aligned with DeepGEMM common/tma_copy.cuh — uses CuTe API directly
 namespace tma {
 
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-// TMA 2D copy for 2SM mode (DeepGEMM tma_copy.cuh L37-44)
-// For K-major BF16, BLOCK_K=64, SWIZZLE_128B: atom_size = 128/2 = 64 elements
-// So BLOCK_K / atom_size = 64/64 = 1 → single TMA per tile (no loop needed)
+// 2SM TMA 2D load (K-major, 128B swizzle -> single atom per tile).
+// Each CTA independently loads its own box at (k_idx, mn_idx); the 2SM op only
+// redirects the transaction bytes to the leader's mbarrier (peer-bit mask).
 __device__ __forceinline__
 void copy_2sm_2d(void const* desc_ptr, Barrier* barrier_ptr,
                  nv_bfloat16* smem_ptr, uint32_t k_idx, uint32_t mn_idx) {
@@ -284,7 +298,7 @@ void copy_2sm_2d(void const* desc_ptr, Barrier* barrier_ptr,
         k_idx, mn_idx);
 }
 
-// TMA store 2D (DeepGEMM sm100_store_cd.cuh L128)
+// TMA store 2D
 __device__ __forceinline__
 void store_2d(void const* desc_ptr, void* smem_ptr,
               uint32_t col_idx, uint32_t row_idx) {
@@ -292,17 +306,3 @@ void store_2d(void const* desc_ptr, void* smem_ptr,
 }
 
 } // namespace tma
-
-// ======================== Pipeline State ========================
-namespace wq_b {
-
-struct PipeState {
-    uint32_t index = 0;
-    uint32_t phase = 0;
-
-    __device__ __forceinline__ void advance() {
-        if (++index >= NUM_STAGES) { index = 0; phase ^= 1; }
-    }
-};
-
-} // namespace wq_b
