@@ -19,14 +19,31 @@ using namespace wq_b;
 using Barrier = mma_desc::Barrier;
 
 // ======================== Shared Memory Layout ========================
+template <int BLOCK_M_TPL>
 struct SharedStorage {
-    alignas(1024) uint8_t smem_cd[SMEM_CD_TOTAL];
-    alignas(1024) uint8_t smem_a[NUM_STAGES * SMEM_A_PER_STAGE];
-    alignas(1024) uint8_t smem_b[NUM_STAGES * SMEM_B_PER_STAGE];
+    static constexpr int LOAD_BLOCK_M_T = BLOCK_M_TPL;
+    static constexpr int STORE_BLOCK_M_T = BLOCK_M_TPL;  // min(128, BLOCK_M) but BLOCK_M<=128
+    static constexpr int NUM_STORE_THREADS_T = STORE_BLOCK_M_T;
+    static constexpr int SMEM_A_PER_STAGE_T = LOAD_BLOCK_M_T * BLOCK_K * sizeof(nv_bfloat16);
+    static constexpr int SMEM_CD_PER_STAGE_T = STORE_BLOCK_M_T * STORE_BLOCK_N * sizeof(float);
+    static constexpr int SMEM_CD_TOTAL_T = SMEM_CD_PER_STAGE_T * NUM_TMA_STORE_STAGES;
 
-    // Barriers (using CUTLASS ClusterTransactionBarrier, same as DeepGEMM)
-    alignas(16) Barrier full_barriers[NUM_STAGES];
-    alignas(16) Barrier empty_barriers[NUM_STAGES];
+    // Dynamic NUM_STAGES: fit within 232448 bytes
+    // DeepGEMM formula: (capacity - smem_extra) / smem_per_stage
+    // smem_extra = smem_cd + barriers(32*8*3 + 2*8*2 + 8 = 808) + tmem_ptr(4)
+    static constexpr int SMEM_PER_STAGE_T = SMEM_A_PER_STAGE_T + SMEM_B_PER_STAGE;
+    static constexpr int SMEM_BARRIERS = 32 * 8 * 3 + 2 * 8 * 2 + 8;  // 808
+    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL_T + SMEM_BARRIERS + 4;
+    static constexpr int NUM_STAGES_COMPUTED = (232448 - SMEM_OVERHEAD) / SMEM_PER_STAGE_T;
+    static constexpr int NUM_STAGES_T = (NUM_STAGES_COMPUTED > 8) ? 8 : NUM_STAGES_COMPUTED;
+
+    alignas(1024) uint8_t smem_cd[SMEM_CD_TOTAL_T];
+    alignas(1024) uint8_t smem_a[NUM_STAGES_T * SMEM_A_PER_STAGE_T];
+    alignas(1024) uint8_t smem_b[NUM_STAGES_T * SMEM_B_PER_STAGE];
+
+    // Barriers
+    alignas(16) Barrier full_barriers[NUM_STAGES_T];
+    alignas(16) Barrier empty_barriers[NUM_STAGES_T];
     alignas(16) Barrier tmem_full_barriers[NUM_EPI_STAGES];
     alignas(16) Barrier tmem_empty_barriers[NUM_EPI_STAGES];
 
@@ -35,6 +52,7 @@ struct SharedStorage {
 };
 
 // ======================== Kernel ========================
+template <int BLOCK_M_TPL>
 __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,
@@ -43,8 +61,16 @@ wq_b_proj_kernel(
     int M, int N, int K,
     int num_m_blocks, int num_n_tiles, int total_tiles, int num_blocks)
 {
+    // Local constants derived from template parameter
+    constexpr int LOAD_BLOCK_M_T = BLOCK_M_TPL;
+    constexpr int STORE_BLOCK_M_T = BLOCK_M_TPL;
+    constexpr int NUM_STORE_THREADS_T = STORE_BLOCK_M_T;
+    constexpr int SMEM_A_PER_STAGE_T = LOAD_BLOCK_M_T * BLOCK_K * sizeof(nv_bfloat16);
+
+    using Storage = SharedStorage<BLOCK_M_TPL>;
+    constexpr int NUM_STAGES_T = Storage::NUM_STAGES_T;
     extern __shared__ __align__(1024) uint8_t smem_buf[];
-    SharedStorage& s = *reinterpret_cast<SharedStorage*>(smem_buf);
+    Storage& s = *reinterpret_cast<Storage*>(smem_buf);
 
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t lane_id = ptx::get_lane_idx();
@@ -67,13 +93,13 @@ wq_b_proj_kernel(
 
     // 3. Initialize barriers (DeepGEMM L148-L167)
     if (warp_id == 1 && ptx::elect_one_sync()) {
-        for (int i = 0; i < NUM_STAGES; ++i) {
+        for (int i = 0; i < NUM_STAGES_T; ++i) {
             s.full_barriers[i].init(NUM_MULTICAST);
             s.empty_barriers[i].init(1);
         }
         for (int i = 0; i < NUM_EPI_STAGES; ++i) {
             s.tmem_full_barriers[i].init(1);
-            s.tmem_empty_barriers[i].init(NUM_MULTICAST * NUM_STORE_THREADS);
+            s.tmem_empty_barriers[i].init(NUM_MULTICAST * NUM_STORE_THREADS_T);
         }
         cutlass::arch::fence_barrier_init();
     }
@@ -99,66 +125,55 @@ wq_b_proj_kernel(
     auto a_desc = mma_desc::make_smem_desc_k_major(smem_a_base);
     auto b_desc = mma_desc::make_smem_desc_k_major(smem_b_base);
 
-    // Pre-store each stage's desc.lo in lane registers
-    uint32_t a_desc_lo = (lane_id < NUM_STAGES)
-        ? a_desc.lo + lane_id * (SMEM_A_PER_STAGE / 16) : 0u;
-    uint32_t b_desc_lo = (lane_id < NUM_STAGES)
+    uint32_t a_desc_lo = (lane_id < NUM_STAGES_T)
+        ? a_desc.lo + lane_id * (SMEM_A_PER_STAGE_T / 16) : 0u;
+    uint32_t b_desc_lo = (lane_id < NUM_STAGES_T)
         ? b_desc.lo + lane_id * (SMEM_B_PER_STAGE / 16) : 0u;
 
     // Instruction descriptor
     uint64_t runtime_idesc = mma_desc::make_runtime_instr_desc();
 
     // ================================================================
-    // PERSISTENT TILE LOOP (DeepGEMM L183-254)
+    // THREE-WAY INDEPENDENT PERSISTENT LOOPS (DeepGEMM architecture)
+    // Tile scheduling: DeepGEMM L117-152 get_swizzled_block_idx
+    // For kIsMulticastOnA=false: grouping on M, interleave M first
+    // m_block_idx = block_idx % num_m_blocks
+    // n_block_idx = block_idx / num_m_blocks
+    // This makes adjacent blocks share B's L2 cache lines.
     // ================================================================
-    // Pipeline state: persistent across tiles (DeepGEMM L184)
-    uint32_t stage_idx = 0, phase = 0;
-    auto advance_pipeline = [&]() {
-        stage_idx = (stage_idx + 1) % NUM_STAGES;
-        if (stage_idx == 0) phase ^= 1;
-    };
-
-    uint32_t persistent_iter = 0;
-
-    // Cluster-aware scheduling: both CTAs in a cluster process the SAME tile
-    // (DeepGEMM scheduler assigns same tile to all CTAs in a cluster)
     int num_clusters = num_blocks / CLUSTER_M;
     int cluster_id = blockIdx.x / CLUSTER_M;
+    int num_tiles_total = total_tiles;
 
-    for (int tile_id = cluster_id; tile_id < total_tiles; tile_id += num_clusters) {
-        int n_tile = tile_id % num_n_tiles;
-        int m_block = tile_id / num_n_tiles;
+    // ======== WARP 0: TMA PRODUCER (independent persistent loop) ========
+    if (warp_id == 0 && ptx::elect_one_sync()) {
+        uint32_t stage_idx = 0, phase = 0;
+        auto advance_pipeline = [&]() {
+            stage_idx = (stage_idx + 1) % NUM_STAGES_T;
+            if (stage_idx == 0) phase ^= 1;
+        };
 
-        // Per-CTA coordinates (DeepGEMM L225-228)
-        // kIsMulticastOnA=false: A has no cta_rank offset, B has cta_rank*LOAD_BLOCK_N offset
-        int n_offset = n_tile * BLOCK_N + cta_rank * LOAD_BLOCK_N;
+        for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
+            // DeepGEMM swizzle: M-major for L2 reuse of B
+            int m_block = tile_id % num_m_blocks;
+            int n_tile = tile_id / num_m_blocks;
+            int n_offset = n_tile * BLOCK_N + cta_rank * LOAD_BLOCK_N;
 
-        // TMEM accumulator stage
-        uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
-        uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
-
-        // ======== WARP 0: TMA PRODUCER (DeepGEMM L194-L254) ========
-        if (warp_id == 0 && ptx::elect_one_sync()) {
             for (int k = 0; k < NUM_K_TILES; ++k) {
-                // Wait consumer release (DeepGEMM L205: unconditional)
                 s.empty_barriers[stage_idx].wait(phase ^ 1);
 
-                // Both CTAs issue TMA (DeepGEMM L230-244)
                 int k_offset = k * BLOCK_K;
                 auto* smem_a_dst = reinterpret_cast<nv_bfloat16*>(
-                    s.smem_a + stage_idx * SMEM_A_PER_STAGE);
+                    s.smem_a + stage_idx * SMEM_A_PER_STAGE_T);
                 auto* smem_b_dst = reinterpret_cast<nv_bfloat16*>(
                     s.smem_b + stage_idx * SMEM_B_PER_STAGE);
 
-                // A: same m_offset for all CTAs (kIsMulticastOnA=false)
                 tma::copy_2sm_2d(&desc_A, &s.full_barriers[stage_idx],
-                                 smem_a_dst, k_offset, m_block * BLOCK_M);
-                // B: each CTA loads its own N-slice
+                                 smem_a_dst, k_offset, m_block * BLOCK_M_TPL);
                 tma::copy_2sm_2d(&desc_B, &s.full_barriers[stage_idx],
                                  smem_b_dst, k_offset, n_offset);
 
-                // Arrive at full barrier AFTER TMA (DeepGEMM L246-252)
-                constexpr uint32_t kNumArrivalBytes = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE;
+                constexpr uint32_t kNumArrivalBytes = SMEM_A_PER_STAGE_T + SMEM_B_PER_STAGE;
                 if (is_leader) {
                     s.full_barriers[stage_idx].arrive_and_expect_tx(
                         kNumArrivalBytes * NUM_MULTICAST);
@@ -169,38 +184,40 @@ wq_b_proj_kernel(
                 advance_pipeline();
             }
         }
+    }
 
-        // ======== WARP 1: MMA CONSUMER (DeepGEMM L255-L397, leader only) ========
-        else if (warp_id == 1 && is_leader) {
-            // Wait for TMEM to be empty (DeepGEMM L304-L306)
+    // ======== WARP 1: MMA CONSUMER (independent persistent loop, leader only) ========
+    else if (warp_id == 1 && is_leader) {
+        uint32_t stage_idx = 0, phase = 0;
+        auto advance_pipeline = [&]() {
+            stage_idx = (stage_idx + 1) % NUM_STAGES_T;
+            if (stage_idx == 0) phase ^= 1;
+        };
+
+        uint32_t persistent_iter = 0;
+        for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
+            uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
+            uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
+
+            // Wait for TMEM to be empty
             s.tmem_empty_barriers[accum_stage].wait(accum_phase ^ 1);
             ptx::tcgen05_fence_after_sync();
 
-            // NOTES: TMEM addresses start from 0, NOT s.tmem_base
-            // s.tmem_base stores (row << 16) | num_cols, used only for dealloc
             uint32_t tmem_c = accum_stage * UMMA_N;
 
-            // MMA consumer pipeline state: persistent across tiles (same as TMA)
-            // Uses the same stage_idx/phase (each warp has its own copy, both start at 0)
-            // Note: we use a local mma_stage/mma_phase that mirrors stage_idx/phase
-            // They track the same pipeline progression.
-
             for (int k = 0; k < NUM_K_TILES; ++k) {
-                // Wait for TMA to fill this stage (DeepGEMM L316)
                 s.full_barriers[stage_idx].wait(phase);
                 ptx::tcgen05_fence_after_sync();
 
-                // Get this stage's descriptor bases via warp shuffle
                 uint32_t a_base = __shfl_sync(0xffffffff, a_desc_lo, stage_idx);
                 uint32_t b_base = __shfl_sync(0xffffffff, b_desc_lo, stage_idx);
 
-                // Issue BLOCK_K / UMMA_K = 4 MMA instructions
                 if (ptx::elect_one_sync()) {
+                    #pragma unroll
                     for (int kk = 0; kk < BLOCK_K / UMMA_K; ++kk) {
                         uint32_t a_lo = mma_desc::advance_desc_lo_for_k(a_base, kk);
                         uint32_t b_lo = mma_desc::advance_desc_lo_for_k(b_base, kk);
 
-                        // Reconstruct full 64-bit descriptors
                         uint64_t a_full = (static_cast<uint64_t>(a_desc.hi) << 32) | a_lo;
                         uint64_t b_full = (static_cast<uint64_t>(b_desc.hi) << 32) | b_lo;
 
@@ -211,12 +228,10 @@ wq_b_proj_kernel(
                 }
                 __syncwarp();
 
-                // Signal MMA done (DeepGEMM L297: umma_arrive multicast to both CTAs)
-                constexpr uint16_t CTA_MASK = (1 << NUM_MULTICAST) - 1; // 0x3
+                // Signal MMA done + optional TMEM full
+                constexpr uint16_t CTA_MASK = (1 << NUM_MULTICAST) - 1;
                 ptx::umma_arrive_multicast_2sm(
                     reinterpret_cast<uint64_t*>(&s.empty_barriers[stage_idx]), CTA_MASK);
-
-                // On last k-tile: signal TMEM is full for epilogue
                 if (k == NUM_K_TILES - 1) {
                     ptx::umma_arrive_multicast_2sm(
                         reinterpret_cast<uint64_t*>(&s.tmem_full_barriers[accum_stage]),
@@ -224,44 +239,57 @@ wq_b_proj_kernel(
                 }
                 __syncwarp();
 
-                // Advance pipeline (same progression as TMA warp)
                 advance_pipeline();
             }
+
+            persistent_iter++;
         }
 
-        // ======== WARPS 4-5: EPILOGUE (only NUM_STORE_THREADS=64 participate) ========
-        else if (warp_id >= NUM_NON_EPI_THREADS / 32 && 
-                 warp_id < (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32) {
-            uint32_t epi_warp_idx = warp_id - (NUM_NON_EPI_THREADS / 32);
+        // Wait last epilogue before dealloc (DeepGEMM L392-397)
+        if (persistent_iter > 0) {
+            uint32_t last_iter = persistent_iter - 1;
+            uint32_t last_accum_stage = last_iter % NUM_EPI_STAGES;
+            uint32_t last_accum_phase = (last_iter / NUM_EPI_STAGES) & 1;
+            s.tmem_empty_barriers[last_accum_stage].wait(last_accum_phase);
+        }
+    }
+
+    // ======== EPILOGUE WARPS (independent persistent loop) ========
+    else if (warp_id >= NUM_NON_EPI_THREADS / 32 &&
+             warp_id < (NUM_NON_EPI_THREADS + NUM_STORE_THREADS_T) / 32) {
+        uint32_t epi_warp_idx = warp_id - (NUM_NON_EPI_THREADS / 32);
+        uint32_t tma_store_idx = 0;
+
+        uint32_t persistent_iter = 0;
+        for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
+            // DeepGEMM swizzle: M-major for L2 reuse of B
+            int m_block = tile_id % num_m_blocks;
+            int n_tile = tile_id / num_m_blocks;
+
+            uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
+            uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
 
             // Wait for MMA to fill TMEM
             s.tmem_full_barriers[accum_stage].wait(accum_phase);
             ptx::tcgen05_fence_after_sync();
 
-            // NOTES: TMEM addresses start from 0, NOT s.tmem_base
             uint32_t tmem_base_addr = accum_stage * UMMA_N;
-            int out_m = m_block * BLOCK_M;
-            // 2SM: both CTAs compute full BLOCK_N, store to same output region
+            int out_m = m_block * BLOCK_M_TPL;
             int out_n = n_tile * BLOCK_N;
 
-            // Iterate over N in STORE_BLOCK_N=32 chunks (DeepGEMM pattern)
-            constexpr int NUM_N_STORES = BLOCK_N / STORE_BLOCK_N; // 256/32 = 8
+            constexpr int NUM_N_STORES = BLOCK_N / STORE_BLOCK_N;
             constexpr int NUM_BANK_GROUP_BYTES = 16;
-            constexpr int ELEMS_PER_BG = NUM_BANK_GROUP_BYTES / sizeof(float); // 4
-
-            uint32_t tma_store_idx = 0;
+            constexpr int ELEMS_PER_BG = NUM_BANK_GROUP_BYTES / sizeof(float);
 
             for (int ns = 0; ns < NUM_N_STORES; ++ns, tma_store_idx = (tma_store_idx + 1) % NUM_TMA_STORE_STAGES) {
                 auto* smem_cd_ptr = reinterpret_cast<uint8_t*>(
-                    s.smem_cd + tma_store_idx * SMEM_CD_PER_STAGE);
+                    s.smem_cd + tma_store_idx * Storage::SMEM_CD_PER_STAGE_T);
 
-                // Wait for previous TMA store
                 if (epi_warp_idx == 0) {
                     cute::tma_store_wait<NUM_TMA_STORE_STAGES - 1>();
                 }
-                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
+                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS_T, 0);
 
-                // TMEM → SMEM with swizzle (from DeepGEMM epilogue)
                 for (int i = 0; i < STORE_BLOCK_N / ELEMS_PER_BG; ++i) {
                     uint32_t tmem_addr = tmem_base_addr + ns * STORE_BLOCK_N + i * ELEMS_PER_BG;
 
@@ -269,7 +297,6 @@ wq_b_proj_kernel(
                     ptx::tmem_load_32dp32b4x(tmem_addr, v0, v1, v2, v3);
                     cutlass::arch::fence_view_async_tmem_load();
 
-                    // Swizzle address (DeepGEMM pattern: 128B swizzle, 8 bank groups)
                     uint32_t bank_group_idx = i + lane_id * (SWIZZLE_CD / NUM_BANK_GROUP_BYTES);
                     constexpr bool kHasShortcut = (SWIZZLE_CD / NUM_BANK_GROUP_BYTES) == 8;
                     uint32_t row = kHasShortcut ? (i / 8 + lane_id) : (bank_group_idx / 8);
@@ -283,15 +310,13 @@ wq_b_proj_kernel(
                     ptx::st_shared_v4(smem_dst, v0, v1, v2, v3);
                 }
 
-                // Signal TMEM empty on last iteration
                 if (ns == NUM_N_STORES - 1) {
                     ptx::tcgen05_fence_before_sync();
                     s.tmem_empty_barriers[accum_stage].arrive(0u);
                 }
 
-                // Fence + sync + TMA store
                 cute::tma_store_fence();
-                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
+                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS_T, 0);
 
                 if (epi_warp_idx == 0 && ptx::elect_one_sync()) {
                     int store_n = out_n + ns * STORE_BLOCK_N;
@@ -300,17 +325,9 @@ wq_b_proj_kernel(
                 }
                 __syncwarp();
             }
+
+            persistent_iter++;
         }
-
-        persistent_iter++;
-    }
-
-    // DeepGEMM waits the last epilogue release before final synchronization/deallocation.
-    if (warp_id == 1 && is_leader && persistent_iter > 0) {
-        uint32_t last_iter = persistent_iter - 1;
-        uint32_t last_accum_stage = last_iter % NUM_EPI_STAGES;
-        uint32_t last_accum_phase = (last_iter / NUM_EPI_STAGES) & 1;
-        s.tmem_empty_barriers[last_accum_stage].wait(last_accum_phase);
     }
 
     // ================================================================
@@ -365,7 +382,10 @@ torch::Tensor wq_b_proj_gemm(
     TORCH_CHECK(w.size(0) == N_TOTAL && w.size(1) == K_DIM);
     TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0);
 
-    const int M_padded = ((M + BLOCK_M - 1) / BLOCK_M) * BLOCK_M;
+    // Select BLOCK_M based on M (DeepGEMM sm100.hpp L62-64)
+    // M<=64 -> BLOCK_M=64, M>64 -> BLOCK_M=128
+    const int block_m = (M <= 64) ? 64 : 128;
+    const int M_padded = ((M + block_m - 1) / block_m) * block_m;
 
     torch::Tensor x_padded = x;
     if (M < M_padded) {
@@ -380,15 +400,17 @@ torch::Tensor wq_b_proj_gemm(
     auto w_ptr = reinterpret_cast<const nv_bfloat16*>(w.data_ptr());
     auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
 
-    // TMA descriptors (passed BY VALUE to kernel via cudaLaunchKernelExC)
-    CUtensorMap desc_A = make_tma_desc_bf16_2d(x_ptr, M_padded, K_DIM, LOAD_BLOCK_M, BLOCK_K);
+    // TMA descriptors
+    const int load_block_m = block_m;  // = BLOCK_M_TPL
+    CUtensorMap desc_A = make_tma_desc_bf16_2d(x_ptr, M_padded, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B = make_tma_desc_bf16_2d(w_ptr, N_TOTAL, K_DIM, LOAD_BLOCK_N, BLOCK_K);
-    CUtensorMap desc_D = make_tma_desc_fp32_2d(out_ptr, M_padded, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N);
+    const int store_block_m = block_m;  // = STORE_BLOCK_M_T
+    CUtensorMap desc_D = make_tma_desc_fp32_2d(out_ptr, M_padded, N_TOTAL, store_block_m, STORE_BLOCK_N);
 
     // Grid: persistent
     int num_SMs;
     cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, 0);
-    int num_m_blocks = M_padded / BLOCK_M;
+    int num_m_blocks = M_padded / block_m;
     int num_n_tiles = N_TOTAL / BLOCK_N;
     int total_tiles_val = num_m_blocks * num_n_tiles;
     // grid_size must be multiple of cluster_dim.x=2
@@ -396,8 +418,14 @@ torch::Tensor wq_b_proj_gemm(
     grid_size = (grid_size / 2) * 2;  // round down to multiple of 2
     if (grid_size < 2) grid_size = 2;
 
-    int smem_bytes = static_cast<int>(sizeof(SharedStorage));
-    auto attr_err = cudaFuncSetAttribute(wq_b_proj_kernel,
+    int smem_bytes = (block_m == 64)
+        ? static_cast<int>(sizeof(SharedStorage<64>))
+        : static_cast<int>(sizeof(SharedStorage<128>));
+    auto kernel_64 = &wq_b_proj_kernel<64>;
+    auto kernel_128 = &wq_b_proj_kernel<128>;
+    void* kernel_ptr = (block_m == 64) ? (void*)kernel_64 : (void*)kernel_128;
+
+    auto attr_err = cudaFuncSetAttribute(kernel_ptr,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err),
                 " smem_bytes=", smem_bytes);
@@ -422,7 +450,6 @@ torch::Tensor wq_b_proj_gemm(
         config.numAttrs = 1;
 
         // Use cudaLaunchKernelExC (C API) to pass CUtensorMap by value
-        // (C++ template cudaLaunchKernelEx doesn't handle 128-byte structs correctly)
         int M_val = M_padded;
         int N_val = N_TOTAL;
         int K_val = K_DIM;
@@ -433,7 +460,7 @@ torch::Tensor wq_b_proj_gemm(
         };
         auto err = cudaLaunchKernelExC(
             &config,
-            (void*)wq_b_proj_kernel,
+            kernel_ptr,
             ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
     }
