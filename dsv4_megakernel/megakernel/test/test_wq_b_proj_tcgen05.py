@@ -160,8 +160,10 @@ def benchmark(module):
     batch_sizes = [32, 64, 128, 256]
     print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
     print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
-    print(f"  {'M':<6} {'tcgen05(us)':<12} {'cuBLAS(us)':<12} {'Ratio':<8} {'TFLOPS':<10} {'BW(GB/s)':<10}")
-    print("  " + "-" * 60)
+    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Our output is FP32,")
+    print(f"        cuBLAS output is BF16, so each BW uses its own output bytes.")
+    print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
+    print("  " + "-" * 70)
 
     for M in batch_sizes:
         x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
@@ -194,11 +196,18 @@ def benchmark(module):
 
         flops = 2 * M * N_TOTAL * K_DIM
         tflops = flops / (ours_us * 1e-6) / 1e12
-        bytes_total = weight_bytes + M * K_DIM * 2 + M * N_TOTAL * 2
-        bw_gbs = bytes_total / (ours_us * 1e-6) / 1e9
-        ratio = ours_us / cublas_us
 
-        print(f"  {M:<6} {ours_us:<12.1f} {cublas_us:<12.1f} {ratio:<8.2f} {tflops:<10.2f} {bw_gbs:<10.1f}")
+        # Bytes moved: shared weight + activation(bf16); output differs by dtype
+        common_bytes = weight_bytes + M * K_DIM * 2
+        ours_bytes   = common_bytes + M * N_TOTAL * 4   # our output is FP32
+        cublas_bytes = common_bytes + M * N_TOTAL * 2   # cuBLAS output is BF16
+        ours_bw   = ours_bytes   / (ours_us   * 1e-6) / 1e9
+        cublas_bw = cublas_bytes / (cublas_us * 1e-6) / 1e9
+
+        # latency-based achievement vs cuBLAS: 100% = same speed, >100% = faster
+        pct_cublas = cublas_us / ours_us * 100.0
+
+        print(f"  {M:<5} {ours_us:<10.1f} {cublas_us:<11.1f} {ours_bw:<10.1f} {cublas_bw:<11.1f} {tflops:<9.1f} {pct_cublas:<7.1f}%")
 
 
 if __name__ == '__main__':
