@@ -4,6 +4,16 @@
 
 计算 C[M, N] = A[M, K] × B^T[N, K]（TN layout：A row-major, B row-major 即 B 转置后参与计算）。
 
+### 核心思想：分块换数据复用
+
+GEMM 是**计算密集 (compute bound)** 型算子：`M=N=K` 时算 `2N³` FLOP，只读 `3N²` 数据，算术强度随 N 增长。瓶颈不在 HBM 带宽，而在能否**喂饱 Tensor Core**——为此必须靠分块把数据搬到片上反复复用：
+
+```
+HBM (慢, 大) → SMEM (每 block 复用一个 tile) → 寄存器 (每 warp/线程复用) → Tensor Core
+```
+
+每个 C tile 的一个元素要累加 K 个乘积，把 A/B 的 tile 提到 smem 后，`BlockM × BlockN` 个输出共享同一份 smem 数据，HBM 读取量降为 `1/BlockN + 1/BlockM`。因此优化主线有二：**① 让搬运不阻塞计算**（double buffering / cp.async / TMA / warp specialize），**② 消除片上访存开销**（bank conflict → padding / swizzle，ldmatrix 直取 mma 布局）。
+
 ### 分层并行结构
 
 ```
@@ -92,6 +102,8 @@ WMMA API 是黑盒，无法控制寄存器布局。替换为手写 PTX：
 1. 精确控制 smem 地址计算，为后续 swizzle 优化铺路
 2. 避免 WMMA 可能的冗余数据搬运
 3. 一个 warp tile（如 64×64）拆成多个 16×16 mma 指令，用 `#pragma unroll` 全展开
+
+**fragment 布局（面试常考）**：`ldmatrix.x4` 一条指令让 32 个 lane 协同从 smem 取一个 8×8×4 的块，直接摆成 mma 需要的寄存器分布——lane `t` 负责 `row = t%16, col = (t/16)*8`，省去手写 shuffle。`mma.m16n8k16` 的累加器每个 lane 持 2 行（`row0 = lane>>2` 与 `row0+8`），两条拼成 m16n16 即 4 个 uint32/lane。掌握这套 per-lane 布局，才能像 FlashAttention 那样直接在累加器寄存器上做 per-row rescale（见 [flash_attention.md](flash_attention.md) §3.3）。
 
 ### 7. Reuse A smem for C [`a3398ad`](https://github.com/guluguluhhhh/wuda/commit/a3398ad)
 
