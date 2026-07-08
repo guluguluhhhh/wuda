@@ -14,6 +14,19 @@
 
 namespace cg = cooperative_groups;
 
+// ============================================================
+// Optimized CC kernel (HC-group split so hidden is read from HBM ONCE)
+//
+//   block_rank==0 owns HC groups {0,1}, block_rank==1 owns {2,3}.
+//   Each block streams its contiguous HALF_K = 2*DIM slice of hidden into
+//   smem ONCE (vectorized 128-bit), then reuses it for:
+//     Phase 1 RMSNorm (partial sq_sum, dsmem merge)
+//     Phase 2 GEMV     (partial acc[N_OUT], dsmem merge)
+//     Phase 5 Collapse (reads own + remote smem via dsmem, no HBM re-read)
+//   Sinkhorn runs on a single warp with shuffles (no __syncthreads storm).
+//   rms_scale is folded into the mix result (mathematically identical to
+//   normalizing x, since it is a per-row scalar).
+// ============================================================
 template <int HC, int DIM, int N_OUT, int BLOCK_SIZE, int SINKHORN_ITERS>
 __global__ void __attribute__((cluster_dim(2, 1, 1))) __launch_bounds__(1024)
 hc_fused_kernel(
@@ -30,12 +43,16 @@ hc_fused_kernel(
     float* __restrict__ comb_out                      // [num_pos, HC*HC]
 ) {
     cg::cluster_group cluster = cg::this_cluster();
-    const int block_rank = cluster.block_rank();
+    const int block_rank = cluster.block_rank();             // 0 or 1
 
     constexpr int HC_DIM_TOTAL = HC * DIM;                    // 28672
-    constexpr int HALF_K = HC_DIM_TOTAL / 2;                  // 14336
-    constexpr int ELEMS_PER_THR = HALF_K / BLOCK_SIZE;        // 14
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;                // 32
+    constexpr int GROUPS_PER_BLOCK = HC / 2;                  // 2 HC groups per block
+    constexpr int HALF_K = GROUPS_PER_BLOCK * DIM;            // 14336 (contiguous slice)
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;               // 32
+    constexpr int HALF_K_I4 = HALF_K / 8;                    // 1792 int4 (128-bit)
+    constexpr int HALF_DIM = DIM / 2;                         // 3584
+    constexpr int HALF_DIM_I4 = HALF_DIM / 8;                // 448
+    constexpr int DIM_I4 = DIM / 8;                          // 896
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -44,18 +61,11 @@ hc_fused_kernel(
     const int num_clusters = gridDim.x / 2;
     const int cluster_id = blockIdx.x / 2;
 
-    for (int pos_idx = cluster_id; pos_idx < num_positions; pos_idx += num_clusters) {
-
-    // Per-position pointers
-    const __nv_bfloat16* hs_ptr = hidden_states + pos_idx * HC_DIM_TOTAL;
-    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * DIM;
-    float* pre_ptr = pre_out + pos_idx * HC;
-    float* post_ptr = post_out + pos_idx * HC;
-    float* comb_ptr = comb_out + pos_idx * HC * HC;
-
     // Shared memory (identical layout in both blocks for dsmem)
-    extern __shared__ float smem[];
-    float* reduce_smem = smem;                            // [NUM_WARPS]
+    extern __shared__ char smem_raw[];
+    __nv_bfloat16* hid_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);   // [HALF_K] bf16
+    float* fsmem = reinterpret_cast<float*>(hid_smem + HALF_K);
+    float* reduce_smem = fsmem;                           // [NUM_WARPS]
     float* partial_sq_slot = reduce_smem + NUM_WARPS;     // [1] dsmem exchange
     float* gemv_smem = partial_sq_slot + 1;               // [NUM_WARPS * N_OUT]
     float* acc_slot = gemv_smem + NUM_WARPS * N_OUT;      // [N_OUT] dsmem exchange
@@ -64,79 +74,75 @@ hc_fused_kernel(
     float* post_smem = pre_smem + HC;                     // [HC]
     float* comb_smem = post_smem + HC;                    // [HC*HC]
 
-    // ================================================================
-    // Phase 1: RMSNorm - each block loads K/2, merge sq_sum via dsmem
-    // block_rank==0 -> [0, HALF_K), block_rank==1 -> [HALF_K, HC_DIM_TOTAL)
-    // ================================================================
-    int half_offset = block_rank * HALF_K;
-    float orig_vals[ELEMS_PER_THR];
-    int base_idx = tid * ELEMS_PER_THR;
+    const float s_pre_scale = attn_hc_scale[0];
+    const float s_post_scale = attn_hc_scale[1];
+    const float s_comb_scale = attn_hc_scale[2];
 
+    for (int pos_idx = cluster_id; pos_idx < num_positions; pos_idx += num_clusters) {
+
+    // block_rank r owns hidden[pos, r*HALF_K : (r+1)*HALF_K) = HC groups {2r, 2r+1}
+    const __nv_bfloat16* hs_base = hidden_states + pos_idx * HC_DIM_TOTAL + block_rank * HALF_K;
+    __nv_bfloat16* col_ptr = collapsed_out + pos_idx * DIM;
+
+    // ================================================================
+    // Phase 0+1: load hidden slice into smem (128-bit) + RMSNorm sq_sum
+    // ================================================================
+    const int4* hs_g = reinterpret_cast<const int4*>(hs_base);
+    int4* hs_s = reinterpret_cast<int4*>(hid_smem);
     float sq_sum = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < ELEMS_PER_THR; i++) {
-        float v = bf16_to_float(hs_ptr[half_offset + base_idx + i]);
-        orig_vals[i] = v;
-        sq_sum += v * v;
+    for (int idx = tid; idx < HALF_K_I4; idx += BLOCK_SIZE) {
+        int4 v = hs_g[idx];
+        hs_s[idx] = v;
+        const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 f = __bfloat1622float2(p[j]);
+            sq_sum += f.x * f.x + f.y * f.y;
+        }
     }
 
+    // Block-local sq_sum reduce only; the cross-block exchange is DEFERRED and
+    // fused with the GEMV acc exchange below (rms_scale is only needed at the
+    // very end when folding into mix, so no early cluster barrier is required).
     float partial_sq = block_reduce_sum<NUM_WARPS>(sq_sum, reduce_smem, tid);
     if (tid == 0) partial_sq_slot[0] = partial_sq;
-    __syncthreads();
-
-    cluster.sync();
-
-    // Each block reads the other's partial sum via dsmem
-    float* remote_sq = cluster.map_shared_rank(partial_sq_slot, 1 - block_rank);
-    float total_sq = partial_sq_slot[0] + *remote_sq;
-    float rms_scale_val = rsqrtf(total_sq / (float)HC_DIM_TOTAL + rms_norm_eps);
-
-    float norm_vals[ELEMS_PER_THR];
-    #pragma unroll
-    for (int i = 0; i < ELEMS_PER_THR; i++) {
-        norm_vals[i] = orig_vals[i] * rms_scale_val;
-    }
+    __syncthreads();  // publish partial_sq_slot + make hid_smem visible for GEMV
 
     // ================================================================
-    // Phase 2: GEMV - each block computes K/2, cluster.sync() + dsmem merge
+    // Phase 2: GEMV over this block's HALF_K (raw x, from smem)
+    // partial acc[N_OUT]; rms_scale folded into mix at the end.
     // ================================================================
-
     float acc[N_OUT];
     #pragma unroll
     for (int n = 0; n < N_OUT; n++) acc[n] = 0.0f;
 
-    #pragma unroll
-    for (int i = 0; i < ELEMS_PER_THR; i++) {
-        int k = half_offset + base_idx + i;
-        float x = norm_vals[i];
+    for (int k_local = tid; k_local < HALF_K; k_local += BLOCK_SIZE) {
+        float x = __bfloat162float(hid_smem[k_local]);
+        int k = block_rank * HALF_K + k_local;
         const int4* w_vec = reinterpret_cast<const int4*>(attn_hc_fn_t + k * N_OUT);
         int4 v0 = w_vec[0], v1 = w_vec[1], v2 = w_vec[2];
-
         __nv_bfloat162* p0 = reinterpret_cast<__nv_bfloat162*>(&v0);
         __nv_bfloat162* p1 = reinterpret_cast<__nv_bfloat162*>(&v1);
         __nv_bfloat162* p2 = reinterpret_cast<__nv_bfloat162*>(&v2);
         #pragma unroll
         for (int j = 0; j < 4; j++) {
-            acc[j*2]     += x * __bfloat162float(__low2bfloat16(p0[j]));
-            acc[j*2+1]   += x * __bfloat162float(__high2bfloat16(p0[j]));
-            acc[8+j*2]   += x * __bfloat162float(__low2bfloat16(p1[j]));
-            acc[8+j*2+1] += x * __bfloat162float(__high2bfloat16(p1[j]));
-            acc[16+j*2]  += x * __bfloat162float(__low2bfloat16(p2[j]));
-            acc[16+j*2+1]+= x * __bfloat162float(__high2bfloat16(p2[j]));
+            float2 f0 = __bfloat1622float2(p0[j]);
+            float2 f1 = __bfloat1622float2(p1[j]);
+            float2 f2 = __bfloat1622float2(p2[j]);
+            acc[j*2]      += x * f0.x;  acc[j*2+1]    += x * f0.y;
+            acc[8+j*2]    += x * f1.x;  acc[8+j*2+1]  += x * f1.y;
+            acc[16+j*2]   += x * f2.x;  acc[16+j*2+1] += x * f2.y;
         }
     }
 
-    // Warp reduce
     #pragma unroll
     for (int n = 0; n < N_OUT; n++) acc[n] = warp_reduce_sum(acc[n]);
-
     if (lane_id == 0) {
         #pragma unroll
         for (int n = 0; n < N_OUT; n++) gemv_smem[warp_id * N_OUT + n] = acc[n];
     }
     __syncthreads();
 
-    // Cross-warp reduce -> acc_slot[N_OUT]
     if (tid < N_OUT) {
         float sum = 0.0f;
         #pragma unroll
@@ -145,130 +151,126 @@ hc_fused_kernel(
     }
     __syncthreads();
 
+    // Single combined cluster exchange: partial_sq (-> rms_scale) AND acc.
     cluster.sync();
-
-    // block_rank==0 merges both halves via dsmem
-    if (block_rank == 0 && tid < N_OUT) {
-        float* remote_acc = cluster.map_shared_rank(acc_slot, 1);
-        mix_smem[tid] = acc_slot[tid] + remote_acc[tid];
-    }
-    if (block_rank == 0) __syncthreads();
-
-    // Broadcast mix_smem[24] to block_rank==1 via dsmem
-    cluster.sync();
-    if (block_rank == 1 && tid < N_OUT) {
-        float* remote_mix = cluster.map_shared_rank(mix_smem, 0);
-        mix_smem[tid] = remote_mix[tid];
+    float total_sq = partial_sq_slot[0] + *cluster.map_shared_rank(partial_sq_slot, 1 - block_rank);
+    float rms_scale_val = rsqrtf(total_sq / (float)HC_DIM_TOTAL + rms_norm_eps);
+    if (tid < N_OUT) {
+        float* remote_acc = cluster.map_shared_rank(acc_slot, 1 - block_rank);
+        mix_smem[tid] = (acc_slot[tid] + remote_acc[tid]) * rms_scale_val;
     }
     __syncthreads();
 
     // ================================================================
-    // Phase 3: Activation (both blocks independently)
+    // Phase 3: Activation. Both blocks compute pre[] (needed by collapse).
+    // block_rank==0 additionally computes post[]/comb[] and writes gates.
     // ================================================================
-    __shared__ float s_pre_scale, s_post_scale, s_comb_scale;
-    if (tid == 0) {
-        s_pre_scale = attn_hc_scale[0];
-        s_post_scale = attn_hc_scale[1];
-        s_comb_scale = attn_hc_scale[2];
-    }
-    __syncthreads();
-
     if (tid < HC) {
         pre_smem[tid] = fast_sigmoid(mix_smem[tid] * s_pre_scale + attn_hc_base[tid]) + hc_eps;
-    } else if (tid < 2 * HC) {
-        int idx = tid - HC;
-        post_smem[idx] = 2.0f * fast_sigmoid(mix_smem[HC + idx] * s_post_scale + attn_hc_base[HC + idx]);
     }
-    if (tid < HC * HC) {
-        comb_smem[tid] = mix_smem[2 * HC + tid] * s_comb_scale + attn_hc_base[2 * HC + tid];
+    if (block_rank == 0) {
+        if (tid < HC) {
+            post_smem[tid] = 2.0f * fast_sigmoid(mix_smem[HC + tid] * s_post_scale + attn_hc_base[HC + tid]);
+        }
+        if (tid < HC * HC) {
+            comb_smem[tid] = mix_smem[2 * HC + tid] * s_comb_scale + attn_hc_base[2 * HC + tid];
+        }
     }
     __syncthreads();
 
     // ================================================================
-    // Phase 4: Softmax + Sinkhorn (both blocks independently)
+    // Phase 4: Softmax + Sinkhorn on the 4x4 comb, warp 0 of block 0 only.
+    // lane l holds comb[row=l/HC][col=l%HC]; reductions via shuffle.
     // ================================================================
-    if (tid == 0) {
+    if (block_rank == 0 && warp_id == 0) {
+        const unsigned FULL = 0xffffffffu;
+        float v = (lane_id < HC * HC) ? comb_smem[lane_id] : 0.0f;
+
+        // row-wise softmax (sum over cols == within groups of HC lanes: xor 1..HC/2)
+        float m = v;
         #pragma unroll
-        for (int row = 0; row < HC; row++) {
-            float max_val = comb_smem[row * HC];
-            for (int col = 1; col < HC; col++)
-                max_val = fmaxf(max_val, comb_smem[row * HC + col]);
-            float row_sum = 0.0f;
-            for (int col = 0; col < HC; col++) {
-                comb_smem[row * HC + col] = expf(comb_smem[row * HC + col] - max_val);
-                row_sum += comb_smem[row * HC + col];
-            }
-            for (int col = 0; col < HC; col++)
-                comb_smem[row * HC + col] = comb_smem[row * HC + col] / row_sum + hc_eps;
-        }
+        for (int o = 1; o < HC; o <<= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+        float e = __expf(v - m);
+        float rs = e;
         #pragma unroll
-        for (int col = 0; col < HC; col++) {
-            float col_sum = 0.0f;
-            for (int row = 0; row < HC; row++) col_sum += comb_smem[row * HC + col];
-            for (int row = 0; row < HC; row++) comb_smem[row * HC + col] /= (col_sum + hc_eps);
-        }
+        for (int o = 1; o < HC; o <<= 1) rs += __shfl_xor_sync(FULL, rs, o);
+        v = e / rs + hc_eps;
+
+        // column normalize (sum over rows == lanes differing by HC: xor HC, 2*HC, ...)
+        float cs = v;
+        #pragma unroll
+        for (int o = HC; o < HC * HC; o <<= 1) cs += __shfl_xor_sync(FULL, cs, o);
+        v = v / (cs + hc_eps);
+
+        #pragma unroll 1
         for (int iter = 0; iter < SINKHORN_ITERS - 1; iter++) {
-            for (int row = 0; row < HC; row++) {
-                float row_sum = 0.0f;
-                for (int col = 0; col < HC; col++) row_sum += comb_smem[row * HC + col];
-                for (int col = 0; col < HC; col++) comb_smem[row * HC + col] /= (row_sum + hc_eps);
-            }
-            for (int col = 0; col < HC; col++) {
-                float col_sum = 0.0f;
-                for (int row = 0; row < HC; row++) col_sum += comb_smem[row * HC + col];
-                for (int row = 0; row < HC; row++) comb_smem[row * HC + col] /= (col_sum + hc_eps);
-            }
-        }
-    }
-    __syncthreads();
-
-    // Write gates to global (block_rank==0 only)
-    if (block_rank == 0 && tid < HC) { pre_ptr[tid] = pre_smem[tid]; post_ptr[tid] = post_smem[tid]; }
-    if (block_rank == 0 && tid < HC * HC) { comb_ptr[tid] = comb_smem[tid]; }
-
-    // ================================================================
-    // Phase 5: Collapse - split output dims, both blocks in parallel
-    // block_rank==0 -> output[0, DIM/2), block_rank==1 -> output[DIM/2, DIM)
-    // Each block loads its half from HBM (14 bf16/thread) and accumulates HC=4
-    // ================================================================
-    constexpr int HALF_DIM = DIM / 2;                        // 3584
-    constexpr int THREADS_PER_HC_C = BLOCK_SIZE / HC;        // 256
-    constexpr int ELEMS_COL = HALF_DIM / THREADS_PER_HC_C;   // 14
-    int h_idx = tid / THREADS_PER_HC_C;                      // 0..3
-    int col_local = tid % THREADS_PER_HC_C;                  // 0..255
-    int d_offset = block_rank * HALF_DIM;                    // 0 or 3584
-    float pre_h = pre_smem[h_idx];
-    __syncthreads();
-
-    // Reuse smem as collapse buffer [HALF_DIM] = 3584 floats
-    float* col_buf = smem;
-    float col_contrib[ELEMS_COL];
-    #pragma unroll
-    for (int i = 0; i < ELEMS_COL; i++) {
-        int d = d_offset + col_local * ELEMS_COL + i;
-        col_contrib[i] = pre_h * bf16_to_float(hs_ptr[h_idx * DIM + d]);
-    }
-
-    if (h_idx == 0) {
-        #pragma unroll
-        for (int i = 0; i < ELEMS_COL; i++) col_buf[col_local * ELEMS_COL + i] = col_contrib[i];
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int g = 1; g < HC; g++) {
-        if (h_idx == g) {
+            float rs2 = v;
             #pragma unroll
-            for (int i = 0; i < ELEMS_COL; i++) col_buf[col_local * ELEMS_COL + i] += col_contrib[i];
+            for (int o = 1; o < HC; o <<= 1) rs2 += __shfl_xor_sync(FULL, rs2, o);
+            v = v / (rs2 + hc_eps);
+            float cs2 = v;
+            #pragma unroll
+            for (int o = HC; o < HC * HC; o <<= 1) cs2 += __shfl_xor_sync(FULL, cs2, o);
+            v = v / (cs2 + hc_eps);
         }
-        __syncthreads();
+        if (lane_id < HC * HC) comb_smem[lane_id] = v;
     }
 
-    // Write output [HALF_DIM] as bf16
-    for (int d = tid; d < HALF_DIM; d += BLOCK_SIZE) {
-        col_ptr[d_offset + d] = float_to_bf16(col_buf[d]);
+    // Write gates to global (block_rank==0)
+    if (block_rank == 0 && tid < HC) {
+        pre_out[pos_idx * HC + tid] = pre_smem[tid];
+        post_out[pos_idx * HC + tid] = post_smem[tid];
+    }
+    if (block_rank == 0 && tid < HC * HC) {
+        comb_out[pos_idx * HC * HC + tid] = comb_smem[tid];
     }
 
-    cluster.sync();  // end-of-iteration barrier
+    // ================================================================
+    // Phase 5: Collapse. out[d] = sum_h pre[h] * hidden[h*DIM + d].
+    // block r writes out[r*HALF_DIM : (r+1)*HALF_DIM); it holds groups
+    // {2r,2r+1} locally and reads {2(1-r),2(1-r)+1} from remote smem.
+    // No leading cluster.sync needed: the combined post-GEMV cluster.sync
+    // already established that both blocks loaded hid_smem, and hid_smem is
+    // untouched until next iteration's Phase 0 (gated by the end-of-iter sync).
+    // ================================================================
+    __nv_bfloat16* rem_smem = cluster.map_shared_rank(hid_smem, 1 - block_rank);
+
+    const float pl0 = pre_smem[2 * block_rank];
+    const float pl1 = pre_smem[2 * block_rank + 1];
+    const float pr0 = pre_smem[2 * (1 - block_rank)];
+    const float pr1 = pre_smem[2 * (1 - block_rank) + 1];
+
+    const int4* loc_i4 = reinterpret_cast<const int4*>(hid_smem);
+    const int4* rem_i4 = reinterpret_cast<const int4*>(rem_smem);
+    int4* out_i4 = reinterpret_cast<int4*>(col_ptr);
+    const int d0_i4 = block_rank * HALF_DIM_I4;   // int4 offset of this block's output range
+
+    for (int t = tid; t < HALF_DIM_I4; t += BLOCK_SIZE) {
+        int di4 = d0_i4 + t;                       // int4 index within [0, DIM_I4)
+        int4 la = loc_i4[di4];                     // local group0 : hidden[0*DIM + d]
+        int4 lb = loc_i4[DIM_I4 + di4];            // local group1 : hidden[1*DIM + d]
+        int4 ra = rem_i4[di4];                     // remote group0
+        int4 rb = rem_i4[DIM_I4 + di4];            // remote group1
+        const __nv_bfloat162* pla = reinterpret_cast<const __nv_bfloat162*>(&la);
+        const __nv_bfloat162* plb = reinterpret_cast<const __nv_bfloat162*>(&lb);
+        const __nv_bfloat162* pra = reinterpret_cast<const __nv_bfloat162*>(&ra);
+        const __nv_bfloat162* prb = reinterpret_cast<const __nv_bfloat162*>(&rb);
+        int4 outv;
+        __nv_bfloat162* po = reinterpret_cast<__nv_bfloat162*>(&outv);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float2 a = __bfloat1622float2(pla[j]);
+            float2 b = __bfloat1622float2(plb[j]);
+            float2 c = __bfloat1622float2(pra[j]);
+            float2 d = __bfloat1622float2(prb[j]);
+            float o0 = pl0 * a.x + pl1 * b.x + pr0 * c.x + pr1 * d.x;
+            float o1 = pl0 * a.y + pl1 * b.y + pr0 * c.y + pr1 * d.y;
+            po[j] = __floats2bfloat162_rn(o0, o1);
+        }
+        out_i4[di4] = outv;
+    }
+
+    cluster.sync();  // end-of-iteration barrier (smem reused next iteration)
     } // end grid-stride loop
 }
 
@@ -468,7 +470,12 @@ void hc_fused_launch(
     int num_sms = get_num_sms();
     int num_clusters = std::min(2 * num_sms, num_positions);
     int grid_size = num_clusters * 2;  // 2 blocks per cluster
-    int smem_size = DIM_DEFAULT * sizeof(float);
+    // smem: hidden slice [HALF_K] bf16 + float scratch (reduce/gemv/mix/gates)
+    constexpr int HALF_K = (HC_DEFAULT / 2) * DIM_DEFAULT;   // 14336
+    constexpr int NUM_WARPS = BLOCK / 32;                    // 32
+    int fscratch = (NUM_WARPS + 1 + NUM_WARPS * N_OUT_DEFAULT + N_OUT_DEFAULT
+                    + N_OUT_DEFAULT + HC_DEFAULT + HC_DEFAULT + HC_DEFAULT * HC_DEFAULT);
+    int smem_size = HALF_K * (int)sizeof(__nv_bfloat16) + fscratch * (int)sizeof(float);
 
     cudaLaunchConfig_t config = {};
     config.gridDim = grid_size;
