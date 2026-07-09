@@ -27,6 +27,7 @@
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/arch/copy_sm100_tma.hpp>
+#include <cute/arch/cluster_sm90.hpp>   // set_block_rank / store_shared_remote (DSMEM)
 
 // ======================== Configuration ========================
 namespace wq_b {
@@ -57,6 +58,15 @@ static constexpr int CLUSTER_BLOCK_N = BLOCK_N * NUM_MULTICAST; // 256 (per-clus
 static constexpr int LOAD_BLOCK_N   = BLOCK_N;      // 128 (weight rows loaded per CTA)
 static constexpr int NUM_N_TILES    = N_TOTAL / CLUSTER_BLOCK_N; // 65536/256 = 256
 
+// ---- Fused weightless RMSNorm over head_dim (aligns model.py wq_b: rsqrt(mean(q^2))) ----
+// A whole head must be resident in one cluster so the head_dim reduction is cluster-local.
+// One 2SM MMA covers CLUSTER_BLOCK_N(256) of N; a head (512) = SUBTILES_PER_HEAD sub-tiles.
+static constexpr int HEAD_DIM          = 512;                        // RMSNorm reduction length
+static constexpr int SUBTILES_PER_HEAD = HEAD_DIM / CLUSTER_BLOCK_N; // 512/256 = 2
+static constexpr int NUM_HEAD_TILES    = N_TOTAL / HEAD_DIM;         // 65536/512 = 128
+static_assert(HEAD_DIM % CLUSTER_BLOCK_N == 0, "head must be an integer number of cluster N-tiles");
+static_assert(N_TOTAL  % HEAD_DIM == 0,        "N must be an integer number of heads");
+
 // ---- Layout: both A(activation) and B(weight) are K-major ----
 static constexpr auto MAJOR_A = cute::UMMA::Major::K;
 static constexpr auto MAJOR_B = cute::UMMA::Major::K;
@@ -67,7 +77,9 @@ static constexpr int SWIZZLE_B  = 128;   // bytes
 static constexpr int SWIZZLE_CD = 128;   // bytes
 
 // ---- Pipeline ----
-static constexpr int NUM_EPI_STAGES      = 2;  // TMEM accumulator double buffer
+// NUM_EPI_STAGES (TMEM accumulator buffering) is now M-dependent and lives in SwapDims:
+// the fused kernel keeps SUBTILES_PER_HEAD accumulators resident per head, so TMEM
+// (512 cols) only fits double-buffering (=2) for M<=128; larger M falls back to 1.
 static constexpr int NUM_TMA_STORE_STAGES = 2;
 
 // ---- Threads: 128 non-epilogue + 128 epilogue = 256 ----
@@ -86,7 +98,9 @@ static constexpr int STORE_BLOCK_N_ATOM = SWIZZLE_CD / (int)sizeof(float); // 12
 // ---- Per-stage SMEM for weight B (constant); A depends on M ----
 static constexpr int SMEM_B_PER_STAGE  = LOAD_BLOCK_N * BLOCK_K * sizeof(nv_bfloat16); // 128*64*2 = 16384
 static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(float); // 16*128*4 = 8192
-static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES;      // 16384
+// Each TMA-store stage holds SUBTILES_PER_HEAD sub-tiles side by side so both are
+// written under one barrier pair (merged store -> halves epilogue barriers).
+static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES * SUBTILES_PER_HEAD; // 32768
 
 // SMEM capacity budget (SM100)
 static constexpr int SMEM_CAPACITY = 232448;
@@ -106,15 +120,24 @@ template <int M_> struct SwapDims {
     static constexpr int LOAD_BLOCK_M     = M_ / NUM_MULTICAST; // M/2 per CTA
     static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
     static constexpr int SMEM_PER_STAGE   = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE;
-    // Allocate kNumEpilogueStages * UMMA_N columns, rounded up to a power of two for
-    // tcgen05.alloc. The MMA/epilogue still address stages at accum_stage * UMMA_N.
-    static constexpr int NUM_TMEM_COLS    = ceil_pow2(NUM_EPI_STAGES * UMMA_N);
+
+    // TMEM accumulator buffering. Fused RMSNorm keeps SUBTILES_PER_HEAD accumulators
+    // (a whole head) resident, each UMMA_N columns wide. TMEM has 512 columns, so
+    // double-buffer (=2) only fits for M<=128; larger M uses a single buffer.
+    static constexpr int NUM_EPI_STAGES   = (SUBTILES_PER_HEAD * 2 * UMMA_N <= 512) ? 2 : 1;
+    // Allocate NUM_EPI_STAGES * SUBTILES_PER_HEAD * UMMA_N columns, rounded up to a power
+    // of two for tcgen05.alloc. Stage s / sub-tile j is addressed at
+    // (s * SUBTILES_PER_HEAD + j) * UMMA_N.
+    static constexpr int NUM_TMEM_COLS    = ceil_pow2(NUM_EPI_STAGES * SUBTILES_PER_HEAD * UMMA_N);
 
     // Solve number of stages fitting the SMEM budget.
-    // Overhead: smem_cd + barriers(full+empty per stage, tmem full/empty) + tmem_ptr.
+    // Overhead: smem_cd + reduction scratch (warp_sq[4][M] + rms[M] + peer_sq[EPI][M])
+    //           + barriers (full+empty per stage, tmem full/empty + dsmem per epi stage) + tmem_ptr.
     // Barrier bytes conservatively budgeted for up to 16 stages (8B each).
-    static constexpr int SMEM_BARRIERS = (16 * 2 + NUM_EPI_STAGES * 2) * 8; // <= actual for <=16 stages
-    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8;
+    // warp_sq[4][M] + peer_sq[EPI][M] + rms[M]  (per-warp reduction slots used by both paths).
+    static constexpr int SMEM_REDUCE   = (5 + NUM_EPI_STAGES) * M_ * (int)sizeof(float);
+    static constexpr int SMEM_BARRIERS = (16 * 2 + NUM_EPI_STAGES * 3) * 8; // <= actual for <=16 stages
+    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_REDUCE + SMEM_BARRIERS + 8;
     static constexpr int STAGES_RAW    = (SMEM_CAPACITY - SMEM_OVERHEAD) / SMEM_PER_STAGE;
     static constexpr int NUM_STAGES    = STAGES_RAW > 12 ? 12 : STAGES_RAW;
 };
@@ -275,6 +298,14 @@ __device__ __forceinline__ bool elect_one_sync() {
         "elect.sync _|p, 0xffffffff;\n\t"
         "selp.b32 %0, 1, 0, p;\n\t}" : "=r"(pred));
     return pred != 0;
+}
+
+// Full-warp (32-lane) sum reduction; result valid in lane 0.
+__device__ __forceinline__ float warp_reduce_sum32(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, o);
+    return v;
 }
 
 } // namespace ptx
