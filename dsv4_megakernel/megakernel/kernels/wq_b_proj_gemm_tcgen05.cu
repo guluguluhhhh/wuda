@@ -277,138 +277,15 @@ wq_b_proj_kernel(
         const uint32_t thread_in_wg = threadIdx.x - NUM_NON_EPI_THREADS;   // 0..127
         const uint32_t peer_rank    = cta_rank ^ 1u;
 
-      if constexpr (M_TPL <= 64) {
-        // ================================================================
-        // SMALL-M FAST PATH: single TMEM read (register-staged), per-warp
-        // reduction (no pre-zero/atomicAdd), TMEM freed right after the read.
-        // Targets the profile's #1 (barrier) and #3 (short-scoreboard/2nd read)
-        // stalls. Register footprint = SUBTILES_PER_HEAD * M floats/thread
-        // (M<=32: 64, M=64: 128); loops are fully unrolled to keep `raw` in
-        // registers — CHECK derived__local_spilling_requests==0 on hardware.
-        // ================================================================
-        uint32_t persistent_iter = 0;
-        for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
-            uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES_T;
-            uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES_T) & 1;
-
-            s.tmem_full_barriers[accum_stage].wait(accum_phase);
-            ptx::tcgen05_fence_after_sync();
-
-            // (1) single read of both sub-tiles into registers (this thread's N-partition, all M rows)
-            float raw[SUBTILES_PER_HEAD][M_TPL];
-            #pragma unroll
-            for (int st = 0; st < NUM_STORES; ++st) {
-                #pragma unroll
-                for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
-                    #pragma unroll
-                    for (int sub = 0; sub < SUBTILES_PER_HEAD; ++sub) {
-                        uint32_t tmem_addr = accum_stage * ACCUM_COLS_T + sub * UMMA_N_T
-                                           + st * STORE_BLOCK_M + i * 8;
-                        uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-                        ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
-                        cutlass::arch::fence_view_async_tmem_load();   // wait::ld before reading results
-                        uint32_t vv[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
-                        #pragma unroll
-                        for (int row = 0; row < 8; ++row)
-                            raw[sub][st * STORE_BLOCK_M + i * 8 + row] = __uint_as_float(vv[row]);
-                    }
-                }
-            }
-
-            // (2) all values now in registers -> free the accumulator immediately
-            ptx::tcgen05_fence_before_sync();
-            s.tmem_empty_barriers[accum_stage].arrive(0u);
-
-            // (3) per-row square + 32-lane warp reduce -> per-warp slot (no atomics)
-            #pragma unroll
-            for (int m = 0; m < M_TPL; ++m) {
-                float sq = 0.f;
-                #pragma unroll
-                for (int sub = 0; sub < SUBTILES_PER_HEAD; ++sub)
-                    sq += raw[sub][m] * raw[sub][m];
-                sq = ptx::warp_reduce_sum32(sq);
-                if (lane_id == 0)
-                    s.smem_warp_sq[epi_warp_idx][m] = sq;
-            }
-            cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);   // barrier #1: warp slots visible
-
-            // (4) combine 4 warps -> local partial; push to peer; wait; rsqrt.
-            uint32_t bar_addr = static_cast<uint32_t>(
-                __cvta_generic_to_shared(&s.dsmem_barriers[accum_stage]));
-            if (thread_in_wg == 0)
-                s.dsmem_barriers[accum_stage].arrive_and_expect_tx(M_TPL * sizeof(float));
-            for (uint32_t m = thread_in_wg; m < M_TPL; m += NUM_STORE_THREADS) {
-                float local = 0.f;
-                #pragma unroll
-                for (int w = 0; w < 4; ++w) local += s.smem_warp_sq[w][m];
-                uint32_t dst = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&s.smem_peer_sq[accum_stage][m]));
-                cute::store_shared_remote(__float_as_uint(local), dst, bar_addr, peer_rank);
-            }
-            s.dsmem_barriers[accum_stage].wait(accum_phase);
-            for (uint32_t m = thread_in_wg; m < M_TPL; m += NUM_STORE_THREADS) {
-                float local = 0.f;
-                #pragma unroll
-                for (int w = 0; w < 4; ++w) local += s.smem_warp_sq[w][m];
-                float full = local + s.smem_peer_sq[accum_stage][m];
-                s.smem_rms[m] = rsqrtf(full / float(HEAD_DIM) + eps);
-            }
-            cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);   // barrier #2: rms visible
-
-            // (5) scaled store straight from registers (no 2nd TMEM read)
-            #pragma unroll
-            for (int sub = 0; sub < SUBTILES_PER_HEAD; ++sub) {
-                int base_n = tile_id * HEAD_DIM + sub * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
-                int base_m = 0;
-                #pragma unroll
-                for (int st = 0; st < NUM_STORES; ++st,
-                     tma_store_idx = (tma_store_idx + 1) % NUM_TMA_STORE_STAGES) {
-                    auto* smem_cd_ptr = reinterpret_cast<uint8_t*>(
-                        s.smem_cd + tma_store_idx * SMEM_CD_PER_STAGE_T);
-
-                    if (epi_warp_idx == 0)
-                        cute::tma_store_wait<NUM_TMA_STORE_STAGES - 1>();
-                    cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
-
-                    #pragma unroll
-                    for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
-                        uint8_t* smem_base_ptr = smem_cd_ptr
-                            + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)
-                            + i * (8 * SWIZZLE_CD);
-                        uint32_t col = lane_id / 4;
-                        #pragma unroll
-                        for (uint32_t row = 0; row < 8; ++row) {
-                            int m = st * STORE_BLOCK_M + i * 8 + row;
-                            float scaled = raw[sub][m] * s.smem_rms[m];
-                            uint8_t* smem_ptr = smem_base_ptr
-                                + row * (16 * 8)
-                                + (col ^ row) * 16
-                                + (lane_id % 4) * sizeof(float);
-                            ptx::st_shared_u32(smem_ptr, __float_as_uint(scaled));
-                        }
-                    }
-
-                    cute::tma_store_fence();
-                    cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
-
-                    if (epi_warp_idx == 0 && ptx::elect_one_sync()) {
-                        #pragma unroll
-                        for (int i = 0; i < NUM_N_STORE_ATOMS; ++i) {
-                            auto* smem_ptr = reinterpret_cast<float*>(smem_cd_ptr)
-                                + i * (STORE_BLOCK_M * STORE_BLOCK_N_ATOM);
-                            int n_idx = base_n + i * STORE_BLOCK_N_ATOM;
-                            int m_idx = base_m + st * STORE_BLOCK_M;
-                            tma::store_2d(&desc_D, smem_ptr, n_idx, m_idx);
-                        }
-                        cute::tma_store_arrive();
-                    }
-                    __syncwarp();
-                }
-            }
-
-            persistent_iter++;
-        }
-      } else {
+      // ================================================================
+      // EPILOGUE (all M): 2-pass — PASS 1 reduces the head_dim sum-of-squares
+      // (per-warp slots -> 4-warp combine -> cross-CTA DSMEM fold -> rsqrt),
+      // PASS 2 re-reads TMEM, scales by rms, and does a merged store of both
+      // sub-tiles under one barrier pair. (The former M<=32 single-read
+      // register-staged fast path was removed: it benchmarked within noise of
+      // 2-pass, so the extra code path wasn't worth keeping.)
+      // ================================================================
+      {
         uint32_t persistent_iter = 0;
         for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES_T;
@@ -548,7 +425,7 @@ wq_b_proj_kernel(
 
             persistent_iter++;
         }
-      }  // end large-M two-pass path
+      }  // end epilogue
     }
 
     // ================================================================

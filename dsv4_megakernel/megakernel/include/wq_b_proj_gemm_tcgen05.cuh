@@ -239,14 +239,6 @@ __device__ __forceinline__ void umma_arrive_multicast_2sm(uint64_t* bar, uint16_
     }
 }
 
-// TMEM load: 32dp32b, x4 (4 FP32 per lane)  [kept for reference]
-__device__ __forceinline__ void tmem_load_32dp32b4x(
-    uint32_t tmem_addr, uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0,%1,%2,%3}, [%4];"
-        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3) : "r"(tmem_addr));
-}
-
 // TMEM load: 32dp32b, x8 (8 FP32 per lane) — used by the swap-AB FP32 store
 __device__ __forceinline__ void tmem_load_32dp32b8x(
     uint32_t tmem_addr,
@@ -267,14 +259,6 @@ __device__ __forceinline__ void tmem_load_fence() {
 __device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     asm volatile("st.shared.u32 [%0], %1;" :: "r"(addr), "r"(v) : "memory");
-}
-
-// Store 4x32-bit to shared memory
-__device__ __forceinline__ void st_shared_v4(void* ptr, uint32_t v0, uint32_t v1,
-                                              uint32_t v2, uint32_t v3) {
-    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};"
-        :: "r"(addr), "r"(v0), "r"(v1), "r"(v2), "r"(v3) : "memory");
 }
 
 // Cluster utilities
