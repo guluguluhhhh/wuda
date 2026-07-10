@@ -93,14 +93,15 @@ static constexpr int NUM_STORE_THREADS   = 128;
 // store_block_m = umma_step_n = 16 ; store_block_n = block_n = 128
 static constexpr int STORE_BLOCK_M      = 16;                          // M-rows per store stage
 static constexpr int STORE_BLOCK_N      = BLOCK_N;                     // 128 (N cols in smem tile)
-static constexpr int STORE_BLOCK_N_ATOM = SWIZZLE_CD / (int)sizeof(float); // 128/4 = 32 (TMA store atom on N)
+// Output is BF16 (model-faithful: q is bf16 in DSV4). 128B swizzle = 64 bf16 per atom.
+static constexpr int STORE_BLOCK_N_ATOM = SWIZZLE_CD / (int)sizeof(nv_bfloat16); // 128/2 = 64
 
 // ---- Per-stage SMEM for weight B (constant); A depends on M ----
 static constexpr int SMEM_B_PER_STAGE  = LOAD_BLOCK_N * BLOCK_K * sizeof(nv_bfloat16); // 128*64*2 = 16384
-static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(float); // 16*128*4 = 8192
+static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(nv_bfloat16); // 16*128*2 = 4096
 // Each TMA-store stage holds SUBTILES_PER_HEAD sub-tiles side by side so both are
 // written under one barrier pair (merged store -> halves epilogue barriers).
-static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES * SUBTILES_PER_HEAD; // 32768
+static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES * SUBTILES_PER_HEAD; // 4096*2*2 = 16384
 
 // SMEM capacity budget (SM100)
 static constexpr int SMEM_CAPACITY = 232448;
@@ -259,6 +260,12 @@ __device__ __forceinline__ void tmem_load_fence() {
 __device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     asm volatile("st.shared.u32 [%0], %1;" :: "r"(addr), "r"(v) : "memory");
+}
+
+// Store a single 16-bit half-word to shared memory (bf16 output store)
+__device__ __forceinline__ void st_shared_u16(void* ptr, uint16_t v) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile("st.shared.u16 [%0], %1;" :: "r"(addr), "h"(v) : "memory");
 }
 
 // Cluster utilities

@@ -378,19 +378,26 @@ wq_b_proj_kernel(
                         cutlass::arch::fence_view_async_tmem_load();
                         uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
+                        // BF16 store: 128 N per sub-tile = 2 atoms of 64 (2 warps/atom).
+                        // Swizzle derived from the fp32 path (bank group = 16B = 8 bf16).
+                        uint32_t atom         = epi_warp_idx >> 1;         // 0..1
+                        uint32_t warp_in_atom = epi_warp_idx & 1u;         // 0/1
+                        uint32_t n_in_atom    = warp_in_atom * 32 + lane_id; // 0..63 logical N
+                        uint32_t bg           = n_in_atom >> 3;            // bank group 0..7
+                        uint32_t intra        = n_in_atom & 7u;            // 0..7 within group
                         uint8_t* smem_base_ptr = smem_cd_ptr
-                            + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)
+                            + atom * (STORE_BLOCK_M * SWIZZLE_CD)
                             + i * (8 * SWIZZLE_CD);
-                        uint32_t col = lane_id / 4;
                         #pragma unroll
                         for (uint32_t row = 0; row < 8; ++row) {
                             int m = st * STORE_BLOCK_M + i * 8 + row;
                             float scaled = __uint_as_float(vals[row]) * s.smem_rms[m];
+                            nv_bfloat16 bscaled = __float2bfloat16(scaled);
                             uint8_t* smem_ptr = smem_base_ptr
                                 + row * (16 * 8)
-                                + (col ^ row) * 16
-                                + (lane_id % 4) * sizeof(float);
-                            ptx::st_shared_u32(smem_ptr, __float_as_uint(scaled));
+                                + ((bg ^ row) * 16)
+                                + intra * (int)sizeof(nv_bfloat16);
+                            ptx::st_shared_u16(smem_ptr, *reinterpret_cast<uint16_t*>(&bscaled));
                         }
                     }
                 }
@@ -411,7 +418,7 @@ wq_b_proj_kernel(
                         int base_n = tile_id * HEAD_DIM + sub * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
                         #pragma unroll
                         for (int i = 0; i < NUM_N_STORE_ATOMS; ++i) {
-                            auto* smem_ptr = reinterpret_cast<float*>(smem_cd_ptr)
+                            auto* smem_ptr = reinterpret_cast<nv_bfloat16*>(smem_cd_ptr)
                                 + i * (STORE_BLOCK_M * STORE_BLOCK_N_ATOM);
                             int n_idx = base_n + i * STORE_BLOCK_N_ATOM;
                             int m_idx = st * STORE_BLOCK_M;
@@ -481,19 +488,20 @@ torch::Tensor wq_b_proj_gemm(
     TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0);
 
     // swap-AB: BLOCK_M = M exactly (single M block), no padding.
-    auto out = torch::empty({M, N_TOTAL}, x.options().dtype(torch::kFloat32));
+    // Output is BF16 (model-faithful: DSV4 wq_b is a bf16 Linear -> q is bf16).
+    auto out = torch::empty({M, N_TOTAL}, x.options().dtype(torch::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto x_ptr   = reinterpret_cast<const nv_bfloat16*>(x.data_ptr());
     auto w_ptr   = reinterpret_cast<const nv_bfloat16*>(w.data_ptr());
-    auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
+    auto out_ptr = reinterpret_cast<nv_bfloat16*>(out.data_ptr());
 
     // TMA descriptors
     const int load_block_m = M / NUM_MULTICAST; // activation rows per CTA
     CUtensorMap desc_A = make_tma_desc_bf16_2d(x_ptr, M, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B = make_tma_desc_bf16_2d(w_ptr, N_TOTAL, K_DIM, LOAD_BLOCK_N, BLOCK_K);
-    // Output D: box = STORE_BLOCK_M (M rows) x STORE_BLOCK_N_ATOM (N cols), 128B swizzle
-    CUtensorMap desc_D = make_tma_desc_fp32_2d(out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
+    // Output D (BF16): box = STORE_BLOCK_M (M rows) x STORE_BLOCK_N_ATOM (=64 bf16), 128B swizzle
+    CUtensorMap desc_D = make_tma_desc_bf16_2d(out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
 
     // Grid: persistent, cluster of 2 CTAs.
     // Cache the SM count once per process (avoids a driver query on every call).

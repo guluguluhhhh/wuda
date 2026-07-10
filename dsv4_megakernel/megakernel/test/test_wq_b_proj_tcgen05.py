@@ -137,10 +137,9 @@ def benchmark(module):
     batch_sizes = [32, 64, 96, 128, 160, 192, 224, 256]
     print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
     print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
-    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Our output is FP32,")
-    print(f"        cuBLAS output is BF16, so each BW uses its own output bytes.")
-    print(f"        Ours also fuses per-head RMSNorm; cuBLAS baseline is GEMM-only")
-    print(f"        (so unfused would additionally read+write D ~= 2*M*N*4 bytes).")
+    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Both outputs are BF16")
+    print(f"        (model-faithful), so BW uses the same byte count for both.")
+    print(f"        Ours also fuses per-head RMSNorm; cuBLAS baseline is GEMM-only.")
     print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
     print("  " + "-" * 70)
 
@@ -176,9 +175,9 @@ def benchmark(module):
         flops = 2 * M * N_TOTAL * K_DIM
         tflops = flops / (ours_us * 1e-6) / 1e12
 
-        # Bytes moved: shared weight + activation(bf16); output differs by dtype
+        # Bytes moved: shared weight + activation(bf16) + output(bf16, both kernels)
         common_bytes = weight_bytes + M * K_DIM * 2
-        ours_bytes   = common_bytes + M * N_TOTAL * 4   # our output is FP32
+        ours_bytes   = common_bytes + M * N_TOTAL * 2   # our output is BF16
         cublas_bytes = common_bytes + M * N_TOTAL * 2   # cuBLAS output is BF16
         ours_bw   = ours_bytes   / (ours_us   * 1e-6) / 1e9
         cublas_bw = cublas_bytes / (cublas_us * 1e-6) / 1e9

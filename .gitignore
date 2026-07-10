@@ -1,1 +1,15 @@
 .claude/
+dsv4_megakernel/cutlass/
+dsv4_megakernel/docs/
+carborundum_skill.md
+dsv4_megakernel/megakernel/kernels/dg32.csv
+dsv4_megakernel/megakernel/kernels/readme.md
+dsv4_megakernel/megakernel/kernels/tcg_profile.csv
+dsv4_megakernel/megakernel/kernels/test_gemmV6_shapes_twostage.cu
+dsv4_megakernel/megakernel/kernels/dg256.csv
+dsv4_megakernel/megakernel/kernels/cublas.txt
+dsv4_megakernel/megakernel/kernels/256profile.csv
+dsv4_megakernel/ncu_report.txt
+dsv4_megakernel/megakernel/kernels/32.csv
+dsv4_megakernel/megakernel/kernels/128.csv
+dsv4_megakernel/megakernel/kernels/fusenorm32.csv
