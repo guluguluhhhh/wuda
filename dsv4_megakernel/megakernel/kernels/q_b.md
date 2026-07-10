@@ -1,4 +1,10 @@
-# wq_b_proj GEMM (tcgen05 / Blackwell) 实现讲解
+# wq_b_proj GEMM (tcgen05 / Blackwell) 优化过程
+
+> **背景**：本文记录 DeepSeek-V4 (DSV4) MLA 注意力里 **wq_b 投影** 在 NVIDIA Blackwell (B300, sm_103) 上、用第五代张量核 **tcgen05** 手写 CUDA kernel 的优化全过程。DSV4 的 Q 走低秩路径 `wq_a → q_norm(RMSNorm) → wq_b`；wq_b 把 `[M,1536]` 投影到 `[M,65536]`（128 head × 512 dim），是个 **M 极小、N 极大的「极扁 GEMM」**，权重 201MB、每 byte 只读一次，属**访存受限 (memory-bound)** 算子，优化目标是把 HBM 带宽喂满。
+>
+> 全文分两部分：**(1)** 纯 GEMM 如何逼近/追平 cuBLAS —— swap-AB 让张量核算力精确匹配真实 M、2SM 权重按 N 切分零冗余、持久化 + 多级软件流水、TMA 128B swizzle、L2 promotion；**(2)** 把 wq_b 之后的 **per-head RMSNorm 融进 kernel** 的得失分析 —— 靠 cluster 内独占整 head + 跨 CTA DSMEM 归约实现融合，小 M（decode 热点）净赚，但 M>128 因 TMEM 容量放不下双缓冲而出现「EPI 断崖」，结论是按 M 门控。
+>
+> 注：DSV4 里 wq_b 实际是 **FP8** GEMM（e4m3 + per-128 ue8m0 block scale，fp32 累加 → bf16 输出）；本文实现为 **BF16** 版本作为基线与方法论参考。
 
 ## 1. 问题定义
 
@@ -13,20 +19,9 @@ D[M, N] = A[M, K] @ B[N, K]^T
 ```
 
 形状特征决定了实现策略：
-- **M 极小（32~256），N 极大（65536）**，K 中等（1536）。
+- **M 极小（32-256），N 极大（65536）**，K 中等（1536）。
 - **权重 B 是绝对大头**：201 MB，每 byte 只读一次、无复用 → 这是一个 **访存受限 (memory-bound)** 算子。理论下界 ≈ 把权重从 HBM 读一遍的时间（≈34 µs），实现的核心目标就是**把 HBM 带宽喂满**。
 - 输出 FP32（M=256 时 67 MB），对大 M 也是可观流量。
-
-当前实现全部 warm 测试 **正确性 PASS（cos_sim ≈ 1.0，max_diff ~5e-7）**，性能：
-
-| M | 延迟 (µs) | 带宽 (GB/s, FP32 输出计) | vs cuBLAS |
-|---|---|---|---|
-| 32  | 38.4 | 5468 | 85% |
-| 64  | 39.3 | 5557 | 88% |
-| 128 | 43.0 | 5471 | 92% |
-| 256 | 51.4 | 5233 | 86% |
-
-> 说明：cuBLAS 基线输出 **BF16**（输出字节只有我们的一半），而本算子按需求输出 **FP32**，因此单看延迟对 cuBLAS 天然吃亏；按"相同字节数"折算后已非常接近硬件上限。带宽按 `权重 + 激活 + FP32 输出` 全部字节计算。
 
 ---
 
@@ -57,7 +52,7 @@ cluster = (2,1,1)，kNumMulticast = 2，cluster_n = 2
 
 ### 优化① swap_ab —— 让张量核算力精确匹配真实 M
 
-这是本 kernel 最关键的设计。2SM MMA 的输出行数 `UMMA_M` 固定是 `128 × 2 = 256`。如果直接把这条 256 的轴对齐到问题的 M 维（M 只有 32~64），张量核每条指令要算 256 行、其中大部分是浪费，会把**张量核管线**顶成瓶颈，反而喂不满 HBM。
+这是本 kernel 最关键的设计。2SM MMA 的输出行数 `UMMA_M` 固定是 `128 × 2 = 256`。如果直接把这条 256 的轴对齐到问题的 M 维（M 只有 32-64），张量核每条指令要算 256 行、其中大部分是浪费，会把**张量核管线**顶成瓶颈，反而喂不满 HBM。
 
 **swap_ab** 把矩阵乘的 A/B 操作数在 MMA 内部对调，使得：
 
@@ -66,7 +61,7 @@ UMMA_M(256) 沿大维度 N → 打满这条大轴
 UMMA_N       沿小维度 M = M(真实) → 张量核算力随 M 精确缩小，无浪费
 ```
 
-于是每条 MMA 只算 `256(N) × M(真实) × 16(K)`，计算量正比于真实 M，kernel 稳定在**访存受限**区间。实测张量核管线利用率降到 ~34%、DRAM 利用率成为头号（~60%），说明瓶颈正确地落在了显存带宽上。
+于是每条 MMA 只算 `256(N) × M(真实) × 16(K)`，计算量正比于真实 M，kernel 稳定在**访存受限**区间。实测张量核管线利用率降到 ≈34%、DRAM 利用率成为头号（≈60%），说明瓶颈正确地落在了显存带宽上。
 
 ### 优化② 2SM MMA + 权重按 N 切分 —— 权重零冗余读取
 
@@ -74,7 +69,7 @@ UMMA_N       沿小维度 M = M(真实) → 张量核算力随 M 精确缩小，
 
 ### 优化③ 多级软件流水 (multi-stage pipeline)
 
-SMEM 里为 A/B 各开一个 6~11 级的环形缓冲。生产者持续把后续 K-block 的 TMA 预取进来，让 **多条 TMA 同时在飞**，用流水深度隐藏 HBM 的长延迟。级数按 SMEM 预算自动求最大值（小 M 富余 → 11 级，大 M 紧张 → 6 级）。
+SMEM 里为 A/B 各开一个 6-11 级的环形缓冲。生产者持续把后续 K-block 的 TMA 预取进来，让 **多条 TMA 同时在飞**，用流水深度隐藏 HBM 的长延迟。级数按 SMEM 预算自动求最大值（小 M 富余 → 11 级，大 M 紧张 → 6 级）。
 
 ### 优化④ Warp specialization + 三条解耦流水
 
@@ -97,7 +92,7 @@ TMEM 累加器开 2 份（`NUM_EPI_STAGES=2`）：MMA 在写第 N+1 个 tile 的
 
 TMA descriptor 的 L2 promotion 粒度设为 **256B**（`CU_TENSOR_MAP_L2_PROMOTION_L2_256B`）。
 
-机理：激活 `[M,1536]`（M=32 时仅 96KB）被**所有 74 个 cluster、每个 cluster 的每个 N-tile 反复读取**。256B 的促进粒度能把这块小激活留在 L2 里跨 cluster 复用，而 128B 粒度留不住、每次都打 DRAM。实测把 L2 命中率从 **4.6% 提到 26.7%**、DRAM 利用率从 58.7% 提到 ~60%，M=32 延迟 40.2 → 38.4 µs。**一行改动、免费收益。**
+机理：激活 `[M,1536]`（M=32 时仅 96KB）被**所有 74 个 cluster、每个 cluster 的每个 N-tile 反复读取**。256B 的促进粒度能把这块小激活留在 L2 里跨 cluster 复用，而 128B 粒度留不住、每次都打 DRAM。实测把 L2 命中率从 **4.6% 提到 26.7%**、DRAM 利用率从 58.7% 提到 ≈60%，M=32 延迟 40.2 → 38.4 µs。**一行改动、免费收益。**
 
 ---
 
@@ -126,7 +121,7 @@ TMA descriptor 的 L2 promotion 粒度设为 **256B**（`CU_TENSOR_MAP_L2_PROMOT
 warp 0        : TMA 生产者 (producer)         —— 两个 CTA 都跑
 warp 1        : MMA 消费者 (仅 leader CTA)
 warp 2        : TMEM 分配 (tcgen05.alloc)
-warp 4~7 (128): epilogue（转置 + TMA store）   —— 两个 CTA 都跑
+warp 4-7 (128): epilogue（转置 + TMA store）   —— 两个 CTA 都跑
 ```
 
 三条持久化循环通过 mbarrier 环形握手：
@@ -135,7 +130,7 @@ warp 4~7 (128): epilogue（转置 + TMA store）   —— 两个 CTA 都跑
 
 2. **MMA (warp 1, leader)**：等 `full_barrier[stage]`（TMA 到齐）→ warp-shuffle 取出该 stage 描述符 → 对 `BLOCK_K/UMMA_K = 4` 个子步发 `tcgen05.mma.cta_group::2`（累加到 TMEM）→ `umma_arrive` 释放 `empty_barrier`（让生产者复用槽位），末 K 时通知 `tmem_full`。
 
-3. **Epilogue (warp 4~7)**：等 `tmem_full` → 从 TMEM 读回 → 转置写入 SMEM → TMA store 到全局 D → 释放 `tmem_empty`（让 MMA 复用累加器）。
+3. **Epilogue (warp 4-7)**：等 `tmem_full` → 从 TMEM 读回 → 转置写入 SMEM → TMA store 到全局 D → 释放 `tmem_empty`（让 MMA 复用累加器）。
 
 barrier 计数：`full_barriers` init(2)（两个 CTA 到达 + TMA 字节）；`tmem_empty_barriers` init(2 × 128)（两个 CTA 的 128 个 epilogue 线程各 arrive 一次）。
 
@@ -159,7 +154,7 @@ swap 布局下 TMEM 里存的是 `Dᵀ`（datapath 轴 = N，列 = M），写回
 |---|---|---|
 | ① | **swap_ab** | 张量核算力随真实 M 缩放，避免浪费，kernel 稳定在访存受限 |
 | ② | **2SM MMA + 权重按 N 切分** | 201 MB 权重恰好读一遍，零冗余 |
-| ③ | **多级软件流水 (6~11 级)** | 多条 TMA 在飞，隐藏 HBM 长延迟 |
+| ③ | **多级软件流水 (6-11 级)** | 多条 TMA 在飞，隐藏 HBM 长延迟 |
 | ④ | **Warp specialization 三路解耦** | 搬运/计算/写回完全重叠 |
 | ⑤ | **TMEM 累加器双缓冲** | 计算与 epilogue 重叠 |
 | ⑥ | **无 padding (BLOCK_M=M)** | 不浪费激活加载与输出写回带宽 |
@@ -168,13 +163,6 @@ swap 布局下 TMEM 里存的是 `Dᵀ`（datapath 轴 = N，列 = M），写回
 
 ---
 
-## 附：关键文件
-
-- `kernels/wq_b_proj_gemm_tcgen05.cu`   —— kernel + host 启动 + PyTorch 绑定
-- `include/wq_b_proj_gemm_tcgen05.cuh`  —— 配置常量、描述符构造、PTX 封装、TMA 封装
-- `test/test_wq_b_proj_tcgen05.py`       —— 正确性 + benchmark（JIT 编译，sm_100+）
-
----
 
 ## 8. 融合 vs 不融合（GEMM + per-head RMSNorm）端到端对比
 
@@ -183,6 +171,21 @@ swap 布局下 TMEM 里存的是 `Dᵀ`（datapath 轴 = N，列 = M），写回
 - **纯 GEMM**：本 kernel 只做 GEMM（B300 实测）。
 - **融合**：GEMM + per-head RMSNorm 融进一个 kernel。
 - **不融合端到端**：本纯 GEMM kernel → 独立 RMSNorm kernel链式串起来计时。
+
+### 融合是怎么做的
+
+RMSNorm 要对每个 head 的 512 维（head_dim）求平方和，所以**让一个 cluster 恰好独占一个完整 head**（512 N = 2 个 subtile，分在 2 个 CTA 上），把 head_dim 归约变成 cluster 内操作。GEMM 累加器留在 TMEM（fp32），epilogue 分两遍：
+
+1. **PASS 1（求 rms）**：读一遍 TMEM 累加器，对每个 M-row 求 Σx²——warp 内 32 lane 归约 → 4 warp 合并 → **跨 2 个 CTA 用 DSMEM（`store_shared_remote`）把两半 256 N 的偏和折叠成完整 512 的平方和** → `rsqrt(Σx²/512+eps)` 得每行 rms，存 SMEM。
+2. **PASS 2（缩放写回）**：再读一遍 TMEM，乘 rms，转置进 SMEM，TMA store。
+
+全程 fp32 累加 + fp32 归约，只在写回转 bf16。相比不融合，**省掉了独立 RMSNorm 那趟对 q 的额外 HBM 读+写**。
+
+### 为何 M>128 后大幅下降（EPI 断崖）
+
+融合要求**整个 head 的累加器常驻 TMEM**：每 head 占 `SUBTILES(2) × M` 列，而 TMEM 只有 **512 列**。要让「MMA（下一个 head）」和「epilogue（当前 head）」重叠，累加器需**双缓冲**（`EPI=2`）：`2 × (2M) = 4M ≤ 512` → **只有 M≤128 装得下双缓冲**。
+
+M>128 时 `EPI` 掉到 **1（单缓冲）**：MMA 必须等 epilogue **完全做完**（读两遍 TMEM + 跨 CTA 归约 + 写回）才能复用累加器 → **计算与 epilogue 不再重叠**；而这个 epilogue 本身又重（2 遍 TMEM 读 + DSMEM 往返）。于是延迟从 M=128 的 ≈49µs 跳到 M=160 的 ≈64µs，并随 M 继续恶化（M=256 到 82µs）。纯 GEMM 因累加器只占 `M` 列（无整-head 常驻约束）始终能双缓冲，所以曲线平稳。
 
 带宽三列**同分子**（`weight + 激活 + 一个 q 输出` 的逻辑最小字节，bf16）→ 可直接横比；只有时间不同。
 
@@ -201,10 +204,10 @@ swap 布局下 TMEM 里存的是 `Dᵀ`（datapath 轴 = N，列 = M），写回
 
 ### 结论
 
-- **纯 GEMM 已达 cuBLAS 水平**：%cuBLAS 86→**99.6%（M=128）→103.7%（M=224）**，带宽 ~5000-5580 GB/s。
+- **纯 GEMM 已达 cuBLAS 水平**：%cuBLAS 86→**99.6%（M=128）→103.7%（M=224）**，带宽 ≈5000-5580 GB/s。
 - **交叉点在 M≈112**：
-  - **小 M（≤96,decode 热点）：融合更快**（省掉 q 的额外读写 + 第二次 launch,-4~10%）。
+  - **小 M（≤96,decode 热点）：融合更快**（省掉 q 的额外读写 + 第二次 launch,-4-10%）。
   - **大 M（≥128）：不融合更快**,大 M 差距悬殊（M=256 融合 82µs vs 不融合 61µs,慢 25%）。融合在大 M 崩是因为 epilogue 要扣着 TMEM 做归约,EPI=1 断崖。
-- **前提**：独立 RMSNorm kernel 近峰值带宽（M=256 ~8000 GB/s ≈ 95% HBM peak,仅 ~9µs）,使得"拆开"在大 M 非常划算。
+- **前提**：独立 RMSNorm kernel 近峰值带宽（M=256-8000 GB/s ≈ 95% HBM peak,仅 ≈9µs）,使得"拆开"在大 M 非常划算。
 - **建议**：按 M 门控——**小 M 用融合,大 M 用纯 GEMM + 独立 RMSNorm**；或图省事全用不融合（仅小 M 亏 1-4µs）。
 
