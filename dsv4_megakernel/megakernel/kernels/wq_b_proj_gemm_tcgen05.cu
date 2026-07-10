@@ -276,18 +276,24 @@ wq_b_proj_kernel(
                     cutlass::arch::fence_view_async_tmem_load();
                     uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
-                    // one 32-wide N atom per epilogue warp
+                    // BF16 store: 128 N = 2 atoms of 64 (2 warps/atom); 16-bit swizzled.
+                    // Swizzle derived from the fp32 path (bank group = 16B = 8 bf16).
+                    uint32_t atom         = epi_warp_idx >> 1;         // 0..1
+                    uint32_t warp_in_atom = epi_warp_idx & 1u;         // 0/1
+                    uint32_t n_in_atom    = warp_in_atom * 32 + lane_id; // 0..63 logical N
+                    uint32_t bg           = n_in_atom >> 3;            // bank group 0..7
+                    uint32_t intra        = n_in_atom & 7u;            // 0..7 within group
                     uint8_t* smem_base_ptr = smem_cd_ptr
-                        + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)   // outer atom offset
-                        + i * (8 * SWIZZLE_CD);                        // inner atom offset
-                    uint32_t col = lane_id / 4;
+                        + atom * (STORE_BLOCK_M * SWIZZLE_CD)
+                        + i * (8 * SWIZZLE_CD);
                     #pragma unroll
                     for (uint32_t row = 0; row < 8; ++row) {
+                        nv_bfloat16 bv = __float2bfloat16(__uint_as_float(vals[row]));
                         uint8_t* smem_ptr = smem_base_ptr
-                            + row * (16 * 8)                // kNumBankGroupBytes(16) * 8
-                            + (col ^ row) * 16
-                            + (lane_id % 4) * sizeof(float);
-                        ptx::st_shared_u32(smem_ptr, vals[row]);
+                            + row * (16 * 8)
+                            + ((bg ^ row) * 16)
+                            + intra * (int)sizeof(nv_bfloat16);
+                        ptx::st_shared_u16(smem_ptr, *reinterpret_cast<uint16_t*>(&bv));
                     }
                 }
 
@@ -302,7 +308,7 @@ wq_b_proj_kernel(
                 if (epi_warp_idx == 0 && ptx::elect_one_sync()) {
                     #pragma unroll
                     for (int i = 0; i < NUM_N_STORE_ATOMS; ++i) {
-                        auto* smem_ptr = reinterpret_cast<float*>(smem_cd_ptr)
+                        auto* smem_ptr = reinterpret_cast<nv_bfloat16*>(smem_cd_ptr)
                             + i * (STORE_BLOCK_M * STORE_BLOCK_N_ATOM);
                         int n_idx = base_n + i * STORE_BLOCK_N_ATOM;
                         int m_idx = base_m + st * STORE_BLOCK_M;
@@ -370,19 +376,20 @@ torch::Tensor wq_b_proj_gemm(
     TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0);
 
     // swap-AB: BLOCK_M = M exactly (single M block), no padding.
-    auto out = torch::empty({M, N_TOTAL}, x.options().dtype(torch::kFloat32));
+    // Output is BF16 (model-faithful: DSV4 wq_b is a bf16 Linear -> q is bf16).
+    auto out = torch::empty({M, N_TOTAL}, x.options().dtype(torch::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto x_ptr   = reinterpret_cast<const nv_bfloat16*>(x.data_ptr());
     auto w_ptr   = reinterpret_cast<const nv_bfloat16*>(w.data_ptr());
-    auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
+    auto out_ptr = reinterpret_cast<nv_bfloat16*>(out.data_ptr());
 
     // TMA descriptors
     const int load_block_m = M / NUM_MULTICAST; // activation rows per CTA
     CUtensorMap desc_A = make_tma_desc_bf16_2d(x_ptr, M, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B = make_tma_desc_bf16_2d(w_ptr, N_TOTAL, K_DIM, LOAD_BLOCK_N, BLOCK_K);
-    // Output D: box = STORE_BLOCK_M (M rows) x STORE_BLOCK_N_ATOM (N cols), 128B swizzle
-    CUtensorMap desc_D = make_tma_desc_fp32_2d(out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
+    // Output D (BF16): box = STORE_BLOCK_M (M rows) x STORE_BLOCK_N_ATOM (=64 bf16), 128B swizzle
+    CUtensorMap desc_D = make_tma_desc_bf16_2d(out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
 
     // Grid: persistent, cluster of 2 CTAs.
     // Cache the SM count once per process (avoids a driver query on every call).
@@ -448,7 +455,68 @@ torch::Tensor wq_b_proj_gemm(
     return out;
 }
 
+// ======================== Standalone per-head RMSNorm kernel ========================
+// Weightless RMSNorm over head_dim (=512), BF16 in/out. Memory-bound baseline for the
+// "unfused" path (GEMM then a separate RMSNorm). One warp per (m, head) row: 512 elems
+// = 32 lanes x 16, loaded/stored as 2x 128-bit vectors; sum-of-squares in fp32.
+__global__ void rmsnorm_per_head_kernel(
+    const nv_bfloat16* __restrict__ in, nv_bfloat16* __restrict__ out,
+    int total_rows, float eps)
+{
+    const int warps_per_block = blockDim.x >> 5;
+    const int row  = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+    if (row >= total_rows) return;
+    const int lane = threadIdx.x & 31;
+
+    const int4* rp = reinterpret_cast<const int4*>(in  + (size_t)row * HEAD_DIM);
+    int4*       wp = reinterpret_cast<int4*>(      out + (size_t)row * HEAD_DIM);
+
+    // Load 16 bf16/lane (2x int4), accumulate sum-of-squares in fp32.
+    int4 raw[2];
+    float ss = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        raw[j] = rp[j * 32 + lane];
+        const nv_bfloat16* h = reinterpret_cast<const nv_bfloat16*>(&raw[j]);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) { float f = __bfloat162float(h[k]); ss += f * f; }
+    }
+    // Full warp reduction (every lane gets the result).
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    float rms = rsqrtf(ss / float(HEAD_DIM) + eps);
+
+    // Scale + store.
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        nv_bfloat16* h = reinterpret_cast<nv_bfloat16*>(&raw[j]);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) h[k] = __float2bfloat16(__bfloat162float(h[k]) * rms);
+        wp[j * 32 + lane] = raw[j];
+    }
+}
+
+torch::Tensor rmsnorm(torch::Tensor y, double eps) {
+    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.scalar_type() == torch::kBFloat16);
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == N_TOTAL, "expected [M, N_TOTAL] bf16");
+    const int M = y.size(0);
+    auto out = torch::empty_like(y);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int total_rows     = M * (N_TOTAL / HEAD_DIM);  // M * 128 heads
+    const int block          = 128;                       // 4 warps -> 4 rows/block
+    const int rows_per_block = block / 32;
+    const int grid           = (total_rows + rows_per_block - 1) / rows_per_block;
+    rmsnorm_per_head_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+        total_rows, static_cast<float>(eps));
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wq_b_proj_gemm", &wq_b_proj_gemm,
           "wq_b proj (tcgen05 2SM MMA, DeepGEMM swap-AB, Blackwell)");
+    m.def("rmsnorm", &rmsnorm,
+          "standalone per-head weightless RMSNorm (bf16 in/out)");
 }

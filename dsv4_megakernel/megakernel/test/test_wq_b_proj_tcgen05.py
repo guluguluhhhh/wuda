@@ -1,7 +1,11 @@
 """
-Test & Benchmark: wq_b Projection + Per-Head RMSNorm (tcgen05.mma Blackwell)
-GEMM: [M, 1536] × [65536, 1536]^T → [M, 65536] → per-head RMSNorm → [M, 65536] BF16
+Test & Benchmark: wq_b Projection (pure GEMM, tcgen05.mma Blackwell)
+GEMM: [M, 1536] x [65536, 1536]^T -> [M, 65536], BF16 in -> BF16 out.
 Requires: NVIDIA B300 (sm_103), CUDA 12.4+, CUTLASS 3.x
+
+This branch is the *unfused* pure-GEMM kernel (no RMSNorm). The benchmark also
+reports the unfused total = cuBLAS GEMM + a standalone per-head RMSNorm pass, so
+it can be compared against the fused GEMM+RMSNorm kernel on the other branch.
 """
 import os, sys, torch
 import torch.nn.functional as F
@@ -51,15 +55,19 @@ def load_module():
     )
 
 
-def reference_gemm_fused_rmsnorm(x, w, rms_w, eps):
-    """PyTorch reference: pure GEMM (no RMSNorm yet - kernel outputs raw float32)."""
-    # x: [M, 1536], w: [65536, 1536]
-    y = x.float() @ w.float().t()              # [M, 65536]
-    return y  # float32, no norm for now
+def reference_gemm(x, w):
+    """PyTorch reference: pure GEMM (no norm). Kernel outputs BF16."""
+    return x.float() @ w.float().t()            # [M, 65536] fp32
 
 
-def test_correctness(module, M=32):
-    """Test GEMM + fused RMSNorm correctness."""
+def rmsnorm_per_head(y):
+    """Standalone per-head RMSNorm on [M, N] (weightless), matches model.py wq_b."""
+    yh = y.unflatten(-1, (NUM_HEADS, HEAD_DIM))                       # [M, 128, 512]
+    inv = torch.rsqrt(yh.float().square().mean(-1, keepdim=True) + RMS_EPS)
+    return (yh.float() * inv).to(y.dtype).flatten(-2)                 # [M, N]
+
+
+def test_correctness(module, M):
     print("=" * 60)
     print(f"Correctness Test: wq_b_proj_gemm tcgen05 (M={M})")
     print("=" * 60)
@@ -69,145 +77,92 @@ def test_correctness(module, M=32):
     w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
     rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
 
-    # Reference
-    ref = reference_gemm_fused_rmsnorm(x, w, rms_w, RMS_EPS)
+    ref = reference_gemm(x, w)                          # fp32 reference
+    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)   # bf16 kernel output
 
-    # CUDA kernel (output: [M, N_TOTAL])
-    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
-
-    print(f"  Output shape: {out.shape} (expect [{M}, {N_TOTAL}])")
-    print(f"  Output dtype: {out.dtype}")
-
-    # Compare
+    print(f"  Output shape: {tuple(out.shape)} dtype: {out.dtype} (expect bf16)")
     diff = (out.float() - ref.float()).abs()
-    cos_sim = F.cosine_similarity(
-        out.float().flatten(), ref.float().flatten(), dim=0).item()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    rel_diff = (diff / (ref.float().abs() + 1e-8)).max().item()
-
-    print(f"  cos_sim:   {cos_sim:.8f}")
-    print(f"  max_diff:  {max_diff:.6e}")
-    print(f"  mean_diff: {mean_diff:.6e}")
-    print(f"  rel_diff:  {rel_diff:.6e}")
-
-    passed = cos_sim > 0.99
-    print(f"  Result: {'PASS' if passed else 'FAIL'}")
-    return passed
-
-
-def test_with_nontrivial_weight(module, M=64):
-    """Test with non-trivial rms_w (not all-ones)."""
-    print("\n" + "=" * 60)
-    print(f"Scale Test: non-trivial rms_w (M={M})")
-    print("=" * 60)
-    device = 'cuda'
-
-    x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
-    w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
-    rms_w = torch.rand(HEAD_DIM, device=device, dtype=torch.float32) * 2 + 0.5
-
-    ref = reference_gemm_fused_rmsnorm(x, w, rms_w, RMS_EPS)
-    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
-
-    cos_sim = F.cosine_similarity(
-        out.float().flatten(), ref.float().flatten(), dim=0).item()
-    max_diff = (out.float() - ref.float()).abs().max().item()
+    cos_sim = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
     print(f"  cos_sim:  {cos_sim:.8f}")
-    print(f"  max_diff: {max_diff:.6e}")
+    print(f"  max_diff: {diff.max().item():.6e}  mean_diff: {diff.mean().item():.6e}")
     passed = cos_sim > 0.99
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
     return passed
 
 
-def test_m_padding(module):
-    """Test M=32 (padded to 64 internally by kernel)."""
-    print("\n" + "=" * 60)
-    print("Padding Test: M=32 padded to MMA_M=64")
+def test_rmsnorm(module, M):
+    print("=" * 60)
+    print(f"Correctness Test: standalone rmsnorm kernel (M={M})")
     print("=" * 60)
     device = 'cuda'
-    M = 32
-
-    x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
-    w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
-    rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
-
-    ref = reference_gemm_fused_rmsnorm(x, w, rms_w, RMS_EPS)
-    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
-
-    assert out.shape == (M, N_TOTAL), f"Shape mismatch: {out.shape}"
-    cos_sim = F.cosine_similarity(
-        out.float().flatten(), ref.float().flatten(), dim=0).item()
-    print(f"  cos_sim: {cos_sim:.8f}")
-    passed = cos_sim > 0.99
+    y = torch.randn(M, N_TOTAL, device=device, dtype=torch.bfloat16)
+    ref = rmsnorm_per_head(y)                  # torch reference
+    out = module.rmsnorm(y, RMS_EPS)           # our kernel
+    cos_sim = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
+    oh = out.float().unflatten(-1, (NUM_HEADS, HEAD_DIM))
+    head_rms = oh.square().mean(-1).sqrt()
+    print(f"  dtype: {out.dtype}  cos_sim: {cos_sim:.8f}")
+    print(f"  per-head RMS: mean={head_rms.mean().item():.6f} (expect ~1.0)")
+    passed = cos_sim > 0.99 and abs(head_rms.mean().item() - 1.0) < 0.05
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
     return passed
+
+
+def _time_us(fn, iters=100, warmup=20):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters * 1000  # us
 
 
 def benchmark(module):
-    """Latency sweep with cuBLAS comparison."""
     print("\n" + "=" * 60)
-    print("Benchmark: wq_b_proj_gemm tcgen05 latency sweep")
+    print("Benchmark: pure GEMM vs cuBLAS, and unfused total (GEMM + RMSNorm)")
     print("=" * 60)
     device = 'cuda'
 
     w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
     rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
     w_t = w.t().contiguous()
+    weight_bytes = N_TOTAL * K_DIM * 2  # 201 MB (bf16)
 
-    weight_bytes = N_TOTAL * K_DIM * 2  # 192 MB
-
-    batch_sizes = [32, 64, 128, 256]
-    print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
-    print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
-    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Our output is FP32,")
-    print(f"        cuBLAS output is BF16, so each BW uses its own output bytes.")
-    print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
-    print("  " + "-" * 70)
+    batch_sizes = [32, 64, 96, 128, 160, 192, 224, 256]
+    print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim), Weight {weight_bytes/1e6:.1f} MB")
+    print(f"  All BW in GB/s (BF16 in/out). %cuBLAS = cuBLAS_us/ours_us (GEMM only).")
+    print(f"  unfused = OUR GEMM kernel -> our RMSNorm kernel, timed END-TO-END (chained).")
+    print(f"  ours_BW/unfBW use the SAME numerator = logical min bytes (weight+act+q), so they and")
+    print(f"  the fused kernel are directly comparable (only the time differs).")
+    print(f"  {'M':<5} {'ours(us)':<9} {'cuBLAS(us)':<11} {'unfused(us)':<12} "
+          f"{'ours_BW':<9} {'unfBW':<9} {'%cuBLAS':<8}")
+    print("  " + "-" * 80)
 
     for M in batch_sizes:
         x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
 
-        # --- tcgen05 kernel ---
-        for _ in range(20):
-            module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
-        torch.cuda.synchronize()
+        def unfused_pipeline():
+            q = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)  # GEMM -> q (bf16)
+            module.rmsnorm(q, RMS_EPS)                        # RMSNorm(q) reads GEMM's output
 
-        iters = 100
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
-        end.record()
-        torch.cuda.synchronize()
-        ours_us = start.elapsed_time(end) / iters * 1000
+        ours_us    = _time_us(lambda: module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS))
+        cublas_us  = _time_us(lambda: torch.mm(x, w_t))
+        unfused_us = _time_us(unfused_pipeline)               # end-to-end GEMM + RMSNorm
 
-        # --- cuBLAS GEMM baseline (no norm) ---
-        for _ in range(20):
-            torch.mm(x, w_t)
-        torch.cuda.synchronize()
-        start.record()
-        for _ in range(iters):
-            torch.mm(x, w_t)
-        end.record()
-        torch.cuda.synchronize()
-        cublas_us = start.elapsed_time(end) / iters * 1000
-
-        flops = 2 * M * N_TOTAL * K_DIM
-        tflops = flops / (ours_us * 1e-6) / 1e12
-
-        # Bytes moved: shared weight + activation(bf16); output differs by dtype
-        common_bytes = weight_bytes + M * K_DIM * 2
-        ours_bytes   = common_bytes + M * N_TOTAL * 4   # our output is FP32
-        cublas_bytes = common_bytes + M * N_TOTAL * 2   # cuBLAS output is BF16
-        ours_bw   = ours_bytes   / (ours_us   * 1e-6) / 1e9
-        cublas_bw = cublas_bytes / (cublas_us * 1e-6) / 1e9
-
-        # latency-based achievement vs cuBLAS: 100% = same speed, >100% = faster
+        # Logical minimum data movement = weight + activation + one q output (bf16).
+        # Same numerator for GEMM, end-to-end, and the fused kernel -> directly comparable.
+        logical_bytes = weight_bytes + M * K_DIM * 2 + M * N_TOTAL * 2
+        ours_bw    = logical_bytes / (ours_us    * 1e-6) / 1e9
+        unfused_bw = logical_bytes / (unfused_us * 1e-6) / 1e9
         pct_cublas = cublas_us / ours_us * 100.0
 
-        print(f"  {M:<5} {ours_us:<10.1f} {cublas_us:<11.1f} {ours_bw:<10.1f} {cublas_bw:<11.1f} {tflops:<9.1f} {pct_cublas:<7.1f}%")
+        print(f"  {M:<5} {ours_us:<9.1f} {cublas_us:<11.1f} {unfused_us:<12.1f} "
+              f"{ours_bw:<9.1f} {unfused_bw:<9.1f} {pct_cublas:<7.1f}%")
 
 
 if __name__ == '__main__':
@@ -218,23 +173,21 @@ if __name__ == '__main__':
     cap = torch.cuda.get_device_capability()
     sm = cap[0] * 10 + cap[1]
     print(f"Compute: sm_{sm}")
-
     if sm < 100:
         print(f"ERROR: tcgen05.mma requires sm_100+ (Blackwell), got sm_{sm}")
         sys.exit(1)
 
     module = load_module()
 
-    ok1 = test_correctness(module, M=32)
-    ok2 = test_correctness(module, M=64)
-    ok3 = test_correctness(module, M=128)
-    ok4 = test_with_nontrivial_weight(module, M=64)
-    ok5 = test_m_padding(module)
+    all_pass = True
+    for M in range(32, 257, 32):
+        all_pass &= test_correctness(module, M)
+    all_pass &= test_rmsnorm(module, 64)
+    all_pass &= test_rmsnorm(module, 256)
 
     benchmark(module)
 
     print("\n" + "=" * 60)
-    all_pass = ok1 and ok2 and ok3 and ok4 and ok5
     print(f"Summary: {'ALL PASS' if all_pass else 'SOME FAILED'}")
     print("=" * 60)
     sys.exit(0 if all_pass else 1)
