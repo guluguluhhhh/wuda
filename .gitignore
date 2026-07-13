@@ -1,1 +1,5 @@
 .claude/
+dsv4_megakernel/docs/
+dsv4_megakernel/ncu_report.txt
+dsv4_megakernel/megakernel/kernels/32.csv
+dsv4_megakernel/megakernel/kernels/128.csv
