@@ -204,6 +204,72 @@ def profile_loop(module, M, iters=40):
     torch.cuda.synchronize()
 
 
+def profile_overlap(module, Ms=(32, 64, 128)):
+    """clock64 profiling of the fused kernel on cluster 0's leader CTA.
+
+    Reports, per M: MMA<->epilogue overlap AND the epilogue internal time
+    distribution. timing[max_iters, 6] columns (clock64 cycles, same SM):
+        0 mma_start      1 mma_end
+        2 epi_start      3 after PASS1 (TMEM read + sum-of-squares)
+        4 after DSMEM fold+rms          5 epi_end (PASS2 re-read+scale+store done)
+    """
+    import numpy as np
+    print("\n" + "=" * 82)
+    print("Fused epilogue profiling (clock64): overlap + internal breakdown")
+    print("=" * 82)
+    device = 'cuda'
+    w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
+    rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
+
+    print(f"  {'M':<5} {'iters':>5} {'MMA':>8} {'EPI':>8} | "
+          f"{'P1_read':>8} {'DSMEM':>8} {'P2_store':>9} | "
+          f"{'P1%':>5} {'DS%':>5} {'P2%':>5} | {'hidden':>7} {'gap':>7}")
+    print("  " + "-" * 80)
+
+    for M in Ms:
+        x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
+        for _ in range(5):
+            module.wq_b_proj_gemm_profiled(x, w, rms_w, RMS_EPS)
+        torch.cuda.synchronize()
+        out, timing = module.wq_b_proj_gemm_profiled(x, w, rms_w, RMS_EPS)
+        torch.cuda.synchronize()
+
+        t = timing.cpu().numpy().astype(np.int64)
+        t = t[~(t == 0).all(axis=1)]
+        if len(t) == 0:
+            print(f"  {M:<5}  (no timing rows)"); continue
+
+        mma_s, mma_e = t[:, 0], t[:, 1]
+        epi_s, epi_p1, epi_fold, epi_e = t[:, 2], t[:, 3], t[:, 4], t[:, 5]
+        niter = len(t)
+
+        mma_win = float((mma_e - mma_s).mean())
+        epi_win = float((epi_e - epi_s).mean())
+        p1   = float((epi_p1   - epi_s ).mean())   # PASS1: TMEM read + Sigma x^2
+        fold = float((epi_fold - epi_p1).mean())   # cross-CTA DSMEM fold + rms
+        p2   = float((epi_e    - epi_fold).mean()) # PASS2: re-read TMEM + scale + store
+        tot  = max(epi_win, 1.0)
+
+        hidden, gaps = [], []
+        for n in range(niter - 1):
+            ov = max(0, min(int(mma_e[n+1]), int(epi_e[n])) - max(int(mma_s[n+1]), int(epi_s[n])))
+            d = int(epi_e[n] - epi_s[n])
+            if d > 0: hidden.append(ov / d)
+            gaps.append(int(mma_s[n+1] - mma_e[n]))
+        hid = f"{np.mean(hidden):.0%}" if hidden else "n/a"
+        gap = f"{np.mean(gaps):.0f}" if gaps else "n/a"
+
+        print(f"  {M:<5} {niter:>5} {mma_win:>8.0f} {epi_win:>8.0f} | "
+              f"{p1:>8.0f} {fold:>8.0f} {p2:>9.0f} | "
+              f"{p1/tot:>5.0%} {fold/tot:>5.0%} {p2/tot:>5.0%} | {hid:>7} {gap:>7}")
+
+    print("  " + "-" * 80)
+    print("  MMA/EPI: mean per-head windows (cyc).  P1_read=PASS1(TMEM read+Sigma x^2), "
+          "DSMEM=cross-CTA fold+rms, P2_store=PASS2(re-read+scale+store).")
+    print("  P1%/DS%/P2% = share of the epilogue window.  hidden = EPI fraction hidden "
+          "under next MMA;  gap = MMA back-to-back gap (cyc).")
+
+
 if __name__ == '__main__':
     if not torch.cuda.is_available():
         print("CUDA not available"); sys.exit(0)
@@ -234,6 +300,8 @@ if __name__ == '__main__':
         all_pass &= test_correctness(module, M=M)
 
     benchmark(module)
+
+    profile_overlap(module, Ms=(32, 64, 128))
 
     print("\n" + "=" * 60)
     print(f"Summary: {'ALL PASS' if all_pass else 'SOME FAILED'}")

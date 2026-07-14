@@ -52,14 +52,15 @@ struct SharedStorage {
 };
 
 // ======================== Kernel ========================
-template <int M_TPL>
+template <int M_TPL, bool kProfile>
 __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,   // activation [M, K], K-major
     const __grid_constant__ CUtensorMap desc_B,   // weight     [N, K], K-major
     const __grid_constant__ CUtensorMap desc_D,   // output     [M, N], FP32 row-major
     int num_blocks,
-    float eps)                                    // fused RMSNorm epsilon
+    float eps,                                    // fused RMSNorm epsilon
+    int64_t* prof)                                // clock64 timing buffer (nullptr if disabled)
 {
     using Dims = SwapDims<M_TPL>;
     constexpr int NUM_STAGES_T       = Dims::NUM_STAGES;
@@ -208,6 +209,11 @@ wq_b_proj_kernel(
             s.tmem_empty_barriers[accum_stage].wait(accum_phase ^ 1);
             ptx::tcgen05_fence_after_sync();
 
+            // [PROFILE] MMA warp: start of this head's issue window.
+            long long prof_mma_t0 = 0;
+            if (kProfile && cluster_id == 0 && lane_id == 0)
+                prof_mma_t0 = ptx::rdclock();
+
             // Each head keeps SUBTILES_PER_HEAD independent accumulators resident.
             for (int sub = 0; sub < SUBTILES_PER_HEAD; ++sub) {
                 uint32_t tmem_c = accum_stage * ACCUM_COLS_T + sub * UMMA_N_T;
@@ -252,6 +258,12 @@ wq_b_proj_kernel(
                 }
             }
 
+            // [PROFILE] MMA warp: end of this head's issue window.
+            if (kProfile && cluster_id == 0 && lane_id == 0) {
+                prof[persistent_iter * 6 + 0] = prof_mma_t0;
+                prof[persistent_iter * 6 + 1] = ptx::rdclock();
+            }
+
             persistent_iter++;
         }
 
@@ -294,6 +306,12 @@ wq_b_proj_kernel(
             s.tmem_full_barriers[accum_stage].wait(accum_phase);
             ptx::tcgen05_fence_after_sync();
 
+            // [PROFILE] Epilogue (leader CTA): start of this head's readback+store.
+            long long prof_epi_t0 = 0;
+            if (kProfile && cluster_id == 0 && cta_rank == 0 &&
+                epi_warp_idx == 0 && lane_id == 0)
+                prof_epi_t0 = ptx::rdclock();
+
             // ============================================================
             // PASS 1: partial sum-of-squares over head_dim (per-warp slots, no
             // pre-zero / no atomicAdd) -> 4-warp combine -> cross-CTA fold -> rsqrt.
@@ -327,6 +345,12 @@ wq_b_proj_kernel(
             }
             cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);   // barrier #1: warp slots visible
 
+            // [PROFILE] epilogue boundary: end of PASS 1 (TMEM read + sum-of-squares).
+            long long prof_epi_t1 = 0;
+            if (kProfile && cluster_id == 0 && cta_rank == 0 &&
+                epi_warp_idx == 0 && lane_id == 0)
+                prof_epi_t1 = ptx::rdclock();
+
             // Cross-CTA fold via DSMEM (cute::store_shared_remote -> peer smem + txn barrier).
             // NOTE: no end-to-end DeepGEMM reference; validate with racecheck/synccheck.
             uint32_t bar_addr = static_cast<uint32_t>(
@@ -351,6 +375,12 @@ wq_b_proj_kernel(
             }
             cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);   // barrier #2: rms visible
 
+            // [PROFILE] epilogue boundary: end of cross-CTA DSMEM fold + rms.
+            long long prof_epi_t2 = 0;
+            if (kProfile && cluster_id == 0 && cta_rank == 0 &&
+                epi_warp_idx == 0 && lane_id == 0)
+                prof_epi_t2 = ptx::rdclock();
+
             // ============================================================
             // PASS 2: MERGED store — both sub-tiles written under ONE barrier pair
             // per st (store iters = NUM_STORES, not NUM_STORES*SUBTILES -> half the
@@ -366,6 +396,8 @@ wq_b_proj_kernel(
                 cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
                 // Read both sub-tiles' TMEM, scale by rms, transpose into their SMEM regions.
+                // BF16 store via stmatrix.trans (DeepGEMM sm100_store_cd_swap_ab bf16 path):
+                // one hardware-transposed matrix store replaces 8 scattered st.shared.u16.
                 #pragma unroll
                 for (int sub = 0; sub < SUBTILES_PER_HEAD; ++sub) {
                     uint32_t tmem_base = accum_stage * ACCUM_COLS_T + sub * UMMA_N_T;
@@ -373,32 +405,43 @@ wq_b_proj_kernel(
                     #pragma unroll
                     for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
                         uint32_t tmem_addr = tmem_base + st * STORE_BLOCK_M + i * 8;
-                        uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-                        ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
-                        cutlass::arch::fence_view_async_tmem_load();
-                        uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
-                        // BF16 store: 128 N per sub-tile = 2 atoms of 64 (2 warps/atom).
-                        // Swizzle derived from the fp32 path (bank group = 16B = 8 bf16).
-                        uint32_t atom         = epi_warp_idx >> 1;         // 0..1
-                        uint32_t warp_in_atom = epi_warp_idx & 1u;         // 0/1
-                        uint32_t n_in_atom    = warp_in_atom * 32 + lane_id; // 0..63 logical N
-                        uint32_t bg           = n_in_atom >> 3;            // bank group 0..7
-                        uint32_t intra        = n_in_atom & 7u;            // 0..7 within group
+                        // 16dp256b layout required by stmatrix.trans: 2 loads -> 8 fp32/lane.
+                        uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+                        ptx::tmem_load_16dp256b1x(tmem_addr,                v0, v1, v2, v3);
+                        ptx::tmem_load_16dp256b1x(tmem_addr | 0x00100000u, v4, v5, v6, v7);
+                        cutlass::arch::fence_view_async_tmem_load();
+
+                        // Per-M-row rms scale in fp32. Each lane's 8 values map to just
+                        // two M-rows: m0 = mbase + 2*(lane%4), m1 = m0 + 1; even value
+                        // indices -> m0, odd -> m1 (from the 16dp256b DstLayout).
+                        int mbase   = st * STORE_BLOCK_M + i * 8;
+                        float rms0  = s.smem_rms[mbase + 2 * (lane_id & 3u) + 0];
+                        float rms1  = s.smem_rms[mbase + 2 * (lane_id & 3u) + 1];
+                        __nv_bfloat162 b0 = __float22bfloat162_rn(
+                            make_float2(__uint_as_float(v0) * rms0, __uint_as_float(v1) * rms1));
+                        __nv_bfloat162 b1 = __float22bfloat162_rn(
+                            make_float2(__uint_as_float(v2) * rms0, __uint_as_float(v3) * rms1));
+                        __nv_bfloat162 b2 = __float22bfloat162_rn(
+                            make_float2(__uint_as_float(v4) * rms0, __uint_as_float(v5) * rms1));
+                        __nv_bfloat162 b3 = __float22bfloat162_rn(
+                            make_float2(__uint_as_float(v6) * rms0, __uint_as_float(v7) * rms1));
+
+                        // Destination in the 128B-swizzled bf16 SMEM tile (2 warps/atom,
+                        // 2 atoms of 64 N per sub-tile). Matches the TMA store box below.
+                        uint32_t row = lane_id & 7u;                          // 0..7 (M within 8)
+                        uint32_t col = (epi_warp_idx & 1u) * 4 + (lane_id >> 3); // 0..7 (N group)
                         uint8_t* smem_base_ptr = smem_cd_ptr
-                            + atom * (STORE_BLOCK_M * SWIZZLE_CD)
-                            + i * (8 * SWIZZLE_CD);
-                        #pragma unroll
-                        for (uint32_t row = 0; row < 8; ++row) {
-                            int m = st * STORE_BLOCK_M + i * 8 + row;
-                            float scaled = __uint_as_float(vals[row]) * s.smem_rms[m];
-                            nv_bfloat16 bscaled = __float2bfloat16(scaled);
-                            uint8_t* smem_ptr = smem_base_ptr
-                                + row * (16 * 8)
-                                + ((bg ^ row) * 16)
-                                + intra * (int)sizeof(nv_bfloat16);
-                            ptx::st_shared_u16(smem_ptr, *reinterpret_cast<uint16_t*>(&bscaled));
-                        }
+                            + (epi_warp_idx >> 1) * (STORE_BLOCK_M * SWIZZLE_CD) // outer atom
+                            + i * (8 * SWIZZLE_CD);                             // inner 8 rows
+                        uint8_t* dst = smem_base_ptr
+                            + row * (16 * 8)               // kNumBankGroupBytes(16) * 8
+                            + ((col ^ row) * 16);
+                        ptx::stmatrix_x4_trans(dst,
+                            *reinterpret_cast<uint32_t*>(&b0),
+                            *reinterpret_cast<uint32_t*>(&b1),
+                            *reinterpret_cast<uint32_t*>(&b2),
+                            *reinterpret_cast<uint32_t*>(&b3));
                     }
                 }
 
@@ -428,6 +471,16 @@ wq_b_proj_kernel(
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+            }
+
+            // [PROFILE] Epilogue (leader CTA): sub-phase timeline of this head.
+            //   col2 epi_start | col3 after PASS1 | col4 after DSMEM fold+rms | col5 epi end
+            if (kProfile && cluster_id == 0 && cta_rank == 0 &&
+                epi_warp_idx == 0 && lane_id == 0) {
+                prof[persistent_iter * 6 + 2] = prof_epi_t0;
+                prof[persistent_iter * 6 + 3] = prof_epi_t1;
+                prof[persistent_iter * 6 + 4] = prof_epi_t2;
+                prof[persistent_iter * 6 + 5] = ptx::rdclock();
             }
 
             persistent_iter++;
@@ -475,9 +528,46 @@ static CUtensorMap make_tma_desc_fp32_2d(
     return desc;
 }
 
-// ======================== PyTorch Binding ========================
-torch::Tensor wq_b_proj_gemm(
-    torch::Tensor x, torch::Tensor w, torch::Tensor rms_w, double eps)
+// ======================== Kernel / SMEM selectors ========================
+template <bool kProfile>
+static void* get_kernel_ptr(int M) {
+    switch (M) {
+        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile>;
+        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile>;
+        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile>;
+        case 128: return (void*)&wq_b_proj_kernel<128, kProfile>;
+        case 160: return (void*)&wq_b_proj_kernel<160, kProfile>;
+        case 192: return (void*)&wq_b_proj_kernel<192, kProfile>;
+        case 224: return (void*)&wq_b_proj_kernel<224, kProfile>;
+        case 256: return (void*)&wq_b_proj_kernel<256, kProfile>;
+        default:  return nullptr;
+    }
+}
+
+static int get_smem_bytes(int M) {
+    switch (M) {
+        case 32:  return (int)sizeof(SharedStorage<32>);
+        case 64:  return (int)sizeof(SharedStorage<64>);
+        case 96:  return (int)sizeof(SharedStorage<96>);
+        case 128: return (int)sizeof(SharedStorage<128>);
+        case 160: return (int)sizeof(SharedStorage<160>);
+        case 192: return (int)sizeof(SharedStorage<192>);
+        case 224: return (int)sizeof(SharedStorage<224>);
+        case 256: return (int)sizeof(SharedStorage<256>);
+        default:  return 0;
+    }
+}
+
+// Common launch. When `profile` is true, allocates a [max_iters, 4] int64 timing
+// tensor and returns it as the 2nd element. Each row is one persistent head-
+// iteration of cluster 0's leader CTA:
+//   col 0 = MMA warp start   (clock64)
+//   col 1 = MMA warp end
+//   col 2 = epilogue start
+//   col 3 = epilogue end
+// MMA and epilogue here are on the SAME CTA (same SM) -> clock64 directly comparable.
+static std::vector<torch::Tensor> run_wq_b(
+    torch::Tensor x, torch::Tensor w, float eps, bool profile)
 {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == torch::kBFloat16);
@@ -504,7 +594,6 @@ torch::Tensor wq_b_proj_gemm(
     CUtensorMap desc_D = make_tma_desc_bf16_2d(out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
 
     // Grid: persistent, cluster of 2 CTAs.
-    // Cache the SM count once per process (avoids a driver query on every call).
     static const int num_SMs = []() {
         int n = 0;
         cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, 0);
@@ -516,30 +605,31 @@ torch::Tensor wq_b_proj_gemm(
     grid_size = (grid_size / CLUSTER_SIZE) * CLUSTER_SIZE;  // multiple of cluster size
     if (grid_size < CLUSTER_SIZE) grid_size = CLUSTER_SIZE;
 
-    // Select kernel + SMEM by M (compile-time)
-    void* kernel_ptr = nullptr;
-    int smem_bytes = 0;
-    switch (M) {
-        case 32:  kernel_ptr = (void*)&wq_b_proj_kernel<32>;  smem_bytes = sizeof(SharedStorage<32>);  break;
-        case 64:  kernel_ptr = (void*)&wq_b_proj_kernel<64>;  smem_bytes = sizeof(SharedStorage<64>);  break;
-        case 96:  kernel_ptr = (void*)&wq_b_proj_kernel<96>;  smem_bytes = sizeof(SharedStorage<96>);  break;
-        case 128: kernel_ptr = (void*)&wq_b_proj_kernel<128>; smem_bytes = sizeof(SharedStorage<128>); break;
-        case 160: kernel_ptr = (void*)&wq_b_proj_kernel<160>; smem_bytes = sizeof(SharedStorage<160>); break;
-        case 192: kernel_ptr = (void*)&wq_b_proj_kernel<192>; smem_bytes = sizeof(SharedStorage<192>); break;
-        case 224: kernel_ptr = (void*)&wq_b_proj_kernel<224>; smem_bytes = sizeof(SharedStorage<224>); break;
-        case 256: kernel_ptr = (void*)&wq_b_proj_kernel<256>; smem_bytes = sizeof(SharedStorage<256>); break;
-        default: TORCH_CHECK(false, "Unsupported M=", M, " (must be a multiple of 32 in [32,256])");
+    const int num_clusters = grid_size / CLUSTER_SIZE;
+    const int max_iters = (NUM_HEAD_TILES + num_clusters - 1) / num_clusters;
+
+    // Profiling timing buffer (only cluster 0's leader CTA writes into it).
+    int64_t* prof_dev = nullptr;
+    torch::Tensor timing;
+    if (profile) {
+        timing = torch::zeros({max_iters, 6}, x.options().dtype(torch::kInt64));
+        prof_dev = reinterpret_cast<int64_t*>(timing.data_ptr());
     }
 
-    // Configure max dynamic SMEM once per kernel variant (M/32 -> 1..8), not every call.
-    static bool smem_configured[9] = {false};
+    void* kernel_ptr = profile ? get_kernel_ptr<true>(M) : get_kernel_ptr<false>(M);
+    int smem_bytes = get_smem_bytes(M);
+    TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
+
+    // Configure max dynamic SMEM once per (profile, M) variant.
+    static bool smem_configured[2][9] = {{false}};
     const int m_idx = M / 32;
-    if (!smem_configured[m_idx]) {
+    const int p_idx = profile ? 1 : 0;
+    if (!smem_configured[p_idx][m_idx]) {
         auto attr_err = cudaFuncSetAttribute(kernel_ptr,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr_err), " smem_bytes=", smem_bytes);
-        smem_configured[m_idx] = true;
+        smem_configured[p_idx][m_idx] = true;
     }
 
     {
@@ -560,16 +650,35 @@ torch::Tensor wq_b_proj_gemm(
         config.attrs = attrs;
         config.numAttrs = 1;
 
-        float eps_f = static_cast<float>(eps);
-        void* ptr_args[] = { &desc_A, &desc_B, &desc_D, &grid_size, &eps_f };
+        void* ptr_args[] = { &desc_A, &desc_B, &desc_D, &grid_size, &eps, &prof_dev };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
     }
 
-    return out;
+    if (profile) return {out, timing};
+    return {out};
+}
+
+// ======================== PyTorch Binding ========================
+torch::Tensor wq_b_proj_gemm(
+    torch::Tensor x, torch::Tensor w, torch::Tensor rms_w, double eps)
+{
+    (void)rms_w;   // weightless RMSNorm: rms_w kept only for API parity
+    return run_wq_b(x, w, static_cast<float>(eps), /*profile=*/false)[0];
+}
+
+// Profiled variant: returns (out, timing[max_iters, 4]) with clock64 timestamps
+// of the MMA / epilogue windows on cluster 0's leader CTA.
+std::vector<torch::Tensor> wq_b_proj_gemm_profiled(
+    torch::Tensor x, torch::Tensor w, torch::Tensor rms_w, double eps)
+{
+    (void)rms_w;
+    return run_wq_b(x, w, static_cast<float>(eps), /*profile=*/true);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wq_b_proj_gemm", &wq_b_proj_gemm,
-          "wq_b proj (tcgen05 2SM MMA, DeepGEMM swap-AB, Blackwell)");
+          "wq_b proj + fused per-head RMSNorm (tcgen05 2SM MMA, swap-AB, Blackwell)");
+    m.def("wq_b_proj_gemm_profiled", &wq_b_proj_gemm_profiled,
+          "wq_b proj + fused RMSNorm + clock64 MMA/epilogue overlap timing -> (out, timing[max_iters,4])");
 }

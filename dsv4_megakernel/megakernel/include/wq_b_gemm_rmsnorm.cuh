@@ -256,6 +256,17 @@ __device__ __forceinline__ void tmem_load_fence() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
+// TMEM load: 16dp256b, x1 (4 FP32 per lane). This is the register layout required
+// by `stmatrix.trans`: two loads (base and base|0x00100000 for datapath 16..31)
+// give 8 values whose columns (= M in swap-AB) are 2*(lane%4)+{0,1} (even value
+// index -> +0, odd -> +1), spanning N across the lanes.
+__device__ __forceinline__ void tmem_load_16dp256b1x(
+    uint32_t tmem_addr, uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];"
+        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3) : "r"(tmem_addr));
+}
+
 // Store a single 32-bit word to shared memory
 __device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
@@ -266,6 +277,16 @@ __device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
 __device__ __forceinline__ void st_shared_u16(void* ptr, uint16_t v) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     asm volatile("st.shared.u16 [%0], %1;" :: "r"(addr), "h"(v) : "memory");
+}
+
+// stmatrix.x4.m8n8.trans: warp-cooperative, hardware-transposed bf16 matrix store
+// (registers -> shared). Replaces the 8 scattered per-element st.shared.u16.
+// Each lane provides its destination row address; r0..r3 are 4 packed bf16x2.
+__device__ __forceinline__ void stmatrix_x4_trans(
+    void* smem_ptr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+    asm volatile(
+        "stmatrix.sync.aligned.x4.m8n8.shared.b16.trans [%0], {%1,%2,%3,%4};"
+        :: "l"(__cvta_generic_to_shared(smem_ptr)), "r"(r0), "r"(r1), "r"(r2), "r"(r3));
 }
 
 // Cluster utilities
@@ -297,6 +318,16 @@ __device__ __forceinline__ float warp_reduce_sum32(float v) {
     for (int o = 16; o > 0; o >>= 1)
         v += __shfl_down_sync(0xffffffff, v, o);
     return v;
+}
+
+// Per-SM cycle counter (clock64). The "memory" clobber prevents the compiler
+// from hoisting/sinking the read across the region being timed. Because all
+// warps of a block share one SM, values are directly comparable within a block
+// (e.g. MMA warp vs epilogue warp overlap on the leader CTA).
+__device__ __forceinline__ long long rdclock() {
+    long long t;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(t) :: "memory");
+    return t;
 }
 
 } // namespace ptx
