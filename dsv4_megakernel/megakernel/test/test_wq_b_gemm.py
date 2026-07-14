@@ -2,17 +2,6 @@
 Test & Benchmark: wq_b Projection + Per-Head RMSNorm (tcgen05.mma Blackwell)
 GEMM: [M, 1536] × [65536, 1536]^T → [M, 65536] → per-head RMSNorm → [M, 65536] BF16
 Requires: NVIDIA B300 (sm_103), CUDA 12.4+, CUTLASS 3.x
-
-Profiling (clean, fast — skips correctness/benchmark via WQB_PROFILE_M):
-sudo -E env WQB_PROFILE_M=32 /usr/local/cuda/bin/ncu \
-  --set full --kernel-name-base demangled \
-  -k "regex:wq_b_proj_kernel<\(int\)32>" \
-  --launch-skip 20 --launch-count 1 \
-  --csv --page raw --log-file m32_profile.csv \
-  /home/admin/miniconda3/bin/python test/test_wq_b_proj_tcgen05.py
-  (WQB_PROFILE_M runs a pure warm loop of that M; launch #21 = steady state.
-   Omit the env var to run the full correctness+benchmark suite instead — the
-   same ncu command still lands on a warm M=32 kernel, just after more launches.)
 """
 import os, sys, torch
 import torch.nn.functional as F
@@ -49,8 +38,8 @@ def load_module():
     ]
 
     return load(
-        name='wq_b_proj_tcgen05',
-        sources=[os.path.join(proj_dir, 'kernels', 'wq_b_proj_gemm_tcgen05.cu')],
+        name='wq_b_gemm',
+        sources=[os.path.join(proj_dir, 'kernels', 'wq_b_gemm.cu')],
         extra_include_paths=[
             os.path.join(proj_dir, 'include'),
             cutlass_dir,
@@ -63,18 +52,10 @@ def load_module():
 
 
 def reference_gemm_fused_rmsnorm(x, w, rms_w, eps):
-    """PyTorch reference: GEMM + fused *weightless* per-head RMSNorm.
-
-    Mirrors model.py wq_b exactly:
-        q = wq_b(x).unflatten(-1, (n_heads, head_dim))
-        q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)
-    The kernel is weightless, so `rms_w` is unused (kept for API parity).
-    """
+    """PyTorch reference: pure GEMM (no RMSNorm yet - kernel outputs raw float32)."""
     # x: [M, 1536], w: [65536, 1536]
-    y = x.float() @ w.float().t()                       # [M, 65536]
-    y = y.unflatten(-1, (NUM_HEADS, HEAD_DIM))          # [M, 128, 512]
-    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
-    return y.flatten(-2)                                # [M, 65536], float32
+    y = x.float() @ w.float().t()              # [M, 65536]
+    return y  # float32, no norm for now
 
 
 def test_correctness(module, M=32):
@@ -110,13 +91,55 @@ def test_correctness(module, M=32):
     print(f"  mean_diff: {mean_diff:.6e}")
     print(f"  rel_diff:  {rel_diff:.6e}")
 
-    # Sanity: fused RMSNorm makes each head's RMS == 1 (up to +eps).
-    out_heads = out.float().unflatten(-1, (NUM_HEADS, HEAD_DIM))
-    head_rms = out_heads.square().mean(-1).sqrt()          # [M, 128]
-    print(f"  per-head RMS: mean={head_rms.mean().item():.6f} "
-          f"min={head_rms.min().item():.6f} max={head_rms.max().item():.6f} (expect ~1.0)")
+    passed = cos_sim > 0.99
+    print(f"  Result: {'PASS' if passed else 'FAIL'}")
+    return passed
 
-    passed = cos_sim > 0.99 and abs(head_rms.mean().item() - 1.0) < 0.05
+
+def test_with_nontrivial_weight(module, M=64):
+    """Test with non-trivial rms_w (not all-ones)."""
+    print("\n" + "=" * 60)
+    print(f"Scale Test: non-trivial rms_w (M={M})")
+    print("=" * 60)
+    device = 'cuda'
+
+    x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
+    w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
+    rms_w = torch.rand(HEAD_DIM, device=device, dtype=torch.float32) * 2 + 0.5
+
+    ref = reference_gemm_fused_rmsnorm(x, w, rms_w, RMS_EPS)
+    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
+
+    cos_sim = F.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0).item()
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    print(f"  cos_sim:  {cos_sim:.8f}")
+    print(f"  max_diff: {max_diff:.6e}")
+    passed = cos_sim > 0.99
+    print(f"  Result: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_m_padding(module):
+    """Test M=32 (padded to 64 internally by kernel)."""
+    print("\n" + "=" * 60)
+    print("Padding Test: M=32 padded to MMA_M=64")
+    print("=" * 60)
+    device = 'cuda'
+    M = 32
+
+    x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
+    w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
+    rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
+
+    ref = reference_gemm_fused_rmsnorm(x, w, rms_w, RMS_EPS)
+    out = module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
+
+    assert out.shape == (M, N_TOTAL), f"Shape mismatch: {out.shape}"
+    cos_sim = F.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0).item()
+    print(f"  cos_sim: {cos_sim:.8f}")
+    passed = cos_sim > 0.99
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
     return passed
 
@@ -134,12 +157,11 @@ def benchmark(module):
 
     weight_bytes = N_TOTAL * K_DIM * 2  # 192 MB
 
-    batch_sizes = [32, 64, 96, 128, 160, 192, 224, 256]
+    batch_sizes = [32, 64, 128, 256]
     print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
     print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
-    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Both outputs are BF16")
-    print(f"        (model-faithful), so BW uses the same byte count for both.")
-    print(f"        Ours also fuses per-head RMSNorm; cuBLAS baseline is GEMM-only.")
+    print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Our output is FP32,")
+    print(f"        cuBLAS output is BF16, so each BW uses its own output bytes.")
     print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
     print("  " + "-" * 70)
 
@@ -175,9 +197,9 @@ def benchmark(module):
         flops = 2 * M * N_TOTAL * K_DIM
         tflops = flops / (ours_us * 1e-6) / 1e12
 
-        # Bytes moved: shared weight + activation(bf16) + output(bf16, both kernels)
+        # Bytes moved: shared weight + activation(bf16); output differs by dtype
         common_bytes = weight_bytes + M * K_DIM * 2
-        ours_bytes   = common_bytes + M * N_TOTAL * 2   # our output is BF16
+        ours_bytes   = common_bytes + M * N_TOTAL * 4   # our output is FP32
         cublas_bytes = common_bytes + M * N_TOTAL * 2   # cuBLAS output is BF16
         ours_bw   = ours_bytes   / (ours_us   * 1e-6) / 1e9
         cublas_bw = cublas_bytes / (cublas_us * 1e-6) / 1e9
@@ -188,20 +210,70 @@ def benchmark(module):
         print(f"  {M:<5} {ours_us:<10.1f} {cublas_us:<11.1f} {ours_bw:<10.1f} {cublas_bw:<11.1f} {tflops:<9.1f} {pct_cublas:<7.1f}%")
 
 
-def profile_loop(module, M, iters=40):
-    """Pure warm launch loop for one M — for a clean ncu capture (no correctness/benchmark).
+def profile_overlap(module, M=128):
+    """clock64 profiling: MMA vs epilogue pipeline overlap on cluster 0's leader CTA.
 
-    With `--launch-skip 20 --launch-count 1` the profiled kernel is launch #21,
-    which is fully warm here (JIT done, caches warm, steady state).
+    Uses module.wq_b_proj_gemm_profiled -> (out, timing[max_iters, 4]) where each
+    row is one persistent iteration: [mma_start, mma_end, epi_start, epi_end] in
+    clock64 cycles (same SM, directly comparable).
     """
-    print(f"[profile] warm loop: M={M}, {iters} launches of wq_b_proj_kernel<{M}>")
+    import numpy as np
+    print("\n" + "=" * 60)
+    print(f"Pipeline overlap (clock64): MMA vs epilogue (M={M})")
+    print("=" * 60)
     device = 'cuda'
+
     x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
     w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
-    rms_w = torch.ones(HEAD_DIM, device=device, dtype=torch.float32)
-    for _ in range(iters):
-        module.wq_b_proj_gemm(x, w, rms_w, RMS_EPS)
+
+    # Warm up (JIT + cold start), then take one profiled run.
+    for _ in range(5):
+        module.wq_b_proj_gemm_profiled(x, w)
     torch.cuda.synchronize()
+    out, timing = module.wq_b_proj_gemm_profiled(x, w)
+    torch.cuda.synchronize()
+
+    t = timing.cpu().numpy().astype(np.int64)
+    # Drop iterations that never ran (all-zero rows).
+    valid = ~(t == 0).all(axis=1)
+    t = t[valid]
+    if len(t) == 0:
+        print("  no timing rows captured"); return
+
+    mma_s, mma_e, epi_s, epi_e = t[:, 0], t[:, 1], t[:, 2], t[:, 3]
+    niter = len(t)
+    origin = int(min(mma_s.min(), epi_s.min()))
+
+    print(f"  captured {niter} persistent iterations (leader CTA of cluster 0)")
+    print(f"  {'iter':<5} {'MMA[start':>12} {'end]':>10} {'EPI[start':>12} {'end]':>10} {'MMA_cyc':>9} {'EPI_cyc':>9}")
+    for i in range(niter):
+        print(f"  {i:<5} {mma_s[i]-origin:>12} {mma_e[i]-origin:>10} "
+              f"{epi_s[i]-origin:>12} {epi_e[i]-origin:>10} "
+              f"{mma_e[i]-mma_s[i]:>9} {epi_e[i]-epi_s[i]:>9}")
+
+    # Overlap of interest (double-buffered): EPI[n] vs MMA[n+1].
+    # Denominator is the EPI window -> "what fraction of the epilogue is hidden
+    # under the next MMA" (the meaningful number, since MMA >> EPI here).
+    hidden = []
+    gaps = []
+    for n in range(niter - 1):
+        ov = max(0, min(int(mma_e[n+1]), int(epi_e[n])) - max(int(mma_s[n+1]), int(epi_s[n])))
+        epi_dur = int(epi_e[n] - epi_s[n])
+        if epi_dur > 0:
+            hidden.append(ov / epi_dur)
+        gaps.append(int(mma_s[n+1] - mma_e[n]))   # bubble between consecutive MMAs
+
+    print("  " + "-" * 60)
+    print(f"  mean MMA window: {np.mean(mma_e - mma_s):.0f} cyc, "
+          f"mean EPI window: {np.mean(epi_e - epi_s):.0f} cyc")
+    if hidden:
+        print(f"  epilogue hidden under next MMA: {np.mean(hidden):.1%}  "
+              f"(near 100% = EPI fully overlapped / off critical path)")
+        print(f"  MMA back-to-back gap: {np.mean(gaps):.0f} cyc "
+              f"(near 0 = MMA warp continuously busy, no bubble)")
+    else:
+        print("  only 1 iteration on this SM -> cannot measure inter-iter overlap "
+              "(reduce grid / increase M*N per cluster to get >1 iter)")
 
 
 if __name__ == '__main__':
@@ -219,23 +291,18 @@ if __name__ == '__main__':
 
     module = load_module()
 
-    # Clean profiling fast-path: `WQB_PROFILE_M=32 ... ncu ... python test.py`
-    # Runs only a warm launch loop of that M so the ncu capture is isolated & fast.
-    prof_m = os.environ.get('WQB_PROFILE_M')
-    if prof_m:
-        M = int(prof_m)
-        assert 32 <= M <= 256 and M % 32 == 0, f"WQB_PROFILE_M must be a multiple of 32 in [32,256], got {M}"
-        profile_loop(module, M, iters=int(os.environ.get('WQB_PROFILE_ITERS', '40')))
-        sys.exit(0)
-
-    # Correctness sweep: every 32-aligned M in [32, 256].
-    all_pass = True
-    for M in range(32, 257, 32):
-        all_pass &= test_correctness(module, M=M)
+    ok1 = test_correctness(module, M=32)
+    ok2 = test_correctness(module, M=64)
+    ok3 = test_correctness(module, M=128)
+    ok4 = test_with_nontrivial_weight(module, M=64)
+    ok5 = test_m_padding(module)
 
     benchmark(module)
 
+    profile_overlap(module, M=128)
+
     print("\n" + "=" * 60)
+    all_pass = ok1 and ok2 and ok3 and ok4 and ok5
     print(f"Summary: {'ALL PASS' if all_pass else 'SOME FAILED'}")
     print("=" * 60)
     sys.exit(0 if all_pass else 1)

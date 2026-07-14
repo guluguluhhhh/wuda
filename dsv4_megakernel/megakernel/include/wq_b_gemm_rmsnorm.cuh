@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-// wq_b_proj_gemm_tcgen05.cuh
+// wq_b_gemm_rmsnorm.cuh
 // tcgen05 BF16 GEMM — Header (SWAP-AB variant)
 // Aligned with DeepGEMM sm100_bf16_gemm.cuh + sm100_store_cd_swap_ab.cuh
 //

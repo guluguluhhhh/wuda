@@ -1,5 +1,5 @@
 // ============================================================
-// wq_b_proj_gemm_tcgen05.cu
+// wq_b_gemm_rmsnorm.cu
 // tcgen05 BF16 GEMM — Kernel + Host + PyTorch Binding (SWAP-AB)
 // Aligned with DeepGEMM sm100_bf16_gemm.cuh (swap_ab path)
 //
@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-#include "wq_b_proj_gemm_tcgen05.cuh"
+#include "wq_b_gemm_rmsnorm.cuh"
 
 using namespace wq_b;
 using Barrier = mma_desc::Barrier;
