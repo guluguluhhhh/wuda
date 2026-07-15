@@ -121,9 +121,9 @@ def test_with_nontrivial_weight(module, M=64):
 
 
 def test_m_padding(module):
-    """Test M=32 (padded to 64 internally by kernel)."""
+    """Test M=32 (FIXED-BM: activation zero-padded to BM=128 internally)."""
     print("\n" + "=" * 60)
-    print("Padding Test: M=32 padded to MMA_M=64")
+    print("Padding Test: M=32 zero-padded to BM=128")
     print("=" * 60)
     device = 'cuda'
     M = 32
@@ -157,7 +157,7 @@ def benchmark(module):
 
     weight_bytes = N_TOTAL * K_DIM * 2  # 192 MB
 
-    batch_sizes = [32, 64, 128, 256]
+    batch_sizes = [32, 64, 96, 128]   # FIXED-BM kernel: M in [32,128]
     print(f"  K={K_DIM}, N={N_TOTAL} (128 heads x 512 dim)")
     print(f"  Weight: {weight_bytes/1e6:.1f} MB (bf16)")
     print(f"  NOTE: %cuBLAS is latency-based (cuBLAS_us/ours_us). Our output is FP32,")

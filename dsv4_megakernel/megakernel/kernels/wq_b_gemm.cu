@@ -3,8 +3,8 @@
 // tcgen05 BF16 GEMM — Kernel + Host + PyTorch Binding (SWAP-AB)
 // Aligned with DeepGEMM sm100_bf16_gemm.cuh (swap_ab path)
 //
-// M=32~256 (32-aligned), K=1536, N=65536, BF16 -> FP32 output
-// swap_ab=1: UMMA_M=256 along N, UMMA_N=M along M.
+// M=32~128 (32-aligned), K=1536, N=65536, BF16 -> FP32 output
+// swap_ab=1: UMMA_M=256 along N, UMMA_N=128 FIXED (BM=128); M<128 zero-padded.
 // 2SM MMA (cta_group::2), Cluster=(2,1,1) [cluster_n=2],
 // kIsMulticastOnA=true, Persistent, Warp-Specialized.
 // ============================================================
@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 
 #include "wq_b_gemm.cuh"
+#include "cluster_mma.cuh"   // fixed-128 2SM swap-AB MMA engine (leader MMA warp)
 
 using namespace wq_b;
 using Barrier = mma_desc::Barrier;
@@ -54,9 +55,9 @@ wq_b_proj_kernel(
     using Dims = SwapDims<M_TPL>;
     constexpr int NUM_STAGES_T       = Dims::NUM_STAGES;
     constexpr int SMEM_A_PER_STAGE_T = Dims::SMEM_A_PER_STAGE;
-    constexpr int LOAD_BLOCK_M_T     = Dims::LOAD_BLOCK_M;   // M/2
-    constexpr int UMMA_N_T           = Dims::UMMA_N;         // M
-    constexpr int NUM_TMEM_COLS_T    = Dims::NUM_TMEM_COLS;  // 2*M
+    constexpr int LOAD_BLOCK_M_T     = Dims::LOAD_BLOCK_M;   // 64  (fixed, BM/2)
+    constexpr int UMMA_N_T           = Dims::UMMA_N;         // 128 (fixed, BM)
+    constexpr int NUM_TMEM_COLS_T    = Dims::NUM_TMEM_COLS;  // 256 (fixed, 2*BM)
 
     constexpr int NUM_TILES_TOTAL = NUM_N_TILES; // single M block -> tiles = N tiles
 
@@ -101,21 +102,12 @@ wq_b_proj_kernel(
     cudaGridDependencySynchronize();
 
     // ================================================================
-    // SMEM DESCRIPTOR PRE-COMPUTATION (warp-shuffle trick)
-    // swap-AB: MMA A-operand = weight (smem_b), B-operand = activation (smem_a)
+    // SMEM bases (swap-AB: MMA A-operand = weight (smem_b), B-operand =
+    // activation (smem_a)). The per-stage descriptor tables are built inside
+    // the MMA warp by cluster_mma::init_desc.
     // ================================================================
     auto* smem_a_base = reinterpret_cast<nv_bfloat16*>(s.smem_a);   // activation
     auto* smem_b_base = reinterpret_cast<nv_bfloat16*>(s.smem_b);   // weight
-
-    auto act_desc = mma_desc::make_smem_desc_k_major(smem_a_base);  // B-operand
-    auto wgt_desc = mma_desc::make_smem_desc_k_major(smem_b_base);  // A-operand
-
-    uint32_t act_desc_lo = (lane_id < NUM_STAGES_T)
-        ? act_desc.lo + lane_id * (SMEM_A_PER_STAGE_T / 16) : 0u;
-    uint32_t wgt_desc_lo = (lane_id < NUM_STAGES_T)
-        ? wgt_desc.lo + lane_id * (SMEM_B_PER_STAGE / 16) : 0u;
-
-    uint64_t runtime_idesc = mma_desc::make_runtime_instr_desc<UMMA_N_T>();
 
     // ================================================================
     // Persistent tile scheduling (single M block; iterate N tiles)
@@ -169,66 +161,35 @@ wq_b_proj_kernel(
     }
 
     // ======== WARP 1: MMA CONSUMER (leader only) ========
+    // The whole per-tile MMA (accumulator-empty wait + K-loop + barrier arrives)
+    // is delegated to the reusable fixed-128 cluster_mma engine. Only the
+    // persistent scheduling, the accum-stage bookkeeping, and the final drain
+    // wait stay here.
     else if (warp_id == 1 && is_leader) {
-        uint32_t stage_idx = 0, phase = 0;
-        auto advance_pipeline = [&]() {
-            stage_idx = (stage_idx + 1) % NUM_STAGES_T;
-            if (stage_idx == 0) phase ^= 1;
-        };
+        using CM = cluster_mma::ClusterMmaBF16<BLOCK_K, NUM_STAGES_T>;
+        static_assert(UMMA_N_T == CM::UMMA_N, "FIXED-BM kernel requires UMMA_N == 128");
 
+        auto ds = CM::init_desc(smem_a_base, smem_b_base, lane_id);
+
+        uint32_t stage_idx = 0, phase = 0;
         uint32_t persistent_iter = 0;
         for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
             uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
 
-            s.tmem_empty_barriers[accum_stage].wait(accum_phase ^ 1);
-            ptx::tcgen05_fence_after_sync();
-
-            // [PROFILE] MMA warp: start of this iteration's issue window.
+            // [PROFILE] MMA warp per-iteration window. NOTE: with cluster_mma the
+            // window now includes the accumulator-empty wait that run_tile does
+            // first (run_tile is a single call), so t0 is slightly earlier than the
+            // old inline path (which stamped right after that wait).
             long long prof_mma_t0 = 0;
             if (kProfile && cluster_id == 0 && lane_id == 0)
                 prof_mma_t0 = ptx::rdclock();
 
-            uint32_t tmem_c = accum_stage * UMMA_N_T;
+            CM::run_tile(ds, s.full_barriers, s.empty_barriers,
+                         s.tmem_full_barriers[accum_stage], s.tmem_empty_barriers[accum_stage],
+                         accum_stage * UMMA_N_T, NUM_K_TILES, accum_phase,
+                         stage_idx, phase);
 
-            for (int k = 0; k < NUM_K_TILES; ++k) {
-                s.full_barriers[stage_idx].wait(phase);
-                ptx::tcgen05_fence_after_sync();
-
-                uint32_t w_base = __shfl_sync(0xffffffff, wgt_desc_lo, stage_idx);
-                uint32_t a_base = __shfl_sync(0xffffffff, act_desc_lo, stage_idx);
-
-                if (ptx::elect_one_sync()) {
-                    #pragma unroll
-                    for (int kk = 0; kk < BLOCK_K / UMMA_K; ++kk) {
-                        uint32_t w_lo = mma_desc::advance_desc_lo_for_k(w_base, kk);
-                        uint32_t a_lo = mma_desc::advance_desc_lo_for_k(a_base, kk);
-
-                        uint64_t w_full = (static_cast<uint64_t>(wgt_desc.hi) << 32) | w_lo;
-                        uint64_t a_full = (static_cast<uint64_t>(act_desc.hi) << 32) | a_lo;
-
-                        uint32_t accum_flag = (k > 0 || kk > 0) ? 1 : 0;
-                        // A-operand = weight (UMMA_M=256), B-operand = activation (UMMA_N=M)
-                        ptx::tcgen05_mma_2sm(tmem_c, w_full, a_full,
-                                             runtime_idesc, accum_flag);
-                    }
-                }
-                __syncwarp();
-
-                constexpr uint16_t CTA_MASK = (1 << NUM_MULTICAST) - 1;
-                ptx::umma_arrive_multicast_2sm(
-                    reinterpret_cast<uint64_t*>(&s.empty_barriers[stage_idx]), CTA_MASK);
-                if (k == NUM_K_TILES - 1) {
-                    ptx::umma_arrive_multicast_2sm(
-                        reinterpret_cast<uint64_t*>(&s.tmem_full_barriers[accum_stage]),
-                        CTA_MASK);
-                }
-                __syncwarp();
-
-                advance_pipeline();
-            }
-
-            // [PROFILE] MMA warp: end of this iteration's issue window.
             if (kProfile && cluster_id == 0 && lane_id == 0) {
                 prof[persistent_iter * 4 + 0] = prof_mma_t0;
                 prof[persistent_iter * 4 + 1] = ptx::rdclock();
@@ -383,6 +344,8 @@ static CUtensorMap make_tma_desc_fp32_2d(
 }
 
 // ======================== Kernel / SMEM selectors ========================
+// FIXED-BM: only M in [32,128] (32-aligned). M>128 is unsupported (UMMA_N=128
+// TMEM region would overflow), so those templates are intentionally not built.
 template <bool kProfile>
 static void* get_kernel_ptr(int M) {
     switch (M) {
@@ -390,10 +353,6 @@ static void* get_kernel_ptr(int M) {
         case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile>;
         case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile>;
         case 128: return (void*)&wq_b_proj_kernel<128, kProfile>;
-        case 160: return (void*)&wq_b_proj_kernel<160, kProfile>;
-        case 192: return (void*)&wq_b_proj_kernel<192, kProfile>;
-        case 224: return (void*)&wq_b_proj_kernel<224, kProfile>;
-        case 256: return (void*)&wq_b_proj_kernel<256, kProfile>;
         default:  return nullptr;
     }
 }
@@ -404,10 +363,6 @@ static int get_smem_bytes(int M) {
         case 64:  return (int)sizeof(SharedStorage<64>);
         case 96:  return (int)sizeof(SharedStorage<96>);
         case 128: return (int)sizeof(SharedStorage<128>);
-        case 160: return (int)sizeof(SharedStorage<160>);
-        case 192: return (int)sizeof(SharedStorage<192>);
-        case 224: return (int)sizeof(SharedStorage<224>);
-        case 256: return (int)sizeof(SharedStorage<256>);
         default:  return 0;
     }
 }
@@ -428,9 +383,11 @@ static std::vector<torch::Tensor> run_wq_b(torch::Tensor x, torch::Tensor w, boo
     const int M = x.size(0);
     TORCH_CHECK(x.size(1) == K_DIM);
     TORCH_CHECK(w.size(0) == N_TOTAL && w.size(1) == K_DIM);
-    TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0);
+    // FIXED-BM: UMMA_N is pinned to 128, so M>128 is not supported by this kernel.
+    TORCH_CHECK(M >= 32 && M <= BM && M % 32 == 0,
+                "FIXED-BM kernel supports M in [32,128] (32-aligned), got M=", M);
 
-    // swap-AB: BLOCK_M = M exactly (single M block), no padding.
+    // Output keeps the true M rows.
     auto out = torch::empty({M, N_TOTAL}, x.options().dtype(torch::kFloat32));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -438,8 +395,14 @@ static std::vector<torch::Tensor> run_wq_b(torch::Tensor x, torch::Tensor w, boo
     auto w_ptr   = reinterpret_cast<const nv_bfloat16*>(w.data_ptr());
     auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
 
-    // TMA descriptors
-    const int load_block_m = M / NUM_MULTICAST; // activation rows per CTA
+    // TMA descriptors. FIXED-BM: the 2SM MMA splits UMMA_N(=128) as 64 activation
+    // rows per CTA (CTA1 reads rows [64,128)). For M<128 those rows are out of the
+    // real activation, but the TMA descriptor's globalDim stays at the true M: the
+    // tiled TMA (cp.async.bulk.tensor ... complete_tx::bytes) ZERO-FILLS out-of-bounds
+    // box elements in smem and still commits the full box byte count, so the mbarrier
+    // completes normally. The zero (padded) UMMA_N columns are simply not stored by
+    // the epilogue. No host-side padding -> no overhead in the timed path.
+    const int load_block_m = BM / NUM_MULTICAST; // 64 activation rows per CTA (fixed)
     CUtensorMap desc_A = make_tma_desc_bf16_2d(x_ptr, M, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B = make_tma_desc_bf16_2d(w_ptr, N_TOTAL, K_DIM, LOAD_BLOCK_N, BLOCK_K);
     // Output D: box = STORE_BLOCK_M (M rows) x STORE_BLOCK_N_ATOM (N cols), 128B swizzle

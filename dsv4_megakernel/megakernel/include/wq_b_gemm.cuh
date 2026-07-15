@@ -4,9 +4,16 @@
 // tcgen05 BF16 GEMM — Header (SWAP-AB variant)
 // Aligned with DeepGEMM sm100_bf16_gemm.cuh + sm100_store_cd_swap_ab.cuh
 //
-// Target: M=32~256 (32-aligned), K=1536, N=65536, BF16 -> FP32 output
+// Target: M=32~128 (32-aligned), K=1536, N=65536, BF16 -> FP32 output
 // swap_ab=1, 2SM MMA (cta_group::2), Cluster=(1,2,1) -> cluster_n=2,
 // kIsMulticastOnA=true, Persistent, Warp-Specialized.
+//
+// FIXED-BM variant: UMMA_N is pinned to 128 (BM=128) regardless of M, so the
+// MMA instruction shape matches the megakernel's cluster_mma building block.
+// M<128 is padded up to 128 (activation zero-padded on the host); the padded
+// output columns are simply not stored in the epilogue. Because the kernel is
+// HBM-bound (192MB weight streamed once), padding small M to 128 is hidden and
+// does not change wall-clock. M>128 is intentionally NOT supported here.
 //
 // Rationale (from NCU profile of the previous non-swap kernel):
 //   the previous kernel was Tensor-pipe / latency bound (DRAM only ~41%,
@@ -45,10 +52,14 @@ static constexpr bool IS_MULTICAST_ON_A = true;    // cluster_n = 2
 
 // ---- MMA instruction shape (2SM) ----
 // UMMA_M = LAYOUT_AD_M(128) * kNumMulticast(2) = 256  (along problem-N)
-// UMMA_N = BLOCK_M = M                                 (along problem-M, per-kernel template)
+// UMMA_N = 128 FIXED (along problem-M = BM). M<128 padded to 128.
 static constexpr int LAYOUT_AD_M = 128;
 static constexpr int UMMA_M = LAYOUT_AD_M * NUM_MULTICAST; // 256
 static constexpr int UMMA_K = 16;                          // BF16: 16 elements
+// Fixed BM/UMMA_N (matches the megakernel cluster_mma primitive).
+static constexpr int BM       = 128;                       // problem-M tile = UMMA_N
+static constexpr int UMMA_N_FIXED = BM;                    // 128
+static constexpr int LOAD_BLOCK_M_FIXED = BM / NUM_MULTICAST; // 64 activation rows per CTA
 
 // ---- N tiling ----
 // Each 2SM cluster produces UMMA_M = 256 columns of N (128 per CTA).
@@ -99,16 +110,18 @@ static constexpr int ceil_pow2(int v) {
 }
 
 // ---- Compile-time helpers parameterised on M ----
-// LOAD_BLOCK_M: activation rows loaded per CTA (split across the 2 CTAs on M).
+// FIXED-BM: UMMA_N and the per-CTA activation load are pinned to 128 / 64, so the
+// MMA shape is identical for every M. Only BLOCK_M (used by the epilogue to decide
+// how many real output rows to store) tracks the true M.
 template <int M_> struct SwapDims {
-    static constexpr int BLOCK_M          = M_;              // = problem M (single M block)
-    static constexpr int UMMA_N           = M_;              // MMA-N = problem M
-    static constexpr int LOAD_BLOCK_M     = M_ / NUM_MULTICAST; // M/2 per CTA
-    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
+    static constexpr int BLOCK_M          = M_;                    // true M (epilogue store count)
+    static constexpr int UMMA_N           = UMMA_N_FIXED;          // 128 (fixed, was M_)
+    static constexpr int LOAD_BLOCK_M     = LOAD_BLOCK_M_FIXED;    // 64  (fixed, was M_/2)
+    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(nv_bfloat16); // 64*64*2 = 8192
     static constexpr int SMEM_PER_STAGE   = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE;
     // Allocate kNumEpilogueStages * UMMA_N columns, rounded up to a power of two for
     // tcgen05.alloc. The MMA/epilogue still address stages at accum_stage * UMMA_N.
-    static constexpr int NUM_TMEM_COLS    = ceil_pow2(NUM_EPI_STAGES * UMMA_N);
+    static constexpr int NUM_TMEM_COLS    = ceil_pow2(NUM_EPI_STAGES * UMMA_N); // 256 (fixed)
 
     // Solve number of stages fitting the SMEM budget.
     // Overhead: smem_cd + barriers(full+empty per stage, tmem full/empty) + tmem_ptr.
