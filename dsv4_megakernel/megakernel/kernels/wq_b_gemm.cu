@@ -120,7 +120,7 @@ wq_b_proj_kernel(
 
     // ======== WARP 0: TMA PRODUCER (both CTAs) ========
     if (warp_id == 0 && ptx::elect_one_sync()) {
-        uint32_t stage_idx = 0, phase = 0;
+        uint32_t stage_idx = 0, phase = 0, persistent_iter = 0;
         auto advance_pipeline = [&]() {
             stage_idx = (stage_idx + 1) % NUM_STAGES_T;
             if (stage_idx == 0) phase ^= 1;
@@ -131,6 +131,11 @@ wq_b_proj_kernel(
             int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N;
             // Activation M base for this CTA (split across the 2 CTAs; single M block).
             int m_base = cta_rank * LOAD_BLOCK_M_T;
+
+            // [PROFILE] Load (producer) window for this iteration's K-loop.
+            long long prof_ld_t0 = 0;
+            if (kProfile && cluster_id == 0 && cta_rank == 0)
+                prof_ld_t0 = ptx::rdclock();
 
             for (int k = 0; k < NUM_K_TILES; ++k) {
                 s.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -157,6 +162,12 @@ wq_b_proj_kernel(
 
                 advance_pipeline();
             }
+
+            if (kProfile && cluster_id == 0 && cta_rank == 0) {
+                prof[persistent_iter * 6 + 0] = prof_ld_t0;
+                prof[persistent_iter * 6 + 1] = ptx::rdclock();
+            }
+            persistent_iter++;
         }
     }
 
@@ -191,8 +202,8 @@ wq_b_proj_kernel(
                          stage_idx, phase);
 
             if (kProfile && cluster_id == 0 && lane_id == 0) {
-                prof[persistent_iter * 4 + 0] = prof_mma_t0;
-                prof[persistent_iter * 4 + 1] = ptx::rdclock();
+                prof[persistent_iter * 6 + 2] = prof_mma_t0;
+                prof[persistent_iter * 6 + 3] = ptx::rdclock();
             }
 
             persistent_iter++;
@@ -295,8 +306,8 @@ wq_b_proj_kernel(
             // [PROFILE] Epilogue (leader CTA): end of this iteration's readback+store.
             if (kProfile && cluster_id == 0 && cta_rank == 0 &&
                 epi_warp_idx == 0 && lane_id == 0) {
-                prof[persistent_iter * 4 + 2] = prof_epi_t0;
-                prof[persistent_iter * 4 + 3] = ptx::rdclock();
+                prof[persistent_iter * 6 + 4] = prof_epi_t0;
+                prof[persistent_iter * 6 + 5] = ptx::rdclock();
             }
 
             persistent_iter++;
@@ -426,7 +437,8 @@ static std::vector<torch::Tensor> run_wq_b(torch::Tensor x, torch::Tensor w, boo
     int64_t* prof_dev = nullptr;
     torch::Tensor timing;
     if (profile) {
-        timing = torch::zeros({max_iters, 4}, x.options().dtype(torch::kInt64));
+        // [max_iters, 6]: col0/1 load_start/end | col2/3 mma_start/end | col4/5 epi_start/end
+        timing = torch::zeros({max_iters, 6}, x.options().dtype(torch::kInt64));
         prof_dev = reinterpret_cast<int64_t*>(timing.data_ptr());
     }
 
@@ -492,5 +504,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wq_b_proj_gemm", &wq_b_proj_gemm,
           "wq_b proj (tcgen05 2SM MMA, DeepGEMM swap-AB, Blackwell)");
     m.def("wq_b_proj_gemm_profiled", &wq_b_proj_gemm_profiled,
-          "wq_b proj + clock64 MMA/epilogue overlap timing -> (out, timing[max_iters,4])");
+          "wq_b proj + clock64 load/MMA/epilogue timing -> (out, timing[max_iters,6])");
 }

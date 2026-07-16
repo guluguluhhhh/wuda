@@ -210,70 +210,61 @@ def benchmark(module):
         print(f"  {M:<5} {ours_us:<10.1f} {cublas_us:<11.1f} {ours_bw:<10.1f} {cublas_bw:<11.1f} {tflops:<9.1f} {pct_cublas:<7.1f}%")
 
 
-def profile_overlap(module, M=128):
-    """clock64 profiling: MMA vs epilogue pipeline overlap on cluster 0's leader CTA.
-
-    Uses module.wq_b_proj_gemm_profiled -> (out, timing[max_iters, 4]) where each
-    row is one persistent iteration: [mma_start, mma_end, epi_start, epi_end] in
-    clock64 cycles (same SM, directly comparable).
-    """
+def profile_pipeline(module, M=128, clock_ghz=1.8):
+    """Visualize load / MMA / epilogue overlap from wq_b_proj_gemm_profiled.
+    timing[max_iters,6] = [load_s, load_e, mma_s, mma_e, epi_s, epi_e] (clock64 cycles,
+    cluster0/CTA0 -> same SM, directly comparable). Same layout/print as the FP8 test
+    for an apples-to-apples BF16-vs-FP8 pipeline comparison."""
     import numpy as np
-    print("\n" + "=" * 60)
-    print(f"Pipeline overlap (clock64): MMA vs epilogue (M={M})")
-    print("=" * 60)
+    print("\n" + "=" * 76)
+    print(f"Pipeline overlap (clock64): LOAD vs MMA vs EPILOGUE (BF16, M={M})")
+    print("=" * 76)
     device = 'cuda'
-
     x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
     w = torch.randn(N_TOTAL, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
 
-    # Warm up (JIT + cold start), then take one profiled run.
     for _ in range(5):
         module.wq_b_proj_gemm_profiled(x, w)
     torch.cuda.synchronize()
-    out, timing = module.wq_b_proj_gemm_profiled(x, w)
+    _, timing = module.wq_b_proj_gemm_profiled(x, w)
     torch.cuda.synchronize()
 
     t = timing.cpu().numpy().astype(np.int64)
-    # Drop iterations that never ran (all-zero rows).
-    valid = ~(t == 0).all(axis=1)
-    t = t[valid]
+    t = t[~(t == 0).all(axis=1)]
     if len(t) == 0:
         print("  no timing rows captured"); return
+    ls, le, ms, me, es, ee = (t[:, i] for i in range(6))
+    origin = int(min(ls.min(), ms.min(), es.min()))
+    ls, le, ms, me, es, ee = (a - origin for a in (ls, le, ms, me, es, ee))
+    span = int(max(le.max(), me.max(), ee.max()))
+    if span <= 0:
+        print("  degenerate span"); return
+    c2us = lambda c: c / clock_ghz / 1e3
+    n = len(t)
+    print(f"  {n} persistent iterations; span={span} cyc (~{c2us(span):.1f} us @ {clock_ghz}GHz assumed)")
+    print(f"  {'it':>3}  {'LOAD [s,e] dur':>26}  {'MMA [s,e] dur':>26}  {'EPI [s,e] dur':>26}")
+    for i in range(min(n, 12)):
+        print(f"  {i:>3}  [{ls[i]:>8},{le[i]:>8}] {le[i]-ls[i]:>6}  "
+              f"[{ms[i]:>8},{me[i]:>8}] {me[i]-ms[i]:>6}  "
+              f"[{es[i]:>8},{ee[i]:>8}] {ee[i]-es[i]:>6}")
 
-    mma_s, mma_e, epi_s, epi_e = t[:, 0], t[:, 1], t[:, 2], t[:, 3]
-    niter = len(t)
-    origin = int(min(mma_s.min(), epi_s.min()))
+    W = 100
+    def track(s, e, ch):
+        line = [' '] * W
+        for a, b in zip(s, e):
+            i0 = int(a / span * W); i1 = max(i0 + 1, int(b / span * W))
+            for j in range(i0, min(i1, W)):
+                line[j] = ch
+        return ''.join(line)
+    print("  timeline (each track = that stage's windows across all iters):")
+    print("   LOAD |" + track(ls, le, 'L') + "|")
+    print("   MMA  |" + track(ms, me, 'M') + "|")
+    print("   EPI  |" + track(es, ee, 'E') + "|")
 
-    print(f"  captured {niter} persistent iterations (leader CTA of cluster 0)")
-    print(f"  {'iter':<5} {'MMA[start':>12} {'end]':>10} {'EPI[start':>12} {'end]':>10} {'MMA_cyc':>9} {'EPI_cyc':>9}")
-    for i in range(niter):
-        print(f"  {i:<5} {mma_s[i]-origin:>12} {mma_e[i]-origin:>10} "
-              f"{epi_s[i]-origin:>12} {epi_e[i]-origin:>10} "
-              f"{mma_e[i]-mma_s[i]:>9} {epi_e[i]-epi_s[i]:>9}")
-
-    # Overlap of interest (double-buffered): EPI[n] vs MMA[n+1].
-    # Denominator is the EPI window -> "what fraction of the epilogue is hidden
-    # under the next MMA" (the meaningful number, since MMA >> EPI here).
-    hidden = []
-    gaps = []
-    for n in range(niter - 1):
-        ov = max(0, min(int(mma_e[n+1]), int(epi_e[n])) - max(int(mma_s[n+1]), int(epi_s[n])))
-        epi_dur = int(epi_e[n] - epi_s[n])
-        if epi_dur > 0:
-            hidden.append(ov / epi_dur)
-        gaps.append(int(mma_s[n+1] - mma_e[n]))   # bubble between consecutive MMAs
-
-    print("  " + "-" * 60)
-    print(f"  mean MMA window: {np.mean(mma_e - mma_s):.0f} cyc, "
-          f"mean EPI window: {np.mean(epi_e - epi_s):.0f} cyc")
-    if hidden:
-        print(f"  epilogue hidden under next MMA: {np.mean(hidden):.1%}  "
-              f"(near 100% = EPI fully overlapped / off critical path)")
-        print(f"  MMA back-to-back gap: {np.mean(gaps):.0f} cyc "
-              f"(near 0 = MMA warp continuously busy, no bubble)")
-    else:
-        print("  only 1 iteration on this SM -> cannot measure inter-iter overlap "
-              "(reduce grid / increase M*N per cluster to get >1 iter)")
+    ld, md, ed = le - ls, me - ms, ee - es
+    print(f"  mean window: LOAD {ld.mean():.0f}  MMA {md.mean():.0f}  EPI {ed.mean():.0f} cyc")
+    print(f"  track fill (sum/span): LOAD {ld.sum()/span:.2f}  MMA {md.sum()/span:.2f}  EPI {ed.sum()/span:.2f}")
+    print("    LOAD~1.0 => load-bound; MMA/EPI<1 & tucked under LOAD => hidden.")
 
 
 if __name__ == '__main__':
@@ -299,7 +290,7 @@ if __name__ == '__main__':
 
     benchmark(module)
 
-    profile_overlap(module, M=128)
+    profile_pipeline(module, M=128)
 
     print("\n" + "=" * 60)
     all_pass = ok1 and ok2 and ok3 and ok4 and ok5

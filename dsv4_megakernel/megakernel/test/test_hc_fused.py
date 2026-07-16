@@ -130,10 +130,28 @@ def benchmark(module, warmup=100, iters=500):
     attn_hc_base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
     attn_hc_scale = torch.tensor([1.0, 1.0, 1.0], device=device, dtype=torch.float32)
 
+    # Pure-GEMM (mix) baseline: cuBLAS via torch.matmul.
+    #   mix = hs_flat[M, HC*DIM] @ attn_hc_fn.T[HC*DIM, N_OUT] -> [M, N_OUT]  (bf16)
+    # Transpose is hoisted out of the timed region so we measure only the GEMM.
+    w_t = attn_hc_fn.t().contiguous()   # [HC*DIM, N_OUT]
+
+    def time_us(fn):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            fn()
+        e.record()
+        torch.cuda.synchronize()
+        return s.elapsed_time(e) / iters * 1000
+
     batch_sizes = [1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096]
     print(f"\nPer-position data: {BYTES_PER_POS / 1024:.1f} KB")
-    print(f"\n{'B×S':<8} {'Latency(us)':<13} {'Throughput':<15} {'BW (GB/s)':<12} {'HBM Util':<10}")
-    print("-" * 65)
+    print(f"\n{'B×S':<8} {'Latency(us)':<13} {'Throughput':<15} {'BW (GB/s)':<12} {'HBM Util':<10} "
+          f"{'cuBLAS_GEMM(us)':<16} {'GEMM_TFLOPS':<12} {'fused/GEMM':<10}")
+    print("-" * 105)
 
     for num_pos in batch_sizes:
         hs = torch.randn(num_pos, HC, DIM, device=device, dtype=torch.bfloat16)
@@ -150,12 +168,18 @@ def benchmark(module, warmup=100, iters=500):
         torch.cuda.synchronize()
         total_us = start.elapsed_time(end) / iters * 1000
 
+        # Pure GEMM (cuBLAS) for the same shape.
+        hs_flat = hs.reshape(num_pos, HC * DIM)
+        gemm_us = time_us(lambda: torch.matmul(hs_flat, w_t))
+        gemm_tflops = 2 * num_pos * N_OUT * HC * DIM / (gemm_us * 1e-6) / 1e12
+
         throughput = num_pos / (total_us * 1e-6)
         bw = (num_pos * BYTES_PER_POS) / (total_us * 1e-6) / 1e9
         util = bw / HBM_PEAK_GBS * 100
-        print(f"{num_pos:<8} {total_us:<13.1f} {throughput/1e6:.2f} M pos/s   {bw:<12.1f} {util:<10.1f}%")
+        print(f"{num_pos:<8} {total_us:<13.1f} {throughput/1e6:.2f} M pos/s   {bw:<12.1f} {util:<10.1f}% "
+              f"{gemm_us:<16.1f} {gemm_tflops:<12.2f} {total_us/gemm_us:<10.2f}")
 
-    print("-" * 65)
+    print("-" * 105)
 
 
 # ============================================================
