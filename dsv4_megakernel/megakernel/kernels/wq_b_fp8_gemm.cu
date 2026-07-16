@@ -168,8 +168,8 @@ wq_b_proj_kernel(
                 }
 
                 if (kProfile && cluster_id == 0 && cta_rank == 0) {
-                    prof[persistent_iter * 6 + 0] = prof_ld_t0;
-                    prof[persistent_iter * 6 + 1] = ptx::rdclock();
+                    prof[persistent_iter * 7 + 0] = prof_ld_t0;
+                    prof[persistent_iter * 7 + 1] = ptx::rdclock();
                 }
                 persistent_iter++;
             }
@@ -230,15 +230,19 @@ wq_b_proj_kernel(
                 prof_mma_t0 = ptx::rdclock();
 
             // SF roles: smem_sfa/TMEM_SFA = activation SF ; smem_sfb/TMEM_SFB = weight SF.
-            CM::run_tile(ds, s.with_sf_full_barriers, s.empty_barriers,
+            // kProfile: run_tile accumulates the MMA warp's WAIT cycles into prof col6,
+            // so MMA_active = (mma_end - mma_start) - wait reveals compute vs stall.
+            long long* wait_ptr = (kProfile && cluster_id == 0)
+                ? reinterpret_cast<long long*>(&prof[persistent_iter * 7 + 6]) : nullptr;
+            CM::template run_tile<kProfile>(ds, s.with_sf_full_barriers, s.empty_barriers,
                          s.tmem_full_barriers[accum_stage], s.tmem_empty_barriers[accum_stage],
                          s.smem_sfa, s.smem_sfb,
                          accum_stage * UMMA_N_T, TMEM_SFA, TMEM_SFB,
-                         NUM_K_TILES, accum_phase, stage, phase);
+                         NUM_K_TILES, accum_phase, stage, phase, wait_ptr);
 
             if (kProfile && cluster_id == 0 && lane_id == 0) {
-                prof[persistent_iter * 6 + 2] = prof_mma_t0;
-                prof[persistent_iter * 6 + 3] = ptx::rdclock();
+                prof[persistent_iter * 7 + 2] = prof_mma_t0;
+                prof[persistent_iter * 7 + 3] = ptx::rdclock();
             }
             persistent_iter++;
           }
@@ -340,8 +344,8 @@ wq_b_proj_kernel(
             // [PROFILE] Epilogue (leader CTA): end of this iteration's readback+store.
             if (kProfile && cluster_id == 0 && cta_rank == 0 &&
                 epi_warp_idx == 0 && lane_id == 0) {
-                prof[persistent_iter * 6 + 4] = prof_epi_t0;
-                prof[persistent_iter * 6 + 5] = ptx::rdclock();
+                prof[persistent_iter * 7 + 4] = prof_epi_t0;
+                prof[persistent_iter * 7 + 5] = ptx::rdclock();
             }
 
             persistent_iter++;
@@ -515,7 +519,7 @@ static std::vector<torch::Tensor> run_wq_b(
     if (profile) {
         // [max_iters, 6] per persistent iteration on cluster0/CTA0 (same SM, clock64):
         //   col0 load_start col1 load_end | col2 mma_start col3 mma_end | col4 epi_start col5 epi_end
-        timing = torch::zeros({max_iters, 6}, x_fp8.options().dtype(torch::kInt64));
+        timing = torch::zeros({max_iters, 7}, x_fp8.options().dtype(torch::kInt64));
         prof_dev = reinterpret_cast<int64_t*>(timing.data_ptr());
     }
 

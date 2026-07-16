@@ -156,6 +156,14 @@ __device__ __forceinline__ void fence_after_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
+// Profiling helpers (only used on the kProfWait path).
+__device__ __forceinline__ long long rdclock() {
+    long long t; asm volatile("mov.u64 %0, %%clock64;" : "=l"(t) :: "memory"); return t;
+}
+__device__ __forceinline__ uint32_t laneid() {
+    uint32_t l; asm volatile("mov.u32 %0, %%laneid;" : "=r"(l)); return l;
+}
+
 __device__ __forceinline__ bool elect_one_sync() {
     uint32_t pred;
     asm volatile("{\n\t.reg .pred p;\n\t"
@@ -243,6 +251,11 @@ struct ClusterMmaFP8BlockScale {
     //
     // Advances stage_idx / phase in place. The caller owns the outer tile-scheduling
     // loop and the final drain wait on tmem_empty after the last tile.
+    // kProfWait (diagnostic): when true, lane 0 accumulates the cycles the MMA warp
+    // spends WAITING (tmem_empty + per-stage with_sf_full) into *wait_out. Then
+    // MMA_active = (MMA window) - *wait_out reveals whether the warp is actually
+    // computing or just stalled on the load/epilogue. Compiled out when false.
+    template <bool kProfWait = false>
     static __device__ __forceinline__
     void run_tile(const DescState& ds,
                   Barrier* with_sf_full_barriers, Barrier* empty_barriers,
@@ -250,12 +263,20 @@ struct ClusterMmaFP8BlockScale {
                   const uint8_t* smem_sf_act_base, const uint8_t* smem_sf_wgt_base,
                   uint32_t tmem_c, uint32_t tmem_sf_act, uint32_t tmem_sf_wgt,
                   int num_k_tiles, uint32_t accum_phase,
-                  uint32_t& stage_idx, uint32_t& phase) {
+                  uint32_t& stage_idx, uint32_t& phase,
+                  long long* wait_out = nullptr) {
+        long long wait_acc = 0, tw = 0;
+        const bool prof0 = kProfWait && (detail::laneid() == 0);
+
+        if (prof0) tw = detail::rdclock();
         tmem_empty.wait(accum_phase ^ 1);
+        if (prof0) wait_acc += detail::rdclock() - tw;
         detail::fence_after_sync();
 
         for (int k = 0; k < num_k_tiles; ++k) {
+            if (prof0) tw = detail::rdclock();
             with_sf_full_barriers[stage_idx].wait(phase);
+            if (prof0) wait_acc += detail::rdclock() - tw;
             detail::fence_after_sync();
 
             uint32_t a_base = __shfl_sync(0xffffffff, ds.act_lo, stage_idx);
@@ -306,6 +327,8 @@ struct ClusterMmaFP8BlockScale {
             stage_idx = (stage_idx + 1) % NUM_STAGES;
             if (stage_idx == 0) phase ^= 1;
         }
+
+        if (prof0 && wait_out) *wait_out = wait_acc;
     }
 };
 

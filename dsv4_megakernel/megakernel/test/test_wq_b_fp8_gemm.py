@@ -193,8 +193,10 @@ def benchmark(module):
 
 def profile_pipeline(module, M=128, clock_ghz=1.8):
     """Visualize load / MMA / epilogue overlap from wq_b_proj_gemm_profiled.
-    timing[max_iters,6] = [load_s, load_e, mma_s, mma_e, epi_s, epi_e] (clock64 cycles,
-    cluster0/CTA0 -> same SM, directly comparable)."""
+    timing[max_iters,7] = [load_s, load_e, mma_s, mma_e, epi_s, epi_e, mma_wait]
+    (clock64 cycles, cluster0/CTA0 -> same SM). col6 mma_wait = cycles the MMA warp
+    spent WAITING (tmem_empty + with_sf_full); MMA_active = (mma_e-mma_s) - mma_wait
+    is the warp's real (non-stalled) work -> tells compute vs stall directly."""
     import numpy as np
     print("\n" + "=" * 76)
     print(f"Pipeline overlap (clock64): LOAD vs MMA vs EPILOGUE (M={M})")
@@ -215,6 +217,7 @@ def profile_pipeline(module, M=128, clock_ghz=1.8):
     if len(t) == 0:
         print("  no timing rows captured"); return
     ls, le, ms, me, es, ee = (t[:, i] for i in range(6))
+    mw = t[:, 6]                                  # MMA wait cycles (duration, not origin-relative)
     origin = int(min(ls.min(), ms.min(), es.min()))
     ls, le, ms, me, es, ee = (a - origin for a in (ls, le, ms, me, es, ee))
     span = int(max(le.max(), me.max(), ee.max()))
@@ -222,14 +225,13 @@ def profile_pipeline(module, M=128, clock_ghz=1.8):
         print("  degenerate span"); return
     c2us = lambda c: c / clock_ghz / 1e3
     n = len(t)
+    mma_active = (me - ms) - mw                   # MMA warp real work (excl. wait)
     print(f"  {n} persistent iterations; span={span} cyc (~{c2us(span):.1f} us @ {clock_ghz}GHz assumed)")
 
-    # ---- per-iteration windows (relative cycles), first 12 ----
-    print(f"  {'it':>3}  {'LOAD [s,e] dur':>26}  {'MMA [s,e] dur':>26}  {'EPI [s,e] dur':>26}")
+    # ---- per-iteration windows (relative cycles), first 12. MMA split into wait|active ----
+    print(f"  {'it':>3}  {'LOAD dur':>9}  {'MMA dur':>9} {'(wait':>7}{'/active)':>9}  {'EPI dur':>9}")
     for i in range(min(n, 12)):
-        print(f"  {i:>3}  [{ls[i]:>8},{le[i]:>8}] {le[i]-ls[i]:>6}  "
-              f"[{ms[i]:>8},{me[i]:>8}] {me[i]-ms[i]:>6}  "
-              f"[{es[i]:>8},{ee[i]:>8}] {ee[i]-es[i]:>6}")
+        print(f"  {i:>3}  {le[i]-ls[i]:>9}  {me[i]-ms[i]:>9} ({mw[i]:>6}/{mma_active[i]:>7})  {ee[i]-es[i]:>9}")
 
     # ---- 3-track ASCII timeline over the full span ----
     W = 100
@@ -247,10 +249,10 @@ def profile_pipeline(module, M=128, clock_ghz=1.8):
 
     # ---- summary: durations + track fill (clock-agnostic) ----
     ld, md, ed = le - ls, me - ms, ee - es
-    print(f"  mean window: LOAD {ld.mean():.0f}  MMA {md.mean():.0f}  EPI {ed.mean():.0f} cyc")
-    print(f"  track fill (sum/span): LOAD {ld.sum()/span:.2f}  MMA {md.sum()/span:.2f}  EPI {ed.sum()/span:.2f}")
-    print("    LOAD~1.0 => load-bound (load fills the timeline); MMA/EPI<1 & tucked under LOAD => hidden.")
-    print("    If span >> sum(LOAD) or EPI sticks past LOAD => epilogue/compute exposed (not overlapped).")
+    print(f"  mean window: LOAD {ld.mean():.0f}  MMA {md.mean():.0f} (wait {mw.mean():.0f} / active {mma_active.mean():.0f})  EPI {ed.mean():.0f} cyc")
+    print(f"  track fill (sum/span): LOAD {ld.sum()/span:.2f}  MMA {md.sum()/span:.2f}  MMA_active {mma_active.sum()/span:.2f}  EPI {ed.sum()/span:.2f}")
+    print("    MMA_active << MMA => MMA warp is mostly WAITING (load/consume-bound), not compute-slow.")
+    print("    If MMA_active ~ MMA fill ~1 => genuinely MMA-warp-bound.")
 
 
 if __name__ == '__main__':
