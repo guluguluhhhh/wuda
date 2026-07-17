@@ -162,63 +162,115 @@ def time_cuda_us(fn, warmup, iters):
     return start.elapsed_time(end) * 1000.0 / iters
 
 
-def benchmark(module, positions, warmup, iters):
+BENCH_WARMUP = 50
+BENCH_ITERS = 200
+
+
+def benchmark(module, positions):
     torch.manual_seed(42)
     _, weight, base, scale = make_inputs(1)
     device_name = torch.cuda.get_device_name()
     print(f"\nBenchmark: {device_name}")
+    print("Full MHC op total latency: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
+    print("  (cuBLAS_gemm = F.linear matmul-only baseline, i.e. just the GEMM sub-step)")
     print(
         f"{'M':>6} {'MT':>4} {'NT':>4} {'splitK':>7} {'Ktile/s':>8} {'grid':>6} "
-        f"{'fused us':>11} {'cuBLAS us':>11} {'fused/GEMM':>12}"
+        f"{'mhc us':>11} {'cuBLAS_gemm':>12}"
     )
-    print("-" * 86)
+    print("-" * 74)
 
+    dev = "cuda"
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
         x = hidden.reshape(m, K_DIM)
         cfg = module.hc_fused_tc_config(m)
-        local_iters = max(20, iters // 2) if m >= 2048 else iters
-        fused_us = time_cuda_us(
-            lambda: module.hc_fused_forward_full(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
-            ),
-            warmup,
-            local_iters,
+        local_iters = max(20, BENCH_ITERS // 2) if m >= 2048 else BENCH_ITERS
+
+        # preallocate outputs so we time the op, not per-call allocation
+        collapsed = torch.empty(m, DIM, device=dev, dtype=torch.bfloat16)
+        pre = torch.empty(m, HC, device=dev, dtype=torch.float32)
+        post = torch.empty(m, HC, device=dev, dtype=torch.float32)
+        comb = torch.empty(m, HC, HC, device=dev, dtype=torch.float32)
+        mhc_us = time_cuda_us(
+            lambda: module.hc_fused_forward_out(
+                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+                collapsed, pre, post, comb),
+            BENCH_WARMUP, local_iters,
         )
-        gemm_us = time_cuda_us(lambda: F.linear(x, weight), warmup, local_iters)
+        cublas_us = time_cuda_us(lambda: F.linear(x, weight), BENCH_WARMUP, local_iters)
         print(
             f"{m:6d} {cfg[7]:4d} {cfg[0]:4d} {cfg[1]:7d} {cfg[2]:8d} {cfg[3]:6d} "
-            f"{fused_us:11.3f} {gemm_us:11.3f} {fused_us / gemm_us:12.3f}"
+            f"{mhc_us:11.3f} {cublas_us:12.3f}"
         )
-        del hidden, x
-    print("-" * 86)
+        del hidden, x, collapsed, pre, post, comb
+    print("-" * 74)
     print("config columns: MT, NT, splitK, K tiles per split, physical CTA grid")
+    print("mhc = full fused op (hc_fused_forward_out, preallocated outputs)")
 
 
-def profile_breakdown(module, m, repeats=10):
-    from torch.profiler import ProfilerActivity, profile
+def gpu_clock_mhz():
+    """SM clock in MHz for converting clock64 cycles -> us. Falls back to 2100."""
+    try:
+        khz = torch.cuda.get_device_properties(0).clock_rate  # kHz
+        if khz and khz > 0:
+            return khz / 1000.0
+    except Exception:
+        pass
+    return 2100.0
 
+
+def stage_breakdown(module, m=128, repeats=50):
+    """Per-stage timing via in-kernel clock64 stamps (wq_b_fp8_gemm.cu style).
+    timing[8] on block 0:
+      [0..1] GEMM (tcgen05 split-K)
+      [2..7] epilogue: start / after {load+rms, reduce, activation, sinkhorn, collapse}
+    GEMM stamps and epilogue stamps live on different SMs, so only intra-kernel
+    deltas are meaningful (the SM clock rate is shared, so us are comparable).
+    """
     torch.manual_seed(9000 + m)
     hidden, weight, base, scale = make_inputs(m)
-    for _ in range(10):
-        module.hc_fused_forward_full(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
-        )
+    for _ in range(BENCH_WARMUP):
+        module.hc_fused_forward_full(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
     torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for _ in range(repeats):
-            module.hc_fused_forward_full(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
-            )
-        torch.cuda.synchronize()
-
-    print(f"\nCUDA kernel breakdown: M={m}, calls={repeats}")
-    print(
-        prof.key_averages().table(
-            sort_by="self_cuda_time_total", row_limit=20
+    # median over a few profiled calls (clock64 has run-to-run jitter).
+    samples = []
+    for _ in range(repeats):
+        res = module.hc_fused_forward_profiled(
+            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
         )
-    )
+        torch.cuda.synchronize()
+        samples.append([int(v) for v in res[-1].cpu().tolist()])
+
+    clk = gpu_clock_mhz()
+
+    def med_us(a, b):
+        vals = sorted((s[b] - s[a]) / clk for s in samples)
+        return vals[len(vals) // 2]
+
+    stages = [
+        ("GEMM  (tcgen05 split-K)", med_us(0, 1)),
+        ("epi: load + RMSNorm sq", med_us(2, 3)),
+        ("epi: split-K reduce", med_us(3, 4)),
+        ("epi: activation", med_us(4, 5)),
+        ("epi: sinkhorn (20 iter)", med_us(5, 6)),
+        ("epi: collapse", med_us(6, 7)),
+    ]
+    epi_total = med_us(2, 7)
+    gemm_us = stages[0][1]
+
+    print(f"\nStage breakdown (M={m}, clock64 on block 0, SM clock={clk:.0f} MHz, "
+          f"median of {repeats})")
+    print(f"{'stage':<28} {'us':>9} {'% of GEMM+epi':>15}")
+    print("-" * 55)
+    denom = gemm_us + epi_total
+    for name, us in stages:
+        pct = 100.0 * us / denom if denom > 0 else 0.0
+        print(f"{name:<28} {us:9.3f} {pct:15.1f}")
+    print("-" * 55)
+    print(f"{'GEMM total':<28} {gemm_us:9.3f}")
+    print(f"{'epilogue total':<28} {epi_total:9.3f}")
+    print(f"{'GEMM + epilogue':<28} {denom:9.3f}   (clock64 compute, excludes launch/gap)")
 
 
 def parse_positions(value):
@@ -231,18 +283,6 @@ def main():
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument(
         "--correctness-positions", type=parse_positions, default=[1, 4, 16, 64, 128, 256]
-    )
-    parser.add_argument(
-        "--benchmark-positions", type=parse_positions, default=PROFILE_M
-    )
-    parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--iters", type=int, default=200)
-    parser.add_argument(
-        "--profile-breakdown",
-        type=int,
-        default=0,
-        metavar="M",
-        help="print per-kernel CUDA time for one M",
     )
     args = parser.parse_args()
 
@@ -262,11 +302,8 @@ def main():
         if not test_correctness(module, args.correctness_positions):
             return 1
     if args.benchmark:
-        benchmark(
-            module, args.benchmark_positions, args.warmup, args.iters
-        )
-    if args.profile_breakdown:
-        profile_breakdown(module, args.profile_breakdown)
+        benchmark(module, PROFILE_M)
+        stage_breakdown(module, m=128)
     return 0
 
 

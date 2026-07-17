@@ -2,9 +2,9 @@
 //
 // The projection is a very tall-K, narrow-N BF16 GEMM:
 //     [M, 28672] x [24, 28672]^T -> [M, 24].
-// A one-SM tcgen05 tile avoids the 8-10x N padding of a 2-SM swap-AB tile.
-// Split-K partials stay FP32; the reduction is fused with RMSNorm, gates,
-// Sinkhorn, and collapse in the second kernel.
+// The tcgen05 split-K GEMM engine lives in include/hc_fused_kernel_tc.cuh; this TU owns
+// the fused epilogue (split-K reduce + RMSNorm + gates + Sinkhorn + collapse)
+// and the PyTorch binding.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -14,321 +14,27 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <vector>
 
-#include <cutlass/arch/barrier.h>
-#include <cutlass/numeric_types.h>
-#include <cute/arch/copy_sm90_tma.hpp>
-#include <cute/arch/mma_sm100_desc.hpp>
-#include <cute/arch/mma_sm100_umma.hpp>
+#include "hc_fused_kernel_tc.cuh"
 
 namespace hc_tc {
-
-using Barrier = cutlass::arch::ClusterTransactionBarrier;
-
-static constexpr int HC = 4;
-static constexpr int DIM = 7168;
-static constexpr int K_DIM = HC * DIM;
-static constexpr int N_OUT = 24;
-static constexpr int SINKHORN_ITERS = 20;
-
-static constexpr int BLOCK_K = 64;
-static constexpr int UMMA_K = 16;
-static constexpr int NUM_K_TILES = K_DIM / BLOCK_K;
-static constexpr int NUM_TMEM_COLS = 32;
-static constexpr int GEMM_THREADS = 256;
-static constexpr int EPILOGUE_THREADS = 256;
-static constexpr int MIN_K_TILES_PER_SPLIT = 8;
-
-static_assert(K_DIM % BLOCK_K == 0, "K must be tiled exactly");
-
-namespace ptx {
-
-__device__ __forceinline__ bool elect_one_sync() {
-    uint32_t pred;
-    asm volatile(
-        "{\n\t.reg .pred p;\n\t"
-        "elect.sync _|p, 0xffffffff;\n\t"
-        "selp.b32 %0, 1, 0, p;\n\t}"
-        : "=r"(pred));
-    return pred != 0;
-}
-
-__device__ __forceinline__ void tcgen05_alloc_1sm(uint32_t smem_addr, uint32_t cols) {
-    asm volatile(
-        "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-        :: "r"(smem_addr), "r"(cols));
-}
-
-__device__ __forceinline__ void tcgen05_dealloc_1sm(uint32_t tmem_addr, uint32_t cols) {
-    asm volatile(
-        "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-        :: "r"(tmem_addr), "r"(cols));
-}
-
-__device__ __forceinline__ void tcgen05_fence_before_sync() {
-    asm volatile("tcgen05.fence::before_thread_sync;");
-}
-
-__device__ __forceinline__ void tcgen05_fence_after_sync() {
-    asm volatile("tcgen05.fence::after_thread_sync;");
-}
-
-__device__ __forceinline__ void tcgen05_mma_1sm(
-    uint32_t tmem_c, uint64_t desc_a, uint64_t desc_b,
-    uint64_t runtime_idesc, uint32_t accumulate) {
-    uint32_t mask[4] = {0, 0, 0, 0};
-    asm volatile(
-        "{\n\t.reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 "
-        "[%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t}"
-        :: "r"(tmem_c), "l"(desc_a), "l"(desc_b),
-           "r"(static_cast<uint32_t>(runtime_idesc >> 32)), "r"(accumulate),
-           "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
-}
-
-__device__ __forceinline__ void tcgen05_commit_1sm(Barrier* barrier) {
-    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
-    if (elect_one_sync()) {
-        asm volatile(
-            "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
-            :: "r"(addr) : "memory");
-    }
-}
-
-__device__ __forceinline__ void tmem_load_32dp32b8x(
-    uint32_t addr,
-    uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3,
-    uint32_t& v4, uint32_t& v5, uint32_t& v6, uint32_t& v7) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
-        "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3),
-          "=r"(v4), "=r"(v5), "=r"(v6), "=r"(v7)
-        : "r"(addr));
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
-    }
-    return v;
-}
-
-}  // namespace ptx
-
-namespace mma_desc {
-
-__device__ __forceinline__ cute::UMMA::SmemDescriptor make_k_major(void* ptr) {
-    cute::UMMA::SmemDescriptor desc;
-    desc.version_ = 1;
-    desc.lbo_mode_ = 0;
-    desc.layout_type_ = static_cast<uint8_t>(cute::UMMA::LayoutType::SWIZZLE_128B);
-    const auto smem_ptr = cute::cast_smem_ptr_to_uint(ptr);
-    desc.start_address_ = static_cast<uint16_t>(smem_ptr >> 4);
-    constexpr uint32_t stride_bytes = 8u * BLOCK_K * sizeof(__nv_bfloat16);
-    desc.stride_byte_offset_ = stride_bytes >> 4;
-    desc.leading_byte_offset_ = 0;
-    desc.base_offset_ = 0;
-    return desc;
-}
-
-template <int M_TILE, int N_TILE>
-__device__ __forceinline__ uint64_t make_runtime_idesc() {
-    auto idesc = cute::UMMA::make_instr_desc<
-        cutlass::bfloat16_t, cutlass::bfloat16_t, float,
-        M_TILE, N_TILE, cute::UMMA::Major::K, cute::UMMA::Major::K>();
-    return cute::UMMA::make_runtime_instr_desc(idesc);
-}
-
-__device__ __forceinline__ uint32_t advance_k(uint32_t lo, int kk) {
-    return lo + kk * (UMMA_K * sizeof(__nv_bfloat16) / 16);
-}
-
-}  // namespace mma_desc
-
-template <int M_TILE, int N_TILE, int STAGES>
-struct GemmSharedStorage {
-    static constexpr int A_STAGE_ELEMS = M_TILE * BLOCK_K;
-    static constexpr int B_STAGE_ELEMS = N_TILE * BLOCK_K;
-
-    alignas(1024) __nv_bfloat16 smem_a[STAGES * A_STAGE_ELEMS];
-    alignas(1024) __nv_bfloat16 smem_b[STAGES * B_STAGE_ELEMS];
-    alignas(16) Barrier full[STAGES];
-    alignas(16) Barrier empty[STAGES];
-    alignas(16) Barrier tmem_full;
-    alignas(16) uint32_t tmem_base;
-};
-
-__device__ __forceinline__ void tma_load_2d(
-    const void* desc, Barrier* barrier, void* smem,
-    int coord0, int coord1) {
-    cute::SM90_TMA_LOAD_2D::copy(
-        desc, reinterpret_cast<uint64_t*>(barrier),
-        static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
-        smem, coord0, coord1);
-}
-
-template <int M_TILE, int N_TILE, int STAGES>
-__global__ void __launch_bounds__(GEMM_THREADS, 1)
-hc_gemm_splitk_kernel(
-    const __grid_constant__ CUtensorMap desc_x,
-    const __grid_constant__ CUtensorMap desc_w,
-    int num_positions,
-    int num_m_tiles,
-    int num_n_tiles,
-    int num_splits,
-    int k_tiles_per_split,
-    float* __restrict__ workspace) {
-    using Storage = GemmSharedStorage<M_TILE, N_TILE, STAGES>;
-    extern __shared__ __align__(1024) unsigned char smem_raw[];
-    Storage& s = *reinterpret_cast<Storage*>(smem_raw);
-
-    const int warp_id = threadIdx.x >> 5;
-    const int lane_id = threadIdx.x & 31;
-
-    int task = static_cast<int>(blockIdx.x);
-    const int m_tile = task % num_m_tiles;
-    task /= num_m_tiles;
-    const int n_tile = task % num_n_tiles;
-    const int split = task / num_n_tiles;
-    if (split >= num_splits) return;
-
-    const int k_begin = split * k_tiles_per_split;
-    const int k_end = min(k_begin + k_tiles_per_split, NUM_K_TILES);
-    const int k_count = k_end - k_begin;
-    const int m_base = m_tile * M_TILE;
-    const int n_base = n_tile * N_TILE;
-
-    if (warp_id == 0 && ptx::elect_one_sync()) {
-        cute::prefetch_tma_descriptor(&desc_x);
-        cute::prefetch_tma_descriptor(&desc_w);
-    }
-    if (warp_id == 1 && ptx::elect_one_sync()) {
-        #pragma unroll
-        for (int stage = 0; stage < STAGES; ++stage) {
-            s.full[stage].init(1);
-            s.empty[stage].init(1);
-        }
-        s.tmem_full.init(1);
-        cutlass::arch::fence_barrier_init();
-    }
-    if (warp_id == 2) {
-        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&s.tmem_base));
-        ptx::tcgen05_alloc_1sm(addr, NUM_TMEM_COLS);
-    }
-    __syncthreads();
-
-    if (warp_id == 0 && ptx::elect_one_sync()) {
-        int stage = 0;
-        int phase = 0;
-        #pragma unroll 1
-        for (int kt = k_begin; kt < k_end; ++kt) {
-            s.empty[stage].wait(phase ^ 1);
-            auto* a_dst = s.smem_a + stage * Storage::A_STAGE_ELEMS;
-            auto* b_dst = s.smem_b + stage * Storage::B_STAGE_ELEMS;
-            const int k_offset = kt * BLOCK_K;
-            tma_load_2d(&desc_x, &s.full[stage], a_dst, k_offset, m_base);
-            tma_load_2d(&desc_w, &s.full[stage], b_dst, k_offset, n_base);
-            constexpr uint32_t tx_bytes =
-                (Storage::A_STAGE_ELEMS + Storage::B_STAGE_ELEMS) * sizeof(__nv_bfloat16);
-            s.full[stage].arrive_and_expect_tx(tx_bytes);
-            if (++stage == STAGES) {
-                stage = 0;
-                phase ^= 1;
-            }
-        }
-    } else if (warp_id == 1) {
-        const auto a_desc = mma_desc::make_k_major(s.smem_a);
-        const auto b_desc = mma_desc::make_k_major(s.smem_b);
-        const uint32_t a_stage_lo = (lane_id < STAGES)
-            ? a_desc.lo + lane_id * (Storage::A_STAGE_ELEMS * sizeof(__nv_bfloat16) / 16)
-            : 0u;
-        const uint32_t b_stage_lo = (lane_id < STAGES)
-            ? b_desc.lo + lane_id * (Storage::B_STAGE_ELEMS * sizeof(__nv_bfloat16) / 16)
-            : 0u;
-        const uint64_t runtime_idesc = mma_desc::make_runtime_idesc<M_TILE, N_TILE>();
-        const uint32_t tmem_c = s.tmem_base;
-
-        int stage = 0;
-        int phase = 0;
-        #pragma unroll 1
-        for (int ki = 0; ki < k_count; ++ki) {
-            s.full[stage].wait(phase);
-            ptx::tcgen05_fence_after_sync();
-            const uint32_t a_base = __shfl_sync(0xffffffffu, a_stage_lo, stage);
-            const uint32_t b_base = __shfl_sync(0xffffffffu, b_stage_lo, stage);
-            if (ptx::elect_one_sync()) {
-                #pragma unroll
-                for (int kk = 0; kk < BLOCK_K / UMMA_K; ++kk) {
-                    const uint32_t a_lo = mma_desc::advance_k(a_base, kk);
-                    const uint32_t b_lo = mma_desc::advance_k(b_base, kk);
-                    const uint64_t a = (static_cast<uint64_t>(a_desc.hi) << 32) | a_lo;
-                    const uint64_t b = (static_cast<uint64_t>(b_desc.hi) << 32) | b_lo;
-                    const uint32_t accumulate = (ki != 0 || kk != 0) ? 1u : 0u;
-                    ptx::tcgen05_mma_1sm(tmem_c, a, b, runtime_idesc, accumulate);
-                }
-            }
-            __syncwarp();
-            ptx::tcgen05_commit_1sm(&s.empty[stage]);
-            if (ki == k_count - 1) {
-                ptx::tcgen05_commit_1sm(&s.tmem_full);
-            }
-            __syncwarp();
-            if (++stage == STAGES) {
-                stage = 0;
-                phase ^= 1;
-            }
-        }
-    } else if (warp_id >= 4) {
-        const int epi_warp = warp_id - 4;
-        // M64 Layout F has four 16-row groups at DP 0/32/64/96; M128
-        // Layout D uses all 32 lanes of each datapath partition.
-        const int rows_per_warp = M_TILE == 64 ? 16 : 32;
-        const int row_local = epi_warp * rows_per_warp + lane_id;
-        const int row = m_base + row_local;
-        s.tmem_full.wait(0);
-        ptx::tcgen05_fence_after_sync();
-
-        #pragma unroll
-        for (int ng = 0; ng < N_TILE / 8; ++ng) {
-            uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-            ptx::tmem_load_32dp32b8x(
-                s.tmem_base + ng * 8, v0, v1, v2, v3, v4, v5, v6, v7);
-            cutlass::arch::fence_view_async_tmem_load();
-            if ((M_TILE == 128 || lane_id < 16) && row < num_positions) {
-                const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
-                const int col0 = n_base + ng * 8;
-                float* dst = workspace
-                    + (static_cast<int64_t>(split) * num_positions + row) * N_OUT + col0;
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    if (col0 + j < N_OUT) dst[j] = __uint_as_float(vals[j]);
-                }
-            }
-        }
-        ptx::tcgen05_fence_before_sync();
-    }
-
-    __syncthreads();
-    if (warp_id == 2) {
-        ptx::tcgen05_dealloc_1sm(s.tmem_base, NUM_TMEM_COLS);
-    }
-}
 
 __device__ __forceinline__ float fast_sigmoid(float x) {
     return 1.0f / (1.0f + __expf(-x));
 }
 
+// ============================================================
+// Epilogue: split-K reduce + RMSNorm + activation + Sinkhorn + collapse.
+//   grid = M (one block per position), block = EPILOGUE_THREADS.
+// ============================================================
 __global__ void __launch_bounds__(EPILOGUE_THREADS, 2)
 hc_reduce_and_fuse_kernel(
     const __nv_bfloat16* __restrict__ hidden_states,
     const float* __restrict__ workspace,
+    const float* __restrict__ sqr_sum,   // [num_splits, M] input-RMSNorm Σx² partials
     const float* __restrict__ base,
     const float* __restrict__ scale,
     float hc_eps,
@@ -338,61 +44,56 @@ hc_reduce_and_fuse_kernel(
     __nv_bfloat16* __restrict__ collapsed_out,
     float* __restrict__ pre_out,
     float* __restrict__ post_out,
-    float* __restrict__ comb_out) {
+    float* __restrict__ comb_out,
+    int64_t* __restrict__ prof) {
     const int pos = static_cast<int>(blockIdx.x);
     if (pos >= num_positions) return;
+    // clock64 phase stamps on block 0 only (see PROF_SLOTS layout in the header).
+    const bool prof0 = (prof != nullptr && pos == 0);
+    if (prof0 && threadIdx.x == 0) prof[2] = ptx::rdclock();
 
+    // No hidden staged in smem anymore: RMSNorm Σx² comes from the GEMM's sqr_sum
+    // partials, and collapse reads hidden straight from global. smem is now tiny ->
+    // much higher epilogue occupancy.
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto* hidden_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    auto* scratch = reinterpret_cast<float*>(hidden_smem + K_DIM);
-    float* warp_sums = scratch;              // 8
-    float* rms_smem = warp_sums + 8;         // 1
-    float* mix_smem = rms_smem + 1;          // 24
-    float* pre_smem = mix_smem + N_OUT;      // 4
-    float* post_smem = pre_smem + HC;        // 4
-    float* comb_smem = post_smem + HC;       // 16
+    float* scratch = reinterpret_cast<float*>(smem_raw);
+    float* rms_smem = scratch;               // 1
+    float* sqsum_smem = rms_smem + 1;        // 1
+    float* mix_smem = sqsum_smem + 1;        // N_OUT
+    float* pre_smem = mix_smem + N_OUT;      // HC
+    float* post_smem = pre_smem + HC;        // HC
+    float* comb_smem = post_smem + HC;       // HC*HC
 
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
-    const auto* src = hidden_states + static_cast<int64_t>(pos) * K_DIM;
 
-    constexpr int NUM_I4 = K_DIM / 8;
-    const int4* src_i4 = reinterpret_cast<const int4*>(src);
-    int4* dst_i4 = reinterpret_cast<int4*>(hidden_smem);
-    float sq_sum = 0.0f;
-    for (int i = tid; i < NUM_I4; i += EPILOGUE_THREADS) {
-        const int4 v = src_i4[i];
-        dst_i4[i] = v;
-        const auto* p = reinterpret_cast<const __nv_bfloat162*>(&v);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 f = __bfloat1622float2(p[j]);
-            sq_sum += f.x * f.x + f.y * f.y;
+    if (prof0 && threadIdx.x == 0) prof[3] = ptx::rdclock();  // (no hidden load phase)
+
+    // Split-K reduce (all threads, atomicAdd to smem):
+    //   mix[n]  = Σ_split workspace[split, pos, n]
+    //   Σx²     = Σ_split sqr_sum[split, pos]    (input RMSNorm sum-of-squares)
+    if (tid == 0) sqsum_smem[0] = 0.0f;
+    if (tid < N_OUT) mix_smem[tid] = 0.0f;
+    __syncthreads();
+    {
+        const float* wbase = workspace + static_cast<int64_t>(pos) * N_OUT;
+        const int64_t sstride = static_cast<int64_t>(num_positions) * N_OUT;
+        const int total = num_splits * N_OUT;
+        for (int idx = tid; idx < total; idx += EPILOGUE_THREADS) {
+            const int split = idx / N_OUT;
+            const int n = idx - split * N_OUT;
+            atomicAdd(&mix_smem[n], wbase[static_cast<int64_t>(split) * sstride + n]);
         }
-    }
-    sq_sum = ptx::warp_sum(sq_sum);
-    if (lane_id == 0) warp_sums[warp_id] = sq_sum;
-    __syncthreads();
-
-    if (warp_id == 0) {
-        float v = lane_id < 8 ? warp_sums[lane_id] : 0.0f;
-        v = ptx::warp_sum(v);
-        if (lane_id == 0) rms_smem[0] = rsqrtf(v / static_cast<float>(K_DIM) + rms_eps);
+        for (int s = tid; s < num_splits; s += EPILOGUE_THREADS)
+            atomicAdd(sqsum_smem, sqr_sum[static_cast<int64_t>(s) * num_positions + pos]);
     }
     __syncthreads();
-
-    if (tid < N_OUT) {
-        float sum = 0.0f;
-        const int64_t split_stride = static_cast<int64_t>(num_positions) * N_OUT;
-        const float* partial = workspace + static_cast<int64_t>(pos) * N_OUT + tid;
-        #pragma unroll 1
-        for (int split = 0; split < num_splits; ++split) {
-            sum += partial[static_cast<int64_t>(split) * split_stride];
-        }
-        mix_smem[tid] = sum * rms_smem[0];
-    }
+    if (tid == 0) rms_smem[0] = rsqrtf(sqsum_smem[0] / static_cast<float>(K_DIM) + rms_eps);
     __syncthreads();
+    if (tid < N_OUT) mix_smem[tid] *= rms_smem[0];   // fold RMSNorm scale into mix
+    __syncthreads();
+    if (prof0 && threadIdx.x == 0) prof[4] = ptx::rdclock();  // reduce + rms done
 
     if (tid < HC) {
         pre_smem[tid] = fast_sigmoid(mix_smem[tid] * scale[0] + base[tid]) + hc_eps;
@@ -403,7 +104,18 @@ hc_reduce_and_fuse_kernel(
         comb_smem[tid] = mix_smem[2 * HC + tid] * scale[2] + base[2 * HC + tid];
     }
     __syncthreads();
+    if (prof0 && threadIdx.x == 0) prof[5] = ptx::rdclock();  // activation done
 
+    // pre/post gates are ready (activation); write them now -- independent of the
+    // Sinkhorn/collapse split below.
+    if (tid < HC) {
+        pre_out[pos * HC + tid] = pre_smem[tid];
+        post_out[pos * HC + tid] = post_smem[tid];
+    }
+
+    // OVERLAP: warp 0 runs Sinkhorn on comb (needs comb_smem); warps 1..7 run the
+    // collapse (needs only pre_smem). The two are independent, so the ~1us collapse
+    // hides under the ~2us Sinkhorn (was serial: 2.0 + 0.96 -> now ~max(2.0, 1.1)).
     if (warp_id == 0) {
         float v = lane_id < HC * HC ? comb_smem[lane_id] : 0.0f;
         float max_v = v;
@@ -441,163 +153,37 @@ hc_reduce_and_fuse_kernel(
             }
             v /= col_sum + hc_eps;
         }
-        if (lane_id < HC * HC) comb_smem[lane_id] = v;
-    }
-
-    if (tid < HC) {
-        pre_out[pos * HC + tid] = pre_smem[tid];
-        post_out[pos * HC + tid] = post_smem[tid];
-    }
-    if (tid < HC * HC) {
-        comb_out[pos * HC * HC + tid] = comb_smem[tid];
+        if (lane_id < HC * HC) comb_out[pos * HC * HC + lane_id] = v;   // final gate
+        if (prof0 && lane_id == 0) prof[6] = ptx::rdclock();  // sinkhorn done (warp0)
+    } else {
+        // Collapse on warps 1..7 (EPILOGUE_THREADS-32 threads), reading hidden
+        // straight from global (overlaps warp 0's Sinkhorn; hidden read hidden
+        // under it). out[d] = Σ_h pre[h] * hidden[pos, h, d].
+        float pre_r[HC];
+        #pragma unroll
+        for (int h = 0; h < HC; ++h) pre_r[h] = pre_smem[h];
+        const __nv_bfloat16* src = hidden_states + static_cast<int64_t>(pos) * K_DIM;
+        auto* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
+        const int cstart = static_cast<int>(threadIdx.x) - 32;   // warp1..7 -> 0..223
+        const int cthreads = EPILOGUE_THREADS - 32;              // 224
+        for (int d = cstart; d < DIM; d += cthreads) {
+            float value = 0.0f;
+            #pragma unroll
+            for (int h = 0; h < HC; ++h) {
+                value += pre_r[h] * __bfloat162float(src[h * DIM + d]);
+            }
+            collapsed[d] = __float2bfloat16_rn(value);
+        }
     }
     __syncthreads();
-
-    auto* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
-    for (int d = tid; d < DIM; d += EPILOGUE_THREADS) {
-        float value = 0.0f;
-        #pragma unroll
-        for (int h = 0; h < HC; ++h) {
-            value += pre_smem[h] * __bfloat162float(hidden_smem[h * DIM + d]);
-        }
-        collapsed[d] = __float2bfloat16_rn(value);
-    }
+    if (prof0 && threadIdx.x == 0) prof[7] = ptx::rdclock();  // both done
 }
 
-struct SplitConfig {
-    int m_tile;
-    int n_tile;
-    int num_m_tiles;
-    int num_n_tiles;
-    int num_splits;
-    int k_tiles_per_split;
-    int grid;
-    int num_sms;
-};
-
-static int ceil_div(int a, int b) {
-    return (a + b - 1) / b;
-}
-
-static int choose_n_tile(int m) {
-    if (m <= 4) return 8;
-    if (m <= 16) return 16;
-    return 32;
-}
-
-static int choose_m_tile(int m) {
-    return m >= 4096 ? 128 : 64;
-}
-
-static SplitConfig make_split_config(int m) {
-    int device = 0;
-    int num_sms = 0;
-    auto err = cudaGetDevice(&device);
-    TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
-    err = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-    TORCH_CHECK(err == cudaSuccess, "cudaDeviceGetAttribute failed: ", cudaGetErrorString(err));
-
-    const int m_tile = choose_m_tile(m);
-    const int n_tile = choose_n_tile(m);
-    const int num_m_tiles = ceil_div(m, m_tile);
-    const int num_n_tiles = ceil_div(N_OUT, n_tile);
-    const int mn_tiles = num_m_tiles * num_n_tiles;
-    const int target_splits = std::max(ceil_div(num_sms, mn_tiles), 1);
-    const int k_tiles_per_split = std::max(
-        ceil_div(NUM_K_TILES, target_splits), MIN_K_TILES_PER_SPLIT);
-    const int num_splits = ceil_div(NUM_K_TILES, k_tiles_per_split);
-    return {m_tile, n_tile, num_m_tiles, num_n_tiles, num_splits,
-            k_tiles_per_split, mn_tiles * num_splits, num_sms};
-}
-
-static CUtensorMap make_tma_bf16_2d(
-    const char* name,
-    const __nv_bfloat16* ptr,
-    int rows,
-    int cols,
-    int box_rows) {
-    CUtensorMap desc{};
-    cuuint64_t global_dims[2] = {
-        static_cast<cuuint64_t>(cols), static_cast<cuuint64_t>(rows)};
-    cuuint64_t global_strides[1] = {
-        static_cast<cuuint64_t>(cols) * sizeof(__nv_bfloat16)};
-    cuuint32_t box_dims[2] = {
-        static_cast<cuuint32_t>(BLOCK_K), static_cast<cuuint32_t>(box_rows)};
-    cuuint32_t elem_strides[2] = {1, 1};
-    const CUresult result = cuTensorMapEncodeTiled(
-        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
-        const_cast<__nv_bfloat16*>(ptr), global_dims, global_strides,
-        box_dims, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    if (result != CUDA_SUCCESS) {
-        const char* message = nullptr;
-        cuGetErrorString(result, &message);
-        TORCH_CHECK(false, "cuTensorMapEncodeTiled(", name, ") failed: ",
-                    message ? message : "unknown", " rows=", rows,
-                    " cols=", cols, " box_rows=", box_rows);
-    }
-    return desc;
-}
-
-struct TmaCache {
-    const void* x_ptr = nullptr;
-    const void* w_ptr = nullptr;
-    int m = -1;
-    int m_tile = -1;
-    int n_tile = -1;
-    CUtensorMap x{};
-    CUtensorMap w{};
-};
-
-template <int M_TILE, int N_TILE, int STAGES>
-static void launch_gemm(
-    const CUtensorMap& desc_x,
-    const CUtensorMap& desc_w,
-    const SplitConfig& cfg,
-    int m,
-    float* workspace,
-    cudaStream_t stream) {
-    using Storage = GemmSharedStorage<M_TILE, N_TILE, STAGES>;
-    void* kernel = reinterpret_cast<void*>(&hc_gemm_splitk_kernel<M_TILE, N_TILE, STAGES>);
-    const int smem_bytes = static_cast<int>(sizeof(Storage));
-
-    static bool configured = false;
-    if (!configured) {
-        const auto attr_err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-        TORCH_CHECK(attr_err == cudaSuccess,
-                    "cudaFuncSetAttribute(gemm) failed: ", cudaGetErrorString(attr_err),
-                    " smem=", smem_bytes, " tile=", M_TILE, "x", N_TILE,
-                    " stages=", STAGES);
-        configured = true;
-    }
-
-    cudaLaunchConfig_t config{};
-    config.gridDim = dim3(cfg.grid, 1, 1);
-    config.blockDim = dim3(GEMM_THREADS, 1, 1);
-    config.dynamicSmemBytes = smem_bytes;
-    config.stream = stream;
-    void* args[] = {
-        const_cast<CUtensorMap*>(&desc_x), const_cast<CUtensorMap*>(&desc_w),
-        &m, const_cast<int*>(&cfg.num_m_tiles), const_cast<int*>(&cfg.num_n_tiles),
-        const_cast<int*>(&cfg.num_splits), const_cast<int*>(&cfg.k_tiles_per_split),
-        &workspace};
-    const auto launch_err = cudaLaunchKernelExC(&config, kernel, args);
-    TORCH_CHECK(launch_err == cudaSuccess,
-                "hc tcgen05 GEMM launch failed: ", cudaGetErrorString(launch_err));
-}
-
-static std::vector<torch::Tensor> hc_fused_forward_full(
-    torch::Tensor hidden_states,
-    torch::Tensor attn_hc_fn,
-    torch::Tensor attn_hc_base,
-    torch::Tensor attn_hc_scale,
-    double hc_eps,
-    double rms_norm_eps) {
+static void hc_validate_inputs(
+    const torch::Tensor& hidden_states, const torch::Tensor& attn_hc_fn,
+    const torch::Tensor& attn_hc_base, const torch::Tensor& attn_hc_scale) {
     TORCH_CHECK(hidden_states.is_cuda(), "hidden_states must be CUDA");
-    TORCH_CHECK(hidden_states.scalar_type() == torch::kBFloat16,
-                "hidden_states must be bf16");
+    TORCH_CHECK(hidden_states.scalar_type() == torch::kBFloat16, "hidden_states must be bf16");
     TORCH_CHECK(hidden_states.dim() == 2 || hidden_states.dim() == 3,
                 "hidden_states must be [HC,DIM] or [M,HC,DIM]");
     if (hidden_states.dim() == 2) {
@@ -610,35 +196,48 @@ static std::vector<torch::Tensor> hc_fused_forward_full(
     TORCH_CHECK(attn_hc_fn.is_cuda() && attn_hc_fn.scalar_type() == torch::kBFloat16,
                 "attn_hc_fn must be CUDA bf16");
     TORCH_CHECK(attn_hc_fn.dim() == 2 && attn_hc_fn.size(0) == N_OUT &&
-                attn_hc_fn.size(1) == K_DIM,
-                "attn_hc_fn must be [24,28672]");
+                attn_hc_fn.size(1) == K_DIM, "attn_hc_fn must be [24,28672]");
     TORCH_CHECK(attn_hc_base.is_cuda() && attn_hc_base.scalar_type() == torch::kFloat32 &&
-                attn_hc_base.numel() == N_OUT,
-                "attn_hc_base must be CUDA fp32 [24]");
+                attn_hc_base.numel() == N_OUT, "attn_hc_base must be CUDA fp32 [24]");
     TORCH_CHECK(attn_hc_scale.is_cuda() && attn_hc_scale.scalar_type() == torch::kFloat32 &&
-                attn_hc_scale.numel() == 3,
-                "attn_hc_scale must be CUDA fp32 [3]");
+                attn_hc_scale.numel() == 3, "attn_hc_scale must be CUDA fp32 [3]");
     TORCH_CHECK(hidden_states.get_device() == attn_hc_fn.get_device() &&
                 hidden_states.get_device() == attn_hc_base.get_device() &&
                 hidden_states.get_device() == attn_hc_scale.get_device(),
                 "all inputs must be on the same CUDA device");
+}
 
-    c10::cuda::CUDAGuard device_guard(hidden_states.device());
-    auto hs = hidden_states.contiguous().view({-1, K_DIM});
-    auto weight = attn_hc_fn.contiguous();
-    auto base = attn_hc_base.contiguous();
-    auto scale = attn_hc_scale.contiguous();
+// Core launch: prepared contiguous inputs + caller-owned output pointers. No
+// allocation of outputs here (mirrors cgemm's fusenorm_run(ctx,out,...)); the
+// split-K workspace is a reused thread_local scratch. prof_dev != nullptr enables
+// clock64 stamps.
+static void hc_launch_core(
+    const torch::Tensor& hs, const torch::Tensor& weight,
+    const float* base_ptr, const float* scale_ptr,
+    float hc_eps, float rms_eps,
+    __nv_bfloat16* collapsed_ptr, float* pre_ptr, float* post_ptr, float* comb_ptr,
+    int64_t* prof_dev) {
     const int m = static_cast<int>(hs.size(0));
-    TORCH_CHECK(m > 0, "num_positions must be positive");
-
     const SplitConfig cfg = make_split_config(m);
     auto fp32_opts = hs.options().dtype(torch::kFloat32);
-    auto bf16_opts = hs.options().dtype(torch::kBFloat16);
-    auto workspace = torch::empty({cfg.num_splits, m, N_OUT}, fp32_opts);
-    auto collapsed = torch::empty({m, DIM}, bf16_opts);
-    auto pre = torch::empty({m, HC}, fp32_opts);
-    auto post = torch::empty({m, HC}, fp32_opts);
-    auto comb = torch::empty({m, HC, HC}, fp32_opts);
+
+    // Split-K partials: mix[splits,M,N_OUT] and the input-RMSNorm Σx²[splits,M].
+    // Both are internal scratch -> reuse cached buffers (no per-call alloc).
+    static thread_local torch::Tensor ws_cache;
+    const int64_t ws_need = static_cast<int64_t>(cfg.num_splits) * m * N_OUT;
+    if (!ws_cache.defined() || ws_cache.numel() < ws_need ||
+        ws_cache.device() != hs.device()) {
+        ws_cache = torch::empty({ws_need}, fp32_opts);
+    }
+    float* workspace_ptr = ws_cache.data_ptr<float>();
+
+    static thread_local torch::Tensor sq_cache;
+    const int64_t sq_need = static_cast<int64_t>(cfg.num_splits) * m;
+    if (!sq_cache.defined() || sq_cache.numel() < sq_need ||
+        sq_cache.device() != hs.device()) {
+        sq_cache = torch::empty({sq_need}, fp32_opts);
+    }
+    float* sqr_sum_ptr = sq_cache.data_ptr<float>();
 
     const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
     const auto* w_ptr = reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());
@@ -647,43 +246,16 @@ static std::vector<torch::Tensor> hc_fused_forward_full(
         cache.m != m || cache.m_tile != cfg.m_tile || cache.n_tile != cfg.n_tile) {
         cache.x = make_tma_bf16_2d("hidden", x_ptr, m, K_DIM, cfg.m_tile);
         cache.w = make_tma_bf16_2d("weight", w_ptr, N_OUT, K_DIM, cfg.n_tile);
-        cache.x_ptr = x_ptr;
-        cache.w_ptr = w_ptr;
-        cache.m = m;
-        cache.m_tile = cfg.m_tile;
-        cache.n_tile = cfg.n_tile;
+        cache.x_ptr = x_ptr; cache.w_ptr = w_ptr; cache.m = m;
+        cache.m_tile = cfg.m_tile; cache.n_tile = cfg.n_tile;
     }
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    float* workspace_ptr = workspace.data_ptr<float>();
-    if (cfg.m_tile == 128) {
-        TORCH_CHECK(cfg.n_tile == 32, "M128 path requires N32");
-        launch_gemm<128, 32, 8>(cache.x, cache.w, cfg, m, workspace_ptr, stream);
-    } else {
-        switch (cfg.n_tile) {
-            case 8:
-                launch_gemm<64, 8, 4>(cache.x, cache.w, cfg, m, workspace_ptr, stream);
-                break;
-            case 16:
-                launch_gemm<64, 16, 4>(cache.x, cache.w, cfg, m, workspace_ptr, stream);
-                break;
-            case 32:
-                if (cfg.k_tiles_per_split <= 16) {
-                    launch_gemm<64, 32, 4>(
-                        cache.x, cache.w, cfg, m, workspace_ptr, stream);
-                } else {
-                    launch_gemm<64, 32, 12>(
-                        cache.x, cache.w, cfg, m, workspace_ptr, stream);
-                }
-                break;
-            default:
-                TORCH_CHECK(false, "unsupported N tile: ", cfg.n_tile);
-        }
-    }
+    launch_gemm_dispatch(cache.x, cache.w, cfg, m, workspace_ptr, sqr_sum_ptr, prof_dev, stream);
 
-    constexpr int scratch_floats = 8 + 1 + N_OUT + HC + HC + HC * HC;
-    constexpr int fuse_smem_bytes = K_DIM * sizeof(__nv_bfloat16)
-        + scratch_floats * sizeof(float);
+    // rms + sqsum + mix + pre + post + comb (no hidden staged in smem anymore).
+    constexpr int scratch_floats = 1 + 1 + N_OUT + HC + HC + HC * HC;
+    constexpr int fuse_smem_bytes = scratch_floats * sizeof(float);
     static bool fuse_configured = false;
     if (!fuse_configured) {
         const auto attr_err = cudaFuncSetAttribute(
@@ -696,19 +268,187 @@ static std::vector<torch::Tensor> hc_fused_forward_full(
     }
 
     hc_reduce_and_fuse_kernel<<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
-        x_ptr, workspace_ptr, base.data_ptr<float>(), scale.data_ptr<float>(),
-        static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
-        m, cfg.num_splits,
-        reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
-        pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>());
-    const auto fuse_err = cudaGetLastError();
-    TORCH_CHECK(fuse_err == cudaSuccess,
-                "HC reduce/fuse launch failed: ", cudaGetErrorString(fuse_err));
+        x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
+        m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr, prof_dev);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "HC reduce/fuse launch failed: ", cudaGetErrorString(cudaGetLastError()));
+}
 
-    if (hidden_states.dim() == 2) {
-        return {collapsed.squeeze(0), pre.squeeze(0), post.squeeze(0), comb.squeeze(0)};
+// ============================================================
+// Matmul-only path: mix[M,N_OUT] = X[M,K] @ W[N_OUT,K]^T (raw, bf16 out).
+// Same 2-kernel structure as cuBLAS (GEMM + split-K reduce), NO RMSNorm/gates/
+// Sinkhorn/collapse -- for an apples-to-apples matmul-vs-cuBLAS comparison.
+// ============================================================
+__global__ void __launch_bounds__(128)
+hc_reduce_mix_kernel(
+    const float* __restrict__ workspace, int num_positions, int num_splits,
+    __nv_bfloat16* __restrict__ mix_out) {
+    const int pos = static_cast<int>(blockIdx.x);
+    if (pos >= num_positions) return;
+    const int tid = threadIdx.x;
+    __shared__ float acc[N_OUT];
+    if (tid < N_OUT) acc[tid] = 0.0f;
+    __syncthreads();
+
+    const float* wbase = workspace + static_cast<int64_t>(pos) * N_OUT;
+    const int64_t sstride = static_cast<int64_t>(num_positions) * N_OUT;
+    const int total = num_splits * N_OUT;
+    for (int idx = tid; idx < total; idx += 128) {
+        const int split = idx / N_OUT;
+        const int n = idx - split * N_OUT;
+        atomicAdd(&acc[n], wbase[static_cast<int64_t>(split) * sstride + n]);
     }
-    return {collapsed, pre, post, comb};
+    __syncthreads();
+    if (tid < N_OUT) mix_out[pos * N_OUT + tid] = __float2bfloat16_rn(acc[tid]);
+}
+
+static torch::Tensor hc_matmul(torch::Tensor hidden_states, torch::Tensor attn_hc_fn) {
+    TORCH_CHECK(hidden_states.is_cuda() && hidden_states.scalar_type() == torch::kBFloat16,
+                "hidden_states must be CUDA bf16");
+    TORCH_CHECK(attn_hc_fn.is_cuda() && attn_hc_fn.scalar_type() == torch::kBFloat16 &&
+                attn_hc_fn.dim() == 2 && attn_hc_fn.size(0) == N_OUT &&
+                attn_hc_fn.size(1) == K_DIM, "attn_hc_fn must be CUDA bf16 [24,28672]");
+
+    c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    auto hs = hidden_states.contiguous().view({-1, K_DIM});
+    auto weight = attn_hc_fn.contiguous();
+    const int m = static_cast<int>(hs.size(0));
+    const SplitConfig cfg = make_split_config(m);
+
+    auto fp32_opts = hs.options().dtype(torch::kFloat32);
+    auto mix = torch::empty({m, N_OUT}, hs.options().dtype(torch::kBFloat16));
+
+    static thread_local torch::Tensor ws_cache;
+    const int64_t ws_need = static_cast<int64_t>(cfg.num_splits) * m * N_OUT;
+    if (!ws_cache.defined() || ws_cache.numel() < ws_need ||
+        ws_cache.device() != hs.device()) {
+        ws_cache = torch::empty({ws_need}, fp32_opts);
+    }
+    float* workspace_ptr = ws_cache.data_ptr<float>();
+
+    const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
+    const auto* w_ptr = reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());
+    thread_local TmaCache cache;
+    if (cache.x_ptr != x_ptr || cache.w_ptr != w_ptr ||
+        cache.m != m || cache.m_tile != cfg.m_tile || cache.n_tile != cfg.n_tile) {
+        cache.x = make_tma_bf16_2d("hidden", x_ptr, m, K_DIM, cfg.m_tile);
+        cache.w = make_tma_bf16_2d("weight", w_ptr, N_OUT, K_DIM, cfg.n_tile);
+        cache.x_ptr = x_ptr; cache.w_ptr = w_ptr; cache.m = m;
+        cache.m_tile = cfg.m_tile; cache.n_tile = cfg.n_tile;
+    }
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_gemm_dispatch(cache.x, cache.w, cfg, m, workspace_ptr,
+                         /*sqr_sum=*/nullptr, /*prof=*/nullptr, stream);
+    hc_reduce_mix_kernel<<<m, 128, 0, stream>>>(
+        workspace_ptr, m, cfg.num_splits,
+        reinterpret_cast<__nv_bfloat16*>(mix.data_ptr()));
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+                "hc_reduce_mix launch failed: ", cudaGetErrorString(cudaGetLastError()));
+    return mix;
+}
+
+static std::vector<torch::Tensor> hc_run_impl(
+    torch::Tensor hidden_states,
+    torch::Tensor attn_hc_fn,
+    torch::Tensor attn_hc_base,
+    torch::Tensor attn_hc_scale,
+    double hc_eps,
+    double rms_norm_eps,
+    bool profile) {
+    hc_validate_inputs(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale);
+
+    c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    auto hs = hidden_states.contiguous().view({-1, K_DIM});
+    auto weight = attn_hc_fn.contiguous();
+    auto base = attn_hc_base.contiguous();
+    auto scale = attn_hc_scale.contiguous();
+    const int m = static_cast<int>(hs.size(0));
+    TORCH_CHECK(m > 0, "num_positions must be positive");
+
+    auto fp32_opts = hs.options().dtype(torch::kFloat32);
+    auto bf16_opts = hs.options().dtype(torch::kBFloat16);
+    auto collapsed = torch::empty({m, DIM}, bf16_opts);
+    auto pre = torch::empty({m, HC}, fp32_opts);
+    auto post = torch::empty({m, HC}, fp32_opts);
+    auto comb = torch::empty({m, HC, HC}, fp32_opts);
+    int64_t* prof_dev = nullptr;
+    torch::Tensor timing;
+    if (profile) {
+        timing = torch::zeros({PROF_SLOTS}, hs.options().dtype(torch::kInt64));
+        prof_dev = timing.data_ptr<int64_t>();
+    }
+
+    hc_launch_core(hs, weight, base.data_ptr<float>(), scale.data_ptr<float>(),
+                   static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
+                   reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
+                   pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
+                   prof_dev);
+
+    std::vector<torch::Tensor> out;
+    if (hidden_states.dim() == 2) {
+        out = {collapsed.squeeze(0), pre.squeeze(0), post.squeeze(0), comb.squeeze(0)};
+    } else {
+        out = {collapsed, pre, post, comb};
+    }
+    if (profile) out.push_back(timing);  // int64 [PROF_SLOTS] clock64 stamps
+    return out;
+}
+
+// Preallocated-output variant (cgemm-style: caller owns collapsed/pre/post/comb).
+// Skips the per-call output torch::empty + Python list marshalling -> lower eager
+// host dispatch. Outputs must be contiguous, correct dtype, and hold m rows.
+static void hc_fused_forward_out(
+    torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
+    torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
+    double hc_eps, double rms_norm_eps,
+    torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post, torch::Tensor comb) {
+    hc_validate_inputs(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale);
+
+    c10::cuda::CUDAGuard device_guard(hidden_states.device());
+    auto hs = hidden_states.contiguous().view({-1, K_DIM});
+    auto weight = attn_hc_fn.contiguous();
+    auto base = attn_hc_base.contiguous();
+    auto scale = attn_hc_scale.contiguous();
+    const int m = static_cast<int>(hs.size(0));
+    TORCH_CHECK(m > 0, "num_positions must be positive");
+    TORCH_CHECK(collapsed.is_cuda() && collapsed.is_contiguous() &&
+                collapsed.scalar_type() == torch::kBFloat16 &&
+                collapsed.numel() == static_cast<int64_t>(m) * DIM,
+                "collapsed must be contiguous bf16 with m*DIM elements");
+    TORCH_CHECK(pre.is_contiguous()  && pre.numel()  == static_cast<int64_t>(m) * HC &&
+                post.is_contiguous() && post.numel() == static_cast<int64_t>(m) * HC &&
+                comb.is_contiguous() && comb.numel() == static_cast<int64_t>(m) * HC * HC &&
+                pre.scalar_type() == torch::kFloat32 &&
+                post.scalar_type() == torch::kFloat32 &&
+                comb.scalar_type() == torch::kFloat32,
+                "pre/post/comb must be contiguous fp32 [m,HC]/[m,HC]/[m,HC,HC]");
+
+    hc_launch_core(hs, weight, base.data_ptr<float>(), scale.data_ptr<float>(),
+                   static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
+                   reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
+                   pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
+                   nullptr);
+}
+
+static std::vector<torch::Tensor> hc_fused_forward_full(
+    torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
+    torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
+    double hc_eps, double rms_norm_eps) {
+    return hc_run_impl(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
+                       hc_eps, rms_norm_eps, /*profile=*/false);
+}
+
+// Profiled: returns {collapsed, pre, post, comb, timing[PROF_SLOTS]} where timing
+// holds clock64 stamps (block 0):
+//   [0..1] GEMM start/end;  [2..7] epilogue start / after {load+rms, reduce,
+//   activation, sinkhorn, collapse}.  Deltas / SM clock (MHz) -> microseconds.
+static std::vector<torch::Tensor> hc_fused_forward_profiled(
+    torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
+    torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
+    double hc_eps, double rms_norm_eps) {
+    return hc_run_impl(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
+                       hc_eps, rms_norm_eps, /*profile=*/true);
 }
 
 static std::vector<int64_t> hc_fused_tc_config(int64_t num_positions) {
@@ -724,6 +464,12 @@ static std::vector<int64_t> hc_fused_tc_config(int64_t num_positions) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_fused_forward_full", &hc_tc::hc_fused_forward_full,
           "MHC fused forward (BF16 tcgen05 + split-K + fused HC epilogue)");
+    m.def("hc_fused_forward_profiled", &hc_tc::hc_fused_forward_profiled,
+          "MHC fused forward + clock64 stamps -> {collapsed,pre,post,comb,timing[8]}");
+    m.def("hc_fused_forward_out", &hc_tc::hc_fused_forward_out,
+          "MHC fused forward into preallocated {collapsed,pre,post,comb} (no alloc, no return)");
+    m.def("hc_matmul", &hc_tc::hc_matmul,
+          "Matmul only: mix[M,24] = X @ W^T (GEMM + split-K reduce, bf16 out; no epilogue)");
     m.def("hc_fused_tc_config", &hc_tc::hc_fused_tc_config,
           "Return [N tile, split-K, K tiles/split, grid, M tiles, N tiles, SMs, M tile]");
 }
