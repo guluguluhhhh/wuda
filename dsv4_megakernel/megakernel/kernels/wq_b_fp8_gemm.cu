@@ -5,7 +5,7 @@
 //
 // x_fp8[M,1536] @ w_fp8[65536,1536]^T -> y[M,65536] (FP32)
 // M=32~256 (32-aligned), K=1536, N=65536, e4m3 inputs + per-32K UE8M0 scale.
-// M<=128: swap-AB BM=M x BN128. M>=160: non-swap BM128xBN224, cluster along M.
+// M<=128: swap-AB BM128xBN128. M>=160: non-swap BM128xBN224, cluster along M.
 // UMMA_K=32, gran_k=32.
 // 2SM MMA (cta_group::2), block_scale, Persistent, Warp-Specialized.
 // SF pipeline: TMA -> smem -> warp2 transpose -> UTCCP -> TMEM (block_scale MMA).
@@ -67,19 +67,17 @@ wq_b_proj_kernel(
     constexpr int NS              = Dims::NUM_STAGES;
     constexpr int SA              = Dims::SMEM_A_PER_STAGE;
     constexpr int SSFA            = Dims::SMEM_SFA_PER_STAGE;
-    constexpr int LOAD_BLOCK_M_T  = Dims::LOAD_BLOCK_M;
-    constexpr int UMMA_N_T        = Dims::UMMA_N;
-    constexpr int NUM_TMEM_COLS_T = Dims::NUM_TMEM_COLS;
-    constexpr int TMEM_SFA        = Dims::TMEM_START_SFA;
-    constexpr int TMEM_SFB        = Dims::TMEM_START_SFB;
-    constexpr int NUM_M_SUB       = Dims::NUM_M_SUB;
-    constexpr int BM_T            = Dims::BLOCK_M;
+    constexpr int LOAD_BLOCK_M_T  = Dims::LOAD_BLOCK_M;    // 64 (fixed, BM/2)
+    constexpr int UMMA_N_T        = Dims::UMMA_N;          // 128 (fixed, BM)
+    constexpr int NUM_TMEM_COLS_T = Dims::NUM_TMEM_COLS;   // 512
+    constexpr int TMEM_SFA        = Dims::TMEM_START_SFA;  // 256 (activation SF)
+    constexpr int TMEM_SFB        = Dims::TMEM_START_SFB;  // 260 (weight SF)
+    constexpr int NUM_M_SUB       = Dims::NUM_M_SUB;       // ceil(M/128) subtiles
+    constexpr int BM_T            = BM;                    // 128 (subtile M)
 
-    constexpr int NUM_TILES_TOTAL = NUM_N_TILES;
+    constexpr int NUM_TILES_TOTAL = NUM_N_TILES; // N tiles (inner loop over M subtiles)
 
     using Storage = SharedStorage<M_TPL>;
-    static_assert(sizeof(Storage) <= SMEM_CAPACITY,
-                  "swap FP8 shared storage exceeds SM100 capacity");
     extern __shared__ __align__(1024) uint8_t smem_buf[];
     Storage& s = *reinterpret_cast<Storage*>(smem_buf);
 
@@ -139,10 +137,10 @@ wq_b_proj_kernel(
         for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
             int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N; // weight N (per CTA)
             int sfb_n  = n_base;                                             // weight SF (per CTA)
-            // The loop is compile-time one trip for every shape-specialized swap kernel.
+            // Inner loop over M subtiles: weight/SFB (n_base) reused -> HBM once, L2 after.
             for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
-                int m_base = m_sub * BM_T + cta_rank * LOAD_BLOCK_M_T;
-                int sfa_m  = m_sub * BM_T;
+                int m_base = m_sub * BM_T + cta_rank * LOAD_BLOCK_M_T;  // this subtile's activation half
+                int sfa_m  = m_sub * BM_T;                             // this subtile's SFA base
 
                 // [PROFILE] Load (producer) window for this iteration's K-loop.
                 long long prof_ld_t0 = 0;
@@ -164,7 +162,7 @@ wq_b_proj_kernel(
                     tma::copy_2d_sf(&desc_SFB, &s.full_barriers[stage], sfb, sfb_n, (uint32_t)k);
 
                     constexpr uint32_t kNumArrivalBytes =
-                        SA + SMEM_B_PER_STAGE + BM_T * sizeof(uint32_t) + SF_BLOCK_N * sizeof(uint32_t);
+                        SA + SMEM_B_PER_STAGE + BM * sizeof(uint32_t) + SF_BLOCK_N * sizeof(uint32_t);
                     s.full_barriers[stage].arrive_and_expect_tx(kNumArrivalBytes);
                     advance();
                 }
@@ -212,11 +210,10 @@ wq_b_proj_kernel(
     }
 
     // ======== WARP 1: MMA CONSUMER (leader only) ========
-    // Per-tile UTCCP + block_scale MMA delegated to the shape-specialized engine.
+    // Per-tile UTCCP + block_scale MMA delegated to the fixed-128 cluster_mma_fp8 engine.
     else if (warp_id == 1 && is_leader) {
-        using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<
-            BLOCK_K, NS, BM_T, BLOCK_N, true>;
-        static_assert(UMMA_N_T == CM::UMMA_N, "swap kernel UMMA N mismatch");
+        using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<BLOCK_K, NS>;
+        static_assert(UMMA_N_T == CM::UMMA_N, "FIXED-BM kernel requires UMMA_N == 128");
 
         auto ds = CM::init_desc(smem_a_base, smem_b_base, lane_id);
 
@@ -265,7 +262,7 @@ wq_b_proj_kernel(
         uint32_t epi_warp_idx = warp_id - (NUM_NON_EPI_THREADS / 32);  // 0..3
         uint32_t tma_store_idx = 0;
 
-        constexpr int NUM_STORES         = BM_T / STORE_BLOCK_M;
+        constexpr int NUM_STORES         = BM_T / STORE_BLOCK_M;               // 8 per subtile (TMA clips rows >= M)
         constexpr int NUM_TMEM_SUBROWS   = STORE_BLOCK_M / 8;                  // 2
         constexpr int NUM_N_STORE_ATOMS  = STORE_BLOCK_N / STORE_BLOCK_N_ATOM; // 4
         constexpr int SMEM_CD_PER_STAGE_T = SMEM_CD_PER_STAGE;                 // 8192
@@ -287,7 +284,7 @@ wq_b_proj_kernel(
 
             uint32_t tmem_base = accum_stage * UMMA_N_T;
             int base_n = tile_id * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
-            int base_m = m_sub * BM_T;
+            int base_m = m_sub * BM_T;   // this subtile's output rows (TMA clips >= M)
 
             for (int st = 0; st < NUM_STORES; ++st,
                  tma_store_idx = (tma_store_idx + 1) % NUM_TMA_STORE_STAGES) {
@@ -735,7 +732,7 @@ static CUtensorMap make_tma_desc_fp32_2d(
 }
 
 // ======================== Kernel / SMEM selectors ========================
-// M<=128 uses a shape-specialized swap-AB BM=M path. M>=160 uses the DeepGEMM-selected
+// M<=128 keeps the established swap-AB path. M>=160 uses the DeepGEMM-selected
 // non-swap BM=128, BN=224 specialization.
 template <bool kProfile>
 static void* get_kernel_ptr(int M) {
@@ -786,7 +783,7 @@ static std::vector<torch::Tensor> run_wq_b(
     TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0,
                 "kernel supports 32-aligned M in [32,256], got M=", M);
     const bool use_nonswap = M > 128;
-    const int num_m_sub = 1;  // all dispatched kernels process one task per N tile
+    const int num_m_sub = (M + BM - 1) / BM;  // swap-path profiling only
 
     // SF shapes: 4 UE8M0/uint32 -> sf_k = K/(gran_k*4) = K/BLOCK_K. mn aligned to 16/4 = 4.
     const int sf_k   = K_DIM / (GRAN_K * SF_IDS_PER_UINT);        // 12
@@ -808,15 +805,14 @@ static std::vector<torch::Tensor> run_wq_b(
 
     // Both paths use K-major 128B-swizzled operands. TMA OOB handling covers the
     // partial second M block and the final 224-column N block in the non-swap path.
-    const int load_block_m = use_nonswap ? nonswap::LOAD_BLOCK_M_NS : M / NUM_MULTICAST;
+    const int load_block_m = use_nonswap ? nonswap::LOAD_BLOCK_M_NS : BM / NUM_MULTICAST;
     const int load_block_n = use_nonswap ? nonswap::LOAD_BLOCK_N_NS : LOAD_BLOCK_N;
     const int sfb_block_n  = use_nonswap ? nonswap::BLOCK_N_NS : SF_BLOCK_N;
     const int store_block_m = use_nonswap ? nonswap::STORE_BLOCK_M_NS : STORE_BLOCK_M;
     const int store_block_n = use_nonswap ? nonswap::STORE_BLOCK_N_NS : STORE_BLOCK_N_ATOM;
     CUtensorMap desc_A   = make_tma_desc_fp8_2d(x_ptr, M, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B   = make_tma_desc_fp8_2d(w_ptr, N_TOTAL, K_DIM, load_block_n, BLOCK_K);
-    CUtensorMap desc_SFA = make_tma_desc_sf_2d(
-        xsf_ptr, sfa_mn, sf_k, use_nonswap ? nonswap::BLOCK_M_NS : M);
+    CUtensorMap desc_SFA = make_tma_desc_sf_2d(xsf_ptr, sfa_mn, sf_k, BM);
     CUtensorMap desc_SFB = make_tma_desc_sf_2d(wsf_ptr, sfb_mn, sf_k, sfb_block_n);
     CUtensorMap desc_D   = make_tma_desc_fp32_2d(
         out_ptr, M, N_TOTAL, store_block_m, store_block_n);

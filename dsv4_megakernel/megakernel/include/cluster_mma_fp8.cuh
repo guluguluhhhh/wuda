@@ -1,37 +1,4 @@
 #pragma once
-// ============================================================
-// cluster_mma_fp8.cuh
-// Single-cluster FP8 (e4m3) block-scale MMA engine (tcgen05, 2SM) —
-// reusable building block for the dsv4 decode megakernel.
-//
-// Analogous to cluster_mma.cuh (BF16), but for FP8 block-scale GEMM:
-//   - operands e4m3, accumulate FP32, UMMA_K = 32
-//   - per-32-K block scale (gran_k = 32): one UE8M0 scale factor per 32 K
-//   - MMA = tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale
-//
-// Supported 2SM layouts:
-//   swap-AB: BM=32..128, BN=128, cluster-N=2, UMMA = 256 x BM x 32
-//   non-swap: BM=128, BN=224, cluster-M=2, UMMA = 256 x 224 x 32
-//
-// Operand roles are selected by the kSwapAB template argument. Both problem
-// operands remain K-major with 128B swizzle.
-//
-// SCOPE / responsibility boundary (matches BF16 cluster_mma — MMA only):
-//   The caller owns everything EXCEPT the tensor-core issue:
-//     - TMA of FP8 A/B and of the raw scale factors into smem
-//     - the warp that transposes the SF in smem (DeepGEMM utccp layout)
-//     - allocating TMEM and choosing the accumulator / SF column offsets
-//   run_tile then, per K-stage: UTCCP (transposed-smem SF -> TMEM) + block_scale MMA.
-//   NOTE: UTCCP is unavoidably inside the K-loop because the SF TMEM columns are
-//   single-buffered (one stage's worth), so they must be refreshed every stage
-//   right before the MMA consumes them. Hence run_tile takes the SF smem bases and
-//   the SF TMEM columns and does the UTCCP itself.
-//
-// Self-contained: depends only on CUTLASS/CuTe arch headers. All helpers live in
-// cluster_mma_fp8::detail so this header can coexist with cluster_mma.cuh /
-// wq_b_gemm.cuh / w1_merged_fp8_gemm.cuh in the same TU.
-// ============================================================
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -206,12 +173,8 @@ struct ClusterMmaFP8BlockScale {
 
     static_assert(BLOCK_K % UMMA_K == 0, "BLOCK_K must be a multiple of UMMA_K(32)");
     static_assert(UMMA_K == GRAN_K, "sf_id == kk assumes UMMA_K == GRAN_K");
-    static_assert(kSwapAB ? BN == 128 : BM == 128,
-                  "2SM geometry must provide 256 rows to hardware operand A");
-    static_assert(UMMA_N >= 16 && UMMA_N <= 256 && (UMMA_N % 16) == 0,
-                  "invalid 2SM UMMA N");
-    static_assert(kSwapAB ? (BM % NUM_MULTICAST) == 0 : (BN % NUM_MULTICAST) == 0,
-                  "the clustered problem dimension must split evenly across two CTAs");
+    static_assert(BM == 128, "the 2SM FP8 engine currently requires BLOCK_M=128");
+    static_assert((BN % 16) == 0 && BN <= 256, "invalid non-swap UMMA N");
 
     // Descriptor state precomputed once per MMA warp.
     struct DescState {
@@ -239,30 +202,6 @@ struct ClusterMmaFP8BlockScale {
         return ds;
     }
 
-    // Run the full K-loop for one cluster tile: per stage, UTCCP the stage's scale
-    // factors from (transposed) smem into TMEM, then issue the block_scale MMA over
-    // the STEPS_PER_STAGE sub-K blocks. Entered by all 32 lanes of the leader CTA's
-    // MMA warp.
-    //
-    // Barriers (mirrors the FP8 SF pipeline):
-    //   with_sf_full_barriers[stage] : signalled AFTER the SF has been transposed in
-    //                                  smem (raw TMA -> transpose warp). run_tile waits it.
-    //   empty_barriers[stage]        : arrived (multicast) once the stage's smem is consumed.
-    //   tmem_full / tmem_empty       : accumulator handshake with the epilogue.
-    //
-    // SF sources / destinations:
-    //   smem_sf_act_base / smem_sf_wgt_base : transposed SF smem bases (per-stage stride
-    //                                         = SMEM_SF_ACT/WGT_PER_STAGE, applied internally).
-    //   tmem_sf_act / tmem_sf_wgt           : TMEM columns holding this tile's activation /
-    //                                         weight SF (single-buffered, refreshed each stage).
-    //   tmem_c                              : accumulator column (= accum_stage * UMMA_N).
-    //
-    // Advances stage_idx / phase in place. The caller owns the outer tile-scheduling
-    // loop and the final drain wait on tmem_empty after the last tile.
-    // kProfWait (diagnostic): when true, lane 0 accumulates the cycles the MMA warp
-    // spends WAITING (tmem_empty + per-stage with_sf_full) into *wait_out. Then
-    // MMA_active = (MMA window) - *wait_out reveals whether the warp is actually
-    // computing or just stalled on the load/epilogue. Compiled out when false.
     template <bool kProfWait = false>
     static __device__ __forceinline__
     void run_tile(const DescState& ds,

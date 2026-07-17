@@ -1,6 +1,6 @@
 """
-Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale).
-  M<=128: swap-AB BM=M x BN128; M>=160: non-swap BM128 x BN224.
+Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale, fixed BM=128).
+  M<=128: swap-AB BM128 x BN128; M>=160: non-swap BM128 x BN224.
   x_fp8[M,1536] @ w_fp8[65536,1536].T -> y[M,65536] (FP32)
 Requires: NVIDIA Blackwell (sm_100+), CUDA 12.8+, CUTLASS 3.x.
 
@@ -190,8 +190,7 @@ def benchmark(module):
             return None
 
     print(f"  K={K_DIM}, N={N_TOTAL}; weight {weight_bytes/1e6:.1f} MB (e4m3)")
-    print("  Dispatch: M<=128 swap-AB BM=M x BN128; M>=160 non-swap BM128xBN224")
-    print("  Small-M stages: M32=11, M64=10, M96=9, M128=8")
+    print("  Dispatch: M<=128 swap-AB BM128xBN128; M>=160 non-swap BM128xBN224")
     print(f"  NOTE: min-of-batches latency (robust to throttling). For stable numbers")
     print(f"        lock clocks: nvidia-smi -lgc <freq>. %cuBLAS = cuBLAS_us/ours_us.")
     print(f"        Baseline = torch._scaled_mm (cuBLASLt FP8, per-32K UE8M0); out FP32.")
