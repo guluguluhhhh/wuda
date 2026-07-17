@@ -1,7 +1,7 @@
 #pragma once
 // ============================================================
 // cluster_mma_fp8.cuh
-// Single-cluster FP8 (e4m3) block-scale swap-AB MMA engine (tcgen05, 2SM) —
+// Single-cluster FP8 (e4m3) block-scale MMA engine (tcgen05, 2SM) —
 // reusable building block for the dsv4 decode megakernel.
 //
 // Analogous to cluster_mma.cuh (BF16), but for FP8 block-scale GEMM:
@@ -9,15 +9,12 @@
 //   - per-32-K block scale (gran_k = 32): one UE8M0 scale factor per 32 K
 //   - MMA = tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale
 //
-// Fixed tile shape (swap-AB, cta_group::2):
-//   BM = 128 (problem-M tile) = UMMA_N = 128
-//   BN = 128 (per-CTA problem-N); cluster of 2 CTAs -> cluster-N = 256 = UMMA_M
-//   UMMA_K = 32, GRAN_K = 32
-//   one block_scale MMA instruction = 256 x 128 x 32
+// Supported 2SM layouts:
+//   swap-AB: BM=32..128, BN=128, cluster-N=2, UMMA = 256 x BM x 32
+//   non-swap: BM=128, BN=224, cluster-M=2, UMMA = 256 x 224 x 32
 //
-// Operand roles (swap-AB):
-//   A-operand = WEIGHT     (spans problem-N via UMMA_M), K-major, 128B swizzle
-//   B-operand = ACTIVATION (spans problem-M via UMMA_N), K-major, 128B swizzle
+// Operand roles are selected by the kSwapAB template argument. Both problem
+// operands remain K-major with 128B swizzle.
 //
 // SCOPE / responsibility boundary (matches BF16 cluster_mma — MMA only):
 //   The caller owns everything EXCEPT the tensor-core issue:
@@ -102,7 +99,7 @@ uint32_t advance_lo_k(uint32_t base_lo, uint32_t kk) {
     return base_lo + kk * (32u * sizeof(__nv_fp8_e4m3) / 16u); // kk * 2
 }
 
-// Base InstrDescriptorBlockScaled (swap-AB: A-operand=weight, B-operand=activation).
+// Base InstrDescriptorBlockScaled. Operand order is selected at issue time.
 template <int UMMA_N_T>
 __device__ __forceinline__
 cute::UMMA::InstrDescriptorBlockScaled make_block_scaled_idesc() {
@@ -128,8 +125,8 @@ __device__ __forceinline__ void utccp_4x32_2cta(uint32_t tmem_col, uint64_t sf_d
 }
 
 // tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale (only hi 32 bits of idesc used).
-//   desc_a / tmem_sfa : A-operand (weight)     value + scale
-//   desc_b / tmem_sfb : B-operand (activation) value + scale
+//   desc_a / tmem_sfa : hardware A-operand value + scale
+//   desc_b / tmem_sfb : hardware B-operand value + scale
 __device__ __forceinline__ void mma_2sm_block_scale(
     uint32_t tmem_c, uint64_t desc_a, uint64_t desc_b,
     uint64_t runtime_idesc, uint32_t accum,
@@ -177,33 +174,44 @@ __device__ __forceinline__ bool elect_one_sync() {
 // ======================== Cluster FP8 block-scale MMA engine ========================
 // BLOCK_K   : K per pipeline stage (multiple of UMMA_K(32); e.g. 128 -> 4 SF sub-blocks).
 // NUM_STAGES: number of SMEM pipeline stages (bounds the per-lane descriptor table).
-template <int BLOCK_K, int NUM_STAGES>
+template <int BLOCK_K, int NUM_STAGES,
+          int BLOCK_M_T = 128, int BLOCK_N_T = 128, bool kSwapAB = true>
 struct ClusterMmaFP8BlockScale {
-    // ---- Fixed geometry ----
-    static constexpr int BM = 128, BN = 128, NUM_MULTICAST = 2;
-    static constexpr int UMMA_M = 256, UMMA_N = 128, UMMA_K = 32, GRAN_K = 32;
+    // ---- Geometry ----
+    static constexpr int BM = BLOCK_M_T, BN = BLOCK_N_T, NUM_MULTICAST = 2;
+    static constexpr int UMMA_M = 256;
+    static constexpr int UMMA_N = kSwapAB ? BM : BN;
+    static constexpr int UMMA_K = 32, GRAN_K = 32;
+    static constexpr int LOAD_BLOCK_M = BM / (kSwapAB ? NUM_MULTICAST : 1);
+    static constexpr int LOAD_BLOCK_N = BN / (kSwapAB ? 1 : NUM_MULTICAST);
     static constexpr int STEPS_PER_STAGE = BLOCK_K / UMMA_K;          // = SF sub-blocks per stage
     static constexpr uint16_t CTA_MASK = (1 << NUM_MULTICAST) - 1;    // 0b11
 
     // ---- Operand SMEM per-stage byte strides (FP8 = 1 byte, tight K-major) ----
-    static constexpr int SMEM_ACT_PER_STAGE = (BM / NUM_MULTICAST) * BLOCK_K * (int)sizeof(__nv_fp8_e4m3); // 64*BK
-    static constexpr int SMEM_WGT_PER_STAGE = BN * BLOCK_K * (int)sizeof(__nv_fp8_e4m3);                    // 128*BK
+    static constexpr int SMEM_ACT_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * (int)sizeof(__nv_fp8_e4m3);
+    static constexpr int SMEM_WGT_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * (int)sizeof(__nv_fp8_e4m3);
 
     // ---- Scale-factor layout ----
     static constexpr int NUM_UTCCP_ALIGNED = 128;
-    static constexpr int SF_BLOCK_M        = BM;   // 128 (already UTCCP-aligned)
-    static constexpr int SF_BLOCK_N        = BN;   // 128
-    static constexpr int NUM_SF_ATOMS_M    = SF_BLOCK_M / NUM_UTCCP_ALIGNED; // 1
-    static constexpr int NUM_SF_ATOMS_N    = SF_BLOCK_N / NUM_UTCCP_ALIGNED; // 1
+    static constexpr int SF_BLOCK_M        = ((BM + NUM_UTCCP_ALIGNED - 1) / NUM_UTCCP_ALIGNED) * NUM_UTCCP_ALIGNED;
+    static constexpr int SF_BLOCK_N        = ((BN + NUM_UTCCP_ALIGNED - 1) / NUM_UTCCP_ALIGNED) * NUM_UTCCP_ALIGNED;
+    static constexpr int NUM_SF_ATOMS_M    = SF_BLOCK_M / NUM_UTCCP_ALIGNED;
+    static constexpr int NUM_SF_ATOMS_N    = SF_BLOCK_N / NUM_UTCCP_ALIGNED;
     // TMEM columns each SF operand occupies (caller lays these out after the accumulator).
-    static constexpr int NUM_SF_TMEM_COLS_ACT = SF_BLOCK_M / 32; // 4
-    static constexpr int NUM_SF_TMEM_COLS_WGT = SF_BLOCK_N / 32; // 4
+    static constexpr int NUM_SF_TMEM_COLS_ACT = SF_BLOCK_M / 32;
+    static constexpr int NUM_SF_TMEM_COLS_WGT = SF_BLOCK_N / 32;
     // Per-stage SF smem byte strides (packed uint32: 4 UE8M0 per word).
-    static constexpr int SMEM_SF_ACT_PER_STAGE = SF_BLOCK_M * (int)sizeof(uint32_t); // 512
-    static constexpr int SMEM_SF_WGT_PER_STAGE = SF_BLOCK_N * (int)sizeof(uint32_t); // 512
+    static constexpr int SMEM_SF_ACT_PER_STAGE = SF_BLOCK_M * (int)sizeof(uint32_t);
+    static constexpr int SMEM_SF_WGT_PER_STAGE = SF_BLOCK_N * (int)sizeof(uint32_t);
 
     static_assert(BLOCK_K % UMMA_K == 0, "BLOCK_K must be a multiple of UMMA_K(32)");
     static_assert(UMMA_K == GRAN_K, "sf_id == kk assumes UMMA_K == GRAN_K");
+    static_assert(kSwapAB ? BN == 128 : BM == 128,
+                  "2SM geometry must provide 256 rows to hardware operand A");
+    static_assert(UMMA_N >= 16 && UMMA_N <= 256 && (UMMA_N % 16) == 0,
+                  "invalid 2SM UMMA N");
+    static_assert(kSwapAB ? (BM % NUM_MULTICAST) == 0 : (BN % NUM_MULTICAST) == 0,
+                  "the clustered problem dimension must split evenly across two CTAs");
 
     // Descriptor state precomputed once per MMA warp.
     struct DescState {
@@ -213,8 +221,8 @@ struct ClusterMmaFP8BlockScale {
     };
 
     // Build the per-stage descriptor tables. Call once at MMA-warp entry, all 32 lanes.
-    //   smem_act_base = activation SMEM base (B-operand)
-    //   smem_wgt_base = weight     SMEM base (A-operand)
+    //   smem_act_base = activation SMEM base
+    //   smem_wgt_base = weight SMEM base
     static __device__ __forceinline__
     DescState init_desc(__nv_fp8_e4m3* smem_act_base, __nv_fp8_e4m3* smem_wgt_base, uint32_t lane_id) {
         auto act_desc = detail::make_smem_desc_k_major<BLOCK_K>(smem_act_base);
@@ -307,13 +315,19 @@ struct ClusterMmaFP8BlockScale {
                     uint64_t rdesc = detail::make_runtime_idesc_with_sf_id(ds.instr_desc, sf_id, sf_id);
                     uint32_t a_lo = detail::advance_lo_k(a_base, kk);
                     uint32_t b_lo = detail::advance_lo_k(b_base, kk);
-                    uint64_t a_full = (static_cast<uint64_t>(ds.act_hi) << 32) | a_lo; // activation (B)
-                    uint64_t b_full = (static_cast<uint64_t>(ds.wgt_hi) << 32) | b_lo; // weight     (A)
+                    uint64_t act_full = (static_cast<uint64_t>(ds.act_hi) << 32) | a_lo;
+                    uint64_t wgt_full = (static_cast<uint64_t>(ds.wgt_hi) << 32) | b_lo;
 
                     uint32_t accum_flag = (k > 0 || kk > 0) ? 1 : 0;
-                    // A-operand = weight (+its SF tmem_sf_wgt), B-operand = activation (+tmem_sf_act)
-                    detail::mma_2sm_block_scale(tmem_c, b_full, a_full, rdesc, accum_flag,
-                                                tmem_sf_wgt, tmem_sf_act);
+                    if constexpr (kSwapAB) {
+                        // A-operand = weight, B-operand = activation.
+                        detail::mma_2sm_block_scale(tmem_c, wgt_full, act_full, rdesc, accum_flag,
+                                                    tmem_sf_wgt, tmem_sf_act);
+                    } else {
+                        // A-operand = activation, B-operand = weight.
+                        detail::mma_2sm_block_scale(tmem_c, act_full, wgt_full, rdesc, accum_flag,
+                                                    tmem_sf_act, tmem_sf_wgt);
+                    }
                 }
             }
             __syncwarp();

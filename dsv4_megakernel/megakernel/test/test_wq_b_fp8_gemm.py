@@ -1,5 +1,6 @@
 """
-Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale, 2SM swap-AB, fixed BM=128).
+Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale).
+  M<=128: swap-AB BM=M x BN128; M>=160: non-swap BM128 x BN224.
   x_fp8[M,1536] @ w_fp8[65536,1536].T -> y[M,65536] (FP32)
 Requires: NVIDIA Blackwell (sm_100+), CUDA 12.8+, CUTLASS 3.x.
 
@@ -54,6 +55,23 @@ def make_sf_ones(mn, device):
     """SF tensor [SF_K, mn] int32, all UE8M0 = 127 (scale 1.0)."""
     packed = (UE8M0_ONE | (UE8M0_ONE << 8) | (UE8M0_ONE << 16) | (UE8M0_ONE << 24))
     return torch.full((SF_K, mn), packed, dtype=torch.int32, device=device)
+
+
+def make_cublaslt_sf_ones(mn, device):
+    """cuBLASLt VEC32_UE8M0 scale storage for an outer dimension of size mn.
+
+    cuBLASLt pads the outer dimension to 128 and the number of 32-K blocks to
+    a multiple of four. Its scale tiles have an additional 128x4 permutation,
+    which is immaterial here because every byte encodes scale 1.0.
+    """
+    if not hasattr(torch, 'float8_e8m0fnu'):
+        return None
+    aligned_mn = ((mn + 127) // 128) * 128
+    padded_k_blocks = ((NUM_32K + 3) // 4) * 4
+    raw = torch.full(
+        (aligned_mn * padded_k_blocks,), UE8M0_ONE,
+        dtype=torch.uint8, device=device)
+    return raw.view(torch.float8_e8m0fnu)
 
 
 def pack_sf(exps):
@@ -131,8 +149,8 @@ def benchmark(module):
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
     w_sf = make_sf_ones(N_TOTAL, dev)
     w_t = w.t()                                 # [K,N] column-major for _scaled_mm
-    one = torch.tensor(1.0, device=dev, dtype=torch.float32)
     weight_bytes = N_TOTAL * K_DIM * 1          # 100.7 MB (fp8)
+    weight_sf_bytes = N_TOTAL * NUM_32K          # one UE8M0 byte per 32 K
 
     def timeit(fn, iters=50, batches=6, warmup=30):
         # min-of-batches: robust to DVFS/thermal throttling (the fastest batch ~=
@@ -148,32 +166,43 @@ def benchmark(module):
             best = min(best, s.elapsed_time(e) / iters * 1000)  # us
         return best
 
-    # cuBLAS FP8 baseline: torch._scaled_mm dispatches to cuBLASLt FP8 GEMM (per-tensor
-    # scale=1). Not identical math (per-tensor vs per-32K block scale) but the right
-    # FP8 tensor-core throughput reference.
+    # Same-math cuBLASLt baseline: e8m0 scale tensors select 32-element 1D block
+    # scaling in torch._scaled_mm. Do not fall back to scalar scaling: that is a
+    # different operation and produced a misleadingly fast reference.
     def cublas_us(x, M):
         if not hasattr(torch, "_scaled_mm"):
             return None
+        if cublas_w_sf is None or cublas_sfs[M] is None:
+            if M == 32:
+                print("  (cuBLASLt block-scale baseline unavailable: "
+                      "torch.float8_e8m0fnu is missing)")
+            return None
         try:
-            fn = lambda: torch._scaled_mm(x, w_t, scale_a=one, scale_b=one,
-                                          out_dtype=torch.float32)
+            fn = lambda: torch._scaled_mm(
+                x, w_t,
+                scale_a=cublas_sfs[M], scale_b=cublas_w_sf,
+                out_dtype=torch.float32, use_fast_accum=False)
             fn()  # probe
             return timeit(fn)
         except Exception as err:
             if M == 32:
-                print(f"  (cuBLAS/torch._scaled_mm baseline unavailable: {err})")
+                print(f"  (cuBLASLt per-32K block-scale baseline unavailable: {err})")
             return None
 
     print(f"  K={K_DIM}, N={N_TOTAL}; weight {weight_bytes/1e6:.1f} MB (e4m3)")
+    print("  Dispatch: M<=128 swap-AB BM=M x BN128; M>=160 non-swap BM128xBN224")
+    print("  Small-M stages: M32=11, M64=10, M96=9, M128=8")
     print(f"  NOTE: min-of-batches latency (robust to throttling). For stable numbers")
     print(f"        lock clocks: nvidia-smi -lgc <freq>. %cuBLAS = cuBLAS_us/ours_us.")
-    print(f"        Baseline = torch._scaled_mm (cuBLASLt FP8, per-tensor scale); out FP32.")
+    print(f"        Baseline = torch._scaled_mm (cuBLASLt FP8, per-32K UE8M0); out FP32.")
     print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
     print("  " + "-" * 68)
 
     Ms = [32, 64, 96, 128, 160, 192, 224, 256]
     xs = {M: (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn) for M in Ms}
     sfs = {M: make_sf_ones(M, dev) for M in Ms}
+    cublas_w_sf = make_cublaslt_sf_ones(N_TOTAL, dev)
+    cublas_sfs = {M: make_cublaslt_sf_ones(M, dev) for M in Ms}
 
     # Two separate passes (ours, then baseline) so the compute-heavy baseline does
     # not heat the GPU in-between our measurements.
@@ -182,7 +211,10 @@ def benchmark(module):
 
     for M in Ms:
         us = ours_us[M]; cb = cbls_us[M]
-        obytes = weight_bytes + M * K_DIM * 1 + M * N_TOTAL * 4   # weight + act + FP32 out
+        # Logical bytes for the same block-scaled operation. Physical cuBLASLt
+        # scale padding is deliberately excluded from this algorithm-level metric.
+        obytes = (weight_bytes + weight_sf_bytes + M * K_DIM +
+                  M * NUM_32K + M * N_TOTAL * 4)
         bw = obytes / (us * 1e-6) / 1e9
         tflops = 2 * M * N_TOTAL * K_DIM / (us * 1e-6) / 1e12
         cb_s  = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
@@ -276,8 +308,8 @@ if __name__ == '__main__':
 
     benchmark(module)
 
-    profile_pipeline(module, M=128)   # single subtile
-    profile_pipeline(module, M=256)   # two subtiles (weight L2-reuse regime)
+    profile_pipeline(module, M=128)   # swap-AB path
+    profile_pipeline(module, M=256)   # non-swap path
 
     print("\n" + "=" * 60)
     print(f"Summary: {'ALL PASS' if all(results) else 'SOME FAILED'}")

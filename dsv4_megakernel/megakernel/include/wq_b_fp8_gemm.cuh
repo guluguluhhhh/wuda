@@ -1,19 +1,18 @@
 #pragma once
 // ============================================================
 // wq_b_gemm.cuh
-// tcgen05 FP8 (e4m3) block-scale GEMM — Header (SWAP-AB, fixed BM=128)
+// tcgen05 FP8 (e4m3) block-scale GEMM — shared config and PTX/TMA helpers
 // Aligned with DeepGEMM sm100_fp8_gemm_1d1d + megakernel/w1_merged_fp8_gemm.
 //
-// Target: M=32~128 (32-aligned), K=1536, N=65536, e4m3 -> FP32 output.
+// Swap-path target: M=32~128 (32-aligned), K=1536, N=65536, e4m3 -> FP32 output.
 //   x_fp8[M,1536] @ w_fp8[65536,1536]^T -> y[M,65536] (FP32)
 //   A = weight (MMA A-operand, UMMA_M=256 along N), B = activation (UMMA_N=128 along M).
 //   Both K-major, 128B swizzle. Per-32-K block scale (gran_k=32), scale = UE8M0.
 //
 // swap_ab=1, 2SM MMA (cta_group::2), Cluster=(2,1,1) -> cluster_n=2, Persistent,
-// Warp-Specialized. UMMA_N is pinned to 128 (BM=128); M<128 is zero-padded (TMA OOB
-// fill) and the padded output columns are dropped in the epilogue. The block_scale
-// MMA is issued by cluster_mma_fp8.cuh; this header carries the config + the SF
-// pipeline plumbing (SMEM/TMA helpers) that feeds it.
+// Warp-Specialized. BM=UMMA_N=M for M<=128, so small-M variants spend the saved
+// SMEM on deeper pipelines. The block_scale MMA is issued by cluster_mma_fp8.cuh;
+// this header carries the config + the SF pipeline plumbing (SMEM/TMA helpers).
 //
 // SF layout (BLOCK_K=128, gran_k=32 -> 4 scale/uint32, DeepGEMM standard):
 //   sf_k = K/(gran_k*4) = 12 ; x_sf/w_sf are [sf_k, aligned_mn] int32, MN-major.
@@ -55,13 +54,11 @@ static constexpr bool IS_MULTICAST_ON_A = true;
 
 // ---- MMA instruction shape (2SM) ----
 // UMMA_M = LAYOUT_AD_M(128) * kNumMulticast(2) = 256 (along problem-N)
-// UMMA_N = 128 FIXED (along problem-M = BM). M<128 padded to 128.
+// UMMA_N is selected by SwapDims<M> along problem M.
 static constexpr int LAYOUT_AD_M = 128;
 static constexpr int UMMA_M = LAYOUT_AD_M * NUM_MULTICAST; // 256
 static constexpr int UMMA_K = 32;                          // FP8 block-scale UMMA K
-static constexpr int BM       = 128;                       // problem-M tile = UMMA_N
-static constexpr int UMMA_N_FIXED = BM;                    // 128
-static constexpr int LOAD_BLOCK_M_FIXED = BM / NUM_MULTICAST; // 64 activation rows per CTA
+static constexpr int MAX_SWAP_BLOCK_M = 128;
 
 // ---- N tiling ----
 static constexpr int BLOCK_N        = 128;
@@ -118,33 +115,33 @@ static constexpr int num_aligned_tmem_cols(int c) {
     return 512;
 }
 
-// ---- Compile-time helpers parameterised on M (fixed BM=128, M split into subtiles) ----
-// Each subtile is a fixed 128-row (BM) tile: UMMA_N=128, LOAD_BLOCK_M=64. M>128 is
-// handled by NUM_M_SUB = ceil(M/128) subtiles processed back-to-back per N-tile
-// (weight stays L2-resident across subtiles -> HBM weight read once). All per-stage
-// SMEM / TMEM sizes are per-subtile (128), so they are identical for every M.
+// ---- Compile-time helpers parameterised on M (swap path, M<=128) ----
+// BM=UMMA_N=M and each CTA supplies M/2 activation rows. The scale-factor SMEM
+// remains UTCCP-aligned to 128 rows, while operand SMEM and accumulator TMEM shrink
+// with M. This yields 11/10/9/8 stages for M=32/64/96/128 respectively.
 template <int M_> struct SwapDims {
-    static constexpr int BLOCK_M          = M_;                    // true M (total)
-    static constexpr int NUM_M_SUB        = div_up(M_, BM);        // ceil(M/128) subtiles
-    static constexpr int UMMA_N           = UMMA_N_FIXED;          // 128 (per subtile)
-    static constexpr int LOAD_BLOCK_M     = LOAD_BLOCK_M_FIXED;    // 64  (per subtile, BM/2)
-    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * FP8_ELEM_SIZE; // 64*128*1 = 8192
+    static_assert(M_ >= 32 && M_ <= MAX_SWAP_BLOCK_M && M_ % 32 == 0,
+                  "swap path requires 32-aligned M in [32,128]");
+    static constexpr int BLOCK_M          = M_;
+    static constexpr int NUM_M_SUB        = 1;
+    static constexpr int UMMA_N           = BLOCK_M;
+    static constexpr int LOAD_BLOCK_M     = BLOCK_M / NUM_MULTICAST;
+    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * FP8_ELEM_SIZE;
 
-    // SFA covers the FULL BLOCK_M(=128) tokens (loaded on each CTA; leader UTCCP
-    // broadcasts into both SMs' TMEM). Aligned up to the UTCCP granularity.
-    static constexpr int SF_BLOCK_M         = align_up(BM, NUM_UTCCP_ALIGNED);        // 128
-    static constexpr int SMEM_SFA_PER_STAGE = SF_BLOCK_M * (int)sizeof(uint32_t);     // 512
-    static constexpr int NUM_SFA_TMEM_COLS  = SF_BLOCK_M / 32;                        // 4
+    // The TMA transfers BLOCK_M scale words; storage stays at one 128-row UTCCP atom.
+    static constexpr int SF_BLOCK_M         = align_up(BLOCK_M, NUM_UTCCP_ALIGNED);
+    static constexpr int SMEM_SFA_PER_STAGE = SF_BLOCK_M * (int)sizeof(uint32_t);
+    static constexpr int NUM_SFA_TMEM_COLS  = SF_BLOCK_M / 32;
 
     static constexpr int SMEM_PER_STAGE = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE +
-                                          SMEM_SFA_PER_STAGE + SMEM_SFB_PER_STAGE;     // 25600
+                                          SMEM_SFA_PER_STAGE + SMEM_SFB_PER_STAGE;
 
     // TMEM layout: [accum (UMMA_N*NUM_EPI_STAGES)] [SFA cols] [SFB cols]
-    static constexpr int NUM_ACCUM_TMEM_COLS = UMMA_N * NUM_EPI_STAGES;               // 256
-    static constexpr int TMEM_START_SFA      = NUM_ACCUM_TMEM_COLS;                   // 256
-    static constexpr int TMEM_START_SFB      = NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS; // 260
+    static constexpr int NUM_ACCUM_TMEM_COLS = UMMA_N * NUM_EPI_STAGES;
+    static constexpr int TMEM_START_SFA      = NUM_ACCUM_TMEM_COLS;
+    static constexpr int TMEM_START_SFB      = NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS;
     static constexpr int NUM_TMEM_COLS = num_aligned_tmem_cols(
-        NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS + NUM_SFB_TMEM_COLS);                 // 512
+        NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS + NUM_SFB_TMEM_COLS);
 
     // Number of pipeline stages fitting the SMEM budget.
     // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr.
@@ -182,6 +179,16 @@ __device__ __forceinline__ void tcgen05_fence_before_sync() {
 }
 __device__ __forceinline__ void tcgen05_fence_after_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
+}
+
+// TMEM load: 32dp32b, x4 (4 FP32 per lane) — used by the non-swap FP32 store
+__device__ __forceinline__ void tmem_load_32dp32b4x(
+    uint32_t tmem_addr,
+    uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0,%1,%2,%3}, [%4];"
+        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+        : "r"(tmem_addr));
 }
 
 // TMEM load: 32dp32b, x8 (8 FP32 per lane) — used by the swap-AB FP32 store
