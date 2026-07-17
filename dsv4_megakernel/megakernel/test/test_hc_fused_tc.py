@@ -15,7 +15,9 @@ N_OUT = (2 + HC) * HC
 HC_EPS = 1e-6
 RMS_NORM_EPS = 1e-6
 SINKHORN_ITERS = 20
-PROFILE_M = [1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096]
+# decode regime only (M<=256): all 32-aligned M plus 1/4/16 edge cases. M>256 is out
+# of scope (the kernel has two configs: NT=8/splitK=18 for M<=128, NT=32/splitK=35 above).
+PROFILE_M = [1, 4, 16, 32, 64, 96, 128, 160, 192, 224, 256]
 
 
 def load_cuda_module():
@@ -192,7 +194,6 @@ def benchmark(module, positions):
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
         x = hidden.reshape(m, K_DIM)
         cfg = module.hc_fused_tc_config(m)
-        local_iters = max(20, BENCH_ITERS // 2) if m >= 2048 else BENCH_ITERS
 
         # preallocate outputs so we time the op, not per-call allocation
         collapsed = torch.empty(m, DIM, device=dev, dtype=torch.bfloat16)
@@ -203,10 +204,10 @@ def benchmark(module, positions):
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
                 collapsed, pre, post, comb),
-            BENCH_WARMUP, local_iters,
+            BENCH_WARMUP, BENCH_ITERS,
         )
         # cuBLAS bf16 floor (x is bf16, wb is the bf16-cast weight).
-        cublas_us = time_cuda_us(lambda: F.linear(x, wb), BENCH_WARMUP, local_iters)
+        cublas_us = time_cuda_us(lambda: F.linear(x, wb), BENCH_WARMUP, BENCH_ITERS)
         print(
             f"{m:6d} {cfg[7]:4d} {cfg[0]:4d} {cfg[1]:7d} {cfg[2]:8d} {cfg[3]:6d} "
             f"{mhc_us:11.3f} {cublas_us:12.3f}"
@@ -291,7 +292,8 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument(
-        "--correctness-positions", type=parse_positions, default=[1, 4, 16, 64, 128, 256]
+        "--correctness-positions", type=parse_positions,
+        default=[1, 4, 16, 32, 64, 96, 128, 160, 192, 224, 256]
     )
     args = parser.parse_args()
 

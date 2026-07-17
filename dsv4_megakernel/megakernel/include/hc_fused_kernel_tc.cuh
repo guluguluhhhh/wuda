@@ -18,7 +18,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 
 #include <cutlass/arch/barrier.h>
@@ -57,7 +56,6 @@ static constexpr int EPILOGUE_THREADS = 256;
 // by-product; after the K-loop they run the TMEM->workspace epilogue.
 static constexpr int kNumReduceThreads = 128;
 static constexpr int kReduceWarpBase = 4;   // first warp of the cast group
-static constexpr int MIN_K_TILES_PER_SPLIT = 8;
 
 // clock64 profiling buffer layout (int64), filled on block 0 only:
 //   [0]=gemm start   [1]=gemm end                       (GEMM kernel)
@@ -514,8 +512,10 @@ inline int ceil_div(int a, int b) {
 }
 
 inline int choose_n_tile(int m) {
-    // cuBLAS (nvjet) uses tile 8x64 for M<256 -> N_OUT-axis tile = 8. Align.
-    if (m < 256) return 8;
+    // M<=128: N_TILE=8 -> N_OUT=24 tiles into 3 (zero padding); with num_m_tiles<=2 the
+    // 3 n-tiles give the grid enough blocks. M in (128,256]: N_TILE=32 (one n-tile) --
+    // NT=8 gets slow at M=160..224 (grid balloons, 2 blocks/SM by TMEM -> multi-wave).
+    if (m <= 128) return 8;
     return 32;
 }
 
@@ -548,21 +548,12 @@ inline SplitConfig make_split_config(int m) {
     const int num_n_tiles = ceil_div(N_OUT, n_tile);
     const int mn_tiles = num_m_tiles * num_n_tiles;
 
-    int k_tiles_per_split, num_splits;
-    if (m < 256) {
-        // cuBLAS alignment (M<256): numSplitsK = 18 (from cublasLt heuristic on
-        // this shape). Fewer splits than our SM-fill default (~56) -> 3x smaller
-        // split-K workspace -> much cheaper reduce; parallelism kept via the 3
-        // N_OUT-tiles (n_tile=8).
-        constexpr int CUBLAS_SPLITS = 18;
-        k_tiles_per_split = ceil_div(NUM_K_TILES, CUBLAS_SPLITS);
-        num_splits = ceil_div(NUM_K_TILES, k_tiles_per_split);
-    } else {
-        const int target_splits = std::max(ceil_div(num_sms, mn_tiles), 1);
-        k_tiles_per_split = std::max(
-            ceil_div(NUM_K_TILES, target_splits), MIN_K_TILES_PER_SPLIT);
-        num_splits = ceil_div(NUM_K_TILES, k_tiles_per_split);
-    }
+    // Two fixed configs, tuned for the decode range M<=256 (M>256 is out of scope):
+    //   M<=128 : NT=8,  splitK=18  (3 n-tiles carry grid parallelism when M is tiny)
+    //   M<=256 : NT=32, splitK=35  (1 n-tile; more splits was slower -- bigger reduce)
+    const int target_splits = (m <= 128) ? 18 : 35;
+    const int k_tiles_per_split = ceil_div(NUM_K_TILES, target_splits);
+    const int num_splits = ceil_div(NUM_K_TILES, k_tiles_per_split);
     return {m_tile, n_tile, num_m_tiles, num_n_tiles, num_splits,
             k_tiles_per_split, mn_tiles * num_splits, num_sms};
 }
@@ -688,22 +679,15 @@ inline void launch_gemm_dispatch(
     const CUtensorMap& desc_x, const CUtensorMap& desc_w,
     const SplitConfig& cfg, int m, float* workspace, float* sqr_sum, int64_t* prof,
     cudaStream_t stream) {
-    // M_TILE is fixed at 64 (the tf32 cast group's 4-sub-warp x 16-row layout is
-    // 64-specific), so dispatch only varies N_TILE / STAGES.
+    // Only two configs (M_TILE fixed at 64; the cast group's 4-sub-warp x 16-row layout
+    // is 64-specific): NT=8/STAGES=4 for M<=128, NT=32/STAGES=4 for M in (128,256].
     TORCH_CHECK(cfg.m_tile == 64, "M tile must be 64");
     switch (cfg.n_tile) {
         case 8:
             launch_gemm<64, 8, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
             break;
-        case 16:
-            launch_gemm<64, 16, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-            break;
         case 32:
-            if (cfg.k_tiles_per_split <= 16) {
-                launch_gemm<64, 32, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-            } else {
-                launch_gemm<64, 32, 12>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-            }
+            launch_gemm<64, 32, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
             break;
         default:
             TORCH_CHECK(false, "unsupported N tile: ", cfg.n_tile);
