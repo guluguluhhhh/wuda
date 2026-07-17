@@ -1,16 +1,17 @@
 #pragma once
 // ============================================================
 // hc_fused_kernel_tc.cuh
-// Reusable tcgen05 (Blackwell sm_100+) BF16 split-K GEMM engine for the MHC
+// Reusable tcgen05 (Blackwell sm_100+) tf32 split-K GEMM engine for the MHC
 // projection:  X[M, K_DIM] @ W[N_OUT, K_DIM]^T -> mix[M, N_OUT], K_DIM huge,
 // N_OUT tiny (24).  A one-SM tcgen05 tile avoids the 8-10x N padding a 2-SM
-// swap-AB tile would need.  Split-K partials stay FP32 in a workspace; the
-// caller fuses the reduction with RMSNorm/gates/Sinkhorn/collapse.
+// swap-AB tile would need.  Activation X is bf16 (cast to tf32 on-chip), weight
+// W is fp32 (read as tf32) -- matching the official DeepSeek-V4 hc precision.
+// Split-K partials stay FP32 in a workspace; the caller fuses the reduction with
+// RMSNorm/gates/Sinkhorn/collapse.
 //
-// Layout mirror of cluster_mma*.cuh: this header owns ONLY the GEMM (tensor
-// core issue + TMA staging + tile/split scheduling + launch).  The epilogue
-// lives in the .cu.  clock64 profiling follows wq_b_fp8_gemm.cu: pass a device
-// int64 `prof` buffer (nullptr = disabled); block 0 stamps phase boundaries.
+// This header owns ONLY the GEMM (tensor core issue + TMA staging + tile/split
+// scheduling + launch); the epilogue lives in the .cu. clock64 profiling: pass a
+// device int64 `prof` buffer (nullptr = disabled); block 0 stamps boundaries.
 // ============================================================
 
 #include <cuda.h>
@@ -23,8 +24,9 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/numeric_types.h>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/copy_sm100.hpp>       // SM100_TMEM_STORE_16dp256b1x (A cast -> TMEM)
 #include <cute/arch/mma_sm100_desc.hpp>
-#include <cute/arch/mma_sm100_umma.hpp>
+#include <cute/arch/mma_sm100_umma.hpp>   // SM100_MMA_TF32_TS (A from TMEM, B from smem)
 
 namespace hc_tc {
 
@@ -38,16 +40,23 @@ static constexpr int N_OUT = 24;
 static constexpr int SINKHORN_ITERS = 20;
 
 static constexpr int BLOCK_K = 64;
-static constexpr int UMMA_K = 16;
+static constexpr int UMMA_K = 8;                 // tf32 MMA K step = 32 / sizeof(float)
 static constexpr int NUM_K_TILES = K_DIM / BLOCK_K;
-static constexpr int NUM_TMEM_COLS = 32;
+// tf32 TS path (aligned to DeepGEMM sm100_tf32_hc_prenorm): A is cast bf16->tf32 into
+// TMEM (double-buffered), C accumulator sits after the A cast tiles.
+//   TMEM cols = BLOCK_K * kNumCastStages (A) + N_TILE (C), rounded up to a pow2.
+//   BLOCK_K*2 = 128 for A; + N_TILE(<=32) -> 160 -> 256 aligned.  256/512 -> only
+//   2 blocks/SM can hold TMEM (was 32 cols -> 16 blocks); occupancy cost of tf32.
+static constexpr int kNumCastStages = 2;         // TMEM A double-buffer (DeepGEMM)
+static constexpr int TMEM_C_OFFSET = BLOCK_K * kNumCastStages;   // 128: C after A tiles
+static constexpr int NUM_TMEM_COLS = 256;        // aligned(128 + N_TILE<=32)
 static constexpr int GEMM_THREADS = 256;
 static constexpr int EPILOGUE_THREADS = 256;
-// Σx² reduce group = warps 4..7 of the GEMM block (128 threads). They are idle
-// during the K-loop (they only do the TMEM->workspace epilogue afterwards), so we
-// reuse them to accumulate the input RMSNorm sum-of-squares while the MMA runs.
+// cast + Σx² group = warps 4..7 (128 threads): during the K-loop they cast the bf16 x
+// tile to tf32 into TMEM for the MMA and accumulate the input RMSNorm Σx² as a
+// by-product; after the K-loop they run the TMEM->workspace epilogue.
 static constexpr int kNumReduceThreads = 128;
-static constexpr int kReduceWarpBase = 4;   // first warp of the reduce group
+static constexpr int kReduceWarpBase = 4;   // first warp of the cast group
 static constexpr int MIN_K_TILES_PER_SPLIT = 8;
 
 // clock64 profiling buffer layout (int64), filled on block 0 only:
@@ -99,16 +108,19 @@ __device__ __forceinline__ void tcgen05_fence_after_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
-__device__ __forceinline__ void tcgen05_mma_1sm(
-    uint32_t tmem_c, uint64_t desc_a, uint64_t desc_b,
+// tf32 TS MMA (cute::SM100_MMA_TF32_TS): A operand is a TMEM address (%1 = [tmem_a]),
+// B operand is an smem descriptor (%2 = desc_b). Mirrors the bf16 f16-kind helper but
+// A comes from TMEM instead of an smem descriptor. Caller guards with elect_one_sync().
+__device__ __forceinline__ void tcgen05_mma_tf32_ts_1sm(
+    uint32_t tmem_c, uint32_t tmem_a, uint64_t desc_b,
     uint64_t runtime_idesc, uint32_t accumulate) {
     uint32_t mask[4] = {0, 0, 0, 0};
     asm volatile(
         "{\n\t.reg .pred p;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 "
-        "[%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t}"
-        :: "r"(tmem_c), "l"(desc_a), "l"(desc_b),
+        "tcgen05.mma.cta_group::1.kind::tf32 "
+        "[%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t}"
+        :: "r"(tmem_c), "r"(tmem_a), "l"(desc_b),
            "r"(static_cast<uint32_t>(runtime_idesc >> 32)), "r"(accumulate),
            "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
 }
@@ -134,14 +146,6 @@ __device__ __forceinline__ void tmem_load_32dp32b8x(
         : "r"(addr));
 }
 
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
-    }
-    return v;
-}
-
 }  // namespace ptx
 
 // ============================================================
@@ -149,14 +153,20 @@ __device__ __forceinline__ float warp_sum(float v) {
 // ============================================================
 namespace mma_desc {
 
-__device__ __forceinline__ cute::UMMA::SmemDescriptor make_k_major(void* ptr) {
+// B (weight) is fp32 K-major with 128B swizzle. Since BLOCK_K*sizeof(float)=256B > 128,
+// the K axis spans BLOCK_SWIZZLED_BK = 128/4 = 32 elems per swizzle atom -> 2 atoms per
+// BLOCK_K=64. Descriptor + advance ported from DeepGEMM mma::sm100 (K-major branch).
+static constexpr int BLOCK_SWIZZLED_BK = 128 / (int)sizeof(float);   // 32
+
+__device__ __forceinline__ cute::UMMA::SmemDescriptor make_b_desc_fp32(void* ptr) {
     cute::UMMA::SmemDescriptor desc;
     desc.version_ = 1;
     desc.lbo_mode_ = 0;
     desc.layout_type_ = static_cast<uint8_t>(cute::UMMA::LayoutType::SWIZZLE_128B);
     const auto smem_ptr = cute::cast_smem_ptr_to_uint(ptr);
     desc.start_address_ = static_cast<uint16_t>(smem_ptr >> 4);
-    constexpr uint32_t stride_bytes = 8u * BLOCK_K * sizeof(__nv_bfloat16);
+    // stride_byte_offset = num_non_contiguous(8) * BLOCK_SWIZZLED_BK(32) * sizeof(float)
+    constexpr uint32_t stride_bytes = 8u * BLOCK_SWIZZLED_BK * sizeof(float);   // 1024
     desc.stride_byte_offset_ = stride_bytes >> 4;
     desc.leading_byte_offset_ = 0;
     desc.base_offset_ = 0;
@@ -166,13 +176,19 @@ __device__ __forceinline__ cute::UMMA::SmemDescriptor make_k_major(void* ptr) {
 template <int M_TILE, int N_TILE>
 __device__ __forceinline__ uint64_t make_runtime_idesc() {
     auto idesc = cute::UMMA::make_instr_desc<
-        cutlass::bfloat16_t, cutlass::bfloat16_t, float,
+        cutlass::tfloat32_t, cutlass::tfloat32_t, float,
         M_TILE, N_TILE, cute::UMMA::Major::K, cute::UMMA::Major::K>();
     return cute::UMMA::make_runtime_instr_desc(idesc);
 }
 
-__device__ __forceinline__ uint32_t advance_k(uint32_t lo, int kk) {
-    return lo + kk * (UMMA_K * sizeof(__nv_bfloat16) / 16);
+// advance B descriptor low bits for the k-th UMMA_K step (fp32, K-major, 2 atoms/BLOCK_K).
+// offset jumps to the next 128B swizzle atom (N_TILE * BLOCK_SWIZZLED_BK floats apart).
+template <int N_TILE>
+__device__ __forceinline__ uint32_t advance_b_k(uint32_t base_lo, int k) {
+    const int atom_idx = (k * UMMA_K) / BLOCK_SWIZZLED_BK;
+    const int in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
+    const int offset = atom_idx * N_TILE * BLOCK_SWIZZLED_BK;
+    return base_lo + static_cast<uint32_t>(((offset + in_atom_idx) * (int)sizeof(float)) >> 4);
 }
 
 }  // namespace mma_desc
@@ -224,12 +240,20 @@ struct GemmSharedStorage {
     static constexpr int A_STAGE_ELEMS = M_TILE * BLOCK_K;
     static constexpr int B_STAGE_ELEMS = N_TILE * BLOCK_K;
 
+    // A stays bf16 in smem (TMA load); the cast group reads it, casts bf16->tf32, and
+    // stores it into TMEM for the MMA. B (weight) is fp32 in smem, read as tf32 by the MMA.
     alignas(1024) __nv_bfloat16 smem_a[STAGES * A_STAGE_ELEMS];
-    alignas(1024) __nv_bfloat16 smem_b[STAGES * B_STAGE_ELEMS];
-    alignas(16) Barrier full[STAGES];
-    alignas(16) Barrier empty[STAGES];        // MMA -> TMA (smem consumed by MMA)
-    alignas(16) Barrier empty_reduce[STAGES]; // Σx² reduce group -> TMA (smem consumed by reduce)
-    alignas(16) Barrier tmem_full;
+    alignas(1024) float smem_b[STAGES * B_STAGE_ELEMS];
+    // Producer/consumer barriers (DeepGEMM tf32 topology):
+    //   TMA --full--> cast group --full_cast--> MMA --empty_cast--> cast (TMEM A reuse)
+    //                                            MMA --empty------> TMA (smem reuse)
+    // empty[stage] is arrived only by the MMA; since the MMA runs after full_cast (i.e.
+    // after the cast group finished reading smem_a), that also releases smem_a safely.
+    alignas(16) Barrier full[STAGES];                    // TMA -> cast (smem A/B ready)
+    alignas(16) Barrier empty[STAGES];                   // MMA -> TMA (smem consumed)
+    alignas(16) Barrier full_cast[kNumCastStages];       // cast -> MMA (A cast in TMEM)
+    alignas(16) Barrier empty_cast[kNumCastStages];      // MMA -> cast (TMEM A slot free)
+    alignas(16) Barrier tmem_full;                       // MMA -> epilogue (C ready)
     alignas(16) uint32_t tmem_base;
 };
 
@@ -289,9 +313,13 @@ hc_gemm_splitk_kernel(
     if (warp_id == 1 && ptx::elect_one_sync()) {
         #pragma unroll
         for (int stage = 0; stage < STAGES; ++stage) {
-            s.full[stage].init(1);
-            s.empty[stage].init(1);
-            s.empty_reduce[stage].init(kNumReduceThreads);  // all reduce threads arrive
+            s.full[stage].init(1);     // TMA producer arrives (1 elected thread)
+            s.empty[stage].init(1);    // MMA arrives via umma_arrive
+        }
+        #pragma unroll
+        for (int cs = 0; cs < kNumCastStages; ++cs) {
+            s.full_cast[cs].init(kNumReduceThreads);  // all 128 cast threads arrive
+            s.empty_cast[cs].init(1);                 // MMA arrives via umma_arrive
         }
         s.tmem_full.init(1);
         cutlass::arch::fence_barrier_init();
@@ -307,15 +335,24 @@ hc_gemm_splitk_kernel(
         int phase = 0;
         #pragma unroll 1
         for (int kt = k_begin; kt < k_end; ++kt) {
-            s.empty[stage].wait(phase ^ 1);          // MMA released the smem
-            s.empty_reduce[stage].wait(phase ^ 1);   // Σx² reduce group released the smem
+            s.empty[stage].wait(phase ^ 1);          // MMA released the smem (covers cast too)
             auto* a_dst = s.smem_a + stage * Storage::A_STAGE_ELEMS;
             auto* b_dst = s.smem_b + stage * Storage::B_STAGE_ELEMS;
             const int k_offset = kt * BLOCK_K;
+            // A bf16: BLOCK_K=64 = 128B = 1 swizzle atom -> single TMA load.
             tma_load_2d(&desc_x, &s.full[stage], a_dst, k_offset, m_base);
-            tma_load_2d(&desc_w, &s.full[stage], b_dst, k_offset, n_base);
+            // B fp32: BLOCK_K=64 = 256B = 2 swizzle atoms of 32 elems -> 2 TMA loads,
+            // atom i into smem_b + i*(N_TILE*32) at K offset k+i*32 (DeepGEMM tma::copy).
+            constexpr int kAtomK = mma_desc::BLOCK_SWIZZLED_BK;   // 32
+            #pragma unroll
+            for (int atom = 0; atom < BLOCK_K / kAtomK; ++atom) {
+                tma_load_2d(&desc_w, &s.full[stage],
+                            b_dst + atom * (N_TILE * kAtomK),
+                            k_offset + atom * kAtomK, n_base);
+            }
             constexpr uint32_t tx_bytes =
-                (Storage::A_STAGE_ELEMS + Storage::B_STAGE_ELEMS) * sizeof(__nv_bfloat16);
+                Storage::A_STAGE_ELEMS * sizeof(__nv_bfloat16)   // A bf16
+                + Storage::B_STAGE_ELEMS * sizeof(float);        // B fp32 (both atoms)
             s.full[stage].arrive_and_expect_tx(tx_bytes);
             if (++stage == STAGES) {
                 stage = 0;
@@ -323,53 +360,49 @@ hc_gemm_splitk_kernel(
             }
         }
     } else if (warp_id == 1) {
-        const auto a_desc = mma_desc::make_k_major(s.smem_a);
-        const auto b_desc = mma_desc::make_k_major(s.smem_b);
-        const uint32_t a_stage_lo = (lane_id < STAGES)
-            ? a_desc.lo + lane_id * (Storage::A_STAGE_ELEMS * sizeof(__nv_bfloat16) / 16)
-            : 0u;
+        // tf32 TS MMA: A operand read from TMEM (cast group filled it), B from smem (fp32).
+        // A tile for stage's cast_stage sits at TMEM columns [cast_stage*BLOCK_K, +BLOCK_K);
+        // C accumulator sits at TMEM_C_OFFSET (after the A cast tiles).
+        const auto b_desc = mma_desc::make_b_desc_fp32(s.smem_b);
         const uint32_t b_stage_lo = (lane_id < STAGES)
-            ? b_desc.lo + lane_id * (Storage::B_STAGE_ELEMS * sizeof(__nv_bfloat16) / 16)
+            ? b_desc.lo + lane_id * static_cast<uint32_t>(Storage::B_STAGE_ELEMS * sizeof(float) / 16)
             : 0u;
         const uint64_t runtime_idesc = mma_desc::make_runtime_idesc<M_TILE, N_TILE>();
-        const uint32_t tmem_c = s.tmem_base;
+        const uint32_t tmem_c = s.tmem_base + TMEM_C_OFFSET;
 
-        int stage = 0;
-        int phase = 0;
         #pragma unroll 1
         for (int ki = 0; ki < k_count; ++ki) {
-            s.full[stage].wait(phase);
+            const int stage_idx = ki % STAGES;
+            const int cast_stage = ki % kNumCastStages;
+            const int cast_phase = (ki / kNumCastStages) & 1;
+            s.full_cast[cast_stage].wait(cast_phase);   // A cast in TMEM (implies B smem ready)
             ptx::tcgen05_fence_after_sync();
-            const uint32_t a_base = __shfl_sync(0xffffffffu, a_stage_lo, stage);
-            const uint32_t b_base = __shfl_sync(0xffffffffu, b_stage_lo, stage);
+            const uint32_t b_base = __shfl_sync(0xffffffffu, b_stage_lo, stage_idx);
+            const uint32_t a_tmem_stage = s.tmem_base + cast_stage * BLOCK_K;
             if (ptx::elect_one_sync()) {
                 #pragma unroll
                 for (int kk = 0; kk < BLOCK_K / UMMA_K; ++kk) {
-                    const uint32_t a_lo = mma_desc::advance_k(a_base, kk);
-                    const uint32_t b_lo = mma_desc::advance_k(b_base, kk);
-                    const uint64_t a = (static_cast<uint64_t>(a_desc.hi) << 32) | a_lo;
+                    const uint32_t a_tmem = a_tmem_stage + kk * UMMA_K;
+                    const uint32_t b_lo = mma_desc::advance_b_k<N_TILE>(b_base, kk);
                     const uint64_t b = (static_cast<uint64_t>(b_desc.hi) << 32) | b_lo;
                     const uint32_t accumulate = (ki != 0 || kk != 0) ? 1u : 0u;
-                    ptx::tcgen05_mma_1sm(tmem_c, a, b, runtime_idesc, accumulate);
+                    ptx::tcgen05_mma_tf32_ts_1sm(tmem_c, a_tmem, b, runtime_idesc, accumulate);
                 }
             }
             __syncwarp();
-            ptx::tcgen05_commit_1sm(&s.empty[stage]);
+            ptx::tcgen05_commit_1sm(&s.empty_cast[cast_stage]);  // release TMEM A slot -> cast
+            ptx::tcgen05_commit_1sm(&s.empty[stage_idx]);        // release smem -> TMA
             if (ki == k_count - 1) {
-                ptx::tcgen05_commit_1sm(&s.tmem_full);
+                ptx::tcgen05_commit_1sm(&s.tmem_full);           // C ready -> epilogue
             }
             __syncwarp();
-            if (++stage == STAGES) {
-                stage = 0;
-                phase ^= 1;
-            }
         }
     } else if (warp_id >= 4) {
-        // ============ Σx² reduce group (warps 4-7), concurrent with MMA ============
-        // Accumulate the input RMSNorm sum-of-squares from the SAME x tiles the MMA
-        // consumes (no extra HBM read), write sqr_sum[split, m]. Ported from DeepGEMM
-        // hc_prenorm else-branch, minus the TF32 cast-to-TMEM (our MMA reads bf16 x
-        // from smem directly). Config matches DeepGEMM: BLOCK_M=64, BLOCK_K=64, SW128.
+        // ===== cast + Σx² group (warps 4-7), concurrent with MMA (DeepGEMM tf32) =====
+        // Read the bf16 x tile the TMA staged, cast bf16->tf32 and store it into TMEM for
+        // the MMA (SM100_TMEM_STORE_16dp256b1x), AND accumulate the input RMSNorm Σx² as a
+        // by-product. Ported verbatim from DeepGEMM sm100_tf32_hc_prenorm else-branch.
+        // Config matches DeepGEMM: BLOCK_M=64, BLOCK_K=64, SW128, 4 sub-warps x 16 rows.
         {
             const int sub_warp_idx = warp_id - kReduceWarpBase;   // 0..3
             constexpr int BLOCK_M_PER_WARP = M_TILE / 4;          // 16
@@ -377,12 +410,14 @@ hc_gemm_splitk_kernel(
             constexpr int kNumElemsPerBankGroup = 16 / (int)sizeof(__nv_bfloat16);  // 8
             constexpr int kNumLoads = BLOCK_K / kNumElemsPerBankGroup;              // 8
             float2 sqacc[2] = { {0.f, 0.f}, {0.f, 0.f} };
-            int rstage = 0, rphase = 0;
             #pragma unroll 1
             for (int ki = 0; ki < k_count; ++ki) {
-                s.full[rstage].wait(rphase);
+                const int stage_idx = ki % STAGES;
+                const int cast_stage = ki % kNumCastStages;
+                const int cast_phase = (ki / kNumCastStages) & 1;
+                s.full[stage_idx].wait((ki / STAGES) & 1);   // smem A ready from TMA
                 const uint8_t* smem_base =
-                    reinterpret_cast<const uint8_t*>(s.smem_a + rstage * Storage::A_STAGE_ELEMS)
+                    reinterpret_cast<const uint8_t*>(s.smem_a + stage_idx * Storage::A_STAGE_ELEMS)
                     + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleAMode;
                 uint32_t uv[2][kNumLoads];
                 #pragma unroll
@@ -391,16 +426,28 @@ hc_gemm_splitk_kernel(
                         hc_swizzled_offset<kSwizzleAMode>(i + lane_id / 16, lane_id % 16);
                     hc_ldmatrix_x4(uv[0][i], uv[1][i], uv[0][i + 1], uv[1][i + 1], sp);
                 }
+                // Wait until the MMA has consumed this TMEM A slot before overwriting it.
+                s.empty_cast[cast_stage].wait(cast_phase ^ 1);
+                // Cast bf16->tf32(fp32 storage), accumulate Σx², store into TMEM.
+                float2 fv[2][kNumLoads];
+                uint32_t* upper = reinterpret_cast<uint32_t*>(&fv[0]);
+                uint32_t* lower = reinterpret_cast<uint32_t*>(&fv[1]);
+                const uint32_t a_tmem_col = s.tmem_base + cast_stage * BLOCK_K;
                 #pragma unroll
                 for (int i = 0; i < kNumLoads; ++i) {
                     #pragma unroll
                     for (int u = 0; u < 2; ++u) {
-                        float2 fv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&uv[u][i]));
-                        sqacc[u] = hc_fma2(fv, fv, sqacc[u]);
+                        fv[u][i] = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&uv[u][i]));
+                        sqacc[u] = hc_fma2(fv[u][i], fv[u][i], sqacc[u]);
                     }
+                    const int idx0 = i * 2, idx1 = i * 2 + 1;
+                    cute::SM100::TMEM::STORE::SM100_TMEM_STORE_16dp256b1x::copy(
+                        upper[idx0], upper[idx1], lower[idx0], lower[idx1],
+                        a_tmem_col + i * 8);
                 }
-                s.empty_reduce[rstage].arrive();
-                if (++rstage == STAGES) { rstage = 0; rphase ^= 1; }
+                cutlass::arch::fence_view_async_tmem_store();
+                ptx::tcgen05_fence_before_sync();
+                s.full_cast[cast_stage].arrive();   // A cast in TMEM -> MMA (all 128 threads)
             }
             // 4 lanes share a row -> reduce, then write sqr_sum (only n_tile==0).
             if (sqr_sum != nullptr && n_tile == 0) {
@@ -413,23 +460,21 @@ hc_gemm_splitk_kernel(
                 }
             }
         }
-        // ============ epilogue: TMEM mix -> workspace (existing) ===================
+        // ============ epilogue: TMEM C (mix) -> workspace ============
+        // M_TILE=64 Layout F: four 16-row groups (one per epilogue warp), 16 lanes each.
         const int epi_warp = warp_id - 4;
-        // M64 Layout F has four 16-row groups at DP 0/32/64/96; M128
-        // Layout D uses all 32 lanes of each datapath partition.
-        const int rows_per_warp = M_TILE == 64 ? 16 : 32;
-        const int row_local = epi_warp * rows_per_warp + lane_id;
-        const int row = m_base + row_local;
+        const int row = m_base + epi_warp * 16 + lane_id;
         s.tmem_full.wait(0);
         ptx::tcgen05_fence_after_sync();
 
         #pragma unroll
         for (int ng = 0; ng < N_TILE / 8; ++ng) {
             uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+            // C accumulator lives after the A cast tiles in TMEM (TMEM_C_OFFSET).
             ptx::tmem_load_32dp32b8x(
-                s.tmem_base + ng * 8, v0, v1, v2, v3, v4, v5, v6, v7);
+                s.tmem_base + TMEM_C_OFFSET + ng * 8, v0, v1, v2, v3, v4, v5, v6, v7);
             cutlass::arch::fence_view_async_tmem_load();
-            if ((M_TILE == 128 || lane_id < 16) && row < num_positions) {
+            if (lane_id < 16 && row < num_positions) {
                 const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
                 const int col0 = n_base + ng * 8;
                 float* dst = workspace
@@ -552,6 +597,42 @@ inline CUtensorMap make_tma_bf16_2d(
     return desc;
 }
 
+// FP32 weight TMA (tf32 path): B is loaded fp32 and read as tf32 by the MMA.
+// Swizzle stays 128B (kSwizzleBMode = min(BLOCK_K*4,128) = 128); a BLOCK_K=64 fp32 row
+// (256B) spans 2 swizzle atoms, handled by make_b_desc_fp32 / advance_b_k in the kernel.
+inline CUtensorMap make_tma_fp32_2d(
+    const char* name,
+    const float* ptr,
+    int rows,
+    int cols,
+    int box_rows) {
+    CUtensorMap desc{};
+    cuuint64_t global_dims[2] = {
+        static_cast<cuuint64_t>(cols), static_cast<cuuint64_t>(rows)};
+    cuuint64_t global_strides[1] = {
+        static_cast<cuuint64_t>(cols) * sizeof(float)};
+    // SW128 with fp32: the box inner dim must be one swizzle atom = 128B / 4 = 32 elems
+    // (BLOCK_K=64 fp32 = 256B spans 2 atoms). The producer issues 2 TMA loads per K-tile.
+    constexpr int kInnerAtom = 128 / (int)sizeof(float);   // 32
+    cuuint32_t box_dims[2] = {
+        static_cast<cuuint32_t>(kInnerAtom), static_cast<cuuint32_t>(box_rows)};
+    cuuint32_t elem_strides[2] = {1, 1};
+    const CUresult result = cuTensorMapEncodeTiled(
+        &desc, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2,
+        const_cast<float*>(ptr), global_dims, global_strides,
+        box_dims, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (result != CUDA_SUCCESS) {
+        const char* message = nullptr;
+        cuGetErrorString(result, &message);
+        TORCH_CHECK(false, "cuTensorMapEncodeTiled(", name, ") failed: ",
+                    message ? message : "unknown", " rows=", rows,
+                    " cols=", cols, " box_rows=", box_rows);
+    }
+    return desc;
+}
+
 struct TmaCache {
     const void* x_ptr = nullptr;
     const void* w_ptr = nullptr;
@@ -607,11 +688,9 @@ inline void launch_gemm_dispatch(
     const CUtensorMap& desc_x, const CUtensorMap& desc_w,
     const SplitConfig& cfg, int m, float* workspace, float* sqr_sum, int64_t* prof,
     cudaStream_t stream) {
-    if (cfg.m_tile == 128) {
-        TORCH_CHECK(cfg.n_tile == 32, "M128 path requires N32");
-        launch_gemm<128, 32, 8>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-        return;
-    }
+    // M_TILE is fixed at 64 (the tf32 cast group's 4-sub-warp x 16-row layout is
+    // 64-specific), so dispatch only varies N_TILE / STAGES.
+    TORCH_CHECK(cfg.m_tile == 64, "M tile must be 64");
     switch (cfg.n_tile) {
         case 8:
             launch_gemm<64, 8, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);

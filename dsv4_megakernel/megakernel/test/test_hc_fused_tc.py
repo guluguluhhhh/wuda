@@ -43,6 +43,8 @@ def load_cuda_module():
         "-DCUTE_ARCH_TCGEN05_TMEM_ENABLED=1",
         "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
         "-DCUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED=1",
+        # tf32 MMA enable is auto-defined by cute/arch/config.hpp for sm_10xa; do not
+        # pass -DCUTE_ARCH_TCGEN05_TF32_MMA_ENABLED (it would redefine -> warning).
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
     ]
@@ -90,8 +92,10 @@ def make_inputs(m, weight=None, base=None, scale=None):
     if m == 1:
         hidden = hidden[0]
     if weight is None:
+        # tf32 GEMM path: weight is fp32 (read as tf32 by the MMA), matching the
+        # official DeepSeek-V4 hc_attn_fn / hc_ffn_fn fp32 parameters.
         weight = (
-            torch.randn(N_OUT, K_DIM, device=device, dtype=torch.bfloat16) * 0.01
+            torch.randn(N_OUT, K_DIM, device=device, dtype=torch.float32) * 0.01
         )
     if base is None:
         base = torch.randn(N_OUT, device=device, dtype=torch.float32) * 0.1
@@ -170,12 +174,16 @@ def benchmark(module, positions):
     torch.manual_seed(42)
     _, weight, base, scale = make_inputs(1)
     device_name = torch.cuda.get_device_name()
+    # cuBLAS baseline = bf16 F.linear: a stable "fastest vendor GEMM floor". cuBLAS's
+    # fp32/tf32 path is pathological for N=24 (non-monotonic, 45us+), so bf16 is the only
+    # meaningful vendor reference here. (Our kernel is tf32 -- higher precision than this.)
+    wb = weight.to(torch.bfloat16)
     print(f"\nBenchmark: {device_name}")
     print("Full MHC op total latency: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
-    print("  (cuBLAS_gemm = F.linear matmul-only baseline, i.e. just the GEMM sub-step)")
+    print("  (cuBLAS_bf16 = F.linear bf16 matmul-only floor; our GEMM is tf32, higher precision)")
     print(
         f"{'M':>6} {'MT':>4} {'NT':>4} {'splitK':>7} {'Ktile/s':>8} {'grid':>6} "
-        f"{'mhc us':>11} {'cuBLAS_gemm':>12}"
+        f"{'mhc us':>11} {'cuBLAS_bf16':>12}"
     )
     print("-" * 74)
 
@@ -197,7 +205,8 @@ def benchmark(module, positions):
                 collapsed, pre, post, comb),
             BENCH_WARMUP, local_iters,
         )
-        cublas_us = time_cuda_us(lambda: F.linear(x, weight), BENCH_WARMUP, local_iters)
+        # cuBLAS bf16 floor (x is bf16, wb is the bf16-cast weight).
+        cublas_us = time_cuda_us(lambda: F.linear(x, wb), BENCH_WARMUP, local_iters)
         print(
             f"{m:6d} {cfg[7]:4d} {cfg[0]:4d} {cfg[1]:7d} {cfg[2]:8d} {cfg[3]:6d} "
             f"{mhc_us:11.3f} {cublas_us:12.3f}"
@@ -289,6 +298,11 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA is not available; this test must run on B300.")
         return 0
+
+    # Correctness reference stays TRUE fp32 (matmul precision 'highest', the default) so
+    # the allclose error reflects our tf32 kernel vs a perfect fp32 ground truth. The
+    # cuBLAS *perf* baseline flips to tf32 locally inside benchmark() for a fair compare.
+    torch.set_float32_matmul_precision("highest")
 
     major, minor = torch.cuda.get_device_capability()
     print(

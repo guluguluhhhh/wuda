@@ -1,6 +1,6 @@
 // DeepSeek-V4 MHC fused forward for NVIDIA Blackwell/B300.
 //
-// The projection is a very tall-K, narrow-N BF16 GEMM:
+// The projection is a very tall-K, narrow-N tf32 GEMM (bf16 activation, fp32 weight):
 //     [M, 28672] x [24, 28672]^T -> [M, 24].
 // The tcgen05 split-K GEMM engine lives in include/hc_fused_kernel_tc.cuh; this TU owns
 // the fused epilogue (split-K reduce + RMSNorm + gates + Sinkhorn + collapse)
@@ -52,9 +52,8 @@ hc_reduce_and_fuse_kernel(
     const bool prof0 = (prof != nullptr && pos == 0);
     if (prof0 && threadIdx.x == 0) prof[2] = ptx::rdclock();
 
-    // No hidden staged in smem anymore: RMSNorm Σx² comes from the GEMM's sqr_sum
-    // partials, and collapse reads hidden straight from global. smem is now tiny ->
-    // much higher epilogue occupancy.
+    // Hidden is not staged in smem: RMSNorm Σx² comes from the GEMM's sqr_sum partials,
+    // and collapse reads hidden straight from global -> tiny smem, high occupancy.
     extern __shared__ __align__(16) unsigned char smem_raw[];
     float* scratch = reinterpret_cast<float*>(smem_raw);
     float* rms_smem = scratch;               // 1
@@ -114,8 +113,8 @@ hc_reduce_and_fuse_kernel(
     }
 
     // OVERLAP: warp 0 runs Sinkhorn on comb (needs comb_smem); warps 1..7 run the
-    // collapse (needs only pre_smem). The two are independent, so the ~1us collapse
-    // hides under the ~2us Sinkhorn (was serial: 2.0 + 0.96 -> now ~max(2.0, 1.1)).
+    // collapse (needs only pre_smem). The two are independent, so the collapse hides
+    // under the (longer) Sinkhorn instead of running serially after it.
     if (warp_id == 0) {
         float v = lane_id < HC * HC ? comb_smem[lane_id] : 0.0f;
         float max_v = v;
@@ -156,9 +155,9 @@ hc_reduce_and_fuse_kernel(
         if (lane_id < HC * HC) comb_out[pos * HC * HC + lane_id] = v;   // final gate
         if (prof0 && lane_id == 0) prof[6] = ptx::rdclock();  // sinkhorn done (warp0)
     } else {
-        // Collapse on warps 1..7 (EPILOGUE_THREADS-32 threads), reading hidden
-        // straight from global (overlaps warp 0's Sinkhorn; hidden read hidden
-        // under it). out[d] = Σ_h pre[h] * hidden[pos, h, d].
+        // Collapse on warps 1..7 (EPILOGUE_THREADS-32 threads), reading hidden straight
+        // from global (the global read overlaps warp 0's Sinkhorn).
+        //   out[d] = Σ_h pre[h] * hidden[pos, h, d].
         float pre_r[HC];
         #pragma unroll
         for (int h = 0; h < HC; ++h) pre_r[h] = pre_smem[h];
@@ -193,8 +192,8 @@ static void hc_validate_inputs(
         TORCH_CHECK(hidden_states.size(1) == HC && hidden_states.size(2) == DIM,
                     "3D hidden_states must be [M,4,7168]");
     }
-    TORCH_CHECK(attn_hc_fn.is_cuda() && attn_hc_fn.scalar_type() == torch::kBFloat16,
-                "attn_hc_fn must be CUDA bf16");
+    TORCH_CHECK(attn_hc_fn.is_cuda() && attn_hc_fn.scalar_type() == torch::kFloat32,
+                "attn_hc_fn must be CUDA fp32 (tf32 GEMM reads the fp32 weight as tf32)");
     TORCH_CHECK(attn_hc_fn.dim() == 2 && attn_hc_fn.size(0) == N_OUT &&
                 attn_hc_fn.size(1) == K_DIM, "attn_hc_fn must be [24,28672]");
     TORCH_CHECK(attn_hc_base.is_cuda() && attn_hc_base.scalar_type() == torch::kFloat32 &&
@@ -239,13 +238,15 @@ static void hc_launch_core(
     }
     float* sqr_sum_ptr = sq_cache.data_ptr<float>();
 
+    // tf32 path: activation x stays bf16 (cast group upcasts to tf32 on-chip); weight is
+    // fp32 (read as tf32 by the MMA) -- this is where the precision vs bf16 is recovered.
     const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
-    const auto* w_ptr = reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());
+    const auto* w_ptr = reinterpret_cast<const float*>(weight.data_ptr());
     thread_local TmaCache cache;
     if (cache.x_ptr != x_ptr || cache.w_ptr != w_ptr ||
         cache.m != m || cache.m_tile != cfg.m_tile || cache.n_tile != cfg.n_tile) {
         cache.x = make_tma_bf16_2d("hidden", x_ptr, m, K_DIM, cfg.m_tile);
-        cache.w = make_tma_bf16_2d("weight", w_ptr, N_OUT, K_DIM, cfg.n_tile);
+        cache.w = make_tma_fp32_2d("weight", w_ptr, N_OUT, K_DIM, cfg.n_tile);
         cache.x_ptr = x_ptr; cache.w_ptr = w_ptr; cache.m = m;
         cache.m_tile = cfg.m_tile; cache.n_tile = cfg.n_tile;
     }
@@ -253,7 +254,7 @@ static void hc_launch_core(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_gemm_dispatch(cache.x, cache.w, cfg, m, workspace_ptr, sqr_sum_ptr, prof_dev, stream);
 
-    // rms + sqsum + mix + pre + post + comb (no hidden staged in smem anymore).
+    // epilogue smem scratch: rms + sqsum + mix + pre + post + comb (no hidden staged).
     constexpr int scratch_floats = 1 + 1 + N_OUT + HC + HC + HC * HC;
     constexpr int fuse_smem_bytes = scratch_floats * sizeof(float);
     static bool fuse_configured = false;
@@ -272,80 +273,6 @@ static void hc_launch_core(
         m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr, prof_dev);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "HC reduce/fuse launch failed: ", cudaGetErrorString(cudaGetLastError()));
-}
-
-// ============================================================
-// Matmul-only path: mix[M,N_OUT] = X[M,K] @ W[N_OUT,K]^T (raw, bf16 out).
-// Same 2-kernel structure as cuBLAS (GEMM + split-K reduce), NO RMSNorm/gates/
-// Sinkhorn/collapse -- for an apples-to-apples matmul-vs-cuBLAS comparison.
-// ============================================================
-__global__ void __launch_bounds__(128)
-hc_reduce_mix_kernel(
-    const float* __restrict__ workspace, int num_positions, int num_splits,
-    __nv_bfloat16* __restrict__ mix_out) {
-    const int pos = static_cast<int>(blockIdx.x);
-    if (pos >= num_positions) return;
-    const int tid = threadIdx.x;
-    __shared__ float acc[N_OUT];
-    if (tid < N_OUT) acc[tid] = 0.0f;
-    __syncthreads();
-
-    const float* wbase = workspace + static_cast<int64_t>(pos) * N_OUT;
-    const int64_t sstride = static_cast<int64_t>(num_positions) * N_OUT;
-    const int total = num_splits * N_OUT;
-    for (int idx = tid; idx < total; idx += 128) {
-        const int split = idx / N_OUT;
-        const int n = idx - split * N_OUT;
-        atomicAdd(&acc[n], wbase[static_cast<int64_t>(split) * sstride + n]);
-    }
-    __syncthreads();
-    if (tid < N_OUT) mix_out[pos * N_OUT + tid] = __float2bfloat16_rn(acc[tid]);
-}
-
-static torch::Tensor hc_matmul(torch::Tensor hidden_states, torch::Tensor attn_hc_fn) {
-    TORCH_CHECK(hidden_states.is_cuda() && hidden_states.scalar_type() == torch::kBFloat16,
-                "hidden_states must be CUDA bf16");
-    TORCH_CHECK(attn_hc_fn.is_cuda() && attn_hc_fn.scalar_type() == torch::kBFloat16 &&
-                attn_hc_fn.dim() == 2 && attn_hc_fn.size(0) == N_OUT &&
-                attn_hc_fn.size(1) == K_DIM, "attn_hc_fn must be CUDA bf16 [24,28672]");
-
-    c10::cuda::CUDAGuard device_guard(hidden_states.device());
-    auto hs = hidden_states.contiguous().view({-1, K_DIM});
-    auto weight = attn_hc_fn.contiguous();
-    const int m = static_cast<int>(hs.size(0));
-    const SplitConfig cfg = make_split_config(m);
-
-    auto fp32_opts = hs.options().dtype(torch::kFloat32);
-    auto mix = torch::empty({m, N_OUT}, hs.options().dtype(torch::kBFloat16));
-
-    static thread_local torch::Tensor ws_cache;
-    const int64_t ws_need = static_cast<int64_t>(cfg.num_splits) * m * N_OUT;
-    if (!ws_cache.defined() || ws_cache.numel() < ws_need ||
-        ws_cache.device() != hs.device()) {
-        ws_cache = torch::empty({ws_need}, fp32_opts);
-    }
-    float* workspace_ptr = ws_cache.data_ptr<float>();
-
-    const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
-    const auto* w_ptr = reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr());
-    thread_local TmaCache cache;
-    if (cache.x_ptr != x_ptr || cache.w_ptr != w_ptr ||
-        cache.m != m || cache.m_tile != cfg.m_tile || cache.n_tile != cfg.n_tile) {
-        cache.x = make_tma_bf16_2d("hidden", x_ptr, m, K_DIM, cfg.m_tile);
-        cache.w = make_tma_bf16_2d("weight", w_ptr, N_OUT, K_DIM, cfg.n_tile);
-        cache.x_ptr = x_ptr; cache.w_ptr = w_ptr; cache.m = m;
-        cache.m_tile = cfg.m_tile; cache.n_tile = cfg.n_tile;
-    }
-
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    launch_gemm_dispatch(cache.x, cache.w, cfg, m, workspace_ptr,
-                         /*sqr_sum=*/nullptr, /*prof=*/nullptr, stream);
-    hc_reduce_mix_kernel<<<m, 128, 0, stream>>>(
-        workspace_ptr, m, cfg.num_splits,
-        reinterpret_cast<__nv_bfloat16*>(mix.data_ptr()));
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
-                "hc_reduce_mix launch failed: ", cudaGetErrorString(cudaGetLastError()));
-    return mix;
 }
 
 static std::vector<torch::Tensor> hc_run_impl(
@@ -463,13 +390,11 @@ static std::vector<int64_t> hc_fused_tc_config(int64_t num_positions) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_fused_forward_full", &hc_tc::hc_fused_forward_full,
-          "MHC fused forward (BF16 tcgen05 + split-K + fused HC epilogue)");
+          "MHC fused forward (tf32 tcgen05 + split-K + fused HC epilogue)");
     m.def("hc_fused_forward_profiled", &hc_tc::hc_fused_forward_profiled,
           "MHC fused forward + clock64 stamps -> {collapsed,pre,post,comb,timing[8]}");
     m.def("hc_fused_forward_out", &hc_tc::hc_fused_forward_out,
           "MHC fused forward into preallocated {collapsed,pre,post,comb} (no alloc, no return)");
-    m.def("hc_matmul", &hc_tc::hc_matmul,
-          "Matmul only: mix[M,24] = X @ W^T (GEMM + split-K reduce, bf16 out; no epilogue)");
     m.def("hc_fused_tc_config", &hc_tc::hc_fused_tc_config,
           "Return [N tile, split-K, K tiles/split, grid, M tiles, N tiles, SMs, M tile]");
 }
