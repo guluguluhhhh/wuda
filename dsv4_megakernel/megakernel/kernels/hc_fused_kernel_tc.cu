@@ -57,7 +57,7 @@ hc_reduce_and_fuse_kernel(
     extern __shared__ __align__(16) unsigned char smem_raw[];
     float* scratch = reinterpret_cast<float*>(smem_raw);
     float* rms_smem = scratch;               // 1
-    float* sqsum_smem = rms_smem + 1;        // 1
+    float* sqsum_smem = rms_smem + 1;        // 1 (unused now; kept for layout offset)
     float* mix_smem = sqsum_smem + 1;        // N_OUT
     float* pre_smem = mix_smem + N_OUT;      // HC
     float* post_smem = pre_smem + HC;        // HC
@@ -69,29 +69,40 @@ hc_reduce_and_fuse_kernel(
 
     if (prof0 && threadIdx.x == 0) prof[3] = ptx::rdclock();  // (no hidden load phase)
 
-    // Split-K reduce (all threads, atomicAdd to smem):
-    //   mix[n]  = Σ_split workspace[split, pos, n]
-    //   Σx²     = Σ_split sqr_sum[split, pos]    (input RMSNorm sum-of-squares)
-    if (tid == 0) sqsum_smem[0] = 0.0f;
-    if (tid < N_OUT) mix_smem[tid] = 0.0f;
-    __syncthreads();
-    {
-        const float* wbase = workspace + static_cast<int64_t>(pos) * N_OUT;
-        const int64_t sstride = static_cast<int64_t>(num_positions) * N_OUT;
-        const int total = num_splits * N_OUT;
-        for (int idx = tid; idx < total; idx += EPILOGUE_THREADS) {
-            const int split = idx / N_OUT;
-            const int n = idx - split * N_OUT;
-            atomicAdd(&mix_smem[n], wbase[static_cast<int64_t>(split) * sstride + n]);
-        }
-        for (int s = tid; s < num_splits; s += EPILOGUE_THREADS)
-            atomicAdd(sqsum_smem, sqr_sum[static_cast<int64_t>(s) * num_positions + pos]);
+    // Split-K reduce (NO smem atomics -- the old atomicAdd(432 vals -> 24 slots) +
+    // 18-way pile onto one sqsum slot was the bottleneck). Instead:
+    //   mix[n] = Σ_split ws[split,pos,n]  : warp 0 lanes<N_OUT own one column each and
+    //            sum its splits in registers (reads are COALESCED -- at a fixed split
+    //            lanes 0..N_OUT-1 read N_OUT contiguous floats). No contention.
+    //   Σx² = Σ_split sqr_sum[split,pos]  : warp 1 reduces the splits via __shfl and
+    //            writes rms directly. Runs concurrently with warp 0's mix reduce.
+    // Split-K reduce (latency-bound -> maximize loads in flight): each warp reduces a
+    // 3-column slice of mix (lane = split, __shfl); warp 0 also reduces Σx² -> rms.
+    const float* wbase = workspace + static_cast<int64_t>(pos) * N_OUT;
+    const int64_t sstride = static_cast<int64_t>(num_positions) * N_OUT;
+    if (warp_id == 0) {
+        float acc = 0.f;
+        for (int s = lane_id; s < num_splits; s += 32)
+            acc += sqr_sum[static_cast<int64_t>(s) * num_positions + pos];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+        if (lane_id == 0) rms_smem[0] = rsqrtf(acc / static_cast<float>(K_DIM) + rms_eps);
     }
-    __syncthreads();
-    if (tid == 0) rms_smem[0] = rsqrtf(sqsum_smem[0] / static_cast<float>(K_DIM) + rms_eps);
-    __syncthreads();
-    if (tid < N_OUT) mix_smem[tid] *= rms_smem[0];   // fold RMSNorm scale into mix
-    __syncthreads();
+    constexpr int NWARPS = EPILOGUE_THREADS / 32;                  // 8
+    constexpr int COLS_PER_WARP = (N_OUT + NWARPS - 1) / NWARPS;   // ceil(24/8) = 3
+    const int c0 = warp_id * COLS_PER_WARP;
+    const int c1 = min(c0 + COLS_PER_WARP, N_OUT);
+    for (int c = c0; c < c1; ++c) {
+        float acc = 0.f;
+        for (int s = lane_id; s < num_splits; s += 32)
+            acc += wbase[static_cast<int64_t>(s) * sstride + c];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+        if (lane_id == 0) mix_smem[c] = acc;
+    }
+    __syncthreads();                                  // mix_smem + rms_smem visible
+    if (tid < N_OUT) mix_smem[tid] *= rms_smem[0];    // fold RMSNorm scale into mix
+    __syncthreads();                                  // folded mix visible to activation
     if (prof0 && threadIdx.x == 0) prof[4] = ptx::rdclock();  // reduce + rms done
 
     if (tid < HC) {
