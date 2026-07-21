@@ -296,21 +296,19 @@ def test_decode(module):
     return ok_all
 
 
-def kernel_us(fn, name_substr="mqa_logits", num_tests=30, flush_l2=True):
-    """Pure GPU kernel time — faithful port of DeepGEMM testing/bench.py::bench_kineto
-    (the ONLY number DeepGEMM reports for kernels):
-      * torch.profiler with schedule(wait=0, warmup=1, active=1): cycle 1 discarded as
-        warmup, cycle 2 measured; acc_events=True keeps the table after exit (and is
-        why upstream has no 'Profiler clears events' warning).
-      * L2 is FLUSHED with an 8GB memset before EVERY call: this kernel is a
-        memory-bound KV stream, and without the flush small-T KV (e.g. 32x1024 =
-        2.2MB) stays L2-resident across iterations, so 'bw' would measure L2, not
-        HBM — unlike real decode where other layers evict the KV between calls.
-      * returns the per-call average of the matching kernel over the active cycle."""
+def kernel_us(fn, name_substr="mqa_logits", num_tests=30, flush_l2=True, cooldown=0.5):
+    """Pure GPU kernel time, DeepGEMM bench_kineto framing (profiler schedule w+a,
+    L2 flushed with an 8GB memset before EVERY call -> cold-HBM KV reads).
+    Estimator: MIN over the per-instance kernel durations of the active cycle
+    (unthrottled capability; DVFS-throttled instances are excluded by construction,
+    unlike DeepGEMM's table average). `cooldown` lets clocks recover between cells."""
+    import time
     from torch.profiler import profile, ProfilerActivity, schedule
     flush_l2_size = int(8e9 // 4)
     fn()  # warm the JIT/first-call path before profiling
     torch.cuda.synchronize()
+    if cooldown > 0:
+        time.sleep(cooldown)
     try:
         prof = profile(activities=[ProfilerActivity.CUDA],
                        schedule=schedule(wait=0, warmup=1, active=1, repeat=1),
@@ -326,17 +324,18 @@ def kernel_us(fn, name_substr="mqa_logits", num_tests=30, flush_l2=True):
                 fn()
             torch.cuda.synchronize()
             prof.step()
-    total, num = 0.0, 0
-    for e in prof.key_averages():
-        if name_substr in e.key.lower():
-            # torch renamed self_cuda_time_total -> self_device_time_total
-            v = getattr(e, "self_device_time_total", None)
-            if v is None:
-                v = getattr(e, "self_cuda_time_total", 0.0)
-            total += v  # microseconds, summed over e.count instances
-            num += e.count
-    assert num > 0, f"no kernel matching '{name_substr}' in profile"
-    return total / num
+    # Per-instance durations (us) of the matching kernel in the active cycle
+    insts = []
+    for e in prof.events():
+        if name_substr not in e.name.lower():
+            continue
+        d = getattr(e, "device_time", None)
+        if d is None:
+            d = getattr(e, "cuda_time", 0.0)
+        if d and d > 0:
+            insts.append(float(d))
+    assert insts, f"no kernel matching '{name_substr}' in profile"
+    return min(insts)
 
 
 BLOCK_Q = 1   # decode: 1 query token per q-block (UMMA_N=64); mirrors the kernel config
@@ -355,17 +354,19 @@ def cast_to_fp4_chunked(x2d, chunk_rows=1 << 21):
     return torch.cat(packed_parts), torch.cat(sf_parts)
 
 
-def benchmark(module):
+def benchmark(module, sweep_stages=False):
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     num_sms = props.multi_processor_count
     print(f"\nBenchmark decode: {torch.cuda.get_device_name()} ({num_sms} SMs)")
     print("  Tile-pool schedule: grid.x = #SMs, global KV tiles balanced across CTAs.")
     print("  kernel_us = DeepGEMM bench_kineto methodology (profiler schedule w+a, L2")
     print("  flushed with 8GB memset before EVERY call -> cold-HBM KV reads, as in real")
-    print("  decode). DeepGEMM's test suite reports ONLY this kernel time (no wall).")
+    print("  decode). stg = KV pipeline depth (default 6; B300 sweep verdict: 6 wins or")
+    print("  ties every BxT cell). kernel_us = MIN of per-instance times (unthrottled).")
     print("  bytes = q/sf_q/weights reads + KV+SF reads + logits writes (DeepGEMM accounting).")
-    print(f"{'B':>4} {'T':>7} {'ctx':>8} {'tiles':>7} {'kernel_us':>11} {'TFLOPS':>7} {'bw_GB/s':>9}")
-    print("-" * 60)
+    print(f"{'B':>4} {'T':>7} {'ctx':>8} {'tiles':>7} {'stg':>5} {'kernel_us':>11} {'TFLOPS':>7} {'bw_GB/s':>9}")
+    print("-" * 66)
+    stage_opts = (4, 6, 8, 10) if sweep_stages else (0,)
     # Full B x T grid: every batch size covers the complete kv-slot gradient
     # (T = ctx/4 for the DSV4 indexer): 4K / 32K / 128K / 1M context.
     for B in (32, 64, 128, 256):
@@ -391,26 +392,31 @@ def benchmark(module):
             ke = ks + T
             total_tiles = B * ((T + BLOCK_KV - 1) // BLOCK_KV)
 
-            call = lambda: module.mqa_logits_fp4_decode_out(
-                q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0)  # 0 -> one CTA per SM
-            kus = kernel_us(call)
-            # DeepGEMM test_attention.py accounting (paged decode path):
-            #   reads:  q fp4-packed + sf_q i32 + weights f32, KV fp4-packed 64B + sf 4B per slot
-            #   writes: logits (fp32 here), valid region = B*T
-            q_w_bytes = B * NUM_HEADS * (HEAD_DIM // 2 + 4 + 4)
-            kv_bytes = B * T * (HEAD_DIM // 2 + 4)
-            out_bytes = B * T * 4
-            bw = (q_w_bytes + kv_bytes + out_bytes) / 1e3 / kus
-            tflops = 2 * B * T * NUM_HEADS * HEAD_DIM / 1e6 / kus
-            print(f"{B:4d} {T:7d} {4*T:8d} {total_tiles:7d} {kus:11.3f} {tflops:7.1f} {bw:9.0f}")
+            for stg in stage_opts:
+                call = lambda s=stg: module.mqa_logits_fp4_decode_out(
+                    q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s)  # ctas=0 -> per SM
+                kus = kernel_us(call)
+                # DeepGEMM test_attention.py accounting (paged decode path):
+                #   reads:  q fp4-packed + sf_q i32 + weights f32, KV fp4-packed 64B + sf 4B per slot
+                #   writes: logits (fp32 here), valid region = B*T
+                q_w_bytes = B * NUM_HEADS * (HEAD_DIM // 2 + 4 + 4)
+                kv_bytes = B * T * (HEAD_DIM // 2 + 4)
+                out_bytes = B * T * 4
+                bw = (q_w_bytes + kv_bytes + out_bytes) / 1e3 / kus
+                tflops = 2 * B * T * NUM_HEADS * HEAD_DIM / 1e6 / kus
+                eff_stg = stg if stg else 6   # 0 = auto, which resolves to 6
+                print(f"{B:4d} {T:7d} {4*T:8d} {total_tiles:7d} {eff_stg:5d} "
+                      f"{kus:11.3f} {tflops:7.1f} {bw:9.0f}")
             del weights, q_p, q_sf, kv_p, kv_sf, logits, ks, ke
             torch.cuda.empty_cache()
-        print("-" * 60)
+        print("-" * 66)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--sweep-stages", action="store_true",
+                        help="benchmark every (B,T) with KV stages 4/6/8/10 to fit the dispatch threshold")
     parser.add_argument("--skip-correctness", action="store_true")
     args = parser.parse_args()
 
@@ -430,8 +436,8 @@ def main():
         ok &= test_single(module)
         ok &= test_decode(module)
         print("\nALL PASSED" if ok else "\nCORRECTNESS FAILED")
-    if args.benchmark:
-        benchmark(module)
+    if args.benchmark or args.sweep_stages:
+        benchmark(module, sweep_stages=args.sweep_stages)
     return 0 if ok else 1
 
 

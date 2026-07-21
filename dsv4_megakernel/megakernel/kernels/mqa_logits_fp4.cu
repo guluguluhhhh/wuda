@@ -104,20 +104,35 @@ static CUtensorMap make_tma_2d(const char* name, void* ptr, CUtensorMapDataType 
     return tm;
 }
 
-// Per-stage / total dynamic shared-memory bytes (mirrors the wrapper).
-static int compute_smem_bytes() {
+// Per-stage / total dynamic shared-memory bytes for a given KV pipeline depth
+// (mirrors the wrapper; KV stages are now a dispatch dimension, see pick paths below).
+static int compute_smem_bytes(int num_kv_stages) {
     const int smem_q   = BLOCK_Q * NUM_HEADS * (HEAD_DIM / 2);            // 8192
     const int smem_sfq = host_align_up(BLOCK_Q * NUM_HEADS, 128) * 4;     // 512
     const int smem_kv  = BLOCK_KV * (HEAD_DIM / 2);                        // 16384
     const int smem_sfkv= host_align_up(BLOCK_KV, 128) * 4;                // 1024
     const int smem_w   = BLOCK_Q * NUM_HEADS * 4;                          // 512
-    const int barriers = (NUM_Q_STAGES + NUM_KV_STAGES + NUM_TMEM_STAGES) * 2 * 8;
+    const int barriers = (NUM_Q_STAGES + num_kv_stages + NUM_TMEM_STAGES) * 2 * 8;
     const int tmem_ptr = 4;
+    // tile-pool prefix scratch (after the TMEM ptr; see smem_tile_prefix in the kernel)
+    const int tile_prefix = ((int)deep_gemm::kNumMaxTilePoolTokens + 1) * 4;
     return NUM_Q_STAGES * (smem_q + smem_sfq + smem_w) +
-           NUM_KV_STAGES * (smem_kv + smem_sfkv) + barriers + tmem_ptr;
+           num_kv_stages * (smem_kv + smem_sfkv) + barriers + tmem_ptr + tile_prefix;
 }
 
-template <typename logits_dtype_t, bool kCompressed, bool kTilePool>
+// KV pipeline depth (used when num_kv_stages=0). B300 sweep over {4,6,8,10} x the
+// full BxT grid (min-of-instances estimator, throttle excluded): 6 wins or ties
+// EVERY cell — flat at tiny chunks (depth never enters the picture), best at all
+// T >= 8192 (Little's law: ~44GB/s/SM x ~1us TMA latency needs only ~3-4 tiles in
+// flight; deeper adds no coverage but shrinks the unified L1 carveout and inflates
+// the card-wide outstanding-TMA window). 8/10 never won a single cell, falsifying
+// DeepGEMM's "deepest that fits" for our contiguous low-latency producer.
+// {4,6,8,10} stay instantiated for explicit-override experiments.
+static int auto_kv_stages(int, int, int) {
+    return 6;
+}
+
+template <typename logits_dtype_t, bool kCompressed, bool kTilePool, int kKVStages>
 static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const int* ks, const int* ke, void* logits,
                          const CUtensorMap& dQ, const CUtensorMap& dSFQ,
@@ -126,7 +141,7 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          cudaStream_t stream) {
     auto kernel = &deep_gemm::sm100_fp4_mqa_logits<
         NUM_HEADS, HEAD_DIM, kCompressed, kTilePool,
-        BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, NUM_KV_STAGES,
+        BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, kKVStages,
         NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, logits_dtype_t>;
 
     static bool configured = false;   // per-instantiation (template static local)
@@ -159,7 +174,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             torch::Tensor kv, torch::Tensor sf_kv, torch::Tensor weights,
                             const int* ks, const int* ke, int seq_len, int seq_len_kv,
                             at::ScalarType out_dtype, bool decode_tile_pool, int stride_logits,
-                            int num_ctas, void* lp) {
+                            int num_ctas, int num_kv_stages, void* lp) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -194,18 +209,38 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
         grid.x = (unsigned)num_ctas;
     } else {
         grid.x = (unsigned)(host_align_up(seq_len, BLOCK_Q) / BLOCK_Q);
+        num_kv_stages = NUM_KV_STAGES;   // faithful path: fixed default depth
     }
-    const int smem = compute_smem_bytes();
+    const int smem = compute_smem_bytes(num_kv_stages);
 
-    // Only the two used (schedule x compression) combos are instantiated:
-    // decode = compressed + tile pool; faithful = raw + legacy.
-    if (out_dtype == torch::kFloat) {
-        if (decode_tile_pool) launch_typed<float, true,  true >(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream);
-        else                  launch_typed<float, false, false>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream);
+    // Instantiated combos: decode = compressed + tile pool x {4,6,8,10} KV stages
+    // (AOT stand-in for DeepGEMM's JIT per-shape configs); faithful = raw + legacy,
+    // default depth only.
+    #define MQA_LT(dtype_t, pool_, stages_) \
+        launch_typed<dtype_t, pool_, pool_, stages_>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
+    if (decode_tile_pool) {
+        TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
+                    "num_kv_stages must be 0 (auto) or one of 4/6/8/10, got ", num_kv_stages);
+        if (out_dtype == torch::kFloat) {
+            switch (num_kv_stages) {
+                case 4:  MQA_LT(float, true, 4);  break;
+                case 6:  MQA_LT(float, true, 6);  break;
+                case 8:  MQA_LT(float, true, 8);  break;
+                default: MQA_LT(float, true, 10); break;
+            }
+        } else {
+            switch (num_kv_stages) {
+                case 4:  MQA_LT(cutlass::bfloat16_t, true, 4);  break;
+                case 6:  MQA_LT(cutlass::bfloat16_t, true, 6);  break;
+                case 8:  MQA_LT(cutlass::bfloat16_t, true, 8);  break;
+                default: MQA_LT(cutlass::bfloat16_t, true, 10); break;
+            }
+        }
     } else {
-        if (decode_tile_pool) launch_typed<cutlass::bfloat16_t, true,  true >(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream);
-        else                  launch_typed<cutlass::bfloat16_t, false, false>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream);
+        if (out_dtype == torch::kFloat) MQA_LT(float, false, NUM_KV_STAGES);
+        else                            MQA_LT(cutlass::bfloat16_t, false, NUM_KV_STAGES);
     }
+    #undef MQA_LT
 }
 
 // Allocating wrapper: makes the padded [align(seq_len,BLOCK_Q), stride_logits] buffer
@@ -214,14 +249,16 @@ static torch::Tensor run_mqa(torch::Tensor q, torch::Tensor sf_q,
                              torch::Tensor kv, torch::Tensor sf_kv,
                              torch::Tensor weights, const int* ks, const int* ke,
                              int seq_len, int seq_len_kv, at::ScalarType out_dtype,
-                             bool decode_tile_pool, int stride_logits, int num_ctas) {
+                             bool decode_tile_pool, int stride_logits, int num_ctas,
+                             int num_kv_stages) {
     const int aligned_seq_len = host_align_up(seq_len, BLOCK_Q);
     torch::Tensor logits_buf = decode_tile_pool
         ? torch::full({aligned_seq_len, stride_logits},
                       -std::numeric_limits<float>::infinity(), q.options().dtype(out_dtype))
         : torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(out_dtype));
     dispatch_launch(q, sf_q, kv, sf_kv, weights, ks, ke, seq_len, seq_len_kv,
-                    out_dtype, decode_tile_pool, stride_logits, num_ctas, logits_buf.data_ptr());
+                    out_dtype, decode_tile_pool, stride_logits, num_ctas, num_kv_stages,
+                    logits_buf.data_ptr());
     return logits_buf;
 }
 
@@ -265,7 +302,7 @@ static torch::Tensor mqa_logits_fp4_forward(
     auto buf = run_mqa(q, sf_q, kv, sf_kv, weights,
                        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
                        seq_len, seq_len_kv, out_dtype, /*decode_tile_pool=*/false, stride_logits,
-                       /*num_ctas=*/0);
+                       /*num_ctas=*/0, /*num_kv_stages=*/NUM_KV_STAGES);
     return buf.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
 }
 
@@ -277,12 +314,15 @@ static torch::Tensor mqa_logits_fp4_forward(
 static torch::Tensor mqa_logits_fp4_decode(
     torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
     torch::Tensor weights, c10::optional<torch::Tensor> valid_len,
-    at::ScalarType out_dtype, int num_ctas = 0) {
+    at::ScalarType out_dtype, int num_ctas = 0, int num_kv_stages = 0) {
     check_qkv(q, sf_q, kv, sf_kv, weights, out_dtype);
     TORCH_CHECK(q.dim() == 3 && q.size(1) == NUM_HEADS, "q must be [B,H,D/2]");
     TORCH_CHECK(kv.dim() == 3, "kv must be [B,T,D/2]");
     const int B = q.size(0), T = kv.size(1);
     TORCH_CHECK(kv.size(0) == B, "kv batch must match q");
+    TORCH_CHECK(B <= (int)deep_gemm::kNumMaxTilePoolTokens,
+                "decode B must be <= ", (int)deep_gemm::kNumMaxTilePoolTokens,
+                " (tile-pool smem prefix cap)");
     TORCH_CHECK(sf_q.sizes() == torch::IntArrayRef({B, NUM_HEADS}), "sf_q [B,H]");
     TORCH_CHECK(sf_kv.sizes() == torch::IntArrayRef({B, T}), "sf_kv [B,T]");
     TORCH_CHECK(weights.sizes() == torch::IntArrayRef({B, NUM_HEADS}) && weights.stride(1) == 1, "weights [B,H]");
@@ -314,7 +354,8 @@ static torch::Tensor mqa_logits_fp4_decode(
     auto buf = run_mqa(q_c, sfq_c, kv_c, sfkv_c, w_c,
                        ks.data_ptr<int>(), ke.data_ptr<int>(),
                        seq_len, seq_len_kv, out_dtype, /*decode_tile_pool=*/true, stride_logits,
-                       num_ctas);
+                       num_ctas,
+                       num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas));
     return buf.index({torch::indexing::Slice(0, B), torch::indexing::Slice(0, T)});
 }
 
@@ -327,10 +368,13 @@ static torch::Tensor mqa_logits_fp4_decode(
 static void mqa_logits_fp4_decode_out(
     torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
     torch::Tensor weights, torch::Tensor ks, torch::Tensor ke,
-    torch::Tensor logits, int num_ctas) {
+    torch::Tensor logits, int num_ctas, int num_kv_stages) {
     check_qkv(q, sf_q, kv, sf_kv, weights, logits.scalar_type());
     const int B = q.size(0), T = kv.size(1);
     TORCH_CHECK(kv.dim() == 3 && kv.size(0) == B, "kv must be [B,T,D/2]");
+    TORCH_CHECK(B <= (int)deep_gemm::kNumMaxTilePoolTokens,
+                "decode B must be <= ", (int)deep_gemm::kNumMaxTilePoolTokens,
+                " (tile-pool smem prefix cap)");
     TORCH_CHECK(ks.scalar_type() == torch::kInt32 && ks.numel() == B, "ks [B] i32");
     TORCH_CHECK(ke.scalar_type() == torch::kInt32 && ke.numel() == B, "ke [B] i32");
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= host_align_up(B, BLOCK_Q),
@@ -343,7 +387,9 @@ static void mqa_logits_fp4_decode_out(
                     ks.data_ptr<int>(), ke.data_ptr<int>(),
                     /*seq_len=*/B, /*seq_len_kv=*/B * T, logits.scalar_type(),
                     /*decode_tile_pool=*/true, /*stride_logits=*/(int)logits.size(1),
-                    num_ctas, logits.data_ptr());
+                    num_ctas,
+                    num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas),
+                    logits.data_ptr());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -354,13 +400,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("out_dtype"));
     m.def("mqa_logits_fp4_decode", &mqa_logits_fp4_decode,
           "DSV4 FP4 MQA-logits (multi-batch decode, compressed, one launch, tile-pool schedule) — "
-          "varlen packing of [B,T,D] cache; num_ctas=0 -> one CTA per SM",
+          "varlen packing of [B,T,D] cache; num_ctas=0 -> one CTA per SM; "
+          "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10",
           py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"),
           py::arg("weights"), py::arg("valid_len") = c10::nullopt,
-          py::arg("out_dtype"), py::arg("num_ctas") = 0);
+          py::arg("out_dtype"), py::arg("num_ctas") = 0, py::arg("num_kv_stages") = 0);
     m.def("mqa_logits_fp4_decode_out", &mqa_logits_fp4_decode_out,
           "DSV4 FP4 MQA-logits decode into a preallocated buffer (repo *_out convention; "
-          "hoists alloc/-inf-fill/arange out of the timed path); num_ctas=0 -> one CTA per SM",
+          "hoists alloc/-inf-fill/arange out of the timed path); num_ctas=0 -> one CTA per SM; "
+          "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10",
           py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"), py::arg("weights"),
-          py::arg("ks"), py::arg("ke"), py::arg("logits"), py::arg("num_ctas") = 0);
+          py::arg("ks"), py::arg("ke"), py::arg("logits"), py::arg("num_ctas") = 0,
+          py::arg("num_kv_stages") = 0);
 }

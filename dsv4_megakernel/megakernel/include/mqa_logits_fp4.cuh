@@ -585,44 +585,44 @@ namespace deep_gemm {
 // Σ_b cdiv(window_b, BLOCK_KV) tiles is split into gridDim.x balanced contiguous
 // chunks (per-CTA imbalance <= 1 tile) that may cross token boundaries — the
 // inline equivalent of DeepGEMM's paged-path metadata kernel (which emits per-SM
-// (q_token_idx, kv_split_idx) starts). B is at most a few hundred, so the O(B)
-// prefix walk here is cheaper than a separate metadata launch; crossing a token
-// boundary only costs a ~4.5KB Q/SF/weights reload vs 16KB per KV tile.
+// (q_token_idx, kv_split_idx) starts), but DEVICE-ONLY and launch-free
+// (megakernel-ready: no host/Python in the loop).
+//
+// Cost model: ONE warp per CTA builds the tile prefix sum into smem with a
+// warp-parallel scan (O(B/32) rounds, see the kernel prologue), published by the
+// existing __syncthreads(); each thread then locates its chunk with a log2(B)
+// binary search on smem. This replaces the previous per-thread O(B) serial
+// global-memory walk, which dominated small-T large-B decode (measured
+// ~0.11us/token slope vs DeepGEMM's metadata-driven ~0.02).
 // ============================================================
+static constexpr uint32_t kNumMaxTilePoolTokens = 512;   // decode B cap (serving: 32-256)
+
 template <uint32_t BLOCK_KV>
 struct TilePoolScheduler {
     const uint32_t* ks;
     const uint32_t* ke;
+    const uint32_t* tile_prefix;     // smem, [num_tokens + 1], built by the warp scan
     uint32_t num_tokens, seq_len_kv;
     uint32_t chunk_cur, chunk_end;   // this CTA's global tile ids: [chunk_cur, chunk_end)
-    uint32_t token, token_base;      // walk state: global tile id of `token`'s first tile
-
-    CUTLASS_DEVICE uint32_t num_tiles(const uint32_t& b) const {
-        // Same geometry as the legacy path: base aligned down to 4 for the SF TMA
-        const uint32_t s = cute::min(ks[b], seq_len_kv) / 4 * 4;
-        const uint32_t e = cute::min(ke[b], seq_len_kv);
-        return e > s ? math::ceil_div(e - s, BLOCK_KV) : 0u;
-    }
+    uint32_t token;                  // current token (tile_prefix[token] <= chunk_cur)
 
     CUTLASS_DEVICE TilePoolScheduler(const uint32_t& cta_idx, const uint32_t& num_ctas,
                                      const uint32_t& num_tokens, const uint32_t& seq_len_kv,
-                                     const uint32_t* ks, const uint32_t* ke):
-            ks(ks), ke(ke), num_tokens(num_tokens), seq_len_kv(seq_len_kv) {
-        uint32_t total = 0;
-        for (uint32_t b = 0; b < num_tokens; ++ b)
-            total += num_tiles(b);
+                                     const uint32_t* ks, const uint32_t* ke,
+                                     const uint32_t* tile_prefix):
+            ks(ks), ke(ke), tile_prefix(tile_prefix), num_tokens(num_tokens), seq_len_kv(seq_len_kv) {
         // Balanced contiguous partition: first `total % num_ctas` CTAs take one extra tile
+        const uint32_t total = tile_prefix[num_tokens];
         const uint32_t per = total / num_ctas, rem = total % num_ctas;
         chunk_cur = cta_idx * per + cute::min(cta_idx, rem);
         chunk_end = chunk_cur + per + (cta_idx < rem ? 1u : 0u);
-        // Walk to the token containing the chunk's first tile
-        token = 0, token_base = 0;
-        while (token < num_tokens) {
-            const uint32_t nt = num_tiles(token);
-            if (token_base + nt > chunk_cur)
-                break;
-            token_base += nt, ++ token;
+        // Binary search: largest token with tile_prefix[token] <= chunk_cur
+        uint32_t lo = 0, hi = num_tokens;
+        while (lo < hi) {
+            const uint32_t mid = (lo + hi + 1) / 2;
+            tile_prefix[mid] <= chunk_cur ? (lo = mid) : (hi = mid - 1);
         }
+        token = lo;
     }
 
     // Emits one (token, contiguous KV tile sub-range) task per call. Deterministic:
@@ -631,20 +631,19 @@ struct TilePoolScheduler {
     CUTLASS_DEVICE bool next(uint32_t& q_idx, uint32_t& kv_start, uint32_t& num_kv_blocks,
                              uint32_t& seq_k_start, uint32_t& seq_k_end) {
         while (chunk_cur < chunk_end and token < num_tokens) {
-            const uint32_t nt = num_tiles(token);
-            const uint32_t t0 = chunk_cur - token_base;   // first tile of `token` in this chunk
-            const uint32_t t1 = cute::min(nt, chunk_end - token_base);
-            if (t1 > t0) {
+            const uint32_t tile_base = tile_prefix[token];
+            const uint32_t tile_end  = cute::min(tile_prefix[token + 1], chunk_end);
+            if (tile_end > chunk_cur) {
                 q_idx = token;
                 seq_k_start = cute::min(ks[token], seq_len_kv);
                 seq_k_end = cute::min(ke[token], seq_len_kv);
-                kv_start = seq_k_start / 4 * 4 + t0 * BLOCK_KV;
-                num_kv_blocks = t1 - t0;
-                chunk_cur = token_base + t1;
-                token_base += nt, ++ token;
+                kv_start = seq_k_start / 4 * 4 + (chunk_cur - tile_base) * BLOCK_KV;
+                num_kv_blocks = tile_end - chunk_cur;
+                chunk_cur = tile_end;
+                ++ token;
                 return true;
             }
-            token_base += nt, ++ token;   // empty-window token; skip
+            ++ token;   // empty-window token (or fully before the chunk); skip
         }
         return false;
     }
@@ -750,6 +749,9 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     auto full_tmem_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + i; });
     auto empty_tmem_barriers = utils::PatternVisitor([&](const uint32_t& i) { return tmem_barrier_ptr + kNumTmemStages + i; });
     auto tmem_ptr_in_smem    = reinterpret_cast<uint32_t*>(tmem_barrier_ptr + kNumTmemStages * 2);
+    // [MEGAKERNEL EDIT] tile-pool prefix scratch ([kNumMaxTilePoolTokens + 1] u32)
+    // lives right after the TMEM pointer; sized in the host's compute_smem_bytes().
+    auto smem_tile_prefix    = tmem_ptr_in_smem + 1;
 
     // Tensor memory configs
     constexpr uint32_t kNumAccumTmemCols = BLOCK_Q * kNumHeads * kNumTmemStages;
@@ -781,6 +783,40 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // Allocate tensor memory
     if (warp_idx == kSpecWarpStart + 2)
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+
+    // [MEGAKERNEL EDIT] tile-pool metadata: one (otherwise idle) warp builds the tile
+    // prefix sum in smem via a warp-parallel scan; the __syncthreads() below publishes
+    // it to all roles. Device-only — the fused equivalent of DeepGEMM's separate
+    // metadata kernel launch (no host/Python in the loop; megakernel-compatible).
+    if constexpr (kTilePool) {
+        if (warp_idx == kSpecWarpStart + 3) {
+            DG_TRAP_ONLY_DEVICE_ASSERT(seq_len <= kNumMaxTilePoolTokens);
+            uint32_t running = 0;
+            if (lane_idx == 0)
+                smem_tile_prefix[0] = 0;
+            for (uint32_t base = 0; base < seq_len; base += 32) {
+                const uint32_t b = base + lane_idx;
+                uint32_t num_tiles = 0;
+                if (b < seq_len) {
+                    // Same tile geometry as the legacy path: base aligned down to 4 (SF TMA)
+                    const uint32_t s = cute::min(cu_seq_len_k_start[b], seq_len_kv) / 4 * 4;
+                    const uint32_t e = cute::min(cu_seq_len_k_end[b], seq_len_kv);
+                    num_tiles = e > s ? math::ceil_div(e - s, BLOCK_KV) : 0u;
+                }
+                // Inclusive warp scan (Hillis-Steele over shfl_up)
+                uint32_t prefix = num_tiles;
+                #pragma unroll
+                for (uint32_t d = 1; d < 32; d <<= 1) {
+                    const uint32_t v = __shfl_up_sync(0xffffffffu, prefix, d);
+                    if (lane_idx >= d)
+                        prefix += v;
+                }
+                if (b < seq_len)
+                    smem_tile_prefix[b + 1] = running + prefix;
+                running += __shfl_sync(0xffffffffu, prefix, 31);
+            }
+        }
+    }
     __syncthreads();
 
     // Scheduler
@@ -819,7 +855,8 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     auto for_each_task = [&](auto&& fn) {
         if constexpr (kTilePool) {
             TilePoolScheduler<BLOCK_KV> sched(sm_idx, kNumSMs, seq_len, seq_len_kv,
-                                              cu_seq_len_k_start, cu_seq_len_k_end);
+                                              cu_seq_len_k_start, cu_seq_len_k_end,
+                                              smem_tile_prefix);
             uint32_t q_idx, kv_start, num_kv_blocks;
             while (sched.next(q_idx, kv_start, num_kv_blocks, seq_k_start[0], seq_k_end[0]))
                 fn(q_idx, kv_start, num_kv_blocks);
@@ -1134,6 +1171,11 @@ static constexpr int HEAD_DIM  = 128;
 static constexpr int BLOCK_Q   = 1;                 // UMMA_N = 64
 static constexpr int BLOCK_KV  = 256;
 static constexpr int NUM_Q_STAGES  = 3;
+// DEFAULT KV pipeline depth (faithful single-seq path only; decode auto-selects 6,
+// with {4,6,8,10} instantiated for explicit override). B300 sweep verdict: 6 wins
+// or ties every BxT cell — depth only needs to cover the TMA latency-bandwidth
+// product (~3-4 tiles in flight); deeper costs unified-L1 carveout and HBM
+// outstanding-window pressure for zero extra coverage.
 static constexpr int NUM_KV_STAGES = 6;
 static constexpr int NUM_TMEM_STAGES = 3;           // hardcoded in the kernel
 static constexpr int NUM_SPECIALIZED_THREADS = 128;
