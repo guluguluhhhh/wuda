@@ -67,8 +67,6 @@ hc_reduce_and_fuse_kernel(
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
 
-    if (prof0 && threadIdx.x == 0) prof[3] = ptx::rdclock();  // (no hidden load phase)
-
     // Split-K reduce (NO smem atomics -- the old atomicAdd(432 vals -> 24 slots) +
     // 18-way pile onto one sqsum slot was the bottleneck). Instead:
     //   mix[n] = Σ_split ws[split,pos,n]  : warp 0 lanes<N_OUT own one column each and
@@ -103,7 +101,7 @@ hc_reduce_and_fuse_kernel(
     __syncthreads();                                  // mix_smem + rms_smem visible
     if (tid < N_OUT) mix_smem[tid] *= rms_smem[0];    // fold RMSNorm scale into mix
     __syncthreads();                                  // folded mix visible to activation
-    if (prof0 && threadIdx.x == 0) prof[4] = ptx::rdclock();  // reduce + rms done
+    if (prof0 && threadIdx.x == 0) prof[3] = ptx::rdclock();  // reduce + rms done
 
     if (tid < HC) {
         pre_smem[tid] = fast_sigmoid(mix_smem[tid] * scale[0] + base[tid]) + hc_eps;
@@ -114,7 +112,7 @@ hc_reduce_and_fuse_kernel(
         comb_smem[tid] = mix_smem[2 * HC + tid] * scale[2] + base[2 * HC + tid];
     }
     __syncthreads();
-    if (prof0 && threadIdx.x == 0) prof[5] = ptx::rdclock();  // activation done
+    if (prof0 && threadIdx.x == 0) prof[4] = ptx::rdclock();  // activation done
 
     // pre/post gates are ready (activation); write them now -- independent of the
     // Sinkhorn/collapse split below.
@@ -124,8 +122,9 @@ hc_reduce_and_fuse_kernel(
     }
 
     // OVERLAP: warp 0 runs Sinkhorn on comb (needs comb_smem); warps 1..7 run the
-    // collapse (needs only pre_smem). The two are independent, so the collapse hides
-    // under the (longer) Sinkhorn instead of running serially after it.
+    // collapse (needs only pre_smem). Independent, run concurrently; which one is the
+    // pole depends on M (small M -> Sinkhorn; large M -> collapse). prof: warp 0 stamps
+    // sinkhorn end [5]; warp 1 stamps collapse start [6] / end [7] -> real collapse time.
     if (warp_id == 0) {
         float v = lane_id < HC * HC ? comb_smem[lane_id] : 0.0f;
         float max_v = v;
@@ -164,29 +163,48 @@ hc_reduce_and_fuse_kernel(
             v /= col_sum + hc_eps;
         }
         if (lane_id < HC * HC) comb_out[pos * HC * HC + lane_id] = v;   // final gate
-        if (prof0 && lane_id == 0) prof[6] = ptx::rdclock();  // sinkhorn done (warp0)
+        if (prof0 && lane_id == 0) prof[5] = ptx::rdclock();  // sinkhorn end (warp0)
     } else {
         // Collapse on warps 1..7 (EPILOGUE_THREADS-32 threads), reading hidden straight
         // from global (the global read overlaps warp 0's Sinkhorn).
         //   out[d] = Σ_h pre[h] * hidden[pos, h, d].
+        // Vectorized: each thread handles VEC=8 consecutive d as one int4 (16B) load per
+        // h + one int4 store -> wide coalesced transactions instead of 2B/thread. hidden
+        // (=X) is re-read here from L2; 16B/thread keeps that read cheap.
+        if (prof0 && threadIdx.x == 32) prof[6] = ptx::rdclock();  // collapse start (warp1)
+        constexpr int VEC = 8;                        // 8 bf16 = 16B = int4
+        static_assert(DIM % VEC == 0, "DIM must be VEC-aligned for the int4 collapse");
         float pre_r[HC];
         #pragma unroll
         for (int h = 0; h < HC; ++h) pre_r[h] = pre_smem[h];
         const __nv_bfloat16* src = hidden_states + static_cast<int64_t>(pos) * K_DIM;
-        auto* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
-        const int cstart = static_cast<int>(threadIdx.x) - 32;   // warp1..7 -> 0..223
-        const int cthreads = EPILOGUE_THREADS - 32;              // 224
-        for (int d = cstart; d < DIM; d += cthreads) {
-            float value = 0.0f;
+        __nv_bfloat16* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
+        const int lane_vec = static_cast<int>(threadIdx.x) - 32;   // warp1..7 -> 0..223
+        const int nthreads = EPILOGUE_THREADS - 32;                // 224
+        for (int vi = lane_vec; vi < DIM / VEC; vi += nthreads) {
+            const int d0 = vi * VEC;
+            float acc[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) acc[j] = 0.0f;
             #pragma unroll
             for (int h = 0; h < HC; ++h) {
-                value += pre_r[h] * __bfloat162float(src[h * DIM + d]);
+                const int4 raw = *reinterpret_cast<const int4*>(src + h * DIM + d0);
+                const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                #pragma unroll
+                for (int k = 0; k < VEC / 2; ++k) {
+                    const float2 f = __bfloat1622float2(v2[k]);
+                    acc[2 * k]     += pre_r[h] * f.x;
+                    acc[2 * k + 1] += pre_r[h] * f.y;
+                }
             }
-            collapsed[d] = __float2bfloat16_rn(value);
+            alignas(16) __nv_bfloat162 out2[VEC / 2];   // 16B-aligned for the int4 store
+            #pragma unroll
+            for (int k = 0; k < VEC / 2; ++k)
+                out2[k] = __float22bfloat162_rn(make_float2(acc[2 * k], acc[2 * k + 1]));
+            *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
         }
+        if (prof0 && threadIdx.x == 32) prof[7] = ptx::rdclock();  // collapse end (warp1)
     }
-    __syncthreads();
-    if (prof0 && threadIdx.x == 0) prof[7] = ptx::rdclock();  // both done
 }
 
 static void hc_validate_inputs(
@@ -378,9 +396,10 @@ static std::vector<torch::Tensor> hc_fused_forward_full(
 }
 
 // Profiled: returns {collapsed, pre, post, comb, timing[PROF_SLOTS]} where timing
-// holds clock64 stamps (block 0):
-//   [0..1] GEMM start/end;  [2..7] epilogue start / after {load+rms, reduce,
-//   activation, sinkhorn, collapse}.  Deltas / SM clock (MHz) -> microseconds.
+// holds clock64 stamps (block 0). Layout (see hc_fused_kernel_tc.cuh):
+//   [0]gemm start [1]gemm end | [2]epi start [3]reduce+rms [4]act
+//   [5]sinkhorn end | [6]collapse start [7]collapse end (warp 1).
+//   stages: gemm=[1]-[0] reduce=[3]-[2] sinkhorn=[5]-[4] collapse=[7]-[6].
 static std::vector<torch::Tensor> hc_fused_forward_profiled(
     torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
     torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,

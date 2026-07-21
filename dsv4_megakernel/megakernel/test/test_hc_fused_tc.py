@@ -175,21 +175,24 @@ BENCH_ITERS = 200
 def benchmark(module, positions):
     torch.manual_seed(42)
     _, weight, base, scale = make_inputs(1)
-    device_name = torch.cuda.get_device_name()
-    # cuBLAS baseline = bf16 F.linear: a stable "fastest vendor GEMM floor". cuBLAS's
-    # fp32/tf32 path is pathological for N=24 (non-monotonic, 45us+), so bf16 is the only
-    # meaningful vendor reference here. (Our kernel is tf32 -- higher precision than this.)
-    wb = weight.to(torch.bfloat16)
-    print(f"\nBenchmark: {device_name}")
-    print("Full MHC op total latency: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
-    print("  (cuBLAS_bf16 = F.linear bf16 matmul-only floor; our GEMM is tf32, higher precision)")
-    print(
-        f"{'M':>6} {'MT':>4} {'NT':>4} {'splitK':>7} {'Ktile/s':>8} {'grid':>6} "
-        f"{'mhc us':>11} {'cuBLAS_bf16':>12}"
-    )
-    print("-" * 74)
-
     dev = "cuda"
+    # cuBLAS baseline = bf16 F.linear: a stable "fastest vendor GEMM floor" (its fp32/tf32
+    # path is pathological for N=24). Our kernel is tf32 -- higher precision than this.
+    wb = weight.to(torch.bfloat16)
+    # Config is constant across all M (single tuned config) -> print once in the header.
+    cfg0 = module.hc_fused_tc_config(positions[0])
+    print(f"\nBenchmark: {torch.cuda.get_device_name()}")
+    print("Full MHC op: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
+    print(f"config (all M): M_TILE={cfg0[7]}  N_TILE={cfg0[0]}  splitK={cfg0[1]}  "
+          f"K_tiles/split={cfg0[2]}")
+    print("  mhc/cuBLAS = wall time (us). gemm/reduce/sinkhorn/collapse = clock64 stage")
+    print("  medians (exclude launch/gap); sinkhorn ‖ collapse run concurrently.")
+    print(
+        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'cuBLAS':>9} "
+        f"{'gemm':>8} {'reduce':>8} {'sinkhrn':>8} {'collapse':>9}"
+    )
+    print("-" * 76)
+
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
         x = hidden.reshape(m, K_DIM)
@@ -206,16 +209,15 @@ def benchmark(module, positions):
                 collapsed, pre, post, comb),
             BENCH_WARMUP, BENCH_ITERS,
         )
-        # cuBLAS bf16 floor (x is bf16, wb is the bf16-cast weight).
         cublas_us = time_cuda_us(lambda: F.linear(x, wb), BENCH_WARMUP, BENCH_ITERS)
+        gemm, reduce, sinkhorn, collapse = profile_stages(
+            module, hidden, weight, base, scale)
         print(
-            f"{m:6d} {cfg[7]:4d} {cfg[0]:4d} {cfg[1]:7d} {cfg[2]:8d} {cfg[3]:6d} "
-            f"{mhc_us:11.3f} {cublas_us:12.3f}"
+            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {cublas_us:9.3f} "
+            f"{gemm:8.3f} {reduce:8.3f} {sinkhorn:8.3f} {collapse:9.3f}"
         )
         del hidden, x, collapsed, pre, post, comb
-    print("-" * 74)
-    print("config columns: MT, NT, splitK, K tiles per split, physical CTA grid")
-    print("mhc = full fused op (hc_fused_forward_out, preallocated outputs)")
+    print("-" * 76)
 
 
 def gpu_clock_mhz():
@@ -229,58 +231,30 @@ def gpu_clock_mhz():
     return 2100.0
 
 
-def stage_breakdown(module, m=128, repeats=50):
-    """Per-stage timing via in-kernel clock64 stamps (wq_b_fp8_gemm.cu style).
-    timing[8] on block 0:
-      [0..1] GEMM (tcgen05 split-K)
-      [2..7] epilogue: start / after {load+rms, reduce, activation, sinkhorn, collapse}
-    GEMM stamps and epilogue stamps live on different SMs, so only intra-kernel
-    deltas are meaningful (the SM clock rate is shared, so us are comparable).
+def profile_stages(module, hidden, weight, base, scale, repeats=30):
+    """Median per-stage us from in-kernel clock64 stamps (prof buffer, block 0).
+    Layout: [0]gemm start [1]gemm end | [2]epi start [3]reduce+rms [4]act |
+            [5]sinkhorn end (warp0) | [6]collapse start [7]collapse end (warp1).
+    Sinkhorn (warp0) ‖ collapse (warp1) run concurrently, so collapse is timed on its
+    own warp -> [7]-[6] is the real collapse duration, not just the overhang.
+    Returns (gemm, reduce, sinkhorn, collapse) in microseconds.
     """
-    torch.manual_seed(9000 + m)
-    hidden, weight, base, scale = make_inputs(m)
-    for _ in range(BENCH_WARMUP):
-        module.hc_fused_forward_full(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
+    for _ in range(5):
+        module.hc_fused_forward_profiled(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
     torch.cuda.synchronize()
-
-    # median over a few profiled calls (clock64 has run-to-run jitter).
     samples = []
     for _ in range(repeats):
         res = module.hc_fused_forward_profiled(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
-        )
+            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
         torch.cuda.synchronize()
         samples.append([int(v) for v in res[-1].cpu().tolist()])
-
     clk = gpu_clock_mhz()
 
-    def med_us(a, b):
+    def med(a, b):
         vals = sorted((s[b] - s[a]) / clk for s in samples)
         return vals[len(vals) // 2]
 
-    stages = [
-        ("GEMM  (tcgen05 split-K)", med_us(0, 1)),
-        ("epi: load + RMSNorm sq", med_us(2, 3)),
-        ("epi: split-K reduce", med_us(3, 4)),
-        ("epi: activation", med_us(4, 5)),
-        ("epi: sinkhorn (20 iter)", med_us(5, 6)),
-        ("epi: collapse", med_us(6, 7)),
-    ]
-    epi_total = med_us(2, 7)
-    gemm_us = stages[0][1]
-
-    print(f"\nStage breakdown (M={m}, clock64 on block 0, SM clock={clk:.0f} MHz, "
-          f"median of {repeats})")
-    print(f"{'stage':<28} {'us':>9} {'% of GEMM+epi':>15}")
-    print("-" * 55)
-    denom = gemm_us + epi_total
-    for name, us in stages:
-        pct = 100.0 * us / denom if denom > 0 else 0.0
-        print(f"{name:<28} {us:9.3f} {pct:15.1f}")
-    print("-" * 55)
-    print(f"{'GEMM total':<28} {gemm_us:9.3f}")
-    print(f"{'epilogue total':<28} {epi_total:9.3f}")
-    print(f"{'GEMM + epilogue':<28} {denom:9.3f}   (clock64 compute, excludes launch/gap)")
+    return med(0, 1), med(2, 3), med(4, 5), med(6, 7)  # gemm, reduce, sinkhorn, collapse
 
 
 def parse_positions(value):
@@ -319,7 +293,6 @@ def main():
             return 1
     if args.benchmark:
         benchmark(module, PROFILE_M)
-        stage_breakdown(module, m=128)
     return 0
 
 

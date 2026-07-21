@@ -57,10 +57,12 @@ static constexpr int EPILOGUE_THREADS = 256;
 static constexpr int kNumReduceThreads = 128;
 static constexpr int kReduceWarpBase = 4;   // first warp of the cast group
 
-// clock64 profiling buffer layout (int64), filled on block 0 only:
-//   [0]=gemm start   [1]=gemm end                       (GEMM kernel)
-//   [2]=epi start    [3]=after load+rms  [4]=after reduce
-//   [5]=after act    [6]=after sinkhorn   [7]=after collapse  (epilogue)
+// clock64 profiling buffer layout (int64), filled on block 0 only. Sinkhorn (warp0)
+// and collapse (warp1..7) run concurrently, so collapse is timed on its own warp:
+//   [0]=gemm start   [1]=gemm end                                  (GEMM kernel)
+//   [2]=epi start    [3]=reduce+rms done   [4]=activation done     (epilogue, tid 0)
+//   [5]=sinkhorn end (tid 0)   [6]=collapse start / [7]=collapse end (tid 32, warp 1)
+// stages: gemm=[1]-[0]  reduce=[3]-[2]  act=[4]-[3]  sinkhorn=[5]-[4]  collapse=[7]-[6]
 static constexpr int PROF_SLOTS = 8;
 
 static_assert(K_DIM % BLOCK_K == 0, "K must be tiled exactly");
