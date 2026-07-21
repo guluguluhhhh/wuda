@@ -511,11 +511,11 @@ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
 
-inline int choose_n_tile(int m) {
-    // M<=128: N_TILE=8 -> N_OUT=24 tiles into 3 (zero padding); with num_m_tiles<=2 the
-    // 3 n-tiles give the grid enough blocks. M in (128,256]: N_TILE=32 (one n-tile) --
-    // NT=8 gets slow at M=160..224 (grid balloons, 2 blocks/SM by TMEM -> multi-wave).
-    if (m <= 128) return 8;
+inline int choose_n_tile(int) {
+    // Fixed N_TILE=32 (one n-tile) across the whole decode range. NT=8 tiles N_OUT=24
+    // into 3 n-tiles with zero padding, BUT each n-tile re-reads the same X slice -> 3x
+    // redundant X reads; measured ~2.5us slower than NT=32 even at M<=128. The 24->32
+    // pad in NT=32 is cheaper than the 3x X re-read.
     return 32;
 }
 
@@ -548,10 +548,9 @@ inline SplitConfig make_split_config(int m) {
     const int num_n_tiles = ceil_div(N_OUT, n_tile);
     const int mn_tiles = num_m_tiles * num_n_tiles;
 
-    // Two fixed configs, tuned for the decode range M<=256 (M>256 is out of scope):
-    //   M<=128 : NT=8,  splitK=18  (3 n-tiles carry grid parallelism when M is tiny)
-    //   M<=256 : NT=32, splitK=35  (1 n-tile; more splits was slower -- bigger reduce)
-    const int target_splits = (m <= 128) ? 18 : 35;
+    // Single config across the decode range M<=256 (M>256 out of scope): NT=32, splitK=35.
+    // (NT=8/splitK=18 for M<=128 measured ~2.5us slower -- see choose_n_tile.)
+    const int target_splits = 35;
     const int k_tiles_per_split = ceil_div(NUM_K_TILES, target_splits);
     const int num_splits = ceil_div(NUM_K_TILES, k_tiles_per_split);
     return {m_tile, n_tile, num_m_tiles, num_n_tiles, num_splits,
@@ -679,19 +678,11 @@ inline void launch_gemm_dispatch(
     const CUtensorMap& desc_x, const CUtensorMap& desc_w,
     const SplitConfig& cfg, int m, float* workspace, float* sqr_sum, int64_t* prof,
     cudaStream_t stream) {
-    // Only two configs (M_TILE fixed at 64; the cast group's 4-sub-warp x 16-row layout
-    // is 64-specific): NT=8/STAGES=4 for M<=128, NT=32/STAGES=4 for M in (128,256].
-    TORCH_CHECK(cfg.m_tile == 64, "M tile must be 64");
-    switch (cfg.n_tile) {
-        case 8:
-            launch_gemm<64, 8, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-            break;
-        case 32:
-            launch_gemm<64, 32, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
-            break;
-        default:
-            TORCH_CHECK(false, "unsupported N tile: ", cfg.n_tile);
-    }
+    // Single config across the decode range M<=256: M_TILE=64 (the cast group's
+    // 4-sub-warp x 16-row layout is 64-specific), N_TILE=32, STAGES=4.
+    TORCH_CHECK(cfg.m_tile == 64 && cfg.n_tile == 32,
+                "expected M tile 64 / N tile 32, got ", cfg.m_tile, "/", cfg.n_tile);
+    launch_gemm<64, 32, 4>(desc_x, desc_w, cfg, m, workspace, sqr_sum, prof, stream);
 }
 
 }  // namespace hc_tc
