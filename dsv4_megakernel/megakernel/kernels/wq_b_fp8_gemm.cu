@@ -4,11 +4,12 @@
 // Aligned with DeepGEMM sm100_fp8_gemm_1d1d / megakernel w1_merged_fp8_gemm.
 //
 // x_fp8[M,1536] @ w_fp8[65536,1536]^T -> y[M,65536] (FP32)
-// M=32~256 (32-aligned), K=1536, N=65536, e4m3 inputs + per-32K UE8M0 scale.
-// M<=128: swap-AB BM128xBN128. M>=160: non-swap BM128xBN224, cluster along M.
-// UMMA_K=32, gran_k=32.
+// M=32~256 (32-aligned), K=1536, N=65536, e4m3 inputs + native DSV4
+// activation-1x128 / weight-128x128 UE8M0 scales.
+// M<=128: swap-AB BM128xBN128. M>=160: non-swap BM128xBN128, cluster along M.
+// UMMA_K=32; each native K128 scale is replicated across four hardware SF IDs.
 // 2SM MMA (cta_group::2), block_scale, Persistent, Warp-Specialized.
-// SF pipeline: TMA -> smem -> warp2 transpose -> UTCCP -> TMEM (block_scale MMA).
+// SF pipeline: native global SF -> warp2 broadcast/layout -> UTCCP -> TMEM.
 // MMA (UTCCP + block_scale) delegated to cluster_mma_fp8.cuh.
 // ============================================================
 
@@ -37,13 +38,13 @@ struct SharedStorage {
     alignas(1024) uint8_t smem_cd[SMEM_CD_TOTAL];
     alignas(1024) uint8_t smem_a[NS * SA];                    // activation e4m3
     alignas(1024) uint8_t smem_b[NS * SMEM_B_PER_STAGE];      // weight     e4m3
-    alignas(128)  uint8_t smem_sfa[NS * SSFA];                // activation SF (uint32 packed)
-    alignas(128)  uint8_t smem_sfb[NS * SMEM_SFB_PER_STAGE];  // weight     SF
+    alignas(128)  uint8_t smem_sfa[NS * SSFA];                // expanded K32 activation SF
+    alignas(128)  uint8_t smem_sfb[NS * SMEM_SFB_PER_STAGE];  // expanded K32 weight SF
 
     // Barriers
-    alignas(16) Barrier full_barriers[NS];            // A/B/SF TMA done (per-CTA, init 1)
+    alignas(16) Barrier full_barriers[NS];            // A/B TMA done (per-CTA, init 1)
     alignas(16) Barrier empty_barriers[NS];           // stage smem reusable
-    alignas(16) Barrier with_sf_full_barriers[NS];    // SF transposed in smem, ready for UTCCP
+    alignas(16) Barrier with_sf_full_barriers[NS];    // expanded SF ready for UTCCP
     alignas(16) Barrier tmem_full_barriers[NUM_EPI_STAGES];
     alignas(16) Barrier tmem_empty_barriers[NUM_EPI_STAGES];
 
@@ -57,9 +58,10 @@ __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,    // activation [M,K] e4m3, K-major
     const __grid_constant__ CUtensorMap desc_B,    // weight     [N,K] e4m3, K-major
-    const __grid_constant__ CUtensorMap desc_SFA,  // x_sf  [sf_k, sfa_mn] int32 (MN-major)
-    const __grid_constant__ CUtensorMap desc_SFB,  // w_sf  [sf_k, sfb_mn] int32 (MN-major)
+    const uint8_t* __restrict__ x_sf,               // [M,K/128] UE8M0
+    const uint8_t* __restrict__ w_sf,               // [N/128,K/128] UE8M0
     const __grid_constant__ CUtensorMap desc_D,    // output [M,N] FP32 row-major
+    int problem_m,
     int num_blocks,
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
@@ -94,14 +96,12 @@ wq_b_proj_kernel(
     if (warp_id == 0) {
         cute::prefetch_tma_descriptor(&desc_A);
         cute::prefetch_tma_descriptor(&desc_B);
-        cute::prefetch_tma_descriptor(&desc_SFA);
-        cute::prefetch_tma_descriptor(&desc_SFB);
         cute::prefetch_tma_descriptor(&desc_D);
     }
 
     if (warp_id == 1 && ptx::elect_one_sync()) {
         for (int i = 0; i < NS; ++i) {
-            s.full_barriers[i].init(1);                        // per-CTA A/B/SF TMA
+            s.full_barriers[i].init(1);                        // per-CTA A/B TMA
             s.empty_barriers[i].init(1);
             s.with_sf_full_barriers[i].init(NUM_MULTICAST * 32); // both CTAs' warp2 (32 lanes each)
         }
@@ -136,11 +136,9 @@ wq_b_proj_kernel(
 
         for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
             int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N; // weight N (per CTA)
-            int sfb_n  = n_base;                                             // weight SF (per CTA)
-            // Inner loop over M subtiles: weight/SFB (n_base) reused -> HBM once, L2 after.
+            // Inner loop over M subtiles: weight (n_base) is reused from L2.
             for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
                 int m_base = m_sub * BM_T + cta_rank * LOAD_BLOCK_M_T;  // this subtile's activation half
-                int sfa_m  = m_sub * BM_T;                             // this subtile's SFA base
 
                 // [PROFILE] Load (producer) window for this iteration's K-loop.
                 long long prof_ld_t0 = 0;
@@ -156,13 +154,7 @@ wq_b_proj_kernel(
                     tma::copy_2d_fp8(&desc_A, &s.full_barriers[stage], sa, k_off, m_base);
                     tma::copy_2d_fp8(&desc_B, &s.full_barriers[stage], sb, k_off, n_base);
 
-                    auto* sfa = reinterpret_cast<uint32_t*>(s.smem_sfa + stage * SSFA);
-                    auto* sfb = reinterpret_cast<uint32_t*>(s.smem_sfb + stage * SMEM_SFB_PER_STAGE);
-                    tma::copy_2d_sf(&desc_SFA, &s.full_barriers[stage], sfa, sfa_m, (uint32_t)k);
-                    tma::copy_2d_sf(&desc_SFB, &s.full_barriers[stage], sfb, sfb_n, (uint32_t)k);
-
-                    constexpr uint32_t kNumArrivalBytes =
-                        SA + SMEM_B_PER_STAGE + BM * sizeof(uint32_t) + SF_BLOCK_N * sizeof(uint32_t);
+                    constexpr uint32_t kNumArrivalBytes = SA + SMEM_B_PER_STAGE;
                     s.full_barriers[stage].arrive_and_expect_tx(kNumArrivalBytes);
                     advance();
                 }
@@ -176,31 +168,42 @@ wq_b_proj_kernel(
         }
     }
 
-    // ======== WARP 2: SF TRANSPOSER (both CTAs) ========
+    // ======== WARP 2: NATIVE K128 SF EXPANDER (both CTAs) ========
     else if (warp_id == 2) {
-        auto warp_transpose = [&](uint32_t* smem_ptr) {
-            // read [4 x 32], write transposed [32 x 4] (DeepGEMM utccp_required_smem_warp_transpose)
-            uint32_t v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] = ptx::ld_shared_u32(smem_ptr + i * 32 + lane_id);
-            __syncwarp();
-            ptx::st_shared_v4_u32(smem_ptr + lane_id * 4, v[0], v[1], v[2], v[3]);
-        };
+        auto pack_k128_sf = [](uint32_t e) { return e * 0x01010101u; };
         uint32_t stage = 0, phase = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
 
         for (int tile_id = cluster_id; tile_id < num_tiles_total; tile_id += num_clusters) {
+          const int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N;
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
+            const int sfa_m = m_sub * BM_T;
             for (int k = 0; k < NUM_K_TILES; ++k) {
+                // Prefetch native scales while operand TMA is in flight. Each activation
+                // row has one K128 scale; one aligned N128 weight block has one scale.
+                uint32_t va[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int row = sfa_m + i * 32 + lane_id;
+                    const uint32_t e = row < problem_m
+                        ? static_cast<uint32_t>(x_sf[row * NUM_K_TILES + k])
+                        : UE8M0_ONE;
+                    va[i] = pack_k128_sf(e);
+                }
+                uint32_t eb = UE8M0_ONE;
+                if (lane_id == 0)
+                    eb = static_cast<uint32_t>(
+                        w_sf[(n_base / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k]);
+                eb = __shfl_sync(0xffffffffu, eb, 0);
+                const uint32_t vb = pack_k128_sf(eb);
+
                 s.full_barriers[stage].wait(phase);
                 auto* sfa = reinterpret_cast<uint32_t*>(s.smem_sfa + stage * SSFA);
                 auto* sfb = reinterpret_cast<uint32_t*>(s.smem_sfb + stage * SMEM_SFB_PER_STAGE);
-                #pragma unroll
-                for (int i = 0; i < Dims::SF_BLOCK_M / NUM_UTCCP_ALIGNED; ++i)
-                    warp_transpose(sfa + i * NUM_UTCCP_ALIGNED);
-                #pragma unroll
-                for (int i = 0; i < SF_BLOCK_N / NUM_UTCCP_ALIGNED; ++i)
-                    warp_transpose(sfb + i * NUM_UTCCP_ALIGNED);
+                // Directly produce UTCCP's [32 lanes][4 row groups] layout. Replicating
+                // the byte makes sf_id 0..3 share the official K128 scale.
+                ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
+                ptx::st_shared_v4_u32(sfb + lane_id * 4, vb, vb, vb, vb);
                 cutlass::arch::fence_view_async_shared();
                 s.with_sf_full_barriers[stage].arrive(0u);   // all 32 lanes arrive (x2 CTAs)
                 advance();
@@ -363,27 +366,26 @@ wq_b_proj_kernel(
 }
 
 // ======================== Non-swap specialization (M >= 160) ========================
-// DeepGEMM's heuristic selects BM=128, BN=224 and a cluster along M for this
-// problem. Consecutive CTA ranks own consecutive 128-row M blocks and share one
-// 224-column N block through the 2SM MMA.
+// Consecutive CTA ranks own consecutive 128-row M blocks and share one aligned
+// 128-column N block through the 2SM MMA.
 namespace nonswap {
 
 static constexpr int BLOCK_M_NS        = 128;
-static constexpr int BLOCK_N_NS        = 224;
+static constexpr int BLOCK_N_NS        = 128;
 static constexpr int LOAD_BLOCK_M_NS   = 128;
-static constexpr int LOAD_BLOCK_N_NS   = BLOCK_N_NS / NUM_MULTICAST;  // 112
+static constexpr int LOAD_BLOCK_N_NS   = BLOCK_N_NS / NUM_MULTICAST;  // 64
 static constexpr int SF_BLOCK_M_NS     = 128;
-static constexpr int SF_BLOCK_N_NS     = 256;  // UTCCP alignment of BLOCK_N_NS
-static constexpr int NUM_STAGES_NS     = 6;
+static constexpr int SF_BLOCK_N_NS     = 128;
+static constexpr int NUM_STAGES_NS     = 7;
 static constexpr int UMMA_N_NS         = BLOCK_N_NS;
 static constexpr int NUM_TMEM_COLS_NS  = 512;
-static constexpr int TMEM_SFA_NS       = UMMA_N_NS * NUM_EPI_STAGES;  // 448
-static constexpr int TMEM_SFB_NS       = TMEM_SFA_NS + SF_BLOCK_M_NS / 32; // 452
+static constexpr int TMEM_SFA_NS       = UMMA_N_NS * NUM_EPI_STAGES;  // 256
+static constexpr int TMEM_SFB_NS       = TMEM_SFA_NS + SF_BLOCK_M_NS / 32; // 260
 
 static constexpr int SMEM_A_PER_STAGE_NS   = LOAD_BLOCK_M_NS * BLOCK_K; // 16384
-static constexpr int SMEM_B_PER_STAGE_NS   = LOAD_BLOCK_N_NS * BLOCK_K; // 14336
+static constexpr int SMEM_B_PER_STAGE_NS   = LOAD_BLOCK_N_NS * BLOCK_K; // 8192
 static constexpr int SMEM_SFA_PER_STAGE_NS = SF_BLOCK_M_NS * sizeof(uint32_t); // 512
-static constexpr int SMEM_SFB_PER_STAGE_NS = SF_BLOCK_N_NS * sizeof(uint32_t); // 1024
+static constexpr int SMEM_SFB_PER_STAGE_NS = SF_BLOCK_N_NS * sizeof(uint32_t); // 512
 
 static constexpr int STORE_BLOCK_M_NS       = BLOCK_M_NS;
 static constexpr int STORE_BLOCK_N_NS       = SWIZZLE_CD / sizeof(float); // 32
@@ -391,8 +393,10 @@ static constexpr int SMEM_CD_PER_STAGE_NS   = STORE_BLOCK_M_NS * STORE_BLOCK_N_N
 static constexpr int SMEM_CD_TOTAL_NS       = SMEM_CD_PER_STAGE_NS * NUM_TMA_STORE_STAGES; // 32768
 
 static constexpr int NUM_M_BLOCKS_NS = 2; // M=160..256 => ceil(M/128)=2
-static constexpr int NUM_N_BLOCKS_NS = (N_TOTAL + BLOCK_N_NS - 1) / BLOCK_N_NS; // 293
-static constexpr int NUM_TASKS_NS    = NUM_M_BLOCKS_NS * NUM_N_BLOCKS_NS;       // 586 CTAs
+static constexpr int NUM_N_BLOCKS_NS = (N_TOTAL + BLOCK_N_NS - 1) / BLOCK_N_NS; // 512
+static constexpr int NUM_TASKS_NS    = NUM_M_BLOCKS_NS * NUM_N_BLOCKS_NS;       // 1024 CTAs
+static_assert(BLOCK_N_NS == WEIGHT_QUANT_BLOCK_N,
+              "non-swap N tile must match the native weight-scale block");
 static_assert(NUM_TASKS_NS % CLUSTER_SIZE == 0, "non-swap task tail must contain full clusters");
 
 struct SharedStorage {
@@ -432,9 +436,10 @@ __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,
     const __grid_constant__ CUtensorMap desc_B,
-    const __grid_constant__ CUtensorMap desc_SFA,
-    const __grid_constant__ CUtensorMap desc_SFB,
+    const uint8_t* __restrict__ x_sf,
+    const uint8_t* __restrict__ w_sf,
     const __grid_constant__ CUtensorMap desc_D,
+    int problem_m,
     int physical_grid,
     int64_t* prof) {
     using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<
@@ -458,8 +463,6 @@ wq_b_proj_kernel(
     if (warp_id == 0) {
         cute::prefetch_tma_descriptor(&desc_A);
         cute::prefetch_tma_descriptor(&desc_B);
-        cute::prefetch_tma_descriptor(&desc_SFA);
-        cute::prefetch_tma_descriptor(&desc_SFB);
         cute::prefetch_tma_descriptor(&desc_D);
     }
 
@@ -498,8 +501,6 @@ wq_b_proj_kernel(
         while (get_task(persistent_iter, physical_grid, m_block_idx, n_block_idx)) {
             const int m_base = m_block_idx * BLOCK_M_NS;
             const int n_base = n_block_idx * BLOCK_N_NS + cta_rank * LOAD_BLOCK_N_NS;
-            const int sfa_m  = m_block_idx * BLOCK_M_NS;
-            const int sfb_n  = n_block_idx * BLOCK_N_NS;
 
             long long prof_t0 = 0;
             if (kProfile && blockIdx.x == 0)
@@ -517,16 +518,8 @@ wq_b_proj_kernel(
                 tma::copy_2d_fp8(&desc_A, &s.full_barriers[stage], sa, k_off, m_base);
                 tma::copy_2d_fp8(&desc_B, &s.full_barriers[stage], sb, k_off, n_base);
 
-                auto* sfa = reinterpret_cast<uint32_t*>(
-                    s.smem_sfa + stage * SMEM_SFA_PER_STAGE_NS);
-                auto* sfb = reinterpret_cast<uint32_t*>(
-                    s.smem_sfb + stage * SMEM_SFB_PER_STAGE_NS);
-                tma::copy_2d_sf(&desc_SFA, &s.full_barriers[stage], sfa, sfa_m, k);
-                tma::copy_2d_sf(&desc_SFB, &s.full_barriers[stage], sfb, sfb_n, k);
-
                 constexpr uint32_t kArrivalBytes =
-                    SMEM_A_PER_STAGE_NS + SMEM_B_PER_STAGE_NS +
-                    BLOCK_M_NS * sizeof(uint32_t) + BLOCK_N_NS * sizeof(uint32_t);
+                    SMEM_A_PER_STAGE_NS + SMEM_B_PER_STAGE_NS;
                 s.full_barriers[stage].arrive_and_expect_tx(kArrivalBytes);
                 advance();
             }
@@ -538,14 +531,7 @@ wq_b_proj_kernel(
             ++persistent_iter;
         }
     } else if (warp_id == 2) {
-        auto warp_transpose = [&](uint32_t* smem_ptr) {
-            uint32_t v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-                v[i] = ptx::ld_shared_u32(smem_ptr + i * 32 + lane_id);
-            __syncwarp();
-            ptx::st_shared_v4_u32(smem_ptr + lane_id * 4, v[0], v[1], v[2], v[3]);
-        };
+        auto pack_k128_sf = [](uint32_t e) { return e * 0x01010101u; };
 
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         auto advance = [&]() {
@@ -555,19 +541,37 @@ wq_b_proj_kernel(
 
         uint32_t m_block_idx, n_block_idx;
         while (get_task(persistent_iter, physical_grid, m_block_idx, n_block_idx)) {
+            const int m_base = m_block_idx * BLOCK_M_NS;
+            const int n_base = n_block_idx * BLOCK_N_NS;
             #pragma unroll 4
             for (int k = 0; k < NUM_K_TILES; ++k) {
+                // Activation SF is per row/K128. The N128 tile exactly matches one
+                // native weight-scale block.
+                uint32_t va[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int row = m_base + i * 32 + lane_id;
+                    const uint32_t e = row < problem_m
+                        ? static_cast<uint32_t>(x_sf[row * NUM_K_TILES + k])
+                        : UE8M0_ONE;
+                    va[i] = pack_k128_sf(e);
+                }
+
+                uint32_t eb = UE8M0_ONE;
+                if (lane_id == 0)
+                    eb = static_cast<uint32_t>(
+                        w_sf[(n_base / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k]);
+                eb = __shfl_sync(0xffffffffu, eb, 0);
+                const uint32_t vb = pack_k128_sf(eb);
+
                 s.full_barriers[stage].wait(phase);
 
                 auto* sfa = reinterpret_cast<uint32_t*>(
                     s.smem_sfa + stage * SMEM_SFA_PER_STAGE_NS);
                 auto* sfb = reinterpret_cast<uint32_t*>(
                     s.smem_sfb + stage * SMEM_SFB_PER_STAGE_NS);
-                warp_transpose(sfa);
-                cutlass::arch::fence_view_async_shared();
-                #pragma unroll
-                for (int i = 0; i < SF_BLOCK_N_NS / NUM_UTCCP_ALIGNED; ++i)
-                    warp_transpose(sfb + i * NUM_UTCCP_ALIGNED);
+                ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
+                ptx::st_shared_v4_u32(sfb + lane_id * 4, vb, vb, vb, vb);
                 cutlass::arch::fence_view_async_shared();
 
                 s.with_sf_full_barriers[stage].arrive(0u);
@@ -701,21 +705,6 @@ static CUtensorMap make_tma_desc_fp8_2d(
     return desc;
 }
 
-// SF descriptor: [sf_k, mn] int32, MN-major, no swizzle. box = (box_mn, 1) at coords (mn, k).
-static CUtensorMap make_tma_desc_sf_2d(const uint32_t* ptr, int mn, int sf_k, int box_mn)
-{
-    CUtensorMap desc{};
-    uint64_t globalDim[2]    = {(uint64_t)mn, (uint64_t)sf_k};
-    uint64_t globalStride[1] = {(uint64_t)mn * sizeof(uint32_t)};
-    uint32_t boxDim[2]       = {(uint32_t)box_mn, 1u};
-    uint32_t elemStride[2]   = {1, 1};
-    cuTensorMapEncodeTiled(&desc, CU_TENSOR_MAP_DATA_TYPE_INT32,
-        2, (void*)ptr, globalDim, globalStride, boxDim, elemStride,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    return desc;
-}
-
 static CUtensorMap make_tma_desc_fp32_2d(
     const float* ptr, int rows, int cols, int box_rows, int box_cols)
 {
@@ -733,7 +722,7 @@ static CUtensorMap make_tma_desc_fp32_2d(
 
 // ======================== Kernel / SMEM selectors ========================
 // M<=128 keeps the established swap-AB path. M>=160 uses the DeepGEMM-selected
-// non-swap BM=128, BN=224 specialization.
+// non-swap BM=128, BN=128 specialization.
 template <bool kProfile>
 static void* get_kernel_ptr(int M) {
     switch (M) {
@@ -762,9 +751,9 @@ static int get_smem_bytes(int M) {
     }
 }
 
-// FP8 block-scale run. Inputs are pre-quantized:
-//   x_fp8 [M,K] e4m3 ; x_sf [sf_k, sfa_mn] int32 (4 UE8M0/uint32, MN-major)
-//   w_fp8 [N,K] e4m3 ; w_sf [sf_k, sfb_mn] int32
+// FP8 block-scale run. Inputs use the native DSV4 checkpoint/runtime layout:
+//   x_fp8 [M,K] e4m3 ; x_sf [M,K/128] UE8M0 (activation 1x128)
+//   w_fp8 [N,K] e4m3 ; w_sf [N/128,K/128] UE8M0 (weight 128x128)
 // Output FP32 [M,N]. (profile: also returns clock64 timing[max_iters,7].)
 static std::vector<torch::Tensor> run_wq_b(
     torch::Tensor x_fp8, torch::Tensor x_sf,
@@ -774,10 +763,16 @@ static std::vector<torch::Tensor> run_wq_b(
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
     TORCH_CHECK(w_fp8.is_cuda() && w_fp8.is_contiguous() &&
                 w_fp8.scalar_type() == torch::kFloat8_e4m3fn, "w_fp8 must be CUDA e4m3");
-    TORCH_CHECK(x_sf.is_cuda() && x_sf.scalar_type() == torch::kInt32, "x_sf must be CUDA int32");
-    TORCH_CHECK(w_sf.is_cuda() && w_sf.scalar_type() == torch::kInt32, "w_sf must be CUDA int32");
+    const auto valid_sf_dtype = [](const torch::Tensor& t) {
+        return t.scalar_type() == torch::kFloat8_e8m0fnu ||
+               t.scalar_type() == torch::kUInt8;
+    };
+    TORCH_CHECK(x_sf.is_cuda() && x_sf.is_contiguous() && valid_sf_dtype(x_sf),
+                "x_sf must be contiguous CUDA UE8M0 (float8_e8m0fnu or raw uint8)");
+    TORCH_CHECK(w_sf.is_cuda() && w_sf.is_contiguous() && valid_sf_dtype(w_sf),
+                "w_sf must be contiguous CUDA UE8M0 (float8_e8m0fnu or raw uint8)");
 
-    const int M = x_fp8.size(0);
+    int M = x_fp8.size(0);
     TORCH_CHECK(x_fp8.size(1) == K_DIM, "x_fp8 must be [M,", K_DIM, "]");
     TORCH_CHECK(w_fp8.size(0) == N_TOTAL && w_fp8.size(1) == K_DIM);
     TORCH_CHECK(M >= 32 && M <= 256 && M % 32 == 0,
@@ -785,35 +780,30 @@ static std::vector<torch::Tensor> run_wq_b(
     const bool use_nonswap = M > 128;
     const int num_m_sub = (M + BM - 1) / BM;  // swap-path profiling only
 
-    // SF shapes: 4 UE8M0/uint32 -> sf_k = K/(gran_k*4) = K/BLOCK_K. mn aligned to 16/4 = 4.
-    const int sf_k   = K_DIM / (GRAN_K * SF_IDS_PER_UINT);        // 12
-    const int sfa_mn = align_up(M, 16 / SF_ELEM_SIZE);           // align M to 4
-    const int sfb_mn = align_up(N_TOTAL, 16 / SF_ELEM_SIZE);     // 65536
-    TORCH_CHECK(x_sf.dim() == 2 && x_sf.size(0) == sf_k && x_sf.size(1) == sfa_mn,
-                "x_sf must be [", sf_k, ",", sfa_mn, "] (MN-major, 4-scale/uint32)");
-    TORCH_CHECK(w_sf.dim() == 2 && w_sf.size(0) == sf_k && w_sf.size(1) == sfb_mn,
-                "w_sf must be [", sf_k, ",", sfb_mn, "]");
+    const int sf_k = K_DIM / QUANT_BLOCK_K;                       // 12
+    const int weight_sf_rows = NUM_WEIGHT_SF_ROWS;
+    TORCH_CHECK(x_sf.dim() == 2 && x_sf.size(0) == M && x_sf.size(1) == sf_k,
+                "x_sf must be [M,K/128]=[", M, ",", sf_k, "]");
+    TORCH_CHECK(w_sf.dim() == 2 && w_sf.size(0) == weight_sf_rows && w_sf.size(1) == sf_k,
+                "w_sf must be [N/128,K/128]=[", weight_sf_rows, ",", sf_k, "]");
 
     auto out = torch::empty({M, N_TOTAL}, x_fp8.options().dtype(torch::kFloat32));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto x_ptr   = reinterpret_cast<const __nv_fp8_e4m3*>(x_fp8.data_ptr());
     auto w_ptr   = reinterpret_cast<const __nv_fp8_e4m3*>(w_fp8.data_ptr());
-    auto xsf_ptr = reinterpret_cast<const uint32_t*>(x_sf.data_ptr());
-    auto wsf_ptr = reinterpret_cast<const uint32_t*>(w_sf.data_ptr());
+    auto xsf_ptr = reinterpret_cast<const uint8_t*>(x_sf.data_ptr());
+    auto wsf_ptr = reinterpret_cast<const uint8_t*>(w_sf.data_ptr());
     auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
 
     // Both paths use K-major 128B-swizzled operands. TMA OOB handling covers the
-    // partial second M block and the final 224-column N block in the non-swap path.
+    // partial second M block in the non-swap path.
     const int load_block_m = use_nonswap ? nonswap::LOAD_BLOCK_M_NS : BM / NUM_MULTICAST;
     const int load_block_n = use_nonswap ? nonswap::LOAD_BLOCK_N_NS : LOAD_BLOCK_N;
-    const int sfb_block_n  = use_nonswap ? nonswap::BLOCK_N_NS : SF_BLOCK_N;
     const int store_block_m = use_nonswap ? nonswap::STORE_BLOCK_M_NS : STORE_BLOCK_M;
     const int store_block_n = use_nonswap ? nonswap::STORE_BLOCK_N_NS : STORE_BLOCK_N_ATOM;
     CUtensorMap desc_A   = make_tma_desc_fp8_2d(x_ptr, M, K_DIM, load_block_m, BLOCK_K);
     CUtensorMap desc_B   = make_tma_desc_fp8_2d(w_ptr, N_TOTAL, K_DIM, load_block_n, BLOCK_K);
-    CUtensorMap desc_SFA = make_tma_desc_sf_2d(xsf_ptr, sfa_mn, sf_k, BM);
-    CUtensorMap desc_SFB = make_tma_desc_sf_2d(wsf_ptr, sfb_mn, sf_k, sfb_block_n);
     CUtensorMap desc_D   = make_tma_desc_fp32_2d(
         out_ptr, M, N_TOTAL, store_block_m, store_block_n);
 
@@ -892,7 +882,10 @@ static std::vector<torch::Tensor> run_wq_b(
         config.attrs = attrs;
         config.numAttrs = 1;
 
-        void* ptr_args[] = { &desc_A, &desc_B, &desc_SFA, &desc_SFB, &desc_D, &grid_size, &prof_dev };
+        void* ptr_args[] = {
+            &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
+            &M, &grid_size, &prof_dev
+        };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
     }

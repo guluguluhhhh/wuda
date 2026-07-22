@@ -7,7 +7,8 @@
 // Swap-path target: M=32~128 (32-aligned), K=1536, N=65536, e4m3 -> FP32 output.
 //   x_fp8[M,1536] @ w_fp8[65536,1536]^T -> y[M,65536] (FP32)
 //   A = weight (MMA A-operand, UMMA_M=256 along N), B = activation (UMMA_N=128 along M).
-//   Both K-major, 128B swizzle. Per-32-K block scale (gran_k=32), scale = UE8M0.
+//   Both K-major, 128B swizzle. Native DSV4 quantization: activation 1x128,
+//   weight 128x128, scale = UE8M0.
 //
 // swap_ab=1, 2SM MMA (cta_group::2), Cluster=(2,1,1) -> cluster_n=2, Persistent,
 // Warp-Specialized. UMMA_N is pinned to 128 (BM=128); M<128 is zero-padded (TMA OOB
@@ -15,9 +16,10 @@
 // MMA is issued by cluster_mma_fp8.cuh; this header carries the config + the SF
 // pipeline plumbing (SMEM/TMA helpers) that feeds it.
 //
-// SF layout (BLOCK_K=128, gran_k=32 -> 4 scale/uint32, DeepGEMM standard):
-//   sf_k = K/(gran_k*4) = 12 ; x_sf/w_sf are [sf_k, aligned_mn] int32, MN-major.
-//   Each pipeline stage loads one uint32/token = the 4 UE8M0 scales of one 128-K tile.
+// Native SF layout:
+//   x_sf[M, K/128] and w_sf[ceil(N/128), K/128], one UE8M0 byte per K128
+//   quantization block. Warp2 expands each byte to four identical K32 scale IDs
+//   because tcgen05.mma.kind::mxf8f6f4 consumes scale factors at K32 granularity.
 // ============================================================
 
 #include <cuda.h>
@@ -42,11 +44,14 @@ static constexpr int K_DIM    = 1536;
 static constexpr int N_TOTAL  = 65536;  // 128 heads x 512 dim
 static constexpr int BLOCK_K  = 128;
 static constexpr int NUM_K_TILES = K_DIM / BLOCK_K; // 12
-static constexpr int GRAN_K   = 32;     // one UE8M0 scale per 32 K
+static constexpr int QUANT_BLOCK_K = 128; // native DSV4 FP8 quantization granularity
+static constexpr int UMMA_SF_GRAN_K = 32; // hardware block-scale consumption granularity
+static constexpr int WEIGHT_QUANT_BLOCK_N = 128;
+static constexpr int NUM_WEIGHT_SF_ROWS =
+    (N_TOTAL + WEIGHT_QUANT_BLOCK_N - 1) / WEIGHT_QUANT_BLOCK_N; // 512
 
 // ---- Element sizes (bytes) ----
 static constexpr int FP8_ELEM_SIZE = 1;   // e4m3
-static constexpr int SF_ELEM_SIZE  = 4;   // packed uint32 (4 UE8M0)
 
 // ---- Cluster / multicast (swap-AB: cluster_n = 2) ----
 static constexpr int CLUSTER_SIZE  = 2;
@@ -79,7 +84,10 @@ static constexpr int SWIZZLE_B  = 128;
 static constexpr int SWIZZLE_CD = 128;
 
 // ---- Scale-factor (block-scale) layout ----
-static constexpr int SF_IDS_PER_UINT   = BLOCK_K / GRAN_K;   // 4
+static constexpr int SF_IDS_PER_QUANT_BLOCK = QUANT_BLOCK_K / UMMA_SF_GRAN_K; // 4
+static constexpr uint32_t UE8M0_ONE = 0x7fu;
+static_assert(BLOCK_K == QUANT_BLOCK_K && SF_IDS_PER_QUANT_BLOCK == 4,
+              "one pipeline stage must expand one K128 scale to four K32 IDs");
 static constexpr int NUM_UTCCP_ALIGNED = 128;
 static constexpr int SF_BLOCK_N        = ((BLOCK_N + NUM_UTCCP_ALIGNED - 1) / NUM_UTCCP_ALIGNED) * NUM_UTCCP_ALIGNED; // 128
 static constexpr int NUM_SFB_TMEM_COLS = SF_BLOCK_N / 32;    // 4
@@ -89,7 +97,7 @@ static constexpr int SMEM_SFB_PER_STAGE = SF_BLOCK_N * (int)sizeof(uint32_t); //
 static constexpr int NUM_EPI_STAGES      = 2;  // TMEM accumulator double buffer
 static constexpr int NUM_TMA_STORE_STAGES = 2;
 
-// ---- Threads: warp0 TMA, warp1 MMA(leader), warp2 SF transpose, warps4-7 epilogue ----
+// ---- Threads: warp0 TMA, warp1 MMA(leader), warp2 SF expand/layout, warps4-7 epilogue ----
 static constexpr int TPB                 = 256;
 static constexpr int NUM_NON_EPI_THREADS = 128;
 static constexpr int NUM_EPI_THREADS     = 128;
@@ -163,7 +171,7 @@ using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
 // ======================== PTX Wrappers ========================
 // Block-scale MMA + descriptors live in cluster_mma_fp8.cuh. Here we keep only the
-// helpers used by the producer / SF transpose / epilogue / init in this kernel.
+// helpers used by the producer / SF layout / epilogue / init in this kernel.
 namespace ptx {
 
 // TMEM alloc/dealloc for 2SM
@@ -209,7 +217,7 @@ __device__ __forceinline__ void tmem_load_fence() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-// Shared memory load/store (used by the SF warp-transpose and the epilogue)
+// Shared memory load/store (used by the SF layout warp and the epilogue)
 __device__ __forceinline__ uint32_t ld_shared_u32(const uint32_t* ptr) {
     uint32_t v;
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
@@ -273,17 +281,6 @@ void copy_2d_fp8(void const* desc_ptr, Barrier* barrier_ptr,
         reinterpret_cast<uint64_t*>(barrier_ptr),
         static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
         smem_ptr, k_idx, mn_idx);
-}
-
-// Plain (per-CTA) TMA 2D load for scale factors (no swizzle). mn inner, k outer.
-__device__ __forceinline__
-void copy_2d_sf(void const* desc_ptr, Barrier* barrier_ptr,
-                uint32_t* smem_ptr, uint32_t mn_idx, uint32_t k_idx) {
-    cute::SM90_TMA_LOAD_2D::copy(
-        desc_ptr,
-        reinterpret_cast<uint64_t*>(barrier_ptr),
-        static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-        smem_ptr, mn_idx, k_idx);
 }
 
 // TMA store 2D (FP32 output)

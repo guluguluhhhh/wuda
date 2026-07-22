@@ -1,13 +1,14 @@
 """
 Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale, fixed BM=128).
-  M<=128: swap-AB BM128 x BN128; M>=160: non-swap BM128 x BN224.
+  M<=128: swap-AB BM128 x BN128; M>=160: non-swap BM128 x BN128.
   x_fp8[M,1536] @ w_fp8[65536,1536].T -> y[M,65536] (FP32)
 Requires: NVIDIA Blackwell (sm_100+), CUDA 12.8+, CUTLASS 3.x.
 
-Scale-factor (SF) physical layout expected by the kernel (DeepGEMM 1D1D, 4-scale/uint32):
-  - dtype int32, one uint32 packs 4 UE8M0 exponents (one per 32-K sub-block).
-  - physical shape [sf_k, mn] with mn contiguous, sf_k = K/128 = 12.
-    x_sf: [12, M] (per token), w_sf: [12, N] (per weight row).
+Native DSV4 scale-factor layout expected by the kernel:
+  - dtype float8_e8m0fnu (raw uint8 is also accepted).
+  - x_sf: [M, K/128] = [M, 12], one scale per token/K128.
+  - w_sf: [N/128, K/128] = [512, 12], one scale per N128xK128 block.
+  - The kernel replicates each K128 scale into four K32 UMMA scale IDs.
   - UE8M0 byte e encodes scale 2^(e-127); e=127 (0x7F) => scale 1.0.
 """
 import os, sys, torch
@@ -16,9 +17,11 @@ import torch.nn.functional as F
 K_DIM   = 1536
 N_TOTAL = 65536          # 128 heads x 512 dim
 BLOCK_K = 128
-GRAN_K  = 32
-SF_K    = K_DIM // BLOCK_K          # 12
-NUM_32K = K_DIM // GRAN_K           # 48 sub-blocks
+QUANT_BLOCK_K = 128
+HW_SF_GRAN_K = 32
+WEIGHT_QUANT_BLOCK_N = 128
+SF_K    = K_DIM // QUANT_BLOCK_K          # 12
+NUM_HW_SF = K_DIM // HW_SF_GRAN_K         # 48 K32 hardware scale slots
 UE8M0_ONE = 0x7F                    # exponent 127 -> 2^0 = 1.0
 
 
@@ -51,10 +54,24 @@ def load_module():
     )
 
 
-def make_sf_ones(mn, device):
-    """SF tensor [SF_K, mn] int32, all UE8M0 = 127 (scale 1.0)."""
-    packed = (UE8M0_ONE | (UE8M0_ONE << 8) | (UE8M0_ONE << 16) | (UE8M0_ONE << 24))
-    return torch.full((SF_K, mn), packed, dtype=torch.int32, device=device)
+def as_ue8m0(exps):
+    """Reinterpret raw UE8M0 exponent bytes without numerical conversion."""
+    assert hasattr(torch, 'float8_e8m0fnu')
+    return exps.contiguous().view(torch.float8_e8m0fnu)
+
+
+def make_act_sf_ones(m, device):
+    """Native activation SF [M,K/128], one UE8M0 byte per 1x128 block."""
+    raw = torch.full((m, SF_K), UE8M0_ONE, dtype=torch.uint8, device=device)
+    return as_ue8m0(raw)
+
+
+def make_weight_sf_ones(device):
+    """Native weight SF [N/128,K/128], one UE8M0 byte per 128x128 block."""
+    raw = torch.full(
+        (N_TOTAL // WEIGHT_QUANT_BLOCK_N, SF_K), UE8M0_ONE,
+        dtype=torch.uint8, device=device)
+    return as_ue8m0(raw)
 
 
 def make_cublaslt_sf_ones(mn, device):
@@ -67,26 +84,24 @@ def make_cublaslt_sf_ones(mn, device):
     if not hasattr(torch, 'float8_e8m0fnu'):
         return None
     aligned_mn = ((mn + 127) // 128) * 128
-    padded_k_blocks = ((NUM_32K + 3) // 4) * 4
+    padded_k_blocks = ((NUM_HW_SF + 3) // 4) * 4
     raw = torch.full(
         (aligned_mn * padded_k_blocks,), UE8M0_ONE,
         dtype=torch.uint8, device=device)
     return raw.view(torch.float8_e8m0fnu)
 
 
-def pack_sf(exps):
-    """Pack per-32-K UE8M0 exponents into DeepGEMM MN-major layout [SF_K, mn] int32.
-    exps: [mn, NUM_32K] uint8; sub-block s = kb*4 + j -> byte j of uint32[kb, mn]."""
-    mn = exps.shape[0]
-    e = exps.view(mn, SF_K, 4).to(torch.int64)
-    packed = e[..., 0] | (e[..., 1] << 8) | (e[..., 2] << 16) | (e[..., 3] << 24)  # [mn, SF_K]
-    return packed.t().contiguous().to(torch.int32)                                  # [SF_K, mn]
+def dequant_act(fp8, exps):
+    """Apply native per-token/K128 activation scales."""
+    scale = torch.pow(2.0, exps.float() - 127.0)
+    return fp8.float() * scale.repeat_interleave(QUANT_BLOCK_K, dim=1)
 
 
-def dequant(fp8, exps):
-    """fp8 [mn,K], exps [mn,NUM_32K] -> float [mn,K] with per-32-K UE8M0 scale."""
-    scale = torch.pow(2.0, exps.float() - 127.0)              # [mn, NUM_32K]
-    return fp8.float() * scale.repeat_interleave(GRAN_K, dim=1)
+def dequant_weight(fp8, exps):
+    """Apply native N128xK128 weight scales."""
+    scale = torch.pow(2.0, exps.float() - 127.0)
+    scale = scale.repeat_interleave(WEIGHT_QUANT_BLOCK_N, dim=0)[:N_TOTAL]
+    return fp8.float() * scale.repeat_interleave(QUANT_BLOCK_K, dim=1)
 
 
 def test_correctness(module, M):
@@ -97,8 +112,8 @@ def test_correctness(module, M):
     dev = 'cuda'
     x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
-    x_sf = make_sf_ones(M, dev)
-    w_sf = make_sf_ones(N_TOTAL, dev)
+    x_sf = make_act_sf_ones(M, dev)
+    w_sf = make_weight_sf_ones(dev)
 
     out = module.wq_b_proj_gemm(x, x_sf, w, w_sf)          # [M, N] FP32
     ref = x.float() @ w.float().t()
@@ -114,21 +129,24 @@ def test_correctness(module, M):
 
 
 def test_correctness_scaled(module, M):
-    """Non-trivial per-32-K scales: exposes SFA/SFB swap, sf_id order, packed layout."""
+    """Non-trivial native scales: exposes K128 replication and N128 weight broadcast."""
     print("\n" + "=" * 60)
-    print(f"Correctness (per-32K scale): wq_b_proj_gemm FP8 (M={M})")
+    print(f"Correctness (native K128 scale): wq_b_proj_gemm FP8 (M={M})")
     print("=" * 60)
     dev = 'cuda'
     torch.manual_seed(M)
     x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
-    # exponents around 127 (scale in [2^-2, 2^2]); distinct per row & sub-block.
-    ea = torch.randint(125, 130, (M, NUM_32K), device=dev, dtype=torch.uint8)
-    eb = torch.randint(125, 130, (N_TOTAL, NUM_32K), device=dev, dtype=torch.uint8)
-    x_sf = pack_sf(ea); w_sf = pack_sf(eb)
+    # Activation: distinct per token/K128. Weight: distinct per N128xK128 block.
+    ea = torch.randint(125, 130, (M, SF_K), device=dev, dtype=torch.uint8)
+    eb = torch.randint(
+        125, 130, (N_TOTAL // WEIGHT_QUANT_BLOCK_N, SF_K),
+        device=dev, dtype=torch.uint8)
+    x_sf = as_ue8m0(ea)
+    w_sf = as_ue8m0(eb)
 
     out = module.wq_b_proj_gemm(x, x_sf, w, w_sf)
-    ref = dequant(x, ea) @ dequant(w, eb).t()
+    ref = dequant_act(x, ea) @ dequant_weight(w, eb).t()
 
     diff = (out.float() - ref).abs()
     cos = F.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
@@ -147,10 +165,10 @@ def benchmark(module):
     print("=" * 60)
     dev = 'cuda'
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
-    w_sf = make_sf_ones(N_TOTAL, dev)
+    w_sf = make_weight_sf_ones(dev)
     w_t = w.t()                                 # [K,N] column-major for _scaled_mm
     weight_bytes = N_TOTAL * K_DIM * 1          # 100.7 MB (fp8)
-    weight_sf_bytes = N_TOTAL * NUM_32K          # one UE8M0 byte per 32 K
+    weight_sf_bytes = (N_TOTAL // WEIGHT_QUANT_BLOCK_N) * SF_K
 
     def timeit(fn, iters=50, batches=6, warmup=30):
         # min-of-batches: robust to DVFS/thermal throttling (the fastest batch ~=
@@ -186,20 +204,20 @@ def benchmark(module):
             return timeit(fn)
         except Exception as err:
             if M == 32:
-                print(f"  (cuBLASLt per-32K block-scale baseline unavailable: {err})")
+                print(f"  (cuBLASLt K32 block-scale baseline unavailable: {err})")
             return None
 
     print(f"  K={K_DIM}, N={N_TOTAL}; weight {weight_bytes/1e6:.1f} MB (e4m3)")
-    print("  Dispatch: M<=128 swap-AB BM128xBN128; M>=160 non-swap BM128xBN224")
+    print("  Dispatch: M<=128 swap-AB BM128xBN128; M>=160 non-swap BM128xBN128")
     print(f"  NOTE: min-of-batches latency (robust to throttling). For stable numbers")
     print(f"        lock clocks: nvidia-smi -lgc <freq>. %cuBLAS = cuBLAS_us/ours_us.")
-    print(f"        Baseline = torch._scaled_mm (cuBLASLt FP8, per-32K UE8M0); out FP32.")
+    print(f"        Baseline = torch._scaled_mm (cuBLASLt K32 SF, K128 scales repeated); out FP32.")
     print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
     print("  " + "-" * 68)
 
     Ms = [32, 64, 96, 128, 160, 192, 224, 256]
     xs = {M: (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn) for M in Ms}
-    sfs = {M: make_sf_ones(M, dev) for M in Ms}
+    sfs = {M: make_act_sf_ones(M, dev) for M in Ms}
     cublas_w_sf = make_cublaslt_sf_ones(N_TOTAL, dev)
     cublas_sfs = {M: make_cublaslt_sf_ones(M, dev) for M in Ms}
 
@@ -213,7 +231,7 @@ def benchmark(module):
         # Logical bytes for the same block-scaled operation. Physical cuBLASLt
         # scale padding is deliberately excluded from this algorithm-level metric.
         obytes = (weight_bytes + weight_sf_bytes + M * K_DIM +
-                  M * NUM_32K + M * N_TOTAL * 4)
+                  M * SF_K + M * N_TOTAL * 4)
         bw = obytes / (us * 1e-6) / 1e9
         tflops = 2 * M * N_TOTAL * K_DIM / (us * 1e-6) / 1e12
         cb_s  = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
@@ -235,7 +253,7 @@ def profile_pipeline(module, M=128, clock_ghz=1.8):
     dev = 'cuda'
     x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
-    x_sf = make_sf_ones(M, dev); w_sf = make_sf_ones(N_TOTAL, dev)
+    x_sf = make_act_sf_ones(M, dev); w_sf = make_weight_sf_ones(dev)
 
     for _ in range(5):
         module.wq_b_proj_gemm_profiled(x, x_sf, w, w_sf)
