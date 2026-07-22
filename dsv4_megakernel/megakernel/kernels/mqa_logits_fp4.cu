@@ -28,6 +28,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <limits>
 
@@ -135,6 +136,8 @@ static int auto_kv_stages(int, int, int) {
 template <typename logits_dtype_t, bool kCompressed, bool kTilePool, int kKVStages>
 static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const int* ks, const int* ke, void* logits,
+                         const float* rms_y, nv_bfloat16* rms_out, int rms_groups, float rms_eps,
+                         unsigned rms_delay_ns, unsigned long long* prof,
                          const CUtensorMap& dQ, const CUtensorMap& dSFQ,
                          const CUtensorMap& dKV, const CUtensorMap& dSFKV,
                          const CUtensorMap& dW, dim3 grid, int smem,
@@ -142,7 +145,7 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
     auto kernel = &deep_gemm::sm100_fp4_mqa_logits<
         NUM_HEADS, HEAD_DIM, kCompressed, kTilePool,
         BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, kKVStages,
-        NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, logits_dtype_t>;
+        NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS, logits_dtype_t>;
 
     static bool configured = false;   // per-instantiation (template static local)
     if (!configured) {
@@ -159,6 +162,7 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
         reinterpret_cast<const uint32_t*>(ks),
         reinterpret_cast<const uint32_t*>(ke),
         reinterpret_cast<logits_dtype_t*>(logits),
+        rms_y, rms_out, (uint32_t)rms_groups, rms_eps, rms_delay_ns, prof,
         dQ, dSFQ, dKV, dSFKV, dW);
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "mqa_logits_fp4 launch failed: ", cudaGetErrorString(err));
@@ -174,7 +178,10 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             torch::Tensor kv, torch::Tensor sf_kv, torch::Tensor weights,
                             const int* ks, const int* ke, int seq_len, int seq_len_kv,
                             at::ScalarType out_dtype, bool decode_tile_pool, int stride_logits,
-                            int num_ctas, int num_kv_stages, void* lp) {
+                            int num_ctas, int num_kv_stages,
+                            const float* rms_y, nv_bfloat16* rms_out, int rms_groups, float rms_eps,
+                            unsigned rms_delay_ns, unsigned long long* prof,
+                            void* lp) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -217,7 +224,9 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
     // (AOT stand-in for DeepGEMM's JIT per-shape configs); faithful = raw + legacy,
     // default depth only.
     #define MQA_LT(dtype_t, pool_, stages_) \
-        launch_typed<dtype_t, pool_, pool_, stages_>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
+        launch_typed<dtype_t, pool_, pool_, stages_>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, \
+                                                     rms_y, rms_out, rms_groups, rms_eps, rms_delay_ns, prof, \
+                                                     dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
     if (decode_tile_pool) {
         TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
                     "num_kv_stages must be 0 (auto) or one of 4/6/8/10, got ", num_kv_stages);
@@ -258,6 +267,8 @@ static torch::Tensor run_mqa(torch::Tensor q, torch::Tensor sf_q,
         : torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(out_dtype));
     dispatch_launch(q, sf_q, kv, sf_kv, weights, ks, ke, seq_len, seq_len_kv,
                     out_dtype, decode_tile_pool, stride_logits, num_ctas, num_kv_stages,
+                    /*rms_y=*/nullptr, /*rms_out=*/nullptr, /*rms_groups=*/0, /*rms_eps=*/0.f,
+                    /*rms_delay_ns=*/0u, /*prof=*/nullptr,
                     logits_buf.data_ptr());
     return logits_buf;
 }
@@ -368,7 +379,9 @@ static torch::Tensor mqa_logits_fp4_decode(
 static void mqa_logits_fp4_decode_out(
     torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
     torch::Tensor weights, torch::Tensor ks, torch::Tensor ke,
-    torch::Tensor logits, int num_ctas, int num_kv_stages) {
+    torch::Tensor logits, int num_ctas, int num_kv_stages,
+    c10::optional<torch::Tensor> rms_y, c10::optional<torch::Tensor> rms_out,
+    double rms_eps, c10::optional<torch::Tensor> prof, double rms_delay_us) {
     check_qkv(q, sf_q, kv, sf_kv, weights, logits.scalar_type());
     const int B = q.size(0), T = kv.size(1);
     TORCH_CHECK(kv.dim() == 3 && kv.size(0) == B, "kv must be [B,T,D/2]");
@@ -381,6 +394,38 @@ static void mqa_logits_fp4_decode_out(
                 "logits must be [>=align(B,BLOCK_Q), stride]");
     TORCH_CHECK(num_ctas >= 0, "num_ctas must be >= 0 (0 = one CTA per SM)");
 
+    // Optional hidden wq_b per-head RMSNorm (tail warpgroup): y fp32 -> out bf16,
+    // weightless rsqrt(mean(y^2, head_dim=512) + eps). Absent -> tail idles.
+    const float* rms_y_ptr = nullptr;
+    nv_bfloat16* rms_out_ptr = nullptr;
+    int rms_groups = 0;
+    if (rms_y.has_value()) {
+        TORCH_CHECK(rms_out.has_value(), "rms_out is required when rms_y is given");
+        auto& y = rms_y.value();
+        auto& o = rms_out.value();
+        TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat && y.is_contiguous(),
+                    "rms_y must be CUDA fp32 contiguous");
+        TORCH_CHECK(o.is_cuda() && o.scalar_type() == torch::kBFloat16 && o.is_contiguous(),
+                    "rms_out must be CUDA bf16 contiguous");
+        TORCH_CHECK(y.numel() == o.numel() && y.numel() % 512 == 0,
+                    "rms_y/rms_out must match and be a multiple of head_dim=512");
+        rms_y_ptr = y.data_ptr<float>();
+        rms_out_ptr = reinterpret_cast<nv_bfloat16*>(o.data_ptr());
+        rms_groups = (int)(y.numel() / 512);
+    }
+
+    // Optional globaltimer stamps [num_ctas, 4] i64 (gemm_fuse_norm_b pattern):
+    // 0=common start, 1=attention end, 2=tail start, 3=tail end (ns).
+    unsigned long long* prof_ptr = nullptr;
+    if (prof.has_value()) {
+        auto& p = prof.value();
+        TORCH_CHECK(p.is_cuda() && p.scalar_type() == torch::kInt64 && p.is_contiguous(),
+                    "prof must be CUDA int64 contiguous");
+        const int need = 4 * (num_ctas > 0 ? num_ctas : get_num_sms());
+        TORCH_CHECK(p.numel() >= need, "prof needs >= ", need, " elements");
+        prof_ptr = reinterpret_cast<unsigned long long*>(p.data_ptr());
+    }
+
     auto kv_c   = kv.reshape({B * T, HEAD_DIM / 2});   // view (cache is contiguous)
     auto sfkv_c = sf_kv.reshape({B * T});
     dispatch_launch(q, sf_q, kv_c, sfkv_c, weights,
@@ -389,6 +434,8 @@ static void mqa_logits_fp4_decode_out(
                     /*decode_tile_pool=*/true, /*stride_logits=*/(int)logits.size(1),
                     num_ctas,
                     num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas),
+                    rms_y_ptr, rms_out_ptr, rms_groups, (float)rms_eps,
+                    (unsigned)(rms_delay_us * 1e3), prof_ptr,
                     logits.data_ptr());
 }
 
@@ -411,5 +458,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10",
           py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"), py::arg("weights"),
           py::arg("ks"), py::arg("ke"), py::arg("logits"), py::arg("num_ctas") = 0,
-          py::arg("num_kv_stages") = 0);
+          py::arg("num_kv_stages") = 0,
+          py::arg("rms_y") = c10::nullopt, py::arg("rms_out") = c10::nullopt,
+          py::arg("rms_eps") = 1e-6, py::arg("prof") = c10::nullopt,
+          py::arg("rms_delay_us") = 0.0);
 }

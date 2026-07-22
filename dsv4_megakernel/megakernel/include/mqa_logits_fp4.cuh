@@ -16,6 +16,14 @@
 //      Σ_b cdiv(ke[b]-ks[b], BLOCK_KV) KV tiles is split into gridDim.x balanced
 //      contiguous chunks (may cross token boundaries) — inline equivalent of
 //      DeepGEMM's paged-path metadata schedule, for decode where B < #SMs.
+//   4. math register diet (224 -> <=128/thread, BIT-EXACT results): weights are
+//      read as float2 from smem inside the reduce (no register cache) and TMEM is
+//      consumed in two 32-head passes reusing one accum[32] — prepares the future
+//      TPB=512 CUDA-core tail (65536/512 = 128 architectural register cap).
+//   5. TPB 384 -> 512: CUDA-core tail warpgroup (warps 12-15) hides the wq_b
+//      per-head WEIGHTLESS RMSNorm (head_dim=512) under the KV stream — the
+//      gemm_fuse_norm_b TC/CC dual-path pattern. Fully decoupled (no shared
+//      barriers); idle when rms_y == nullptr.
 //
 // Math: logits[t] = Σ_h relu(<iq[h,:],kvc[t,:]>)·weights[h]  (fp4 UMMA + cuda reduce)
 // Host launcher + PyTorch binding: kernels/mqa_logits_fp4.cu
@@ -252,6 +260,21 @@ CUTLASS_DEVICE uint32_t get_lane_idx() {
     uint32_t lane_id;
     asm ("mov.u32 %0, %%laneid;" : "=r"(lane_id));
     return lane_id;
+}
+
+// [MEGAKERNEL EDIT] Device-wide nanosecond timer (%globaltimer): ONE clock for the
+// whole GPU, so stamps from different warps/CTAs are directly comparable — used to
+// SEE the score-attention path and the CUDA-core RMSNorm tail overlap (the
+// gemm_fuse_norm_b profiling pattern), instead of inferring it from time deltas.
+// NOTE the "memory" clobber: without it the compiler may hoist the (independent)
+// first loads ABOVE the timer read — the stamp then records "first data arrived"
+// instead of "reached this line" (observed as a fake ~5us late tail start under
+// the post-L2-flush DRAM writeback storm). The clobber pins the stamp in program
+// order; prof-guarded and outside hot loops, so codegen of real work is untouched.
+CUTLASS_DEVICE unsigned long long globaltimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) : : "memory");
+    return t;
 }
 
 CUTLASS_DEVICE void sync_aligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
@@ -655,15 +678,30 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           // [MEGAKERNEL EDIT] `kNumSMs` template param removed; see gridDim.x below.
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+          // [MEGAKERNEL EDIT] CUDA-core tail warpgroup (0 disables the branch entirely)
+          uint32_t kNumTailThreads,
           typename logits_dtype_t,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
-CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
+CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads + kNumTailThreads, 1)
 void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           const uint32_t max_seqlen_k,
                           const uint32_t logits_stride,
                           const uint32_t* cu_seq_len_k_start,
                           const uint32_t* cu_seq_len_k_end,
                           logits_dtype_t* logits,
+                          // [MEGAKERNEL EDIT] hidden wq_b per-head RMSNorm (tail warps);
+                          // rms_y == nullptr -> tail idles. groups = numel / 512.
+                          const float* rms_y, nv_bfloat16* rms_out,
+                          const uint32_t rms_num_groups, const float rms_eps,
+                          // [MEGAKERNEL EDIT] tail head-start experiment knob: the tail
+                          // spins this long (ns) before touching memory, letting the KV
+                          // pipeline fill uncontended. 0 = start immediately.
+                          const uint32_t rms_delay_ns,
+                          // [MEGAKERNEL EDIT] globaltimer stamps [gridDim.x][4]:
+                          // 0=attention-path start (post-prologue), 1=attention end,
+                          // 2=tail start (at CTA start), 3=tail end.
+                          // nullptr = off (gemm_fuse_norm_b pattern).
+                          unsigned long long* prof,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -684,6 +722,99 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
     constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+
+    // [MEGAKERNEL EDIT] CUDA-core tail warpgroup (warps 12-15), hoisted ABOVE the
+    // whole prologue — gemm_fuse_norm_b discipline: the attention path and the tail
+    // NEVER share a block-wide barrier; each side handles its own sync. The tail
+    // touches no smem / mbarrier / TMEM state, so it starts the instant the CTA
+    // does: it must NOT wait for barrier init, TMEM alloc, or the tile-prefix scan
+    // warp (whose serial ks/ke global reads take ~us on a cold L2). The remaining
+    // 384 threads publish the prologue via a role-scoped NamedBarrier below.
+    // Work: wq_b per-head WEIGHTLESS RMSNorm  q *= rsqrt(mean(q^2) + eps),
+    // head_dim = 512, fp32 in -> bf16 out, hidden under this kernel's KV stream.
+    // Tuned for the two MEASURED bottlenecks:
+    //  * solo bandwidth is in-flight-bytes limited (Little's law): 4 groups in
+    //    flight = 8KB/warp outstanding, ~2x the 2-group ceiling of ~4TB/s;
+    //  * the long-T interference tax is write-turnaround driven: bf16 results
+    //    are packed 4-per-lane into ONE 8B st.v2 (256B full-line bursts per
+    //    warp instruction) instead of 16 half-line 64B scalar stores per group.
+    // Layout: lane owns 4 CONSECUTIVE elements per 128-elem segment
+    // (elem = e*128 + lane*4 + i) -> float4 loads, still perfectly coalesced.
+    // ~90 regs/thread (64 data + control), under the 128 cap. Remainder groups
+    // load a duplicated (discarded) partner; their stores are guarded off.
+    if (kNumTailThreads > 0 and warp_idx >= kSpecWarpStart + 4) {
+        const bool prof_lane = prof != nullptr and warp_idx == kSpecWarpStart + 4 and lane_idx == 0;
+        if (prof_lane)
+            prof[blockIdx.x * 4 + 2] = ptx::globaltimer();
+        // Optional deferred start: park the tail (no memory traffic) so the KV
+        // pipeline's latency-critical FILL phase runs uncontended — tests the
+        // "tail head-start slows attention" hypothesis / doubles as a pacing knob.
+        if (rms_delay_ns > 0) {
+            const unsigned long long t_go = ptx::globaltimer() + rms_delay_ns;
+            while (ptx::globaltimer() < t_go)
+                ;
+        }
+        if (rms_y != nullptr) {
+            constexpr uint32_t kRmsHeadDim = 512;
+            constexpr uint32_t kInFlight = 4;      // groups in flight per warp
+            const uint32_t tail_warp = warp_idx - (kSpecWarpStart + 4);
+            const uint32_t num_tail_warps = kNumTailThreads / 32;
+            const uint32_t stride = gridDim.x * num_tail_warps;
+            for (uint32_t g0 = blockIdx.x * num_tail_warps + tail_warp; g0 < rms_num_groups;
+                 g0 += kInFlight * stride) {
+                float4 v[kInFlight][4];
+                uint32_t g[kInFlight];
+                bool valid[kInFlight];
+                // Issue ALL 16 float4 loads before any dependent math
+                #pragma unroll
+                for (uint32_t p = 0; p < kInFlight; ++ p) {
+                    g[p] = g0 + p * stride;
+                    valid[p] = g[p] < rms_num_groups;
+                    const auto src = reinterpret_cast<const float4*>(
+                        rms_y + (uint64_t)(valid[p] ? g[p] : g0) * kRmsHeadDim) + lane_idx;
+                    #pragma unroll
+                    for (uint32_t e = 0; e < 4; ++ e)
+                        v[p][e] = __ldcs(src + e * 32);   // evict-first reads
+                }
+                float sq[kInFlight];
+                #pragma unroll
+                for (uint32_t p = 0; p < kInFlight; ++ p) {
+                    sq[p] = 0.f;
+                    #pragma unroll
+                    for (uint32_t e = 0; e < 4; ++ e) {
+                        const float4& f = v[p][e];
+                        sq[p] += f.x * f.x + f.y * f.y + f.z * f.z + f.w * f.w;
+                    }
+                }
+                #pragma unroll
+                for (uint32_t o = 16; o > 0; o >>= 1) {   // 4 interleaved shfl chains (ILP)
+                    #pragma unroll
+                    for (uint32_t p = 0; p < kInFlight; ++ p)
+                        sq[p] += __shfl_xor_sync(0xffffffffu, sq[p], o);
+                }
+                #pragma unroll
+                for (uint32_t p = 0; p < kInFlight; ++ p) {
+                    if (not valid[p])
+                        continue;
+                    const float rms = rsqrtf(sq[p] / float(kRmsHeadDim) + rms_eps);
+                    const auto dst = rms_out + (uint64_t)g[p] * kRmsHeadDim + lane_idx * 4;
+                    #pragma unroll
+                    for (uint32_t e = 0; e < 4; ++ e) {
+                        const float4& f = v[p][e];
+                        const auto ab = __floats2bfloat162_rn(f.x * rms, f.y * rms);
+                        const auto cd = __floats2bfloat162_rn(f.z * rms, f.w * rms);
+                        asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};"
+                                     :: "l"(dst + e * 128),
+                                        "r"(*reinterpret_cast<const uint32_t*>(&ab)),
+                                        "r"(*reinterpret_cast<const uint32_t*>(&cd)) : "memory");
+                    }
+                }
+            }
+        }
+        if (prof_lane)
+            prof[blockIdx.x * 4 + 3] = ptx::globaltimer();
+        return;
+    }
 
     // Prefetch TMA descriptors
     if (warp_idx == kSpecWarpStart) {
@@ -817,7 +948,17 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
         }
     }
-    __syncthreads();
+    // [MEGAKERNEL EDIT] role-scoped prologue publish (barrier init / TMEM ptr /
+    // tile prefix) for the 384 attention-path threads ONLY — the tail warpgroup
+    // exited above and must not be made to wait here (gemm_fuse_norm_b: the two
+    // sides never share a block-wide barrier, so __syncthreads is forbidden).
+    // NamedBarrier id 1; id 0 is the math-only barrier at the epilogue.
+    cutlass::arch::NamedBarrier(kNumSpecializedThreads + kNumMathThreads, 1).sync();
+
+    // [MEGAKERNEL EDIT] attention-path start stamp (post-prologue; the tail's t2 is
+    // stamped at CTA start above, so t2 <= t0 is expected on the timeline)
+    if (prof != nullptr and threadIdx.x == 0)
+        prof[blockIdx.x * 4 + 0] = ptx::globaltimer();
 
     // Scheduler
     const uint32_t num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
@@ -882,8 +1023,12 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     auto advance_tmem_pipeline = make_pipeline(kNumTmemStages);
 
     // Register reconfigurations
+    // [MEGAKERNEL EDIT] math target lowered 224 -> 128 after the register diet
+    // (weights from smem + two-pass accum[32]); setmaxnreg.inc requires the
+    // compiled per-thread count <= 128 — verify via `--ptxas-options=-v` in the
+    // test build; if ptxas reports more, raise this to the next multiple of 8.
     constexpr uint32_t kNumSpecializedRegisters = 56;
-    constexpr uint32_t kNumMathRegisters = 224;
+    constexpr uint32_t kNumMathRegisters = 128;
 
     // Wait for primary kernel completion
     // [MEGAKERNEL EDIT] PDL-only; neutralized for standalone launch.
@@ -1068,23 +1213,18 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         advance_tmem_pipeline(math_warpgroup_idx);
 
         // Local register buffers
-        float accum[kNumHeads];
-        float weights[BLOCK_Q][kNumHeads];
+        // [MEGAKERNEL EDIT] register diet: no register-cached weights (the reduce reads
+        // float2 pairs straight from smem — the Q stage stays valid until the empty_q
+        // arrive below), and accum halved to 32 (TMEM consumed in two 32-head passes
+        // reusing these registers). fp32 accumulation order per (sum_0, sum_1) chain is
+        // identical to the previous single-pass form -> bit-exact.
+        float accum[kNumHeads / 2];
 
         // Enumerate assigned tasks
         for_each_task([&](const uint32_t& q_idx, const uint32_t& kv_start, const uint32_t& num_kv_blocks) {
             // Wait TMA Q arrivals
             CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
             full_q_barriers[q_stage_idx]->wait(q_phase);
-
-            // Read weights
-            // TODO: optimize bank conflicts
-            #pragma unroll
-            for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumHeads; ++ j)
-                    weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + j);
-            }
 
             // Enumerate KV blocks
             for (uint32_t kv_idx = 0; kv_idx < num_kv_blocks; ++ kv_idx) {
@@ -1100,31 +1240,38 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 // Reduce over the head dim and store
                 #pragma unroll
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                    // Load accumulator from TMEM
-                    uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
-                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+                    const uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
+                    const auto w2 = reinterpret_cast<const float2*>(
+                        smem_weights[q_stage_idx] + i * kNumHeads);
 
-                    // Release TMEM empty
-                    if (i == BLOCK_Q - 1) {
-                        ptx::tcgen05_before_thread_sync();
-                        empty_tmem_barriers[tmem_stage_idx]->arrive();
-                    }
-
-                    // Accumulate weighted ReLU in parallel
                     auto sum_0 = make_float2(0, 0);
                     auto sum_1 = make_float2(0, 0);
 
-                    const auto transform = [&](const uint32_t& j, const float2& sum) {
-                        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
-                        auto b = make_float2(weights[i][j], weights[i][j + 1]);
-                        return __ffma2_rn(a, b, sum);
-                    };
-
+                    // Two 32-head passes reusing the same accum registers
                     #pragma unroll
-                    for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                        sum_0 = transform(j, sum_0);
-                        sum_1 = transform(j + 2, sum_1);
+                    for (uint32_t half = 0; half < 2; ++ half) {
+                        // Load accumulator from TMEM
+                        tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + half * (kNumHeads / 2), accum);
+
+                        // Release TMEM empty once ALL reads of this stage are done
+                        if (half == 1 and i == BLOCK_Q - 1) {
+                            ptx::tcgen05_before_thread_sync();
+                            empty_tmem_barriers[tmem_stage_idx]->arrive();
+                        }
+
+                        // Accumulate weighted ReLU in parallel (weights via smem float2)
+                        const uint32_t jb = half * (kNumHeads / 2);
+                        const auto transform = [&](const uint32_t& j, const float2& sum) {
+                            auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
+                            auto b = ptx::ld_shared(w2 + ((jb + j) >> 1));
+                            return __ffma2_rn(a, b, sum);
+                        };
+
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumHeads / 2; j += 4) {
+                            sum_0 = transform(j, sum_0);
+                            sum_1 = transform(j + 2, sum_1);
+                        }
                     }
 
                     auto sum = __fadd2_rn(sum_0, sum_1);
@@ -1147,6 +1294,10 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             // Release last Q empty
             empty_q_barriers[q_stage_idx]->arrive();
         });
+
+        // [MEGAKERNEL EDIT] attention-path end stamp (math warpgroup 0 done consuming)
+        if (prof != nullptr and threadIdx.x == 0)
+            prof[blockIdx.x * 4 + 1] = ptx::globaltimer();
 
         // Free tensor memory
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
@@ -1180,5 +1331,10 @@ static constexpr int NUM_KV_STAGES = 6;
 static constexpr int NUM_TMEM_STAGES = 3;           // hardcoded in the kernel
 static constexpr int NUM_SPECIALIZED_THREADS = 128;
 static constexpr int NUM_MATH_THREADS        = 2 * 128;
-static constexpr int TPB = NUM_SPECIALIZED_THREADS + NUM_MATH_THREADS;  // 384
+// CUDA-core tail warpgroup (warps 12-15): hides the wq_b per-head RMSNorm under
+// the KV stream; idle when no rms work is passed. NOTE: TPB=512 caps the
+// architectural register budget at 65536/512 = 128 — the math register diet
+// (edit #4) is the prerequisite.
+static constexpr int NUM_TAIL_THREADS        = 128;
+static constexpr int TPB = NUM_SPECIALIZED_THREADS + NUM_MATH_THREADS + NUM_TAIL_THREADS;  // 512
 }  // namespace mqa_logits_fp4
