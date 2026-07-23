@@ -34,6 +34,7 @@
 // ============================================================
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>   // [MEGAKERNEL EDIT] fused MAIN compressor: real e4m3 quant
 #include <cstdint>
 #include <cutlass/numeric_types.h>
 
@@ -672,6 +673,177 @@ struct TilePoolScheduler {
     }
 };
 
+// [MEGAKERNEL EDIT] MAIN-compressor argument bundle (gemm_fuse_norm_b
+// compressor_process_row, d=512 MAIN part ONLY; the indexer(d=128) part stays
+// upstream). The [m, 8, 1024] state slots are assumed already written by the
+// producer op; this kernel's tail only post-processes COMPRESS rows
+// ((pos+1)%4 == 0): overlap-cat softmax aggregate -> weighted
+// bf16 RMSNorm -> interleaved RoPE(last 64) -> fp8 e4m3 block-64 quant.
+// kv == nullptr disables the whole section.
+struct MainCompressorArgs {
+    const long long* pos;      // [M] absolute token positions
+    const float* norm;         // [512] RMSNorm weight (comp_norm)
+    const float* cos_tab;      // [S, 32] RoPE tables, row = compressed position
+    const float* sin_tab;      // [S, 32]
+    // [B1] PING-PONG state window (READ-ONLY here; no physical shift): the 8 rows
+    // are a pos-derived circular window, physical row = (4*(⌊pos/4⌋&1) + rr) & 7
+    // for logical row rr. The producer writes the fresh token at logical 4+pos%4
+    // under the SAME mapping, so "current" rows become next window's "previous"
+    // rows by phase flip alone -- the old rows[0:4]=rows[4:8] copy (64KB/row, 4
+    // latency waves) is gone. Anyone touching kv/sc must use this mapping.
+    const float* kv;           // [M, 8, 1024] state (aggregate reads only)
+    const float* sc;           // [M, 8, 1024] state scores
+    uint8_t* q8;               // [M, 448] e4m3 output
+    float* s8;                 // [M, 7]   per-block-64 scales
+    nv_bfloat16* rope;         // [M, 64]  bf16 rope-tail output
+};
+
+// One-warp-per-row MAIN-compressor row chain (d=512): aggregate ->
+// (bf16) weighted RMSNorm -> RoPE(last 64) -> fp8 block-64 quant. SHARED by the
+// fused tail (prof = per-CTA phase stamps) and the standalone reference kernel
+// used for the benchmark's "each op as its OWN kernel" column (prof = nullptr).
+// [B1] The state shift is GONE: rows are addressed through the pos-derived
+// ping-pong mapping (see MainCompressorArgs), so the chain is 4 aggregate
+// rounds + epilogue instead of 4 rounds + 4 copy waves.
+__device__ __forceinline__ void run_main_compressor_row(
+    const MainCompressorArgs& comp, uint32_t m, long long p,
+    uint32_t lane_idx, float rms_eps, unsigned long long* prof) {
+    constexpr uint32_t D_M = 512, WK_M = 1024, RD = 64, RATIO = 4;
+    const float* bkv = comp.kv + (uint64_t)m * 8 * WK_M;
+    const float* bsc = comp.sc + (uint64_t)m * 8 * WK_M;
+    // Ping-pong base: window index k = ⌊p/4⌋ (p is a compress step, p%4==3);
+    // logical row rr lives at physical row (base + rr) & 7.
+    const uint32_t base = 4u * ((uint32_t)(p >> 2) & 1u);
+    // Phase stamps (the processing warp's lane 0; last compress row wins per
+    // CTA -- the test picks the latest-finishing CTA, test_complex.cu style)
+    const bool cprof = prof != nullptr and lane_idx == 0;
+
+    // Aggregate: per-column softmax over the 8 overlap-cat rows
+    // (rows<4 read col c, rows>=4 read col 512+c) -- column-independent,
+    // so the fixed row order keeps it bit-exact vs the original.
+    // complex_b.cuh layout lesson: round g covers 128 CONTIGUOUS columns
+    // (lane owns cols g*128 + lane*4 .. +3) -> each load instruction is a
+    // fully-coalesced 512B warp burst AND 16 float4 are in flight per
+    // round (the first per-column form was a serial latency chain; the
+    // lane-strided float4 form only used 16B of every 64B segment).
+    // cmp[g*4+e] <-> column g*128 + lane*4 + e.
+    float cmp[16];
+    {
+        const float4* bsc4 = reinterpret_cast<const float4*>(bsc);
+        const float4* bkv4 = reinterpret_cast<const float4*>(bkv);
+        #pragma unroll
+        for (uint32_t g = 0; g < 4; ++ g) {
+            const uint32_t c4 = g * 32 + lane_idx;     // float4 col; warp = 512B contiguous
+            float4 s4[8], k4[8];
+            #pragma unroll
+            for (uint32_t rr = 0; rr < 8; ++ rr) {
+                const uint32_t pr = (base + rr) & 7;        // [B1] ping-pong physical row
+                const uint32_t col4 = (rr < RATIO) ? c4 : (D_M / 4 + c4);
+                s4[rr] = bsc4[pr * (WK_M / 4) + col4];
+                k4[rr] = bkv4[pr * (WK_M / 4) + col4];
+            }
+            #pragma unroll
+            for (uint32_t e = 0; e < 4; ++ e) {
+                float mx = (&s4[0].x)[e];
+                #pragma unroll
+                for (uint32_t rr = 1; rr < 8; ++ rr)
+                    mx = fmaxf(mx, (&s4[rr].x)[e]);
+                float sm = 0.f, acc = 0.f;
+                #pragma unroll
+                for (uint32_t rr = 0; rr < 8; ++ rr) {
+                    const float ex = expf((&s4[rr].x)[e] - mx);
+                    sm += ex;
+                    acc += ex * (&k4[rr].x)[e];
+                }
+                cmp[g * 4 + e] = acc / sm;
+            }
+        }
+    }
+    if (cprof)
+        prof[blockIdx.x * 8 + 5] = ptx::globaltimer();   // aggregate done
+    // [B1] no shift, no __syncwarp: the state is read-only (phase flip does the
+    // "current -> previous" handover); prof slot 6 is retired.
+
+    // (bf16) weighted RMSNorm over d=512 (single-warp shuffle total).
+    // NOTE: __float2bfloat16/__bfloat162float instead of C-style casts —
+    // torch extensions build with -D__CUDA_NO_BFLOAT16_CONVERSIONS__.
+    float part = 0.f;
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; ++ i) {
+        const float vb = __bfloat162float(__float2bfloat16(cmp[i]));
+        part += vb * vb;
+    }
+    #pragma unroll
+    for (uint32_t o = 16; o > 0; o >>= 1)
+        part += __shfl_xor_sync(0xffffffffu, part, o);
+    const float rms = rsqrtf(part / float(D_M) + rms_eps);
+    #pragma unroll
+    for (uint32_t g = 0; g < 4; ++ g) {   // norm via coalesced float4 reads
+        const float4 ng = reinterpret_cast<const float4*>(comp.norm)[g * 32 + lane_idx];
+        #pragma unroll
+        for (uint32_t e = 0; e < 4; ++ e) {
+            const float vb = __bfloat162float(__float2bfloat16(cmp[g * 4 + e]));
+            cmp[g * 4 + e] = __bfloat162float(__float2bfloat16(vb * rms * (&ng.x)[e]));
+        }
+    }
+
+    // Interleaved RoPE on the last 64 dims: cols 448..511 = round g=3's
+    // UPPER half-warp (lanes 16..31, 4 consecutive cols each -> both pair
+    // elements (2j, 2j+1) live in the same lane).
+    const long long ri = p + 1 - RATIO;        // compressed-token position
+    if (lane_idx >= 16) {
+        const float* crow = comp.cos_tab + (uint64_t)ri * (RD / 2);
+        const float* srow = comp.sin_tab + (uint64_t)ri * (RD / 2);
+        #pragma unroll
+        for (uint32_t e = 0; e < 4; e += 2) {
+            const uint32_t j = (lane_idx - 16) * 2 + e / 2;
+            const float ev = cmp[12 + e], ov = cmp[12 + e + 1];
+            const float cc = crow[j], ss = srow[j];
+            cmp[12 + e]     = __bfloat162float(__float2bfloat16(ev * cc - ov * ss));
+            cmp[12 + e + 1] = __bfloat162float(__float2bfloat16(ev * ss + ov * cc));
+        }
+    }
+
+    // fp8 e4m3 quant of [0,448) in blocks of 64 (= one half-warp per round;
+    // width-16 shuffle amax) + bf16 store of the roped tail [448,512).
+    // q8 stores are one u32 per lane at consecutive addresses -> 128B
+    // fully-coalesced bursts (complex_b coalescing discipline).
+    #pragma unroll
+    for (uint32_t g = 0; g < 4; ++ g) {
+        float mx = 0.f;
+        #pragma unroll
+        for (uint32_t e = 0; e < 4; ++ e)
+            mx = fmaxf(mx, fabsf(cmp[g * 4 + e]));
+        #pragma unroll
+        for (uint32_t o = 1; o < 16; o <<= 1)      // all lanes participate
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 16));
+        const uint32_t col0 = g * 128 + lane_idx * 4;
+        if (col0 < D_M - RD) {                     // quant half-warps
+            const float scale = fmaxf(mx, 1e-4f) * (1.0f / 448.0f);
+            uint32_t packed = 0;
+            #pragma unroll
+            for (uint32_t e = 0; e < 4; ++ e) {
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(cmp[g * 4 + e] / scale);
+                packed |= (uint32_t)f8.__x << (8 * e);
+            }
+            *reinterpret_cast<uint32_t*>(
+                comp.q8 + (uint64_t)m * (D_M - RD) + col0) = packed;
+            if ((lane_idx & 15) == 0)
+                comp.s8[(uint64_t)m * 7 + (col0 >> 6)] = scale;
+        } else {                                   // rope tail: pack 2 bf16 -> u32
+            #pragma unroll
+            for (uint32_t e = 0; e < 4; e += 2) {
+                const auto b2 = __floats2bfloat162_rn(cmp[g * 4 + e], cmp[g * 4 + e + 1]);
+                *reinterpret_cast<uint32_t*>(
+                    comp.rope + (uint64_t)m * RD + (col0 - (D_M - RD)) + e) =
+                    *reinterpret_cast<const uint32_t*>(&b2);
+            }
+        }
+    }
+    if (cprof)
+        prof[blockIdx.x * 8 + 7] = ptx::globaltimer();   // row end (norm+rope+quant)
+}
+
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           bool kIsCompressedLogits, bool kTilePool,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
@@ -697,11 +869,22 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           // spins this long (ns) before touching memory, letting the KV
                           // pipeline fill uncontended. 0 = start immediately.
                           const uint32_t rms_delay_ns,
-                          // [MEGAKERNEL EDIT] globaltimer stamps [gridDim.x][4]:
+                          // [MEGAKERNEL EDIT] globaltimer stamps [gridDim.x][8]
+                          // (test_complex.cu phase-breakdown pattern):
                           // 0=attention-path start (post-prologue), 1=attention end,
-                          // 2=tail start (at CTA start), 3=tail end.
-                          // nullptr = off (gemm_fuse_norm_b pattern).
+                          // 2=tail start (at CTA start), 3=tail end,
+                          // 4=rms section end, and per compress row (last one per CTA):
+                          // 5=aggregate done, 6=retired (was shift; B1),
+                          // 7=row end (norm+rope+quant).
+                          // nullptr = off.
                           unsigned long long* prof,
+                          // [MEGAKERNEL EDIT] MAIN compressor bundle (tail warps; see
+                          // MainCompressorArgs above). comp.kv == nullptr -> disabled.
+                          const MainCompressorArgs comp,
+                          // [MEGAKERNEL EDIT] benchmark tail_us: true -> the 384
+                          // attention threads exit before the prologue, leaving the
+                          // tail warpgroup running ALONE in its in-situ launch shape.
+                          const bool attn_mock,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -722,6 +905,9 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
     constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+    // [MEGAKERNEL EDIT] tail rms work-pool ticket (4B STATIC smem, coexists with the
+    // extern dynamic smem; init'd and used exclusively by the tail warps below)
+    __shared__ uint32_t tail_pool_next;
 
     // [MEGAKERNEL EDIT] CUDA-core tail warpgroup (warps 12-15), hoisted ABOVE the
     // whole prologue — gemm_fuse_norm_b discipline: the attention path and the tail
@@ -733,19 +919,22 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // Work: wq_b per-head WEIGHTLESS RMSNorm  q *= rsqrt(mean(q^2) + eps),
     // head_dim = 512, fp32 in -> bf16 out, hidden under this kernel's KV stream.
     // Tuned for the two MEASURED bottlenecks:
-    //  * solo bandwidth is in-flight-bytes limited (Little's law): 4 groups in
-    //    flight = 8KB/warp outstanding, ~2x the 2-group ceiling of ~4TB/s;
+    //  * solo bandwidth is in-flight-bytes limited (Little's law): 6 groups in
+    //    flight = 12KB/warp outstanding (4 -> 6 bought ~+50% in-flight; the next
+    //    step is NOT more registers -- 128 is the TPB=512 architectural cap --
+    //    but TMA-to-smem staging, which takes data out of the register file);
     //  * the long-T interference tax is write-turnaround driven: bf16 results
     //    are packed 4-per-lane into ONE 8B st.v2 (256B full-line bursts per
     //    warp instruction) instead of 16 half-line 64B scalar stores per group.
     // Layout: lane owns 4 CONSECUTIVE elements per 128-elem segment
     // (elem = e*128 + lane*4 + i) -> float4 loads, still perfectly coalesced.
-    // ~90 regs/thread (64 data + control), under the 128 cap. Remainder groups
+    // ~120 regs/thread (96 data + control), at the 128 cap: tail_us regressing
+    // vs kInFlight=4 would mean ptxas spilled -> fall back to 5. Remainder groups
     // load a duplicated (discarded) partner; their stores are guarded off.
     if (kNumTailThreads > 0 and warp_idx >= kSpecWarpStart + 4) {
         const bool prof_lane = prof != nullptr and warp_idx == kSpecWarpStart + 4 and lane_idx == 0;
         if (prof_lane)
-            prof[blockIdx.x * 4 + 2] = ptx::globaltimer();
+            prof[blockIdx.x * 8 + 2] = ptx::globaltimer();
         // Optional deferred start: park the tail (no memory traffic) so the KV
         // pipeline's latency-critical FILL phase runs uncontended — tests the
         // "tail head-start slows attention" hypothesis / doubles as a pacing knob.
@@ -754,14 +943,51 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             while (ptx::globaltimer() < t_go)
                 ;
         }
+        // [MEGAKERNEL EDIT] LOAD BALANCE (measured: the compress warp ran ~10us
+        // longer than its 3 siblings -> CTA tail = that warp). Order of work:
+        //   1. init the shared rms ticket pool (ONE tail-local NamedBarrier id 2;
+        //      ids 0/1 belong to the attention path -- never shared);
+        //   2. compressor rows FIRST (static one-warp-per-row);
+        //   3. rms groups drained from the pool -- a warp that ran a compressor
+        //      row joins late and naturally claims fewer bundles, so all 4 tail
+        //      warps finish together (max parallelism over independent work).
         if (rms_y != nullptr) {
-            constexpr uint32_t kRmsHeadDim = 512;
-            constexpr uint32_t kInFlight = 4;      // groups in flight per warp
+            if (warp_idx == kSpecWarpStart + 4 and lane_idx == 0)
+                tail_pool_next = 0u;
+            cutlass::arch::NamedBarrier(kNumTailThreads, 2).sync();
+        }
+        // ---- MAIN compressor rows (one warp per row; the aggregate -> norm ->
+        // rope -> quant chain lives in run_main_compressor_row above, shared
+        // with the standalone reference kernel). Runs BEFORE the rms pool so a warp
+        // that compressed joins the pool late and claims fewer tickets (load balance).
+        if (comp.kv != nullptr) {
             const uint32_t tail_warp = warp_idx - (kSpecWarpStart + 4);
             const uint32_t num_tail_warps = kNumTailThreads / 32;
+            for (uint32_t m = blockIdx.x * num_tail_warps + tail_warp; m < seq_len;
+                 m += gridDim.x * num_tail_warps) {
+                const long long p = comp.pos[m];
+                if (((p + 1) & 3) != 0)
+                    continue;                              // not a compress row
+                run_main_compressor_row(comp, m, p, lane_idx, rms_eps, prof);
+            }
+        }
+        // ---- wq_b per-head RMSNorm groups, drained from the shared ticket pool ----
+        if (rms_y != nullptr) {
+            constexpr uint32_t kRmsHeadDim = 512;
+            constexpr uint32_t kInFlight = 6;      // groups in flight per warp (A1: 4 -> 6)
+            const uint32_t num_tail_warps = kNumTailThreads / 32;
             const uint32_t stride = gridDim.x * num_tail_warps;
-            for (uint32_t g0 = blockIdx.x * num_tail_warps + tail_warp; g0 < rms_num_groups;
-                 g0 += kInFlight * stride) {
+            for (;;) {
+                // one ticket = one kInFlight-wide bundle; g0(ticket) is monotonic
+                // non-decreasing, so the first out-of-range ticket ends this warp.
+                uint32_t tk = 0;
+                if (lane_idx == 0)
+                    tk = atomicAdd(&tail_pool_next, 1u);
+                tk = __shfl_sync(0xffffffffu, tk, 0);
+                const uint32_t g0 = blockIdx.x * num_tail_warps + (tk % num_tail_warps)
+                                    + (tk / num_tail_warps) * (kInFlight * stride);
+                if (g0 >= rms_num_groups)
+                    break;
                 float4 v[kInFlight][4];
                 uint32_t g[kInFlight];
                 bool valid[kInFlight];
@@ -812,9 +1038,18 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
         }
         if (prof_lane)
-            prof[blockIdx.x * 4 + 3] = ptx::globaltimer();
+            prof[blockIdx.x * 8 + 4] = ptx::globaltimer();   // warp 12's pool draining done
+        // Tail end = the LATEST tail warp (atomicMax): the previous single-warp
+        // stamp under-reported compress CTAs by the whole compressor duration.
+        if (prof != nullptr and lane_idx == 0)
+            atomicMax(prof + blockIdx.x * 8 + 3, ptx::globaltimer());
         return;
     }
+    // [MEGAKERNEL EDIT] benchmark tail_us: attention mocked out -- the remaining
+    // 384 threads leave BEFORE any prologue state (mbarrier init / TMEM alloc /
+    // scan), so the kernel degenerates to the tail warpgroup alone, in situ.
+    if (attn_mock)
+        return;
 
     // Prefetch TMA descriptors
     if (warp_idx == kSpecWarpStart) {
@@ -958,7 +1193,7 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // [MEGAKERNEL EDIT] attention-path start stamp (post-prologue; the tail's t2 is
     // stamped at CTA start above, so t2 <= t0 is expected on the timeline)
     if (prof != nullptr and threadIdx.x == 0)
-        prof[blockIdx.x * 4 + 0] = ptx::globaltimer();
+        prof[blockIdx.x * 8 + 0] = ptx::globaltimer();
 
     // Scheduler
     const uint32_t num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
@@ -1297,7 +1532,7 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
         // [MEGAKERNEL EDIT] attention-path end stamp (math warpgroup 0 done consuming)
         if (prof != nullptr and threadIdx.x == 0)
-            prof[blockIdx.x * 4 + 1] = ptx::globaltimer();
+            prof[blockIdx.x * 8 + 1] = ptx::globaltimer();
 
         // Free tensor memory
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();

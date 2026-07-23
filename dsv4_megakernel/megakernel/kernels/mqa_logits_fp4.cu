@@ -45,6 +45,52 @@ using namespace mqa_logits_fp4;
 
 static int host_align_up(int a, int b) { return (a + b - 1) / b * b; }
 
+// ---- "each op as its OWN kernel" references (benchmark sep_us column only) ----
+// Well-written standalone versions of the two ops the fused tail hides: same math
+// and lane layout as the tail, but with the whole GPU to themselves (one warp per
+// group/row, full grid). sep_us = base + these two ≙ test_complex.cu's base_sum.
+__global__ void standalone_rmsnorm_kernel(const float* __restrict__ y,
+                                          nv_bfloat16* __restrict__ out,
+                                          uint32_t num_groups, float eps) {
+    const uint32_t g = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const uint32_t lane = threadIdx.x & 31;
+    if (g >= num_groups)
+        return;
+    const float4* src = reinterpret_cast<const float4*>(y + (uint64_t)g * 512) + lane;
+    float4 v[4];
+    #pragma unroll
+    for (int e = 0; e < 4; ++ e)
+        v[e] = src[e * 32];
+    float sq = 0.f;
+    #pragma unroll
+    for (int e = 0; e < 4; ++ e)
+        sq += v[e].x * v[e].x + v[e].y * v[e].y + v[e].z * v[e].z + v[e].w * v[e].w;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    const float rms = rsqrtf(sq / 512.f + eps);
+    nv_bfloat16* dst = out + (uint64_t)g * 512 + lane * 4;
+    #pragma unroll
+    for (int e = 0; e < 4; ++ e) {
+        const auto ab = __floats2bfloat162_rn(v[e].x * rms, v[e].y * rms);
+        const auto cd = __floats2bfloat162_rn(v[e].z * rms, v[e].w * rms);
+        const uint2 pk = {*reinterpret_cast<const uint32_t*>(&ab),
+                          *reinterpret_cast<const uint32_t*>(&cd)};
+        *reinterpret_cast<uint2*>(dst + e * 128) = pk;
+    }
+}
+
+__global__ void standalone_compressor_kernel(deep_gemm::MainCompressorArgs comp,
+                                             uint32_t seq_len, float eps) {
+    const uint32_t m = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (m >= seq_len)
+        return;
+    const long long p = comp.pos[m];
+    if (((p + 1) & 3) != 0)
+        return;
+    deep_gemm::run_main_compressor_row(comp, m, p, threadIdx.x & 31, eps, nullptr);
+}
+
 // One CTA per SM (queried once; matches DeepGEMM's device_runtime->get_num_sms()).
 static int get_num_sms() {
     static int num_sms = -1;
@@ -138,6 +184,8 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const int* ks, const int* ke, void* logits,
                          const float* rms_y, nv_bfloat16* rms_out, int rms_groups, float rms_eps,
                          unsigned rms_delay_ns, unsigned long long* prof,
+                         const deep_gemm::MainCompressorArgs& comp,
+                         bool attn_mock,
                          const CUtensorMap& dQ, const CUtensorMap& dSFQ,
                          const CUtensorMap& dKV, const CUtensorMap& dSFKV,
                          const CUtensorMap& dW, dim3 grid, int smem,
@@ -163,6 +211,7 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
         reinterpret_cast<const uint32_t*>(ke),
         reinterpret_cast<logits_dtype_t*>(logits),
         rms_y, rms_out, (uint32_t)rms_groups, rms_eps, rms_delay_ns, prof,
+        comp, attn_mock,
         dQ, dSFQ, dKV, dSFKV, dW);
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "mqa_logits_fp4 launch failed: ", cudaGetErrorString(err));
@@ -181,6 +230,8 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             int num_ctas, int num_kv_stages,
                             const float* rms_y, nv_bfloat16* rms_out, int rms_groups, float rms_eps,
                             unsigned rms_delay_ns, unsigned long long* prof,
+                            const deep_gemm::MainCompressorArgs& comp,
+                            bool attn_mock,
                             void* lp) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -225,7 +276,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
     // default depth only.
     #define MQA_LT(dtype_t, pool_, stages_) \
         launch_typed<dtype_t, pool_, pool_, stages_>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, \
-                                                     rms_y, rms_out, rms_groups, rms_eps, rms_delay_ns, prof, \
+                                                     rms_y, rms_out, rms_groups, rms_eps, rms_delay_ns, prof, comp, attn_mock, \
                                                      dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
     if (decode_tile_pool) {
         TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
@@ -269,6 +320,8 @@ static torch::Tensor run_mqa(torch::Tensor q, torch::Tensor sf_q,
                     out_dtype, decode_tile_pool, stride_logits, num_ctas, num_kv_stages,
                     /*rms_y=*/nullptr, /*rms_out=*/nullptr, /*rms_groups=*/0, /*rms_eps=*/0.f,
                     /*rms_delay_ns=*/0u, /*prof=*/nullptr,
+                    /*comp=*/deep_gemm::MainCompressorArgs{},
+                    /*attn_mock=*/false,
                     logits_buf.data_ptr());
     return logits_buf;
 }
@@ -381,7 +434,12 @@ static void mqa_logits_fp4_decode_out(
     torch::Tensor weights, torch::Tensor ks, torch::Tensor ke,
     torch::Tensor logits, int num_ctas, int num_kv_stages,
     c10::optional<torch::Tensor> rms_y, c10::optional<torch::Tensor> rms_out,
-    double rms_eps, c10::optional<torch::Tensor> prof, double rms_delay_us) {
+    double rms_eps, c10::optional<torch::Tensor> prof, double rms_delay_us,
+    c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> comp_norm,
+    c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
+    c10::optional<torch::Tensor> comp_kv, c10::optional<torch::Tensor> comp_sc,
+    c10::optional<torch::Tensor> comp_q8, c10::optional<torch::Tensor> comp_s8,
+    c10::optional<torch::Tensor> comp_rope, bool mock_attn) {
     check_qkv(q, sf_q, kv, sf_kv, weights, logits.scalar_type());
     const int B = q.size(0), T = kv.size(1);
     TORCH_CHECK(kv.dim() == 3 && kv.size(0) == B, "kv must be [B,T,D/2]");
@@ -414,16 +472,53 @@ static void mqa_logits_fp4_decode_out(
         rms_groups = (int)(y.numel() / 512);
     }
 
-    // Optional globaltimer stamps [num_ctas, 4] i64 (gemm_fuse_norm_b pattern):
-    // 0=common start, 1=attention end, 2=tail start, 3=tail end (ns).
+    // Optional globaltimer stamps [num_ctas, 8] i64 (test_complex.cu phase pattern):
+    // 0=attn start, 1=attn end, 2=tail start, 3=tail end, 4=rms end,
+    // 5=aggregate done, 6=retired (was shift; gone with the B1 ping-pong state),
+    // 7=compress-row end (ns).
     unsigned long long* prof_ptr = nullptr;
     if (prof.has_value()) {
         auto& p = prof.value();
         TORCH_CHECK(p.is_cuda() && p.scalar_type() == torch::kInt64 && p.is_contiguous(),
                     "prof must be CUDA int64 contiguous");
-        const int need = 4 * (num_ctas > 0 ? num_ctas : get_num_sms());
+        const int need = 8 * (num_ctas > 0 ? num_ctas : get_num_sms());
         TORCH_CHECK(p.numel() >= need, "prof needs >= ", need, " elements");
         prof_ptr = reinterpret_cast<unsigned long long*>(p.data_ptr());
+    }
+
+    // Optional MAIN-compressor bundle (gemm_fuse_norm_b d=512 part; tail warps).
+    // All-or-none: gated on comp_kv like the original (comp_kv==null => disabled).
+    deep_gemm::MainCompressorArgs comp{};
+    if (comp_kv.has_value()) {
+        TORCH_CHECK(cmp_pos && comp_norm && cos_tab && sin_tab && comp_sc
+                    && comp_q8 && comp_s8 && comp_rope,
+                    "main-compressor tensors must be given together");
+        auto chk = [](const torch::Tensor& t, at::ScalarType ty, const char* n) {
+            TORCH_CHECK(t.is_cuda() && t.scalar_type() == ty && t.is_contiguous(),
+                        n, " must be CUDA contiguous of the right dtype");
+        };
+        chk(*cmp_pos, torch::kInt64, "cmp_pos");   chk(*comp_norm, torch::kFloat, "comp_norm");
+        chk(*cos_tab, torch::kFloat, "cos_tab");   chk(*sin_tab, torch::kFloat, "sin_tab");
+        chk(*comp_kv, torch::kFloat, "comp_kv");   chk(*comp_sc, torch::kFloat, "comp_sc");
+        chk(*comp_q8, torch::kUInt8, "comp_q8");   chk(*comp_s8, torch::kFloat, "comp_s8");
+        chk(*comp_rope, torch::kBFloat16, "comp_rope");
+        TORCH_CHECK(cmp_pos->numel() >= B && comp_norm->numel() == 512
+                    && comp_kv->numel() >= (int64_t)B * 8 * 1024
+                    && comp_sc->numel() >= (int64_t)B * 8 * 1024
+                    && comp_q8->numel() >= (int64_t)B * 448
+                    && comp_s8->numel() >= (int64_t)B * 7
+                    && comp_rope->numel() >= (int64_t)B * 64,
+                    "main-compressor tensor shapes");
+        // int64_t is `long` on linux; the device struct uses `long long` (same width)
+        comp.pos = reinterpret_cast<const long long*>(cmp_pos->data_ptr<int64_t>());
+        comp.norm = comp_norm->data_ptr<float>();
+        comp.cos_tab = cos_tab->data_ptr<float>();
+        comp.sin_tab = sin_tab->data_ptr<float>();
+        comp.kv = comp_kv->data_ptr<float>();
+        comp.sc = comp_sc->data_ptr<float>();
+        comp.q8 = comp_q8->data_ptr<uint8_t>();
+        comp.s8 = comp_s8->data_ptr<float>();
+        comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope->data_ptr());
     }
 
     auto kv_c   = kv.reshape({B * T, HEAD_DIM / 2});   // view (cache is contiguous)
@@ -436,10 +531,50 @@ static void mqa_logits_fp4_decode_out(
                     num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas),
                     rms_y_ptr, rms_out_ptr, rms_groups, (float)rms_eps,
                     (unsigned)(rms_delay_us * 1e3), prof_ptr,
+                    comp,
+                    /*attn_mock=*/mock_attn,
                     logits.data_ptr());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mqa_rmsnorm_standalone",
+          [](torch::Tensor y, torch::Tensor out, double eps) {
+              TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat && y.is_contiguous()
+                          && out.scalar_type() == torch::kBFloat16 && out.numel() == y.numel(),
+                          "y fp32 / out bf16, same numel");
+              const uint32_t groups = (uint32_t)(y.numel() / 512);
+              standalone_rmsnorm_kernel<<<(groups + 7) / 8, 256, 0,
+                                          at::cuda::getCurrentCUDAStream()>>>(
+                  y.data_ptr<float>(), reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+                  groups, (float)eps);
+          },
+          "standalone wq_b per-head RMSNorm reference (benchmark sep_us column)",
+          py::arg("y"), py::arg("out"), py::arg("eps") = 1e-6);
+    m.def("mqa_compressor_standalone",
+          [](torch::Tensor cmp_pos, torch::Tensor comp_norm,
+             torch::Tensor cos_tab, torch::Tensor sin_tab,
+             torch::Tensor comp_kv, torch::Tensor comp_sc,
+             torch::Tensor comp_q8, torch::Tensor comp_s8,
+             torch::Tensor comp_rope, double eps) {
+              deep_gemm::MainCompressorArgs comp{};
+              comp.pos = reinterpret_cast<const long long*>(cmp_pos.data_ptr<int64_t>());
+              comp.norm = comp_norm.data_ptr<float>();
+              comp.cos_tab = cos_tab.data_ptr<float>();
+              comp.sin_tab = sin_tab.data_ptr<float>();
+              comp.kv = comp_kv.data_ptr<float>();
+              comp.sc = comp_sc.data_ptr<float>();
+              comp.q8 = comp_q8.data_ptr<uint8_t>();
+              comp.s8 = comp_s8.data_ptr<float>();
+              comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope.data_ptr());
+              const uint32_t B = (uint32_t)cmp_pos.numel();
+              standalone_compressor_kernel<<<(B + 7) / 8, 256, 0,
+                                             at::cuda::getCurrentCUDAStream()>>>(
+                  comp, B, (float)eps);
+          },
+          "standalone MAIN-compressor reference (benchmark sep_us column)",
+          py::arg("cmp_pos"), py::arg("comp_norm"), py::arg("cos_tab"), py::arg("sin_tab"),
+          py::arg("comp_kv"), py::arg("comp_sc"), py::arg("comp_q8"), py::arg("comp_s8"),
+          py::arg("comp_rope"), py::arg("eps") = 1e-6);
     m.def("mqa_logits_fp4", &mqa_logits_fp4_forward,
           "DSV4 FP4 MQA-logits (single-seq, non-compressed RAW logits) — migrated from DeepGEMM",
           py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"),
@@ -461,5 +596,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("num_kv_stages") = 0,
           py::arg("rms_y") = c10::nullopt, py::arg("rms_out") = c10::nullopt,
           py::arg("rms_eps") = 1e-6, py::arg("prof") = c10::nullopt,
-          py::arg("rms_delay_us") = 0.0);
+          py::arg("rms_delay_us") = 0.0,
+          py::arg("cmp_pos") = c10::nullopt, py::arg("comp_norm") = c10::nullopt,
+          py::arg("cos_tab") = c10::nullopt, py::arg("sin_tab") = c10::nullopt,
+          py::arg("comp_kv") = c10::nullopt, py::arg("comp_sc") = c10::nullopt,
+          py::arg("comp_q8") = c10::nullopt, py::arg("comp_s8") = c10::nullopt,
+          py::arg("comp_rope") = c10::nullopt, py::arg("mock_attn") = false);
 }

@@ -399,6 +399,101 @@ def test_fused_rmsnorm(module):
     return ok_all
 
 
+def test_main_compressor(module):
+    """MAIN compressor fused into the score-attention tail (gemm_fuse_norm_b
+    compressor_process_row, d=512 part): per COMPRESS row ((pos+1)%4==0)
+      overlap-cat softmax aggregate -> weighted bf16 RMSNorm ->
+      RoPE(last 64) -> fp8 e4m3 block-64 quant.
+    [B1] state rows are a pos-derived PING-PONG window (physical row =
+    (4*(pos//4 % 2) + rr) & 7 for logical row rr); the kernel never writes the
+    state, so ALL rows must come back untouched (the old shift is gone).
+    Checks vs a torch reference with the same per-step bf16 rounding (softmax /
+    RMSNorm reduce ORDER differs -> tolerance-based), logits bitwise unchanged."""
+    print("\n[main-compressor] tail port vs torch ref")
+    torch.manual_seed(11)
+    B, T = 8, 512
+    q = torch.randn(B, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(B, T, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(B, NUM_HEADS, device="cuda", dtype=torch.float32)
+    q_p, q_sf, _ = quantize_fp4(q, HEAD_DIM)
+    kv_p, kv_sf, _ = quantize_fp4(kv, HEAD_DIM)
+    q_p = q_p.view(B, NUM_HEADS, HEAD_DIM // 2).contiguous()
+    q_sf = q_sf.view(B, NUM_HEADS).contiguous()
+    kv_p = kv_p.view(B, T, HEAD_DIM // 2).contiguous()
+    kv_sf = kv_sf.view(B, T).contiguous()
+    stride = ((T + BLOCK_KV - 1) // BLOCK_KV) * BLOCK_KV
+    ks = torch.arange(B, dtype=torch.int32, device="cuda") * T
+    ke = ks + T
+    logits_base = torch.full((B, stride), float("-inf"), device="cuda", dtype=torch.float32)
+    module.mqa_logits_fp4_decode_out(q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits_base, 0, 0)
+    torch.cuda.synchronize()
+
+    # compressor inputs: rows 3 and 7 are compress rows ((pos+1)%4 == 0)
+    pos = torch.arange(B, dtype=torch.int64, device="cuda")
+    comp_norm = (torch.rand(512, device="cuda") + 0.5)
+    S = 64
+    ang = torch.outer(torch.arange(S, device="cuda", dtype=torch.float32),
+                      1.0 / (10000.0 ** (torch.arange(32, device="cuda") / 32.0)))
+    cos_tab, sin_tab = torch.cos(ang).contiguous(), torch.sin(ang).contiguous()
+    comp_kv = torch.randn(B, 8, 1024, device="cuda", dtype=torch.float32)
+    comp_sc = torch.randn(B, 8, 1024, device="cuda", dtype=torch.float32)
+    kv0, sc0 = comp_kv.clone(), comp_sc.clone()
+    comp_q8 = torch.full((B, 448), 0xAB, device="cuda", dtype=torch.uint8)   # sentinel
+    comp_s8 = torch.full((B, 7), -1.0, device="cuda", dtype=torch.float32)
+    comp_rope = torch.zeros(B, 64, device="cuda", dtype=torch.bfloat16)
+
+    logits = torch.full((B, stride), float("-inf"), device="cuda", dtype=torch.float32)
+    module.mqa_logits_fp4_decode_out(
+        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, 0,
+        cmp_pos=pos, comp_norm=comp_norm, cos_tab=cos_tab, sin_tab=sin_tab,
+        comp_kv=comp_kv, comp_sc=comp_sc, comp_q8=comp_q8, comp_s8=comp_s8,
+        comp_rope=comp_rope)
+    torch.cuda.synchronize()
+
+    ok = torch.equal(logits, logits_base)
+    print(f"  logits bitwise unchanged: {'PASS' if ok else 'FAIL'}")
+
+    idx = torch.arange(512, device="cuda")
+    for m in range(B):
+        p = int(pos[m])
+        if (p + 1) % 4 != 0:   # untouched row
+            row_ok = (torch.equal(comp_kv[m], kv0[m]) and torch.equal(comp_sc[m], sc0[m])
+                      and bool((comp_q8[m] == 0xAB).all()) and bool((comp_s8[m] == -1.0).all()))
+            ok &= row_ok
+            print(f"  row {m} (pos {p}, skip): untouched {'PASS' if row_ok else 'FAIL'}")
+            continue
+        # torch reference; logical row rr lives at physical row (base+rr)&7
+        # (B1 ping-pong: pos 3 -> base 0 = identity, pos 7 -> base 4 = flipped)
+        base = 4 * ((p >> 2) & 1)
+        perm = [(base + r) & 7 for r in range(8)]
+        col = torch.stack([idx if r < 4 else idx + 512 for r in range(8)])       # [8,512]
+        sc8 = torch.gather(sc0[m][perm], 1, col)
+        kv8 = torch.gather(kv0[m][perm], 1, col)
+        e = torch.exp(sc8 - sc8.max(0).values)
+        agg = (e * kv8).sum(0) / e.sum(0)
+        vb = agg.bfloat16().float()
+        rms = torch.rsqrt((vb * vb).sum() / 512.0 + 1e-6)
+        ro = (vb * rms * comp_norm).bfloat16().float()
+        ri = p + 1 - 4
+        ev, ov = ro[448::2].clone(), ro[449::2].clone()
+        ro[448::2] = (ev * cos_tab[ri] - ov * sin_tab[ri]).bfloat16().float()
+        ro[449::2] = (ev * sin_tab[ri] + ov * cos_tab[ri]).bfloat16().float()
+        blk = ro[:448].view(7, 64)
+        scale_ref = (blk.abs().max(1).values.clamp_min(1e-4)) / 448.0
+        # checks (reduce-order ulps -> tolerances; B1: state must be UNTOUCHED)
+        state_ok = torch.equal(comp_kv[m], kv0[m]) and torch.equal(comp_sc[m], sc0[m])
+        s8_diff = ((comp_s8[m] - scale_ref).abs() / scale_ref).max().item()
+        deq = comp_q8[m].view(torch.float8_e4m3fn).float().view(7, 64) * comp_s8[m][:, None]
+        q8_diff = ((deq - blk).abs() / (blk.abs() + comp_s8[m][:, None] * 448 * 0.01)).max().item()
+        rope_diff = (comp_rope[m].float() - ro[448:]).abs().max().item()
+        row_ok = state_ok and s8_diff < 1e-2 and q8_diff < 0.15 and rope_diff < 0.05
+        ok &= row_ok
+        print(f"  row {m} (pos {p}, compress): state {'ok' if state_ok else 'WRITTEN!'} "
+              f"s8 {s8_diff:.2e} q8 {q8_diff:.3f} rope {rope_diff:.3f} "
+              f"{'PASS' if row_ok else 'FAIL'}")
+    return bool(ok)
+
+
 def cast_to_fp4_chunked(x2d, chunk_rows=1 << 21):
     """per_token_cast_to_fp4 over row-chunks. The one-shot path materializes several
     full-size intermediates (~5x the bf16 input); at B=256 x T=262144 that would peak
@@ -425,12 +520,23 @@ def benchmark(module, sweep_stages=False, fuse_norm=False, rms_delay_us=0.0):
         print("  bw0 = attention bytes / base_us; bw1 = (attention + rmsnorm bytes) / fused_us")
         print("  -> TOTAL achieved HBM bandwidth before/after fusion (bw1 > bw0 means the")
         print("  fused kernel moves more bytes per second, i.e. the tail rides free-ish).")
-        print("  d_us = fused_us - base_us: the latency the fusion adds.")
+        print("  d_us = fused_us - base_us: the latency the RMSNorm fusion adds.")
+        print("  dc_us = all_us - fused_us: the MAIN-compressor marginal cost on top")
+        print("  (REALISTIC trigger: staggered positions -> ~B/4 compress rows per step,")
+        print("  matching complex_b's cmp_pos semantics in steady-state decode).")
+        print("  sep_us = base_us + standalone rmsnorm + standalone compressor kernels")
+        print("  (each op as its OWN well-written kernel, same estimator; test_complex.cu")
+        print("  base_sum flavor -- pure GPU exec, so real separate launches would be")
+        print("  WORSE by per-launch CPU overhead). fx = sep_us / all_us.")
+        print("  tail_us = attention MOCKED OUT (384 attn threads exit at entry): the")
+        print("  4 tail warps/CTA run rmsnorm+compressor alone, in situ -> the tail's")
+        print("  uncovered wall; all_us ~ max(fused-ish window, tail_us) explains dc_us.")
         if rms_delay_us > 0:
             print(f"  tail deferred start: {rms_delay_us:.1f} us (head-start hypothesis knob)")
         print(f"{'B':>4} {'T':>7} {'ctx':>8} {'stg':>5} {'base_us':>9} {'fused_us':>9} "
-              f"{'d_us':>7} {'bw0_GB/s':>9} {'bw1_GB/s':>9}")
-        print("-" * 74)
+              f"{'d_us':>7} {'all_us':>8} {'dc_us':>7} {'tail_us':>8} {'rms1_us':>8} "
+              f"{'cmp1_us':>8} {'sep_us':>8} {'fx':>5} {'bw0_GB/s':>9} {'bw1_GB/s':>9}")
+        print("-" * 131)
     else:
         print("  bytes = q/sf_q/weights reads + KV+SF reads + logits writes (DeepGEMM accounting).")
         print(f"{'B':>4} {'T':>7} {'ctx':>8} {'tiles':>7} {'stg':>5} {'kernel_us':>11} {'TFLOPS':>7} {'bw_GB/s':>9}")
@@ -477,6 +583,43 @@ def benchmark(module, sweep_stages=False, fuse_norm=False, rms_delay_us=0.0):
                     # correctness sentinel (not printed; loud failure only)
                     diff = (qn.view(-1, 512).float() - rmsnorm_ref(y).float()).abs().max().item()
                     assert diff < 0.05, f"fused rmsnorm diverged: max diff {diff}"
+                    # + MAIN compressor, REALISTIC trigger: staggered decode positions
+                    # -> (pos+1)%4==0 on exactly B/4 rows, spread one-per-CTA (aligns
+                    # complex_b's cmp_pos semantics; full-compress was a false worst case)
+                    cpos = torch.arange(B, dtype=torch.int64, device="cuda")
+                    cnorm = torch.rand(512, device="cuda") + 0.5
+                    ctab = torch.rand(4, 32, device="cuda")
+                    stab = torch.rand(4, 32, device="cuda")
+                    ckv = torch.randn(B, 8, 1024, device="cuda")
+                    csc = torch.randn(B, 8, 1024, device="cuda")
+                    cq8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
+                    cs8 = torch.empty(B, 7, device="cuda")
+                    crope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
+                    acall = lambda s=stg: module.mqa_logits_fp4_decode_out(
+                        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s,
+                        rms_y=y, rms_out=qn, rms_eps=1e-6, rms_delay_us=rms_delay_us,
+                        cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
+                        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
+                    aus = kernel_us(acall)
+                    # "each op as its OWN kernel" reference: standalone rmsnorm +
+                    # standalone compressor (one warp per group/row, full grid),
+                    # timed with the SAME L2-flushed min-of-instances estimator.
+                    rms1 = kernel_us(lambda: module.mqa_rmsnorm_standalone(y, qn, 1e-6),
+                                     name_substr="standalone_rmsnorm")
+                    cmp1 = kernel_us(lambda: module.mqa_compressor_standalone(
+                        cpos, cnorm, ctab, stab, ckv, csc, cq8, cs8, crope, 1e-6),
+                                     name_substr="standalone_compressor")
+                    sep = kus + rms1 + cmp1
+                    # tail IN SITU solo: attention mocked out (384 threads exit at
+                    # entry), same 512-thread launch shape, only the tail warpgroup
+                    # works -> the tail's uncovered wall in its real environment.
+                    tcall = lambda s=stg: module.mqa_logits_fp4_decode_out(
+                        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s,
+                        rms_y=y, rms_out=qn, rms_eps=1e-6,
+                        cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
+                        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope,
+                        mock_attn=True)
+                    tus = kernel_us(tcall)
                     # TOTAL achieved HBM bandwidth, DeepGEMM byte accounting:
                     #   attention: q/sf_q/weights reads + KV+SF reads + logits writes
                     #   rmsnorm:   y fp32 read + q_normed bf16 write
@@ -486,8 +629,10 @@ def benchmark(module, sweep_stages=False, fuse_norm=False, rms_delay_us=0.0):
                     bw0 = attn_bytes / 1e3 / kus
                     bw1 = (attn_bytes + tail_bytes) / 1e3 / fus
                     print(f"{B:4d} {T:7d} {4*T:8d} {eff_stg:5d} "
-                          f"{kus:9.3f} {fus:9.3f} {fus-kus:7.3f} {bw0:9.0f} {bw1:9.0f}")
-                    del y, qn
+                          f"{kus:9.3f} {fus:9.3f} {fus-kus:7.3f} {aus:8.3f} {aus-fus:7.3f} "
+                          f"{tus:8.3f} {rms1:8.3f} {cmp1:8.3f} {sep:8.3f} {sep/aus:5.2f} "
+                          f"{bw0:9.0f} {bw1:9.0f}")
+                    del y, qn, cpos, cnorm, ctab, stab, ckv, csc, cq8, cs8, crope
                 else:
                     # DeepGEMM test_attention.py accounting (paged decode path):
                     #   reads:  q fp4-packed + sf_q i32 + weights f32, KV fp4-packed 64B + sf 4B per slot
@@ -527,18 +672,30 @@ def timeline(module, B, T, stg=0):
     ke = ks + T
     y = torch.randn(B, 128 * 512, device="cuda", dtype=torch.float32)
     qn = torch.empty(B, 128 * 512, device="cuda", dtype=torch.bfloat16)
-    prof_t = torch.zeros(num_sms * 4, dtype=torch.int64, device="cuda")
+    # MAIN compressor (realistic 1/4 trigger) so the phase stamps have work to show
+    cpos = torch.arange(B, dtype=torch.int64, device="cuda")
+    cnorm = torch.rand(512, device="cuda") + 0.5
+    ctab = torch.rand(4, 32, device="cuda")
+    stab = torch.rand(4, 32, device="cuda")
+    ckv = torch.randn(B, 8, 1024, device="cuda")
+    csc = torch.randn(B, 8, 1024, device="cuda")
+    cq8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
+    cs8 = torch.empty(B, 7, device="cuda")
+    crope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
+    prof_t = torch.zeros(num_sms * 8, dtype=torch.int64, device="cuda")
 
     fcall = lambda p=None: module.mqa_logits_fp4_decode_out(
         q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, stg,
-        rms_y=y, rms_out=qn, rms_eps=1e-6, prof=p)
+        rms_y=y, rms_out=qn, rms_eps=1e-6, prof=p,
+        cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
+        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
     fcall()  # warmup
     torch.cuda.synchronize()
     torch.empty(int(8e9 // 4), dtype=torch.int, device="cuda").zero_()  # cold L2/HBM
     fcall(prof_t)
     torch.cuda.synchronize()
 
-    p = prof_t.view(-1, 4).cpu()
+    p = prof_t.view(-1, 8).cpu()
     # Origin = earliest stamp of any kind. The tail stamps at CTA entry while the
     # attention t0 is post-prologue, so min must include t2 or tail bars go negative.
     t0 = min(p[:, 0].min().item(), p[:, 2].min().item())
@@ -571,6 +728,17 @@ def timeline(module, B, T, stg=0):
           f"mean tail = {tail_dur.mean().item():.2f} us, {ratio:.1f}% of it overlapped; "
           f"max hang = {hang:.2f} us")
 
+    # ---- compressor phase breakdown, critical (latest-finishing) compress-row CTA
+    # (test_complex.cu pattern). Tail order: compressor rows FIRST, then the shared
+    # rms ticket pool -- comp phases are relative to tail start; slot 6 retired
+    # with the B1 ping-pong state (no shift phase anymore).
+    if int(p[:, 7].max()) > 0:
+        i = int(p[:, 7].argmax())
+        t2, t4, t5, t7 = (p[i, k].item() for k in (2, 4, 5, 7))
+        print(f"compressor phases (critical CTA {i}, us): "
+              f"agg {(t5-t2)/1e3:.2f} | norm+rope+quant {(t7-t5)/1e3:.2f} | "
+              f"comp total {(t7-t2)/1e3:.2f} | rms pool (w12) {(t4-t2)/1e3:.2f}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -602,6 +770,7 @@ def main():
         ok &= test_single(module)
         ok &= test_decode(module)
         ok &= test_fused_rmsnorm(module)
+        ok &= test_main_compressor(module)
         print("\nALL PASSED" if ok else "\nCORRECTNESS FAILED")
     if args.benchmark or args.sweep_stages or args.fuse_norm:
         benchmark(module, sweep_stages=args.sweep_stages, fuse_norm=args.fuse_norm,
