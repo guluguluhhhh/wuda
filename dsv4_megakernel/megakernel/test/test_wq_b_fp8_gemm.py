@@ -1,6 +1,6 @@
 """
-Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale, fixed BM=128).
-  M<=128: swap-AB BM128 x BN128; M>=160: non-swap BM128 x BN128.
+Test & Benchmark: wq_b_proj_gemm (tcgen05 FP8 block-scale).
+  M<=128: swap-AB UMMA_N=M x BN128; M>=160: non-swap BM128 x BN224.
   x_fp8[M,1536] @ w_fp8[65536,1536].T -> y[M,65536] (FP32)
 Requires: NVIDIA Blackwell (sm_100+), CUDA 12.8+, CUTLASS 3.x.
 
@@ -14,14 +14,15 @@ Native DSV4 scale-factor layout expected by the kernel:
 import os, sys, torch
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench_utils import bench_kineto   # DeepGEMM's bench_kineto, vendored verbatim
+
 K_DIM   = 1536
 N_TOTAL = 65536          # 128 heads x 512 dim
 BLOCK_K = 128
 QUANT_BLOCK_K = 128
-HW_SF_GRAN_K = 32
 WEIGHT_QUANT_BLOCK_N = 128
 SF_K    = K_DIM // QUANT_BLOCK_K          # 12
-NUM_HW_SF = K_DIM // HW_SF_GRAN_K         # 48 K32 hardware scale slots
 UE8M0_ONE = 0x7F                    # exponent 127 -> 2^0 = 1.0
 
 
@@ -72,23 +73,6 @@ def make_weight_sf_ones(device):
         (N_TOTAL // WEIGHT_QUANT_BLOCK_N, SF_K), UE8M0_ONE,
         dtype=torch.uint8, device=device)
     return as_ue8m0(raw)
-
-
-def make_cublaslt_sf_ones(mn, device):
-    """cuBLASLt VEC32_UE8M0 scale storage for an outer dimension of size mn.
-
-    cuBLASLt pads the outer dimension to 128 and the number of 32-K blocks to
-    a multiple of four. Its scale tiles have an additional 128x4 permutation,
-    which is immaterial here because every byte encodes scale 1.0.
-    """
-    if not hasattr(torch, 'float8_e8m0fnu'):
-        return None
-    aligned_mn = ((mn + 127) // 128) * 128
-    padded_k_blocks = ((NUM_HW_SF + 3) // 4) * 4
-    raw = torch.full(
-        (aligned_mn * padded_k_blocks,), UE8M0_ONE,
-        dtype=torch.uint8, device=device)
-    return raw.view(torch.float8_e8m0fnu)
 
 
 def dequant_act(fp8, exps):
@@ -159,7 +143,44 @@ def test_correctness_scaled(module, M):
     return ok
 
 
+def test_head_ssq(module, M):
+    """RMSNorm scale folding: the epilogue RED-accumulates per-(row, head)
+    sum-of-squares into head_ssq[M,128]. Reference = the kernel's OWN fp32 output
+    (isolates the accumulation from fp8 quant error); tolerance covers the
+    non-deterministic f32 atomic order. Also sanity-checks s_h = rsqrt(ssq/512+eps)."""
+    print("\n" + "=" * 60)
+    print(f"Correctness (head_ssq / RMSNorm scale folding, M={M})")
+    print("=" * 60)
+    dev = 'cuda'
+    torch.manual_seed(M + 7)
+    x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    x_sf = make_act_sf_ones(M, dev)
+    w_sf = make_weight_sf_ones(dev)
+
+    ssq = torch.zeros(M, N_TOTAL // 512, device=dev, dtype=torch.float32)
+    out = module.wq_b_proj_gemm(x, x_sf, w, w_sf, head_ssq=ssq)
+    ssq_ref = out.view(M, N_TOTAL // 512, 512).double().square().sum(-1).float()
+    rel = ((ssq - ssq_ref).abs() / (ssq_ref + 1e-6)).max().item()
+    s_h = torch.rsqrt(ssq / 512.0 + 1e-6)
+    s_ref = torch.rsqrt(ssq_ref / 512.0 + 1e-6)
+    s_rel = ((s_h - s_ref).abs() / s_ref).max().item()
+    ok = rel < 1e-3
+    print(f"  ssq max rel diff vs own-output reference: {rel:.3e}")
+    print(f"  s_h max rel diff: {s_rel:.3e}   (s_h range: {s_h.min().item():.4f} .. {s_h.max().item():.4f})")
+    print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def benchmark(module):
+    """Latency sweep, DeepGEMM bench methodology end-to-end:
+      * timing = vendored bench_kineto (8GB L2 flush per call, kineto kernel
+        device-time, warmup cycle discarded, mean of instances);
+      * cuBLAS baseline = BARE fp8 GEMM with per-tensor scale (torch._scaled_mm,
+        scale=1.0) -- the same operation deep_gemm.cublaslt_gemm_nt performs --
+        timed via its ('nvjet', 'reduce') kernel pair exactly like DeepGEMM's
+        own tests (the reduce kernel appears only when cuBLASLt picks split-K;
+        a missing name contributes 0)."""
     print("\n" + "=" * 60)
     print("Benchmark: wq_b_proj_gemm FP8 latency sweep")
     print("=" * 60)
@@ -167,69 +188,41 @@ def benchmark(module):
     w = (torch.randn(N_TOTAL, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
     w_sf = make_weight_sf_ones(dev)
     w_t = w.t()                                 # [K,N] column-major for _scaled_mm
+    one = torch.ones((), device=dev, dtype=torch.float32)
     weight_bytes = N_TOTAL * K_DIM * 1          # 100.7 MB (fp8)
     weight_sf_bytes = (N_TOTAL // WEIGHT_QUANT_BLOCK_N) * SF_K
 
-    def timeit(fn, iters=50, batches=6, warmup=30):
-        # min-of-batches: robust to DVFS/thermal throttling (the fastest batch ~=
-        # unthrottled latency). Otherwise a hot GPU makes every number look ~2x slow.
-        for _ in range(warmup): fn()
-        torch.cuda.synchronize()
-        best = float('inf')
-        for _ in range(batches):
-            s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            for _ in range(iters): fn()
-            e.record(); torch.cuda.synchronize()
-            best = min(best, s.elapsed_time(e) / iters * 1000)  # us
-        return best
-
-    # Same-math cuBLASLt baseline: e8m0 scale tensors select 32-element 1D block
-    # scaling in torch._scaled_mm. Do not fall back to scalar scaling: that is a
-    # different operation and produced a misleadingly fast reference.
-    def cublas_us(x, M):
-        if not hasattr(torch, "_scaled_mm"):
-            return None
-        if cublas_w_sf is None or cublas_sfs[M] is None:
-            if M == 32:
-                print("  (cuBLASLt block-scale baseline unavailable: "
-                      "torch.float8_e8m0fnu is missing)")
-            return None
-        try:
-            fn = lambda: torch._scaled_mm(
-                x, w_t,
-                scale_a=cublas_sfs[M], scale_b=cublas_w_sf,
-                out_dtype=torch.float32, use_fast_accum=False)
-            fn()  # probe
-            return timeit(fn)
-        except Exception as err:
-            if M == 32:
-                print(f"  (cuBLASLt K32 block-scale baseline unavailable: {err})")
-            return None
-
     print(f"  K={K_DIM}, N={N_TOTAL}; weight {weight_bytes/1e6:.1f} MB (e4m3)")
-    print("  Dispatch: M<=128 swap-AB BM128xBN128; M>=160 non-swap BM128xBN128")
-    print(f"  NOTE: min-of-batches latency (robust to throttling). For stable numbers")
-    print(f"        lock clocks: nvidia-smi -lgc <freq>. %cuBLAS = cuBLAS_us/ours_us.")
-    print(f"        Baseline = torch._scaled_mm (cuBLASLt K32 SF, K128 scales repeated); out FP32.")
-    print(f"  {'M':<5} {'ours(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
-    print("  " + "-" * 68)
+    print("  Dispatch: M<=128 swap-AB UMMA_N=M x BN128; M>=160 non-swap BM128xBN224")
+    print("  Timing: DeepGEMM bench_kineto (vendored). cuBLAS = bare-fp8 cuBLASLt")
+    print("  via torch._scaled_mm(scale=1), nvjet+reduce kernel pair.")
+    print(f"  {'M':<5} {'ours(us)':<10} {'+ssq(us)':<10} {'cuBLAS(us)':<11} {'ours_BW':<10} {'cuBLAS_BW':<11} {'TFLOPS':<9} {'%cuBLAS':<8}")
+    print("  " + "-" * 78)
 
-    Ms = [32, 64, 96, 128, 160, 192, 224, 256]
-    xs = {M: (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn) for M in Ms}
-    sfs = {M: make_act_sf_ones(M, dev) for M in Ms}
-    cublas_w_sf = make_cublaslt_sf_ones(N_TOTAL, dev)
-    cublas_sfs = {M: make_cublaslt_sf_ones(M, dev) for M in Ms}
+    for M in [32, 64, 96, 128, 160, 192, 224, 256]:
+        x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+        x_sf = make_act_sf_ones(M, dev)
+        ssqbuf = torch.zeros(M, 128, device=dev, dtype=torch.float32)
 
-    # Two separate passes (ours, then baseline) so the compute-heavy baseline does
-    # not heat the GPU in-between our measurements.
-    ours_us  = {M: timeit(lambda M=M: module.wq_b_proj_gemm(xs[M], sfs[M], w, w_sf)) for M in Ms}
-    cbls_us  = {M: cublas_us(xs[M], M) for M in Ms}
+        us = 1e6 * bench_kineto(
+            lambda: module.wq_b_proj_gemm(x, x_sf, w, w_sf),
+            'wq_b_proj_kernel', suppress_kineto_output=True)
+        # + head_ssq (RMSNorm scale folding); buffer accumulates garbage across
+        # timing iters -- irrelevant for latency; must be ~= ours.
+        sq = 1e6 * bench_kineto(
+            lambda: module.wq_b_proj_gemm(x, x_sf, w, w_sf, head_ssq=ssqbuf),
+            'wq_b_proj_kernel', suppress_kineto_output=True)
+        try:
+            cb_pair = bench_kineto(
+                lambda: torch._scaled_mm(x, w_t, scale_a=one, scale_b=one,
+                                         out_dtype=torch.float32),
+                ('nvjet', 'reduce'), suppress_kineto_output=True)
+            cb = 1e6 * sum(cb_pair)
+        except Exception as err:
+            cb = None
+            if M == 32:
+                print(f"  (cuBLAS baseline unavailable: {err})")
 
-    for M in Ms:
-        us = ours_us[M]; cb = cbls_us[M]
-        # Logical bytes for the same block-scaled operation. Physical cuBLASLt
-        # scale padding is deliberately excluded from this algorithm-level metric.
         obytes = (weight_bytes + weight_sf_bytes + M * K_DIM +
                   M * SF_K + M * N_TOTAL * 4)
         bw = obytes / (us * 1e-6) / 1e9
@@ -237,7 +230,7 @@ def benchmark(module):
         cb_s  = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
         cb_bw = f"{obytes/(cb*1e-6)/1e9:<11.1f}" if cb else f"{'-':<11}"
         pct   = f"{cb/us*100:<8.1f}" if cb else f"{'-':<8}"
-        print(f"  {M:<5} {us:<10.1f} {cb_s} {bw:<10.1f} {cb_bw} {tflops:<9.1f} {pct}")
+        print(f"  {M:<5} {us:<10.1f} {sq:<10.1f} {cb_s} {bw:<10.1f} {cb_bw} {tflops:<9.1f} {pct}")
 
 
 def profile_pipeline(module, M=128, clock_ghz=1.8):
@@ -322,6 +315,8 @@ if __name__ == '__main__':
         results.append(test_correctness(module, M))
     for M in [32, 96, 128, 160, 256]:
         results.append(test_correctness_scaled(module, M))
+    for M in [32, 128, 160, 256]:
+        results.append(test_head_ssq(module, M))
 
     benchmark(module)
 

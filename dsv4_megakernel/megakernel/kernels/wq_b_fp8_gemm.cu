@@ -48,6 +48,10 @@ struct SharedStorage {
     alignas(16) Barrier tmem_full_barriers[NUM_EPI_STAGES];
     alignas(16) Barrier tmem_empty_barriers[NUM_EPI_STAGES];
 
+    // head_ssq per-warp scratch (RMSNorm scale folding): warp w's partial
+    // sum-of-squares of row r over its 32 columns; folded + RED'd at tile end.
+    alignas(16) float ssq_scratch[4][BM];
+
     // TMEM base address
     alignas(16) uint32_t tmem_base;
 };
@@ -63,6 +67,7 @@ wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_D,    // output [M,N] FP32 row-major
     int problem_m,
     int num_blocks,
+    float* __restrict__ head_ssq,                  // [M,128] per-head sum-of-squares (RED-accumulated; nullptr off)
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
     using Dims = SwapDims<M_TPL>;
@@ -168,9 +173,14 @@ wq_b_proj_kernel(
         }
     }
 
-    // ======== WARP 2: NATIVE K128 SF EXPANDER (both CTAs) ========
+    // ======== WARP 2: NATIVE SF PACKER (both CTAs) ========
+    // DeepGEMM SF amortization: the native layouts x_sf[M, K/128] / w_sf[N/128,
+    // K/128] keep a row's K scales CONTIGUOUS, so the 4 bytes of one SF group are
+    // ONE naturally-aligned u32 (row stride 12 % 4 == 0) -- a single coalesced LDG
+    // replaces the old per-stage byte read + x0x01010101 replication. Only the
+    // GROUP-START stage (k % 4 == 0) fills smem + UTCCPs; the other stages just
+    // relay the barrier. sf_id in the MMA selects the byte within the group.
     else if (warp_id == 2) {
-        auto pack_k128_sf = [](uint32_t e) { return e * 0x01010101u; };
         uint32_t stage = 0, phase = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
 
@@ -179,33 +189,32 @@ wq_b_proj_kernel(
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             const int sfa_m = m_sub * BM_T;
             for (int k = 0; k < NUM_K_TILES; ++k) {
-                // Prefetch native scales while operand TMA is in flight. Each activation
-                // row has one K128 scale; one aligned N128 weight block has one scale.
-                uint32_t va[4];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const int row = sfa_m + i * 32 + lane_id;
-                    const uint32_t e = row < problem_m
-                        ? static_cast<uint32_t>(x_sf[row * NUM_K_TILES + k])
-                        : UE8M0_ONE;
-                    va[i] = pack_k128_sf(e);
-                }
-                uint32_t eb = UE8M0_ONE;
-                if (lane_id == 0)
-                    eb = static_cast<uint32_t>(
-                        w_sf[(n_base / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k]);
-                eb = __shfl_sync(0xffffffffu, eb, 0);
-                const uint32_t vb = pack_k128_sf(eb);
+                if (k % 4 == 0) {
+                    // One u32 per row = this group's 4 consecutive K128 exponents.
+                    uint32_t va[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int row = sfa_m + i * 32 + lane_id;
+                        va[i] = row < problem_m
+                            ? *reinterpret_cast<const uint32_t*>(x_sf + row * NUM_K_TILES + k)
+                            : UE8M0_ONE * 0x01010101u;
+                    }
+                    uint32_t vb = UE8M0_ONE * 0x01010101u;
+                    if (lane_id == 0)
+                        vb = *reinterpret_cast<const uint32_t*>(
+                            w_sf + (n_base / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k);
+                    vb = __shfl_sync(0xffffffffu, vb, 0);
 
-                s.full_barriers[stage].wait(phase);
-                auto* sfa = reinterpret_cast<uint32_t*>(s.smem_sfa + stage * SSFA);
-                auto* sfb = reinterpret_cast<uint32_t*>(s.smem_sfb + stage * SMEM_SFB_PER_STAGE);
-                // Directly produce UTCCP's [32 lanes][4 row groups] layout. Replicating
-                // the byte makes sf_id 0..3 share the official K128 scale.
-                ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
-                ptx::st_shared_v4_u32(sfb + lane_id * 4, vb, vb, vb, vb);
-                cutlass::arch::fence_view_async_shared();
-                s.with_sf_full_barriers[stage].arrive(0u);   // all 32 lanes arrive (x2 CTAs)
+                    s.full_barriers[stage].wait(phase);
+                    auto* sfa = reinterpret_cast<uint32_t*>(s.smem_sfa + stage * SSFA);
+                    auto* sfb = reinterpret_cast<uint32_t*>(s.smem_sfb + stage * SMEM_SFB_PER_STAGE);
+                    ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
+                    ptx::st_shared_v4_u32(sfb + lane_id * 4, vb, vb, vb, vb);
+                    cutlass::arch::fence_view_async_shared();
+                } else {
+                    s.full_barriers[stage].wait(phase);   // operands only this stage
+                }
+                s.with_sf_full_barriers[stage].arrive(0u);
                 advance();
             }
           }
@@ -213,10 +222,10 @@ wq_b_proj_kernel(
     }
 
     // ======== WARP 1: MMA CONSUMER (leader only) ========
-    // Per-tile UTCCP + block_scale MMA delegated to the fixed-128 cluster_mma_fp8 engine.
+    // Per-tile UTCCP + block_scale MMA delegated to cluster_mma_fp8 (UMMA_N = M).
     else if (warp_id == 1 && is_leader) {
-        using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<BLOCK_K, NS>;
-        static_assert(UMMA_N_T == CM::UMMA_N, "FIXED-BM kernel requires UMMA_N == 128");
+        using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<BLOCK_K, NS, UMMA_N_T, BLOCK_N, true>;
+        static_assert(UMMA_N_T == CM::UMMA_N, "swap-AB requires UMMA_N == problem M");
 
         auto ds = CM::init_desc(smem_a_base, smem_b_base, lane_id);
 
@@ -265,7 +274,7 @@ wq_b_proj_kernel(
         uint32_t epi_warp_idx = warp_id - (NUM_NON_EPI_THREADS / 32);  // 0..3
         uint32_t tma_store_idx = 0;
 
-        constexpr int NUM_STORES         = BM_T / STORE_BLOCK_M;               // 8 per subtile (TMA clips rows >= M)
+        constexpr int NUM_STORES         = UMMA_N_T / STORE_BLOCK_M;          // M/16 (no padding rows)
         constexpr int NUM_TMEM_SUBROWS   = STORE_BLOCK_M / 8;                  // 2
         constexpr int NUM_N_STORE_ATOMS  = STORE_BLOCK_N / STORE_BLOCK_N_ATOM; // 4
         constexpr int SMEM_CD_PER_STAGE_T = SMEM_CD_PER_STAGE;                 // 8192
@@ -320,6 +329,28 @@ wq_b_proj_kernel(
                             + (lane_id % 4) * sizeof(float);
                         ptx::st_shared_u32(smem_ptr, vals[row]);
                     }
+
+                    // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
+                    // vals[8] = 8 consecutive M rows; this warp's 32 lanes cover 32
+                    // distinct columns, all inside ONE 512-col head. Placed AFTER the
+                    // smem stores so they issue first and the reduction retires in
+                    // their shadow (this epilogue gates tmem_empty -> MMA).
+                    // (redux.sync.add.f32 rejected by ptxas -- redux add is integer-
+                    // only here -- so a shuffle tree it is.) Partials park in smem
+                    // scratch; ONE global RED per row at tile end (per-(row,warp)
+                    // REDs here measured 3x swap-path latency).
+                    if (head_ssq != nullptr) {
+                        #pragma unroll
+                        for (uint32_t row = 0; row < 8; ++row) {
+                            const float f = __uint_as_float(vals[row]);
+                            float sq = f * f;
+                            #pragma unroll
+                            for (int o = 16; o > 0; o >>= 1)
+                                sq += __shfl_down_sync(0xffffffffu, sq, o);
+                            if (lane_id == 0)
+                                s.ssq_scratch[epi_warp_idx][st * STORE_BLOCK_M + i * 8 + (int)row] = sq;
+                        }
+                    }
                 }
 
                 if (st == NUM_STORES - 1) {
@@ -344,6 +375,20 @@ wq_b_proj_kernel(
                 __syncwarp();
             }
 
+            // Tile-end fold: thread r sums the 4 warp partials of row r and issues
+            // ONE fire-and-forget RED (128 per CTA-tile, no intra-CTA same-address
+            // collisions). Ordering is free: the last st's NamedBarrier above made
+            // all scratch writes visible, and the next tile's first NamedBarrier
+            // orders scratch reuse.
+            if (head_ssq != nullptr) {
+                const int r = (int)threadIdx.x - NUM_NON_EPI_THREADS;   // 0..127
+                const int m = base_m + r;
+                const float v = s.ssq_scratch[0][r] + s.ssq_scratch[1][r]
+                              + s.ssq_scratch[2][r] + s.ssq_scratch[3][r];
+                if (m < problem_m)
+                    atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + base_n / HEAD_DIM_OUT, v);
+            }
+
             // [PROFILE] Epilogue (leader CTA): end of this iteration's readback+store.
             if (kProfile && cluster_id == 0 && cta_rank == 0 &&
                 epi_warp_idx == 0 && lane_id == 0) {
@@ -366,37 +411,41 @@ wq_b_proj_kernel(
 }
 
 // ======================== Non-swap specialization (M >= 160) ========================
-// Consecutive CTA ranks own consecutive 128-row M blocks and share one aligned
-// 128-column N block through the 2SM MMA.
+// Consecutive CTA ranks own consecutive 128-row M blocks and share one 224-column
+// N tile through the 2SM MMA. BN=224 matches DeepGEMM's pick for this shape: it
+// nearly halves the tile count (1024 -> 586 CTA tasks), halving per-tile fixed
+// costs (TMEM handoffs, epilogue barrier trains) -- the measured 12%% gap vs
+// DeepGEMM at M>=160. A 224-col tile is NOT aligned to the native 128-col weight
+// scale blocks, so the SF-B path carries one scale byte PER OUTPUT COLUMN.
 namespace nonswap {
 
 static constexpr int BLOCK_M_NS        = 128;
-static constexpr int BLOCK_N_NS        = 128;
+static constexpr int BLOCK_N_NS        = 224;
 static constexpr int LOAD_BLOCK_M_NS   = 128;
-static constexpr int LOAD_BLOCK_N_NS   = BLOCK_N_NS / NUM_MULTICAST;  // 64
+static constexpr int LOAD_BLOCK_N_NS   = BLOCK_N_NS / NUM_MULTICAST;  // 112
 static constexpr int SF_BLOCK_M_NS     = 128;
-static constexpr int SF_BLOCK_N_NS     = 128;
-static constexpr int NUM_STAGES_NS     = 7;
+static constexpr int SF_BLOCK_N_NS     = 256;  // align(224,128): 2 UTCCP atoms
+static constexpr int NUM_STAGES_NS     = 6;
 static constexpr int UMMA_N_NS         = BLOCK_N_NS;
-static constexpr int NUM_TMEM_COLS_NS  = 512;
-static constexpr int TMEM_SFA_NS       = UMMA_N_NS * NUM_EPI_STAGES;  // 256
-static constexpr int TMEM_SFB_NS       = TMEM_SFA_NS + SF_BLOCK_M_NS / 32; // 260
+static constexpr int NUM_TMEM_COLS_NS  = 512;  // 448 accum + 4 SFA + 8 SFB = 460
+static constexpr int TMEM_SFA_NS       = UMMA_N_NS * NUM_EPI_STAGES;  // 448
+static constexpr int TMEM_SFB_NS       = TMEM_SFA_NS + SF_BLOCK_M_NS / 32; // 452
 
 static constexpr int SMEM_A_PER_STAGE_NS   = LOAD_BLOCK_M_NS * BLOCK_K; // 16384
-static constexpr int SMEM_B_PER_STAGE_NS   = LOAD_BLOCK_N_NS * BLOCK_K; // 8192
+static constexpr int SMEM_B_PER_STAGE_NS   = LOAD_BLOCK_N_NS * BLOCK_K; // 14336
 static constexpr int SMEM_SFA_PER_STAGE_NS = SF_BLOCK_M_NS * sizeof(uint32_t); // 512
-static constexpr int SMEM_SFB_PER_STAGE_NS = SF_BLOCK_N_NS * sizeof(uint32_t); // 512
+static constexpr int SMEM_SFB_PER_STAGE_NS = SF_BLOCK_N_NS * sizeof(uint32_t); // 1024
 
 static constexpr int STORE_BLOCK_M_NS       = BLOCK_M_NS;
-static constexpr int STORE_BLOCK_N_NS       = SWIZZLE_CD / sizeof(float); // 32
+static constexpr int STORE_BLOCK_N_NS       = SWIZZLE_CD / sizeof(float); // 32 (7 st per tile)
 static constexpr int SMEM_CD_PER_STAGE_NS   = STORE_BLOCK_M_NS * STORE_BLOCK_N_NS * sizeof(float); // 16384
 static constexpr int SMEM_CD_TOTAL_NS       = SMEM_CD_PER_STAGE_NS * NUM_TMA_STORE_STAGES; // 32768
 
 static constexpr int NUM_M_BLOCKS_NS = 2; // M=160..256 => ceil(M/128)=2
-static constexpr int NUM_N_BLOCKS_NS = (N_TOTAL + BLOCK_N_NS - 1) / BLOCK_N_NS; // 512
-static constexpr int NUM_TASKS_NS    = NUM_M_BLOCKS_NS * NUM_N_BLOCKS_NS;       // 1024 CTAs
-static_assert(BLOCK_N_NS == WEIGHT_QUANT_BLOCK_N,
-              "non-swap N tile must match the native weight-scale block");
+static constexpr int NUM_N_BLOCKS_NS = (N_TOTAL + BLOCK_N_NS - 1) / BLOCK_N_NS; // 293 (tail 128 cols)
+static constexpr int NUM_TASKS_NS    = NUM_M_BLOCKS_NS * NUM_N_BLOCKS_NS;       // 586 CTAs
+static_assert(BLOCK_N_NS % STORE_BLOCK_N_NS == 0, "epilogue st loop must tile BN exactly");
+static_assert(BLOCK_N_NS < HEAD_DIM_OUT, "a tile spans at most 2 output heads (ssq path)");
 static_assert(NUM_TASKS_NS % CLUSTER_SIZE == 0, "non-swap task tail must contain full clusters");
 
 struct SharedStorage {
@@ -441,6 +490,7 @@ wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_D,
     int problem_m,
     int physical_grid,
+    float* __restrict__ head_ssq,   // [M,128] per-head sum-of-squares (RED-accumulated; nullptr off)
     int64_t* prof) {
     using CM = cluster_mma_fp8::ClusterMmaFP8BlockScale<
         BLOCK_K, NUM_STAGES_NS, BLOCK_M_NS, BLOCK_N_NS, false>;
@@ -531,8 +581,9 @@ wq_b_proj_kernel(
             ++persistent_iter;
         }
     } else if (warp_id == 2) {
-        auto pack_k128_sf = [](uint32_t e) { return e * 0x01010101u; };
-
+        // Native SF PACKER (see the swap-path warp 2): one u32 LDG per row at each
+        // GROUP-START stage (k % 4 == 0) carries 4 consecutive K128 exponents; the
+        // shared run_tile UTCCPs once per group and selects bytes via sf_id.
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         auto advance = [&]() {
             stage = (stage + 1) % NUM_STAGES_NS;
@@ -545,35 +596,48 @@ wq_b_proj_kernel(
             const int n_base = n_block_idx * BLOCK_N_NS;
             #pragma unroll 4
             for (int k = 0; k < NUM_K_TILES; ++k) {
-                // Activation SF is per row/K128. The N128 tile exactly matches one
-                // native weight-scale block.
-                uint32_t va[4];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const int row = m_base + i * 32 + lane_id;
-                    const uint32_t e = row < problem_m
-                        ? static_cast<uint32_t>(x_sf[row * NUM_K_TILES + k])
-                        : UE8M0_ONE;
-                    va[i] = pack_k128_sf(e);
+                if (k % 4 == 0) {
+                    uint32_t va[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int row = m_base + i * 32 + lane_id;
+                        va[i] = row < problem_m
+                            ? *reinterpret_cast<const uint32_t*>(x_sf + row * NUM_K_TILES + k)
+                            : UE8M0_ONE * 0x01010101u;
+                    }
+                    // Weight SF per OUTPUT COLUMN: BN=224 is not aligned to the
+                    // native 128-col scale blocks, so column r takes its u32 from
+                    // block (n_base+r)/128. Two UTCCP atoms (SF_BLOCK_N=256); rows
+                    // >= 224 and OOB tail columns pad with 1.0. Adjacent lanes hit
+                    // 1-2 distinct addresses -> L1-broadcast LDGs.
+                    uint32_t vb[2][4];
+                    #pragma unroll
+                    for (int a = 0; a < 2; ++a) {
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int r = a * 128 + i * 32 + (int)lane_id;
+                            const int n = n_base + r;
+                            vb[a][i] = (r < BLOCK_N_NS && n < N_TOTAL)
+                                ? *reinterpret_cast<const uint32_t*>(
+                                      w_sf + (n / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k)
+                                : UE8M0_ONE * 0x01010101u;
+                        }
+                    }
+
+                    s.full_barriers[stage].wait(phase);
+                    auto* sfa = reinterpret_cast<uint32_t*>(
+                        s.smem_sfa + stage * SMEM_SFA_PER_STAGE_NS);
+                    auto* sfb = reinterpret_cast<uint32_t*>(
+                        s.smem_sfb + stage * SMEM_SFB_PER_STAGE_NS);
+                    ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
+                    ptx::st_shared_v4_u32(sfb + lane_id * 4,
+                                          vb[0][0], vb[0][1], vb[0][2], vb[0][3]);
+                    ptx::st_shared_v4_u32(sfb + 128 + lane_id * 4,
+                                          vb[1][0], vb[1][1], vb[1][2], vb[1][3]);
+                    cutlass::arch::fence_view_async_shared();
+                } else {
+                    s.full_barriers[stage].wait(phase);   // operands only this stage
                 }
-
-                uint32_t eb = UE8M0_ONE;
-                if (lane_id == 0)
-                    eb = static_cast<uint32_t>(
-                        w_sf[(n_base / WEIGHT_QUANT_BLOCK_N) * NUM_K_TILES + k]);
-                eb = __shfl_sync(0xffffffffu, eb, 0);
-                const uint32_t vb = pack_k128_sf(eb);
-
-                s.full_barriers[stage].wait(phase);
-
-                auto* sfa = reinterpret_cast<uint32_t*>(
-                    s.smem_sfa + stage * SMEM_SFA_PER_STAGE_NS);
-                auto* sfb = reinterpret_cast<uint32_t*>(
-                    s.smem_sfb + stage * SMEM_SFB_PER_STAGE_NS);
-                ptx::st_shared_v4_u32(sfa + lane_id * 4, va[0], va[1], va[2], va[3]);
-                ptx::st_shared_v4_u32(sfb + lane_id * 4, vb, vb, vb, vb);
-                cutlass::arch::fence_view_async_shared();
-
                 s.with_sf_full_barriers[stage].arrive(0u);
                 advance();
             }
@@ -633,6 +697,14 @@ wq_b_proj_kernel(
             const uint32_t tmem_base = accum_stage * UMMA_N_NS;
             const int base_m = m_block_idx * BLOCK_M_NS;
             const int base_n = n_block_idx * BLOCK_N_NS;
+            // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
+            // Non-swap layout: each lane owns ONE output row (m = base_m +
+            // epi_warp*32 + lane) and walks all 224 columns of this tile across
+            // (st, i). BN=224 may straddle ONE 512-col head boundary (224 < 512),
+            // so keep two accumulators and select per 4-col chunk (a chunk never
+            // straddles: 512 % 4 == 0). OOB tail columns accumulate zeros.
+            const int ssq_head0 = base_n / HEAD_DIM_OUT;
+            float ssq_acc0 = 0.f, ssq_acc1 = 0.f;
 
             #pragma unroll
             for (int st = 0; st < BLOCK_N_NS / STORE_BLOCK_N_NS; ++st) {
@@ -649,6 +721,14 @@ wq_b_proj_kernel(
                     uint32_t v0, v1, v2, v3;
                     ptx::tmem_load_32dp32b4x(tmem_addr, v0, v1, v2, v3);
                     cutlass::arch::fence_view_async_tmem_load();
+
+                    if (head_ssq != nullptr) {
+                        const float f0 = __uint_as_float(v0), f1 = __uint_as_float(v1);
+                        const float f2 = __uint_as_float(v2), f3 = __uint_as_float(v3);
+                        const float sq = f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3;
+                        const int chunk_head = (base_n + st * STORE_BLOCK_N_NS + i * 4) / HEAD_DIM_OUT;
+                        (chunk_head == ssq_head0 ? ssq_acc0 : ssq_acc1) += sq;
+                    }
 
                     const uint32_t row = lane_id;
                     const uint32_t col = i ^ (row % 8);
@@ -674,6 +754,14 @@ wq_b_proj_kernel(
                 tma_store_idx = (tma_store_idx + 1) % NUM_TMA_STORE_STAGES;
             }
 
+            if (head_ssq != nullptr) {
+                const int m = base_m + (int)epi_warp_idx * 32 + (int)lane_id;
+                if (m < problem_m) {
+                    atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + ssq_head0, ssq_acc0);
+                    if (ssq_head0 + 1 < NUM_HEADS_OUT && ssq_acc1 != 0.f)
+                        atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + ssq_head0 + 1, ssq_acc1);
+                }
+            }
             if (kProfile && blockIdx.x == 0 && epi_warp_idx == 0 && lane_id == 0) {
                 prof[persistent_iter * 7 + 4] = prof_t0;
                 prof[persistent_iter * 7 + 5] = ptx::rdclock();
@@ -755,9 +843,14 @@ static int get_smem_bytes(int M) {
 //   x_fp8 [M,K] e4m3 ; x_sf [M,K/128] UE8M0 (activation 1x128)
 //   w_fp8 [N,K] e4m3 ; w_sf [N/128,K/128] UE8M0 (weight 128x128)
 // Output FP32 [M,N]. (profile: also returns clock64 timing[max_iters,7].)
+// head_ssq (optional): ZERO-INITIALIZED fp32 [M,128]; the epilogue RED-accumulates
+// per-(row, head) sum-of-squares into it (RMSNorm scale folding: the consumer
+// finalizes s_h = rsqrt(ssq/512 + eps) in its own q pass). f32 atomic order is
+// non-deterministic -> ulp-level run-to-run wobble; nullptr = bit-identical GEMM.
 static std::vector<torch::Tensor> run_wq_b(
     torch::Tensor x_fp8, torch::Tensor x_sf,
-    torch::Tensor w_fp8, torch::Tensor w_sf, bool profile)
+    torch::Tensor w_fp8, torch::Tensor w_sf, bool profile,
+    c10::optional<torch::Tensor> head_ssq)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
@@ -798,7 +891,7 @@ static std::vector<torch::Tensor> run_wq_b(
 
     // Both paths use K-major 128B-swizzled operands. TMA OOB handling covers the
     // partial second M block in the non-swap path.
-    const int load_block_m = use_nonswap ? nonswap::LOAD_BLOCK_M_NS : BM / NUM_MULTICAST;
+    const int load_block_m = use_nonswap ? nonswap::LOAD_BLOCK_M_NS : M / NUM_MULTICAST;
     const int load_block_n = use_nonswap ? nonswap::LOAD_BLOCK_N_NS : LOAD_BLOCK_N;
     const int store_block_m = use_nonswap ? nonswap::STORE_BLOCK_M_NS : STORE_BLOCK_M;
     const int store_block_n = use_nonswap ? nonswap::STORE_BLOCK_N_NS : STORE_BLOCK_N_ATOM;
@@ -849,6 +942,16 @@ static std::vector<torch::Tensor> run_wq_b(
         prof_dev = reinterpret_cast<int64_t*>(timing.data_ptr());
     }
 
+    float* ssq_ptr = nullptr;
+    if (head_ssq.has_value()) {
+        auto& t = head_ssq.value();
+        TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat && t.is_contiguous()
+                    && t.numel() >= (int64_t)M * NUM_HEADS_OUT,
+                    "head_ssq must be CUDA fp32 contiguous [M,", NUM_HEADS_OUT,
+                    "], ZERO-INITIALIZED (the kernel accumulates via f32 RED atomics)");
+        ssq_ptr = t.data_ptr<float>();
+    }
+
     void* kernel_ptr = profile ? get_kernel_ptr<true>(M) : get_kernel_ptr<false>(M);
     int smem_bytes = get_smem_bytes(M);
     TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
@@ -884,7 +987,7 @@ static std::vector<torch::Tensor> run_wq_b(
 
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
-            &M, &grid_size, &prof_dev
+            &M, &grid_size, &ssq_ptr, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
@@ -896,20 +999,25 @@ static std::vector<torch::Tensor> run_wq_b(
 
 // ======================== PyTorch Binding ========================
 torch::Tensor wq_b_proj_gemm(
-    torch::Tensor x_fp8, torch::Tensor x_sf, torch::Tensor w_fp8, torch::Tensor w_sf)
+    torch::Tensor x_fp8, torch::Tensor x_sf, torch::Tensor w_fp8, torch::Tensor w_sf,
+    c10::optional<torch::Tensor> head_ssq)
 {
-    return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false)[0];
+    return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq)[0];
 }
 
 std::vector<torch::Tensor> wq_b_proj_gemm_profiled(
     torch::Tensor x_fp8, torch::Tensor x_sf, torch::Tensor w_fp8, torch::Tensor w_sf)
 {
-    return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/true);
+    return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/true, c10::nullopt);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wq_b_proj_gemm", &wq_b_proj_gemm,
-          "wq_b proj FP8 block-scale (tcgen05 2SM, hybrid layout, Blackwell) -> FP32");
+          "wq_b proj FP8 block-scale (tcgen05 2SM, hybrid layout, Blackwell) -> FP32; "
+          "head_ssq (optional, zero-init fp32 [M,128]): RED-accumulated per-head "
+          "sum-of-squares for RMSNorm scale folding",
+          py::arg("x_fp8"), py::arg("x_sf"), py::arg("w_fp8"), py::arg("w_sf"),
+          py::arg("head_ssq") = c10::nullopt);
     m.def("wq_b_proj_gemm_profiled", &wq_b_proj_gemm_profiled,
           "wq_b proj FP8 + clock64 load/MMA/epilogue timing -> (out, timing[max_iters,7])");
 }

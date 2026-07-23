@@ -149,6 +149,11 @@ struct ClusterMmaFP8BlockScale {
     static constexpr int UMMA_M = 256;
     static constexpr int UMMA_N = kSwapAB ? BM : BN;
     static constexpr int UMMA_K = 32, GRAN_K = 32;
+    // DeepGEMM SF amortization: one packed u32 per row carries the UE8M0 exponents
+    // of SF_STAGES_PER_LOAD consecutive K128 stages; UTCCP runs once per group and
+    // the MMA's sf_id selects the BYTE (= stage index within the group). 4x fewer
+    // SF loads / smem writes / UTCCPs than the old replicate-per-stage scheme.
+    static constexpr int SF_STAGES_PER_LOAD = 4;
     static constexpr int LOAD_BLOCK_M = BM / (kSwapAB ? NUM_MULTICAST : 1);
     static constexpr int LOAD_BLOCK_N = BN / (kSwapAB ? 1 : NUM_MULTICAST);
     static constexpr int STEPS_PER_STAGE = BLOCK_K / UMMA_K;          // = SF sub-blocks per stage
@@ -172,8 +177,11 @@ struct ClusterMmaFP8BlockScale {
     static constexpr int SMEM_SF_WGT_PER_STAGE = SF_BLOCK_N * (int)sizeof(uint32_t);
 
     static_assert(BLOCK_K % UMMA_K == 0, "BLOCK_K must be a multiple of UMMA_K(32)");
-    static_assert(UMMA_K == GRAN_K, "sf_id == kk assumes UMMA_K == GRAN_K");
-    static_assert(BM == 128, "the 2SM FP8 engine currently requires BLOCK_M=128");
+    static_assert(BLOCK_K == 128, "one SF byte covers one K128 stage");
+    // BM is fully parameterised: SMEM strides scale with LOAD_BLOCK_M, the SF path
+    // UTCCPs align(BM,128) rows regardless (padding rows carry UE8M0_ONE), and the
+    // K-major smem descriptor's SBO depends only on BLOCK_K. Real constraints:
+    static_assert(BM % 16 == 0 && BM <= 256, "invalid (swap) UMMA N = BM");
     static_assert((BN % 16) == 0 && BN <= 256, "invalid non-swap UMMA N");
 
     // Descriptor state precomputed once per MMA warp.
@@ -230,28 +238,35 @@ struct ClusterMmaFP8BlockScale {
             uint32_t b_base = __shfl_sync(0xffffffff, ds.wgt_lo, stage_idx);
 
             if (detail::elect_one_sync()) {
-                // ---- UTCCP this stage's scale factors (smem -> TMEM) ----
-                auto sf_desc = detail::make_sf_desc();
-                const auto* sf_act = reinterpret_cast<const uint32_t*>(
-                    smem_sf_act_base + stage_idx * SMEM_SF_ACT_PER_STAGE);
-                const auto* sf_wgt = reinterpret_cast<const uint32_t*>(
-                    smem_sf_wgt_base + stage_idx * SMEM_SF_WGT_PER_STAGE);
-                #pragma unroll
-                for (int i = 0; i < NUM_SF_ATOMS_M; ++i) {
-                    detail::replace_sf_desc_addr(sf_desc, sf_act + i * NUM_UTCCP_ALIGNED);
-                    detail::utccp_4x32_2cta(tmem_sf_act + i * 4, detail::sf_desc_bits(sf_desc));
-                }
-                #pragma unroll
-                for (int i = 0; i < NUM_SF_ATOMS_N; ++i) {
-                    detail::replace_sf_desc_addr(sf_desc, sf_wgt + i * NUM_UTCCP_ALIGNED);
-                    detail::utccp_4x32_2cta(tmem_sf_wgt + i * 4, detail::sf_desc_bits(sf_desc));
+                // ---- UTCCP the scale factors once per SF group (smem -> TMEM) ----
+                // The group-start stage's smem slot holds [rows] x u32, each u32 =
+                // the exponents of the next SF_STAGES_PER_LOAD K128 stages.
+                const uint32_t sf_group_idx = (uint32_t)k % SF_STAGES_PER_LOAD;
+                if (sf_group_idx == 0) {
+                    auto sf_desc = detail::make_sf_desc();
+                    const auto* sf_act = reinterpret_cast<const uint32_t*>(
+                        smem_sf_act_base + stage_idx * SMEM_SF_ACT_PER_STAGE);
+                    const auto* sf_wgt = reinterpret_cast<const uint32_t*>(
+                        smem_sf_wgt_base + stage_idx * SMEM_SF_WGT_PER_STAGE);
+                    #pragma unroll
+                    for (int i = 0; i < NUM_SF_ATOMS_M; ++i) {
+                        detail::replace_sf_desc_addr(sf_desc, sf_act + i * NUM_UTCCP_ALIGNED);
+                        detail::utccp_4x32_2cta(tmem_sf_act + i * 4, detail::sf_desc_bits(sf_desc));
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < NUM_SF_ATOMS_N; ++i) {
+                        detail::replace_sf_desc_addr(sf_desc, sf_wgt + i * NUM_UTCCP_ALIGNED);
+                        detail::utccp_4x32_2cta(tmem_sf_wgt + i * 4, detail::sf_desc_bits(sf_desc));
+                    }
                 }
 
-                // ---- block_scale MMA over UMMA_K sub-blocks (gran_k=32 -> sf id = kk) ----
+                // ---- block_scale MMA: all UMMA_K sub-blocks of a K128 stage share
+                // ONE scale byte -> sf_id = stage index within the SF group, and the
+                // runtime descriptor is hoisted out of the kk loop. ----
+                uint64_t rdesc = detail::make_runtime_idesc_with_sf_id(
+                    ds.instr_desc, sf_group_idx, sf_group_idx);
                 #pragma unroll
                 for (int kk = 0; kk < STEPS_PER_STAGE; ++kk) {
-                    uint32_t sf_id = kk;
-                    uint64_t rdesc = detail::make_runtime_idesc_with_sf_id(ds.instr_desc, sf_id, sf_id);
                     uint32_t a_lo = detail::advance_lo_k(a_base, kk);
                     uint32_t b_lo = detail::advance_lo_k(b_base, kk);
                     uint64_t act_full = (static_cast<uint64_t>(ds.act_hi) << 32) | a_lo;

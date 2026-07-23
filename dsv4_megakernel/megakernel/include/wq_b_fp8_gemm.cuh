@@ -11,10 +11,12 @@
 //   weight 128x128, scale = UE8M0.
 //
 // swap_ab=1, 2SM MMA (cta_group::2), Cluster=(2,1,1) -> cluster_n=2, Persistent,
-// Warp-Specialized. UMMA_N is pinned to 128 (BM=128); M<128 is zero-padded (TMA OOB
-// fill) and the padded output columns are dropped in the epilogue. The block_scale
-// MMA is issued by cluster_mma_fp8.cuh; this header carries the config + the SF
-// pipeline plumbing (SMEM/TMA helpers) that feeds it.
+// Warp-Specialized. UMMA_N = M (32-aligned, <=128): the MMA and the epilogue touch
+// EXACTLY M rows -- no padding work (verified vs DeepGEMM's config choice, which
+// picks block_m=M for this shape; the old fixed UMMA_N=128 paid a 1.04-1.13x
+// padding tax at M<128). Smaller M also frees SMEM_A -> deeper pipelines. The
+// block_scale MMA is issued by cluster_mma_fp8.cuh; this header carries the config
+// + the SF pipeline plumbing (SMEM/TMA helpers) that feeds it.
 //
 // Native SF layout:
 //   x_sf[M, K/128] and w_sf[ceil(N/128), K/128], one UE8M0 byte per K128
@@ -42,6 +44,14 @@ namespace wq_b {
 // ---- Problem dimensions (fixed for wq_b projection) ----
 static constexpr int K_DIM    = 1536;
 static constexpr int N_TOTAL  = 65536;  // 128 heads x 512 dim
+// ---- Output head geometry (per-head RMSNorm scale folding) ----
+// The epilogue can ACCUMULATE per-(row, head) sum-of-squares into an optional
+// zero-initialized head_ssq[M, NUM_HEADS_OUT] fp32 buffer (fire-and-forget f32
+// RED atomics; each 128-col N block lies inside ONE 512-col head). The consumer
+// finalizes s_h = rsqrt(ssq/512 + eps) and folds it into its own q pass -- the
+// normalized y never round-trips HBM and TMEM never has to hold a whole head.
+static constexpr int HEAD_DIM_OUT  = 512;
+static constexpr int NUM_HEADS_OUT = N_TOTAL / HEAD_DIM_OUT;   // 128
 static constexpr int BLOCK_K  = 128;
 static constexpr int NUM_K_TILES = K_DIM / BLOCK_K; // 12
 static constexpr int QUANT_BLOCK_K = 128; // native DSV4 FP8 quantization granularity
@@ -60,13 +70,11 @@ static constexpr bool IS_MULTICAST_ON_A = true;
 
 // ---- MMA instruction shape (2SM) ----
 // UMMA_M = LAYOUT_AD_M(128) * kNumMulticast(2) = 256 (along problem-N)
-// UMMA_N = 128 FIXED (along problem-M = BM). M<128 padded to 128.
+// UMMA_N = M (along problem-M; per-SwapDims template, no padding).
 static constexpr int LAYOUT_AD_M = 128;
 static constexpr int UMMA_M = LAYOUT_AD_M * NUM_MULTICAST; // 256
 static constexpr int UMMA_K = 32;                          // FP8 block-scale UMMA K
-static constexpr int BM       = 128;                       // problem-M tile = UMMA_N
-static constexpr int UMMA_N_FIXED = BM;                    // 128
-static constexpr int LOAD_BLOCK_M_FIXED = BM / NUM_MULTICAST; // 64 activation rows per CTA
+static constexpr int BM       = 128;                       // max swap-path M (scratch sizing)
 
 // ---- N tiling ----
 static constexpr int BLOCK_N        = 128;
@@ -126,38 +134,39 @@ static constexpr int num_aligned_tmem_cols(int c) {
     return 512;
 }
 
-// ---- Compile-time helpers parameterised on M (fixed BM=128, M split into subtiles) ----
-// Each subtile is a fixed 128-row (BM) tile: UMMA_N=128, LOAD_BLOCK_M=64. M>128 is
-// handled by NUM_M_SUB = ceil(M/128) subtiles processed back-to-back per N-tile
-// (weight stays L2-resident across subtiles -> HBM weight read once). All per-stage
-// SMEM / TMEM sizes are per-subtile (128), so they are identical for every M.
+// ---- Compile-time helpers parameterised on M (UMMA_N = M, no padding) ----
+// One tile covers the WHOLE problem M: UMMA_N = M, LOAD_BLOCK_M = M/2 per CTA.
+// Smaller M shrinks SMEM_A and the TMEM accumulator footprint, so the pipeline
+// deepens automatically (M=32 -> ~11 stages, matching DeepGEMM's pick).
 template <int M_> struct SwapDims {
-    static constexpr int BLOCK_M          = M_;                    // true M (total)
-    static constexpr int NUM_M_SUB        = div_up(M_, BM);        // ceil(M/128) subtiles
-    static constexpr int UMMA_N           = UMMA_N_FIXED;          // 128 (per subtile)
-    static constexpr int LOAD_BLOCK_M     = LOAD_BLOCK_M_FIXED;    // 64  (per subtile, BM/2)
-    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * FP8_ELEM_SIZE; // 64*128*1 = 8192
+    static constexpr int BLOCK_M          = M_;                    // true M (<= 128)
+    static constexpr int NUM_M_SUB        = div_up(M_, BM);        // 1 for all swap Ms
+    static constexpr int UMMA_N           = M_;                    // MMA-N = problem M
+    static constexpr int LOAD_BLOCK_M     = M_ / NUM_MULTICAST;    // M/2 per CTA
+    static constexpr int SMEM_A_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * FP8_ELEM_SIZE;
 
-    // SFA covers the FULL BLOCK_M(=128) tokens (loaded on each CTA; leader UTCCP
-    // broadcasts into both SMs' TMEM). Aligned up to the UTCCP granularity.
-    static constexpr int SF_BLOCK_M         = align_up(BM, NUM_UTCCP_ALIGNED);        // 128
+    // SFA stays UTCCP-aligned to 128 rows (rows >= M carry UE8M0_ONE padding;
+    // the MMA only consumes the first M).
+    static constexpr int SF_BLOCK_M         = align_up(M_, NUM_UTCCP_ALIGNED);        // 128
     static constexpr int SMEM_SFA_PER_STAGE = SF_BLOCK_M * (int)sizeof(uint32_t);     // 512
     static constexpr int NUM_SFA_TMEM_COLS  = SF_BLOCK_M / 32;                        // 4
 
     static constexpr int SMEM_PER_STAGE = SMEM_A_PER_STAGE + SMEM_B_PER_STAGE +
-                                          SMEM_SFA_PER_STAGE + SMEM_SFB_PER_STAGE;     // 25600
+                                          SMEM_SFA_PER_STAGE + SMEM_SFB_PER_STAGE;
 
     // TMEM layout: [accum (UMMA_N*NUM_EPI_STAGES)] [SFA cols] [SFB cols]
-    static constexpr int NUM_ACCUM_TMEM_COLS = UMMA_N * NUM_EPI_STAGES;               // 256
-    static constexpr int TMEM_START_SFA      = NUM_ACCUM_TMEM_COLS;                   // 256
-    static constexpr int TMEM_START_SFB      = NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS; // 260
+    static constexpr int NUM_ACCUM_TMEM_COLS = UMMA_N * NUM_EPI_STAGES;               // 2M
+    static constexpr int TMEM_START_SFA      = NUM_ACCUM_TMEM_COLS;
+    static constexpr int TMEM_START_SFB      = NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS;
     static constexpr int NUM_TMEM_COLS = num_aligned_tmem_cols(
-        NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS + NUM_SFB_TMEM_COLS);                 // 512
+        NUM_ACCUM_TMEM_COLS + NUM_SFA_TMEM_COLS + NUM_SFB_TMEM_COLS);
 
     // Number of pipeline stages fitting the SMEM budget.
-    // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr.
+    // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr
+    //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding).
     static constexpr int SMEM_BARRIERS = (16 * 3 + NUM_EPI_STAGES * 2) * 8;
-    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8;
+    static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8
+                                         + 4 * BM * (int)sizeof(float);
     static constexpr int STAGES_RAW    = (SMEM_CAPACITY - SMEM_OVERHEAD) / SMEM_PER_STAGE;
     static constexpr int NUM_STAGES    = STAGES_RAW > 12 ? 12 : STAGES_RAW;
 };
