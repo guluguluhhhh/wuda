@@ -30,6 +30,10 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
 // Epilogue: split-K reduce + RMSNorm + activation + Sinkhorn + collapse.
 //   grid = M (one block per position), block = EPILOGUE_THREADS.
 // ============================================================
+// kWithPostComb=false (A/B lite): the split-K reduce is UNTOUCHED (full 24
+// columns -- DeepGEMM-style gather, already optimal); only the post/comb
+// activation + Sinkhorn are dropped, and ALL 8 warps run the collapse.
+template <bool kWithPostComb>
 __global__ void __launch_bounds__(EPILOGUE_THREADS, 2)
 hc_reduce_and_fuse_kernel(
     const __nv_bfloat16* __restrict__ hidden_states,
@@ -105,11 +109,13 @@ hc_reduce_and_fuse_kernel(
 
     if (tid < HC) {
         pre_smem[tid] = fast_sigmoid(mix_smem[tid] * scale[0] + base[tid]) + hc_eps;
-        post_smem[tid] = 2.0f * fast_sigmoid(
-            mix_smem[HC + tid] * scale[1] + base[HC + tid]);
+        if constexpr (kWithPostComb)
+            post_smem[tid] = 2.0f * fast_sigmoid(
+                mix_smem[HC + tid] * scale[1] + base[HC + tid]);
     }
-    if (tid < HC * HC) {
-        comb_smem[tid] = mix_smem[2 * HC + tid] * scale[2] + base[2 * HC + tid];
+    if constexpr (kWithPostComb) {
+        if (tid < HC * HC)
+            comb_smem[tid] = mix_smem[2 * HC + tid] * scale[2] + base[2 * HC + tid];
     }
     __syncthreads();
     if (prof0 && threadIdx.x == 0) prof[4] = ptx::rdclock();  // activation done
@@ -118,14 +124,15 @@ hc_reduce_and_fuse_kernel(
     // Sinkhorn/collapse split below.
     if (tid < HC) {
         pre_out[pos * HC + tid] = pre_smem[tid];
-        post_out[pos * HC + tid] = post_smem[tid];
+        if constexpr (kWithPostComb)
+            post_out[pos * HC + tid] = post_smem[tid];
     }
 
     // OVERLAP: warp 0 runs Sinkhorn on comb (needs comb_smem); warps 1..7 run the
     // collapse (needs only pre_smem). Independent, run concurrently; which one is the
     // pole depends on M (small M -> Sinkhorn; large M -> collapse). prof: warp 0 stamps
     // sinkhorn end [5]; warp 1 stamps collapse start [6] / end [7] -> real collapse time.
-    if (warp_id == 0) {
+    if (kWithPostComb && warp_id == 0) {
         float v = lane_id < HC * HC ? comb_smem[lane_id] : 0.0f;
         float max_v = v;
         #pragma unroll
@@ -165,13 +172,14 @@ hc_reduce_and_fuse_kernel(
         if (lane_id < HC * HC) comb_out[pos * HC * HC + lane_id] = v;   // final gate
         if (prof0 && lane_id == 0) prof[5] = ptx::rdclock();  // sinkhorn end (warp0)
     } else {
-        // Collapse on warps 1..7 (EPILOGUE_THREADS-32 threads), reading hidden straight
-        // from global (the global read overlaps warp 0's Sinkhorn).
+        // Collapse: with post/comb, warps 1..7 (the global read overlaps warp 0's
+        // Sinkhorn); lite variant: ALL 8 warps (no Sinkhorn to hide).
         //   out[d] = Σ_h pre[h] * hidden[pos, h, d].
         // Vectorized: each thread handles VEC=8 consecutive d as one int4 (16B) load per
         // h + one int4 store -> wide coalesced transactions instead of 2B/thread. hidden
         // (=X) is re-read here from L2; 16B/thread keeps that read cheap.
-        if (prof0 && threadIdx.x == 32) prof[6] = ptx::rdclock();  // collapse start (warp1)
+        constexpr int COLLAPSE_BASE = kWithPostComb ? 32 : 0;
+        if (prof0 && threadIdx.x == COLLAPSE_BASE) prof[6] = ptx::rdclock();  // collapse start
         constexpr int VEC = 8;                        // 8 bf16 = 16B = int4
         static_assert(DIM % VEC == 0, "DIM must be VEC-aligned for the int4 collapse");
         float pre_r[HC];
@@ -179,8 +187,8 @@ hc_reduce_and_fuse_kernel(
         for (int h = 0; h < HC; ++h) pre_r[h] = pre_smem[h];
         const __nv_bfloat16* src = hidden_states + static_cast<int64_t>(pos) * K_DIM;
         __nv_bfloat16* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
-        const int lane_vec = static_cast<int>(threadIdx.x) - 32;   // warp1..7 -> 0..223
-        const int nthreads = EPILOGUE_THREADS - 32;                // 224
+        const int lane_vec = static_cast<int>(threadIdx.x) - COLLAPSE_BASE;
+        constexpr int nthreads = EPILOGUE_THREADS - COLLAPSE_BASE;
         for (int vi = lane_vec; vi < DIM / VEC; vi += nthreads) {
             const int d0 = vi * VEC;
             float acc[VEC];
@@ -203,7 +211,7 @@ hc_reduce_and_fuse_kernel(
                 out2[k] = __float22bfloat162_rn(make_float2(acc[2 * k], acc[2 * k + 1]));
             *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
         }
-        if (prof0 && threadIdx.x == 32) prof[7] = ptx::rdclock();  // collapse end (warp1)
+        if (prof0 && threadIdx.x == COLLAPSE_BASE) prof[7] = ptx::rdclock();  // collapse end
     }
 }
 
@@ -244,7 +252,7 @@ static void hc_launch_core(
     const float* base_ptr, const float* scale_ptr,
     float hc_eps, float rms_eps,
     __nv_bfloat16* collapsed_ptr, float* pre_ptr, float* post_ptr, float* comb_ptr,
-    int64_t* prof_dev) {
+    int64_t* prof_dev, bool with_post_comb = true) {
     const int m = static_cast<int>(hs.size(0));
     const SplitConfig cfg = make_split_config(m);
     auto fp32_opts = hs.options().dtype(torch::kFloat32);
@@ -288,18 +296,26 @@ static void hc_launch_core(
     constexpr int fuse_smem_bytes = scratch_floats * sizeof(float);
     static bool fuse_configured = false;
     if (!fuse_configured) {
-        const auto attr_err = cudaFuncSetAttribute(
-            reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, fuse_smem_bytes);
-        TORCH_CHECK(attr_err == cudaSuccess,
-                    "cudaFuncSetAttribute(fuse) failed: ", cudaGetErrorString(attr_err),
-                    " smem=", fuse_smem_bytes);
+        for (auto* fptr : {reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<true>),
+                           reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<false>)}) {
+            const auto attr_err = cudaFuncSetAttribute(
+                fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, fuse_smem_bytes);
+            TORCH_CHECK(attr_err == cudaSuccess,
+                        "cudaFuncSetAttribute(fuse) failed: ", cudaGetErrorString(attr_err),
+                        " smem=", fuse_smem_bytes);
+        }
         fuse_configured = true;
     }
 
-    hc_reduce_and_fuse_kernel<<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
-        x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
-        m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr, prof_dev);
+    if (with_post_comb) {
+        hc_reduce_and_fuse_kernel<true><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
+            x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
+            m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr, prof_dev);
+    } else {
+        hc_reduce_and_fuse_kernel<false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
+            x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
+            m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr, prof_dev);
+    }
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "HC reduce/fuse launch failed: ", cudaGetErrorString(cudaGetLastError()));
 }
@@ -311,7 +327,8 @@ static std::vector<torch::Tensor> hc_run_impl(
     torch::Tensor attn_hc_scale,
     double hc_eps,
     double rms_norm_eps,
-    bool profile) {
+    bool profile,
+    bool with_post_comb = true) {
     hc_validate_inputs(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale);
 
     c10::cuda::CUDAGuard device_guard(hidden_states.device());
@@ -339,7 +356,7 @@ static std::vector<torch::Tensor> hc_run_impl(
                    static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
                    reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
                    pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
-                   prof_dev);
+                   prof_dev, with_post_comb);
 
     std::vector<torch::Tensor> out;
     if (hidden_states.dim() == 2) {
@@ -358,7 +375,8 @@ static void hc_fused_forward_out(
     torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
     torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
     double hc_eps, double rms_norm_eps,
-    torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post, torch::Tensor comb) {
+    torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post, torch::Tensor comb,
+    bool with_post_comb) {
     hc_validate_inputs(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale);
 
     c10::cuda::CUDAGuard device_guard(hidden_states.device());
@@ -384,7 +402,7 @@ static void hc_fused_forward_out(
                    static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
                    reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
                    pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
-                   nullptr);
+                   nullptr, with_post_comb);
 }
 
 static std::vector<torch::Tensor> hc_fused_forward_full(
@@ -403,9 +421,9 @@ static std::vector<torch::Tensor> hc_fused_forward_full(
 static std::vector<torch::Tensor> hc_fused_forward_profiled(
     torch::Tensor hidden_states, torch::Tensor attn_hc_fn,
     torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
-    double hc_eps, double rms_norm_eps) {
+    double hc_eps, double rms_norm_eps, bool with_post_comb) {
     return hc_run_impl(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale,
-                       hc_eps, rms_norm_eps, /*profile=*/true);
+                       hc_eps, rms_norm_eps, /*profile=*/true, with_post_comb);
 }
 
 static std::vector<int64_t> hc_fused_tc_config(int64_t num_positions) {
@@ -422,9 +440,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hc_fused_forward_full", &hc_tc::hc_fused_forward_full,
           "MHC fused forward (tf32 tcgen05 + split-K + fused HC epilogue)");
     m.def("hc_fused_forward_profiled", &hc_tc::hc_fused_forward_profiled,
-          "MHC fused forward + clock64 stamps -> {collapsed,pre,post,comb,timing[8]}");
+          "MHC fused forward + clock64 stamps -> {collapsed,pre,post,comb,timing[8]}; "
+          "with_post_comb=False profiles the lite variant ([5] sinkhorn not stamped)",
+          py::arg("hidden_states"), py::arg("attn_hc_fn"), py::arg("attn_hc_base"),
+          py::arg("attn_hc_scale"), py::arg("hc_eps"), py::arg("rms_norm_eps"),
+          py::arg("with_post_comb") = true);
     m.def("hc_fused_forward_out", &hc_tc::hc_fused_forward_out,
-          "MHC fused forward into preallocated {collapsed,pre,post,comb} (no alloc, no return)");
+          "MHC fused forward into preallocated {collapsed,pre,post,comb} (no alloc, no return); "
+          "with_post_comb=False = lite: full reduce, but post/comb activation + Sinkhorn "
+          "dropped and ALL warps collapse",
+          py::arg("hidden_states"), py::arg("attn_hc_fn"), py::arg("attn_hc_base"),
+          py::arg("attn_hc_scale"), py::arg("hc_eps"), py::arg("rms_norm_eps"),
+          py::arg("collapsed"), py::arg("pre"), py::arg("post"), py::arg("comb"),
+          py::arg("with_post_comb") = true);
     m.def("hc_fused_tc_config", &hc_tc::hc_fused_tc_config,
           "Return [N tile, split-K, K tiles/split, grid, M tiles, N tiles, SMs, M tile]");
 }

@@ -7,6 +7,9 @@ import sys
 import torch
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench_utils import bench_kineto   # DeepGEMM's bench_kineto, vendored verbatim
+
 
 HC = 4
 DIM = 7168
@@ -154,30 +157,61 @@ def test_correctness(module, positions):
     return all_ok
 
 
-def time_cuda_us(fn, warmup, iters):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / iters
+def time_cuda_us(fn, kernel_names):
+    """DeepGEMM bench_kineto (see bench_utils.py): 8GB L2 flush before EVERY
+    call, kineto kernel device-time only, warmup cycle discarded, MEAN over
+    instances; tuple names are summed (one MHC call = gemm + reduce kernels).
+    NOTE: switched from CUDA-Event wall time over a hot-L2 200-call burst --
+    expect different (launch-free, cold-L2) numbers than historical tables."""
+    t = bench_kineto(fn, kernel_names, suppress_kineto_output=True)
+    return 1e6 * (sum(t) if isinstance(t, tuple) else t)
 
 
-BENCH_WARMUP = 50
-BENCH_ITERS = 200
+def probe_kernel_names(fn):
+    """One mini kineto pass -> tuple of ALL kernel names fn launches (flush/
+    memset/memcpy families excluded). cuBLAS picks DIFFERENT kernels per shape
+    (gemv / sgemm / nvjet ...), so guessing name substrings makes bench_kineto
+    silently return 0 for unmatched names (measured: the fp32 column read
+    0.000 at M=1). Probe the names, then time with the standard estimator."""
+    from torch.profiler import profile, ProfilerActivity
+    fn()
+    torch.cuda.synchronize()
+    try:   # acc_events silences torch's clears-events-per-cycle warning on prof.events()
+        prof_ctx = profile(activities=[ProfilerActivity.CUDA], acc_events=True)
+    except TypeError:  # older torch without acc_events
+        prof_ctx = profile(activities=[ProfilerActivity.CUDA])
+    with prof_ctx as prof:
+        fn()
+        torch.cuda.synchronize()
+    names = []
+    for e in prof.events():
+        n = e.name
+        if any(x in n for x in ('elementwise', 'Memset', 'memset', 'fill',
+                                'Memcpy', 'vectorized_')):
+            continue
+        d = getattr(e, 'device_time', None)
+        if d is None:
+            d = getattr(e, 'cuda_time', 0.0)
+        if d and d > 0:
+            n = n[:80]   # bench_kineto's table truncates names at 100 chars
+            if n not in names:
+                names.append(n)
+    assert names, 'probe found no kernels'
+    return tuple(names)
+
+
+def time_cuda_us_probed(fn):
+    return time_cuda_us(fn, probe_kernel_names(fn))
 
 
 def benchmark(module, positions):
     torch.manual_seed(42)
     _, weight, base, scale = make_inputs(1)
     dev = "cuda"
-    # cuBLAS baseline = bf16 F.linear: a stable "fastest vendor GEMM floor" (its fp32/tf32
-    # path is pathological for N=24). Our kernel is tf32 -- higher precision than this.
+    # cuBLAS = the MIDDLE GEMM only ([m,K]@[K,24], bf16, fastest vendor floor) --
+    # compare it against the 'gemm' STAGE column, not the full fused op. The
+    # fp32/tf32 path is not used: N=24 has no TF32 tensor-core coverage and falls
+    # back to pathological SIMT sgemm (measured 42-48us).
     wb = weight.to(torch.bfloat16)
     # Config is constant across all M (single tuned config) -> print once in the header.
     cfg0 = module.hc_fused_tc_config(positions[0])
@@ -185,13 +219,17 @@ def benchmark(module, positions):
     print("Full MHC op: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
     print(f"config (all M): M_TILE={cfg0[7]}  N_TILE={cfg0[0]}  splitK={cfg0[1]}  "
           f"K_tiles/split={cfg0[2]}")
-    print("  mhc/cuBLAS = wall time (us). gemm/reduce/sinkhorn/collapse = clock64 stage")
-    print("  medians (exclude launch/gap); sinkhorn ‖ collapse run concurrently.")
+    print("  mhc/cuBLAS = kernel time (us), DeepGEMM bench_kineto (cold L2, launch-free).")
+    print("  no-pc = A/B: post/comb+Sinkhorn dropped, ALL 8 warps collapse (upper bound")
+    print("  for moving post/comb to the post-layer scatter). cuBLAS = middle GEMM only")
+    print("  (bf16) -> compare with the 'gemm' stage col.")
+    print("  gemm/reduce/activ/sinkhorn/collapse = clock64 stage")
+    print("  medians (exclude launch/gap); sinkhorn \u2016 collapse run concurrently.")
     print(
-        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'cuBLAS':>9} "
-        f"{'gemm':>8} {'reduce':>8} {'sinkhrn':>8} {'collapse':>9}"
+        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} {'cuBLAS':>9} "
+        f"{'gemm':>8} {'reduce':>8} {'activ':>7} {'sinkhrn':>8} {'collapse':>9}"
     )
-    print("-" * 76)
+    print("-" * 92)
 
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
@@ -207,17 +245,25 @@ def benchmark(module, positions):
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
                 collapsed, pre, post, comb),
-            BENCH_WARMUP, BENCH_ITERS,
+            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
         )
-        cublas_us = time_cuda_us(lambda: F.linear(x, wb), BENCH_WARMUP, BENCH_ITERS)
-        gemm, reduce, sinkhorn, collapse = profile_stages(
+        # A/B: same op minus post/comb (+Sinkhorn); correctness sentinel on pre.
+        nopc_us = time_cuda_us(
+            lambda: module.hc_fused_forward_out(
+                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+                collapsed, pre, post, comb, with_post_comb=False),
+            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
+        )
+        # Baseline kernel names are shape-dependent -> probed, not guessed.
+        cublas_us = time_cuda_us_probed(lambda: F.linear(x, wb))
+        gemm, reduce, activ, sinkhorn, collapse = profile_stages(
             module, hidden, weight, base, scale)
         print(
-            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {cublas_us:9.3f} "
-            f"{gemm:8.3f} {reduce:8.3f} {sinkhorn:8.3f} {collapse:9.3f}"
+            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} {cublas_us:9.3f} "
+            f"{gemm:8.3f} {reduce:8.3f} {activ:7.3f} {sinkhorn:8.3f} {collapse:9.3f}"
         )
         del hidden, x, collapsed, pre, post, comb
-    print("-" * 76)
+    print("-" * 92)
 
 
 def gpu_clock_mhz():
@@ -231,21 +277,25 @@ def gpu_clock_mhz():
     return 2100.0
 
 
-def profile_stages(module, hidden, weight, base, scale, repeats=30):
+def profile_stages(module, hidden, weight, base, scale, repeats=30, with_post_comb=True):
     """Median per-stage us from in-kernel clock64 stamps (prof buffer, block 0).
     Layout: [0]gemm start [1]gemm end | [2]epi start [3]reduce+rms [4]act |
             [5]sinkhorn end (warp0) | [6]collapse start [7]collapse end (warp1).
-    Sinkhorn (warp0) ‖ collapse (warp1) run concurrently, so collapse is timed on its
+    Sinkhorn (warp0) \u2016 collapse (warp1) run concurrently, so collapse is timed on its
     own warp -> [7]-[6] is the real collapse duration, not just the overhang.
-    Returns (gemm, reduce, sinkhorn, collapse) in microseconds.
+    Returns (gemm, reduce, activ, sinkhorn, collapse) in microseconds; activ =
+    [4]-[3] = the pre/post sigmoids + comb affine (one warp-wide instruction
+    burst -- previously unprinted, hidden between reduce and sinkhorn).
     """
     for _ in range(5):
-        module.hc_fused_forward_profiled(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
+        module.hc_fused_forward_profiled(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+                                         with_post_comb=with_post_comb)
     torch.cuda.synchronize()
     samples = []
     for _ in range(repeats):
         res = module.hc_fused_forward_profiled(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS)
+            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+            with_post_comb=with_post_comb)
         torch.cuda.synchronize()
         samples.append([int(v) for v in res[-1].cpu().tolist()])
     clk = gpu_clock_mhz()
@@ -254,7 +304,7 @@ def profile_stages(module, hidden, weight, base, scale, repeats=30):
         vals = sorted((s[b] - s[a]) / clk for s in samples)
         return vals[len(vals) // 2]
 
-    return med(0, 1), med(2, 3), med(4, 5), med(6, 7)  # gemm, reduce, sinkhorn, collapse
+    return med(0, 1), med(2, 3), med(3, 4), med(4, 5), med(6, 7)  # gemm, reduce, activ, sinkhorn, collapse
 
 
 def parse_positions(value):
@@ -263,7 +313,6 @@ def parse_positions(value):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument(
         "--correctness-positions", type=parse_positions,
@@ -277,7 +326,7 @@ def main():
 
     # Correctness reference stays TRUE fp32 (matmul precision 'highest', the default) so
     # the allclose error reflects our tf32 kernel vs a perfect fp32 ground truth. The
-    # cuBLAS *perf* baseline flips to tf32 locally inside benchmark() for a fair compare.
+    # cuBLAS *perf* baseline is a bf16 GEMM-only floor inside benchmark().
     torch.set_float32_matmul_precision("highest")
 
     major, minor = torch.cuda.get_device_capability()
@@ -291,8 +340,7 @@ def main():
     if not args.skip_correctness:
         if not test_correctness(module, args.correctness_positions):
             return 1
-    if args.benchmark:
-        benchmark(module, PROFILE_M)
+    benchmark(module, PROFILE_M)
     return 0
 
 

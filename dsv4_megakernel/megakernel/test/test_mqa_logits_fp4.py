@@ -25,6 +25,9 @@ import sys
 
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench_utils import bench_kineto   # DeepGEMM's bench_kineto, vendored verbatim
+
 NUM_HEADS = 64
 HEAD_DIM = 128
 
@@ -301,46 +304,15 @@ def test_decode(module):
     return ok_all
 
 
-def kernel_us(fn, name_substr="mqa_logits", num_tests=30, flush_l2=True, cooldown=0.5):
-    """Pure GPU kernel time, DeepGEMM bench_kineto framing (profiler schedule w+a,
-    L2 flushed with an 8GB memset before EVERY call -> cold-HBM KV reads).
-    Estimator: MIN over the per-instance kernel durations of the active cycle
-    (unthrottled capability; DVFS-throttled instances are excluded by construction,
-    unlike DeepGEMM's table average). `cooldown` lets clocks recover between cells."""
-    import time
-    from torch.profiler import profile, ProfilerActivity, schedule
-    flush_l2_size = int(8e9 // 4)
-    fn()  # warm the JIT/first-call path before profiling
-    torch.cuda.synchronize()
-    if cooldown > 0:
-        time.sleep(cooldown)
-    try:
-        prof = profile(activities=[ProfilerActivity.CUDA],
-                       schedule=schedule(wait=0, warmup=1, active=1, repeat=1),
-                       acc_events=True)
-    except TypeError:  # older torch without acc_events
-        prof = profile(activities=[ProfilerActivity.CUDA],
-                       schedule=schedule(wait=0, warmup=1, active=1, repeat=1))
-    with prof:
-        for _ in range(2):  # cycle 1 = warmup (discarded), cycle 2 = active (measured)
-            for _ in range(num_tests):
-                if flush_l2:
-                    torch.empty(flush_l2_size, dtype=torch.int, device="cuda").zero_()
-                fn()
-            torch.cuda.synchronize()
-            prof.step()
-    # Per-instance durations (us) of the matching kernel in the active cycle
-    insts = []
-    for e in prof.events():
-        if name_substr not in e.name.lower():
-            continue
-        d = getattr(e, "device_time", None)
-        if d is None:
-            d = getattr(e, "cuda_time", 0.0)
-        if d and d > 0:
-            insts.append(float(d))
-    assert insts, f"no kernel matching '{name_substr}' in profile"
-    return min(insts)
+def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
+    """Thin adapter over bench_utils.bench_kineto (DeepGEMM's bench, vendored
+    verbatim): 8GB L2 flush before EVERY call (cold-HBM KV reads + GPU chill
+    time), kineto kernel device-time, warmup cycle discarded, MEAN over
+    instances. NOTE: estimator switched from min to DeepGEMM's mean so every
+    operator in this repo reports the same number -- expect slightly higher
+    values than historical (min-based) tables."""
+    return 1e6 * bench_kineto(fn, name_substr, num_tests=num_tests,
+                              suppress_kineto_output=True)
 
 
 BLOCK_Q = 1   # decode: 1 query token per q-block (UMMA_N=64); mirrors the kernel config
@@ -603,7 +575,7 @@ def benchmark(module, sweep_stages=False, fuse_norm=False, rms_delay_us=0.0):
                     aus = kernel_us(acall)
                     # "each op as its OWN kernel" reference: standalone rmsnorm +
                     # standalone compressor (one warp per group/row, full grid),
-                    # timed with the SAME L2-flushed min-of-instances estimator.
+                    # timed with the SAME L2-flushed estimator.
                     rms1 = kernel_us(lambda: module.mqa_rmsnorm_standalone(y, qn, 1e-6),
                                      name_substr="standalone_rmsnorm")
                     cmp1 = kernel_us(lambda: module.mqa_compressor_standalone(
