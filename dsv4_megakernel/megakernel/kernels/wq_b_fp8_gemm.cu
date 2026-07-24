@@ -56,8 +56,21 @@ struct SharedStorage {
     alignas(16) uint32_t tmem_base;
 };
 
+// Compile-time guard: SwapDims::NUM_STAGES comes from an OVERHEAD ESTIMATE in
+// wq_b_fp8_gemm.cuh that must track the members above (incl. the 2KB ssq_scratch:
+// the `+ 4 * BM * sizeof(float)` term). Any skew -- e.g. a stale header on the
+// build box -- otherwise only surfaces at RUNTIME as cudaFuncSetAttribute
+// "invalid argument" (observed: headerless-ssq NS=11 + scratch = 233472 > 232448).
+static_assert(sizeof(SharedStorage<32>)  <= wq_b::SMEM_CAPACITY &&
+              sizeof(SharedStorage<64>)  <= wq_b::SMEM_CAPACITY &&
+              sizeof(SharedStorage<96>)  <= wq_b::SMEM_CAPACITY &&
+              sizeof(SharedStorage<128>) <= wq_b::SMEM_CAPACITY,
+              "SharedStorage exceeds SM100 smem capacity: SwapDims::SMEM_OVERHEAD "
+              "(wq_b_fp8_gemm.cuh) is out of sync with the SharedStorage members -- "
+              "is the header stale (missing the ssq_scratch overhead term)?");
+
 // ======================== Kernel ========================
-template <int M_TPL, bool kProfile>
+template <int M_TPL, bool kProfile, bool kSsq>
 __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,    // activation [M,K] e4m3, K-major
@@ -308,19 +321,14 @@ wq_b_proj_kernel(
                 cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
                 // ---- Read TMEM (FP32), transpose into SMEM (DeepGEMM swap FP32 path) ----
-                // Keep the loaded accumulator in registers (vals_all) so the optional
-                // sum-of-squares reduction can run LATER, after the accumulator has
-                // been released and the TMA store issued -- see the deferred block below.
-                uint32_t vals_all[NUM_TMEM_SUBROWS][8];
                 #pragma unroll
                 for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
                     uint32_t tmem_addr = tmem_base + st * STORE_BLOCK_M + i * 8;
 
-                    uint32_t* vals = vals_all[i];
-                    ptx::tmem_load_32dp32b8x(tmem_addr,
-                        vals[0], vals[1], vals[2], vals[3],
-                        vals[4], vals[5], vals[6], vals[7]);
+                    uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+                    ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
                     cutlass::arch::fence_view_async_tmem_load();
+                    uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
                     uint8_t* smem_base_ptr = smem_cd_ptr
                         + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)
@@ -334,12 +342,56 @@ wq_b_proj_kernel(
                             + (lane_id % 4) * sizeof(float);
                         ptx::st_shared_u32(smem_ptr, vals[row]);
                     }
+
+                    // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
+                    // vals[8] = 8 consecutive M rows; this warp's 32 lanes cover 32
+                    // distinct columns, all inside ONE 512-col head. Multi-row
+                    // BUTTERFLY co-reduction: each xor step halves BOTH the rows-per-
+                    // lane and the lane redundancy, so all 8 row sums cost
+                    // 8+4+2+1+1 = 16 shuffles instead of 8 rows x 5-step tree = 40
+                    // (CUTLASS-EVT row-reduction discipline: no per-row tree in the
+                    // element loop -- this epilogue gates tmem_empty -> MMA, so every
+                    // shuffle here delays the pipeline). After the xor-4 step lane l
+                    // holds row r = (l>>2)&7 over 8 columns; two more folds finish
+                    // the 32. fp32 association differs from the old tree -- fine, the
+                    // consumer RED is order-free. (redux.sync f32 is min/max-only on
+                    // sm_100a -- no .add -- so shuffles it stays.)
+                    if constexpr (kSsq) {
+                        float v[8];
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const float f = __uint_as_float(vals[j]);
+                            v[j] = f * f;
+                        }
+                        float t8[8];
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j)
+                            t8[j] = __shfl_xor_sync(0xffffffffu, v[j], 16);
+                        const bool hi16 = (lane_id & 16) != 0;   // keep rows 4..7
+                        float w4[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            w4[j] = hi16 ? (v[j + 4] + t8[j + 4]) : (v[j] + t8[j]);
+                        float t4[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                            t4[j] = __shfl_xor_sync(0xffffffffu, w4[j], 8);
+                        const bool hi8 = (lane_id & 8) != 0;     // keep back half
+                        float w2[2];
+                        #pragma unroll
+                        for (int j = 0; j < 2; ++j)
+                            w2[j] = hi8 ? (w4[j + 2] + t4[j + 2]) : (w4[j] + t4[j]);
+                        const float ta = __shfl_xor_sync(0xffffffffu, w2[0], 4);
+                        const float tb = __shfl_xor_sync(0xffffffffu, w2[1], 4);
+                        float sq = (lane_id & 4) ? (w2[1] + tb) : (w2[0] + ta);
+                        sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+                        sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+                        if ((lane_id & 3) == 0)
+                            s.ssq_scratch[epi_warp_idx]
+                                [st * STORE_BLOCK_M + i * 8 + (int)((lane_id >> 2) & 7)] = sq;
+                    }
                 }
 
-                // Release the accumulator ASAP: the sum-of-squares reduction below
-                // works on the register copy (vals_all), so it must NOT extend the
-                // TMEM accumulator's lifetime (CUTLASS sm100_epilogue L885-890 /
-                // DeepGEMM sm100_store_cd L110-115: "notify tensor memory empty ASAP").
                 if (st == NUM_STORES - 1) {
                     ptx::tcgen05_fence_before_sync();
                     s.tmem_empty_barriers[accum_stage].arrive(0u);
@@ -360,62 +412,14 @@ wq_b_proj_kernel(
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
-
-                // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
-                // vals_all[i][8] = 8 consecutive M rows; this warp's 32 lanes cover 32
-                // distinct columns, all inside ONE 512-col head. In swap-AB the reduced
-                // axis (N) lies on the LANES, so a per-row col-sum is inherently
-                // cross-lane -- 8 rows x 5-step shuffle tree (redux.sync only has
-                // .max.abs.f32 on sm100a, no .add, so a shuffle tree is minimal).
-                // The key is placement: issued AFTER tmem_empty.arrive and the TMA
-                // store, so the shuffles retire in the shadow of the async store /
-                // the next stage's tma_store_wait instead of gating MMA or delaying
-                // the store issue (memory-bound path -> effectively hidden). Partials
-                // park in smem scratch; ONE global RED per row at tile end.
-                if (head_ssq != nullptr) {
-                    // Level-major reduction: all NUM_TMEM_SUBROWS*8 = 16 per-row
-                    // partial sums are independent, so issuing one shuffle LEVEL
-                    // across all 16 (instead of finishing each row's 5-deep chain
-                    // before starting the next) exposes 16-way ILP per level and
-                    // hides the SHFL latency -- the reduction becomes throughput-
-                    // bound on the shuffle pipe rather than latency-bound.
-                    float sq[NUM_TMEM_SUBROWS][8];
-                    #pragma unroll
-                    for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
-                        #pragma unroll
-                        for (int row = 0; row < 8; ++row) {
-                            const float f = __uint_as_float(vals_all[i][row]);
-                            sq[i][row] = f * f;
-                        }
-                    #pragma unroll
-                    for (int o = 16; o > 0; o >>= 1)
-                        #pragma unroll
-                        for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
-                            #pragma unroll
-                            for (int row = 0; row < 8; ++row)
-                                sq[i][row] += __shfl_down_sync(0xffffffffu, sq[i][row], o);
-                    if (lane_id == 0) {
-                        #pragma unroll
-                        for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
-                            #pragma unroll
-                            for (int row = 0; row < 8; ++row)
-                                s.ssq_scratch[epi_warp_idx][st * STORE_BLOCK_M + i * 8 + row] = sq[i][row];
-                    }
-                }
             }
-
-            // The deferred ssq writes scratch AFTER the last store's NamedBarrier, so
-            // an explicit barrier is needed to make all 4 warps' partials visible to
-            // the tile-end fold below (was implicit when ssq preceded that barrier).
-            if (head_ssq != nullptr)
-                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
             // Tile-end fold: thread r sums the 4 warp partials of row r and issues
             // ONE fire-and-forget RED (128 per CTA-tile, no intra-CTA same-address
-            // collisions). The dedicated NamedBarrier just above makes the deferred
-            // scratch writes visible; the next tile's first NamedBarrier orders
-            // scratch reuse.
-            if (head_ssq != nullptr) {
+            // collisions). Ordering is free: the last st's NamedBarrier above made
+            // all scratch writes visible, and the next tile's first NamedBarrier
+            // orders scratch reuse.
+            if constexpr (kSsq) {
                 const int r = (int)threadIdx.x - NUM_NON_EPI_THREADS;   // 0..127
                 const int m = base_m + r;
                 const float v = s.ssq_scratch[0][r] + s.ssq_scratch[1][r]
@@ -515,7 +519,7 @@ __device__ __forceinline__ bool get_task(
     return true;
 }
 
-template <bool kProfile>
+template <bool kProfile, bool kSsq>
 __global__ void __launch_bounds__(TPB, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,
@@ -757,7 +761,7 @@ wq_b_proj_kernel(
                     ptx::tmem_load_32dp32b4x(tmem_addr, v0, v1, v2, v3);
                     cutlass::arch::fence_view_async_tmem_load();
 
-                    if (head_ssq != nullptr) {
+                    if constexpr (kSsq) {
                         const float f0 = __uint_as_float(v0), f1 = __uint_as_float(v1);
                         const float f2 = __uint_as_float(v2), f3 = __uint_as_float(v3);
                         const float sq = f0 * f0 + f1 * f1 + f2 * f2 + f3 * f3;
@@ -789,7 +793,7 @@ wq_b_proj_kernel(
                 tma_store_idx = (tma_store_idx + 1) % NUM_TMA_STORE_STAGES;
             }
 
-            if (head_ssq != nullptr) {
+            if constexpr (kSsq) {
                 const int m = base_m + (int)epi_warp_idx * 32 + (int)lane_id;
                 if (m < problem_m) {
                     atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + ssq_head0, ssq_acc0);
@@ -845,18 +849,21 @@ static CUtensorMap make_tma_desc_fp32_2d(
 
 // ======================== Kernel / SMEM selectors ========================
 // M<=128 keeps the established swap-AB path. M>=160 uses the DeepGEMM-selected
-// non-swap BM=128, BN=128 specialization.
-template <bool kProfile>
+// non-swap BM=128, BN=128 specialization. kSsq is a COMPILE-TIME dispatch
+// dimension (DeepGEMM JIT-config discipline): the ssq-off binary is bit-identical
+// to the pre-ssq kernel (no dead branch in the hot loops), and the ssq-on binary
+// gets its loads/shuffles properly scheduled around a constexpr block.
+template <bool kProfile, bool kSsq>
 static void* get_kernel_ptr(int M) {
     switch (M) {
-        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile>;
-        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile>;
-        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile>;
-        case 128: return (void*)&wq_b_proj_kernel<128, kProfile>;
+        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq>;
+        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq>;
+        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq>;
+        case 128: return (void*)&wq_b_proj_kernel<128, kProfile, kSsq>;
         case 160:
         case 192:
         case 224:
-        case 256: return (void*)&nonswap::wq_b_proj_kernel<kProfile>;
+        case 256: return (void*)&nonswap::wq_b_proj_kernel<kProfile, kSsq>;
         default:  return nullptr;
     }
 }
@@ -987,19 +994,23 @@ static std::vector<torch::Tensor> run_wq_b(
         ssq_ptr = t.data_ptr<float>();
     }
 
-    void* kernel_ptr = profile ? get_kernel_ptr<true>(M) : get_kernel_ptr<false>(M);
+    const bool want_ssq = ssq_ptr != nullptr;
+    void* kernel_ptr = profile
+        ? (want_ssq ? get_kernel_ptr<true, true>(M)  : get_kernel_ptr<true, false>(M))
+        : (want_ssq ? get_kernel_ptr<false, true>(M) : get_kernel_ptr<false, false>(M));
     int smem_bytes = get_smem_bytes(M);
     TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
 
-    static bool smem_configured[2][9] = {{false}};
+    static bool smem_configured[2][2][9] = {{{false}}};
     const int m_idx = M / 32;
     const int p_idx = profile ? 1 : 0;
-    if (!smem_configured[p_idx][m_idx]) {
+    const int s_idx = want_ssq ? 1 : 0;
+    if (!smem_configured[p_idx][s_idx][m_idx]) {
         auto attr_err = cudaFuncSetAttribute(kernel_ptr,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr_err), " smem_bytes=", smem_bytes);
-        smem_configured[p_idx][m_idx] = true;
+        smem_configured[p_idx][s_idx][m_idx] = true;
     }
 
     {
