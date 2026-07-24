@@ -1157,16 +1157,41 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     if constexpr (kTilePool) {
         if (warp_idx == kSpecWarpStart + 3) {
             DG_TRAP_ONLY_DEVICE_ASSERT(seq_len <= kNumMaxTilePoolTokens);
+            // [MEGAKERNEL EDIT] latency-flattened scan. The previous form fused load +
+            // scan per 32-token round; the scan's `running` carry serialized the rounds,
+            // so each round paid a FULL cold-L2/HBM ks/ke read latency (~0.4-0.5us with
+            // the bench's 8GB flush) while all 384 attention threads sat on the prologue
+            // NamedBarrier. That O(B/32) serial-latency chain was the exact B-linear
+            // deficit vs DeepGEMM's paged path at decode sizes (measured -0.5/-1.6/-3.3us
+            // at B=64/128/256, T-independent; DeepGEMM precomputes its schedule in a
+            // separate untimed metadata kernel and reads ONE uint2 per CTA).
+            // Fix: phase 1 issues ALL ks/ke loads back-to-back into registers (fully
+            // unrolled + predicated -> every load in flight, ONE latency wave); phase 2
+            // scans from registers (carry chain is shfl-only). Bit-identical prefix.
+            constexpr uint32_t kMaxScanRounds = kNumMaxTilePoolTokens / 32;   // 16
+            uint32_t sv[kMaxScanRounds], ev[kMaxScanRounds];
+            #pragma unroll
+            for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
+                const uint32_t b = r * 32 + lane_idx;
+                sv[r] = ev[r] = 0;
+                if (b < seq_len) {
+                    sv[r] = __ldg(cu_seq_len_k_start + b);
+                    ev[r] = __ldg(cu_seq_len_k_end + b);
+                }
+            }
             uint32_t running = 0;
             if (lane_idx == 0)
                 smem_tile_prefix[0] = 0;
-            for (uint32_t base = 0; base < seq_len; base += 32) {
-                const uint32_t b = base + lane_idx;
+            #pragma unroll
+            for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
+                if (r * 32 >= seq_len)
+                    break;
+                const uint32_t b = r * 32 + lane_idx;
                 uint32_t num_tiles = 0;
                 if (b < seq_len) {
                     // Same tile geometry as the legacy path: base aligned down to 4 (SF TMA)
-                    const uint32_t s = cute::min(cu_seq_len_k_start[b], seq_len_kv) / 4 * 4;
-                    const uint32_t e = cute::min(cu_seq_len_k_end[b], seq_len_kv);
+                    const uint32_t s = cute::min(sv[r], seq_len_kv) / 4 * 4;
+                    const uint32_t e = cute::min(ev[r], seq_len_kv);
                     num_tiles = e > s ? math::ceil_div(e - s, BLOCK_KV) : 0u;
                 }
                 // Inclusive warp scan (Hillis-Steele over shfl_up)

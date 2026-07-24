@@ -308,14 +308,19 @@ wq_b_proj_kernel(
                 cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
                 // ---- Read TMEM (FP32), transpose into SMEM (DeepGEMM swap FP32 path) ----
+                // Keep the loaded accumulator in registers (vals_all) so the optional
+                // sum-of-squares reduction can run LATER, after the accumulator has
+                // been released and the TMA store issued -- see the deferred block below.
+                uint32_t vals_all[NUM_TMEM_SUBROWS][8];
                 #pragma unroll
                 for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
                     uint32_t tmem_addr = tmem_base + st * STORE_BLOCK_M + i * 8;
 
-                    uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-                    ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
+                    uint32_t* vals = vals_all[i];
+                    ptx::tmem_load_32dp32b8x(tmem_addr,
+                        vals[0], vals[1], vals[2], vals[3],
+                        vals[4], vals[5], vals[6], vals[7]);
                     cutlass::arch::fence_view_async_tmem_load();
-                    uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
                     uint8_t* smem_base_ptr = smem_cd_ptr
                         + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)
@@ -329,30 +334,12 @@ wq_b_proj_kernel(
                             + (lane_id % 4) * sizeof(float);
                         ptx::st_shared_u32(smem_ptr, vals[row]);
                     }
-
-                    // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
-                    // vals[8] = 8 consecutive M rows; this warp's 32 lanes cover 32
-                    // distinct columns, all inside ONE 512-col head. Placed AFTER the
-                    // smem stores so they issue first and the reduction retires in
-                    // their shadow (this epilogue gates tmem_empty -> MMA).
-                    // (redux.sync.add.f32 rejected by ptxas -- redux add is integer-
-                    // only here -- so a shuffle tree it is.) Partials park in smem
-                    // scratch; ONE global RED per row at tile end (per-(row,warp)
-                    // REDs here measured 3x swap-path latency).
-                    if (head_ssq != nullptr) {
-                        #pragma unroll
-                        for (uint32_t row = 0; row < 8; ++row) {
-                            const float f = __uint_as_float(vals[row]);
-                            float sq = f * f;
-                            #pragma unroll
-                            for (int o = 16; o > 0; o >>= 1)
-                                sq += __shfl_down_sync(0xffffffffu, sq, o);
-                            if (lane_id == 0)
-                                s.ssq_scratch[epi_warp_idx][st * STORE_BLOCK_M + i * 8 + (int)row] = sq;
-                        }
-                    }
                 }
 
+                // Release the accumulator ASAP: the sum-of-squares reduction below
+                // works on the register copy (vals_all), so it must NOT extend the
+                // TMEM accumulator's lifetime (CUTLASS sm100_epilogue L885-890 /
+                // DeepGEMM sm100_store_cd L110-115: "notify tensor memory empty ASAP").
                 if (st == NUM_STORES - 1) {
                     ptx::tcgen05_fence_before_sync();
                     s.tmem_empty_barriers[accum_stage].arrive(0u);
@@ -373,13 +360,61 @@ wq_b_proj_kernel(
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+
+                // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
+                // vals_all[i][8] = 8 consecutive M rows; this warp's 32 lanes cover 32
+                // distinct columns, all inside ONE 512-col head. In swap-AB the reduced
+                // axis (N) lies on the LANES, so a per-row col-sum is inherently
+                // cross-lane -- 8 rows x 5-step shuffle tree (redux.sync only has
+                // .max.abs.f32 on sm100a, no .add, so a shuffle tree is minimal).
+                // The key is placement: issued AFTER tmem_empty.arrive and the TMA
+                // store, so the shuffles retire in the shadow of the async store /
+                // the next stage's tma_store_wait instead of gating MMA or delaying
+                // the store issue (memory-bound path -> effectively hidden). Partials
+                // park in smem scratch; ONE global RED per row at tile end.
+                if (head_ssq != nullptr) {
+                    // Level-major reduction: all NUM_TMEM_SUBROWS*8 = 16 per-row
+                    // partial sums are independent, so issuing one shuffle LEVEL
+                    // across all 16 (instead of finishing each row's 5-deep chain
+                    // before starting the next) exposes 16-way ILP per level and
+                    // hides the SHFL latency -- the reduction becomes throughput-
+                    // bound on the shuffle pipe rather than latency-bound.
+                    float sq[NUM_TMEM_SUBROWS][8];
+                    #pragma unroll
+                    for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
+                        #pragma unroll
+                        for (int row = 0; row < 8; ++row) {
+                            const float f = __uint_as_float(vals_all[i][row]);
+                            sq[i][row] = f * f;
+                        }
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        #pragma unroll
+                        for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
+                            #pragma unroll
+                            for (int row = 0; row < 8; ++row)
+                                sq[i][row] += __shfl_down_sync(0xffffffffu, sq[i][row], o);
+                    if (lane_id == 0) {
+                        #pragma unroll
+                        for (int i = 0; i < NUM_TMEM_SUBROWS; ++i)
+                            #pragma unroll
+                            for (int row = 0; row < 8; ++row)
+                                s.ssq_scratch[epi_warp_idx][st * STORE_BLOCK_M + i * 8 + row] = sq[i][row];
+                    }
+                }
             }
+
+            // The deferred ssq writes scratch AFTER the last store's NamedBarrier, so
+            // an explicit barrier is needed to make all 4 warps' partials visible to
+            // the tile-end fold below (was implicit when ssq preceded that barrier).
+            if (head_ssq != nullptr)
+                cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
             // Tile-end fold: thread r sums the 4 warp partials of row r and issues
             // ONE fire-and-forget RED (128 per CTA-tile, no intra-CTA same-address
-            // collisions). Ordering is free: the last st's NamedBarrier above made
-            // all scratch writes visible, and the next tile's first NamedBarrier
-            // orders scratch reuse.
+            // collisions). The dedicated NamedBarrier just above makes the deferred
+            // scratch writes visible; the next tile's first NamedBarrier orders
+            // scratch reuse.
             if (head_ssq != nullptr) {
                 const int r = (int)threadIdx.x - NUM_NON_EPI_THREADS;   // 0..127
                 const int m = base_m + r;
