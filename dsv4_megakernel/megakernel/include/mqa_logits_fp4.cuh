@@ -12,7 +12,7 @@
 // Three AOT edits vs upstream, marked `// [MEGAKERNEL EDIT]`:
 //   1. kernel `kNumSMs` template param -> gridDim.x
 //   2. cudaGridDependencySynchronize() (PDL-only) neutralized
-//   3. decode tile-pool scheduler (`kTilePool`): the GLOBAL pool of
+//   3. decode tile-pool scheduler: the GLOBAL pool of
 //      Σ_b cdiv(ke[b]-ks[b], BLOCK_KV) KV tiles is split into gridDim.x balanced
 //      contiguous chunks (may cross token boundaries) — inline equivalent of
 //      DeepGEMM's paged-path metadata schedule, for decode where B < #SMs.
@@ -23,6 +23,13 @@
 //   5. TPB 384 -> 512: CUDA-core tail warpgroup (warps 12-15) hides the MAIN-indexer
 //      compressor rows under the KV stream — the gemm_fuse_norm_b TC/CC dual-path
 //      pattern. Fully decoupled (no shared barriers); idle when comp.kv == nullptr.
+//   6. PAGED decode KV (RTP-LLM integration; the ONLY schedule — the contiguous-KV
+//      faithful path is gone): the indexer cache is read through a block_table
+//      (fused page layout, per page: [PAGE_KV*64B fp4 | PAGE_KV*4B packed-ue8m0 sf],
+//      DeepGEMM kv_cache_cast_to_mxfp4-compatible). Each 256-slot KV tile =
+//      BLOCK_KV/PAGE_KV page TMAs (3D desc, batch dim = physical page id); per-token
+//      windows are context_lens (ks==0; page starts are PAGE_KV-aligned, so the old
+//      /4 SF alignment fixup vanishes).
 //
 // Math: logits[t] = Σ_h relu(<iq[h,:],kvc[t,:]>)·weights[h]  (fp4 UMMA + cuda reduce)
 // Host launcher + PyTorch binding: kernels/mqa_logits_fp4.cu
@@ -585,9 +592,9 @@ CUTLASS_DEVICE uint64_t make_runtime_instr_desc_with_sf_id(
 //      DeepGEMM; AOT can't, and gridDim.x always equals the launch grid).
 //   2. `cudaGridDependencySynchronize()` neutralized (PDL-only; we launch
 //      standalone, not as a programmatic-dependent-launch megakernel).
-//   3. `kTilePool` decode schedule: all 4 warp roles enumerate tasks through a
-//      shared `for_each_task` closure; kTilePool=false reproduces the original
-//      per-q-block enumeration byte-identically (faithful single-seq path).
+//   3. tile-pool decode schedule: all 4 warp roles enumerate tasks through a
+//      shared `for_each_task` closure (the legacy per-q-block contiguous
+//      enumeration has been removed together with the contiguous-KV path).
 // Everything else is byte-identical to the proven DeepGEMM kernel.
 // ============================================================
 
@@ -601,39 +608,35 @@ CUTLASS_DEVICE uint64_t make_runtime_instr_desc_with_sf_id(
 namespace deep_gemm {
 
 // ============================================================
-// [MEGAKERNEL EDIT] Decode tile-pool scheduler (kTilePool=true path).
+// [MEGAKERNEL EDIT] Decode tile-pool scheduler (PAGED; the only schedule).
 //
-// Decode-only geometry: seq_len = B tokens (BLOCK_Q == 1), token b owns the KV
-// window [ks[b], ke[b]) inside the flat kv[B*T]. The GLOBAL pool of
-// Σ_b cdiv(window_b, BLOCK_KV) tiles is split into gridDim.x balanced contiguous
-// chunks (per-CTA imbalance <= 1 tile) that may cross token boundaries — the
-// inline equivalent of DeepGEMM's paged-path metadata kernel (which emits per-SM
-// (q_token_idx, kv_split_idx) starts), but DEVICE-ONLY and launch-free
-// (megakernel-ready: no host/Python in the loop).
+// PAGED decode geometry (RTP-LLM model): seq_len = B tokens (BLOCK_Q == 1), token b
+// owns the KV window [0, context_lens[b]) addressed through its block_table row
+// (fused pages, PAGE_KV tokens each). The GLOBAL pool of Σ_b cdiv(ctx_b, BLOCK_KV)
+// tiles is split into gridDim.x balanced contiguous chunks (may cross token
+// boundaries) — the inline equivalent of DeepGEMM's paged-path metadata kernel
+// (which emits per-SM (q_token_idx, kv_split_idx) starts), but DEVICE-ONLY and
+// launch-free (megakernel-ready: no host/Python in the loop, no schedule_meta,
+// no per-step metadata launch).
 //
 // Cost model: ONE warp per CTA builds the tile prefix sum into smem with a
-// warp-parallel scan (O(B/32) rounds, see the kernel prologue), published by the
-// existing __syncthreads(); each thread then locates its chunk with a log2(B)
-// binary search on smem. This replaces the previous per-thread O(B) serial
-// global-memory walk, which dominated small-T large-B decode (measured
-// ~0.11us/token slope vs DeepGEMM's metadata-driven ~0.02).
+// warp-parallel scan (latency-flattened, see the kernel prologue); each thread
+// then locates its chunk with a log2(B) binary search on smem.
 // ============================================================
 static constexpr uint32_t kNumMaxTilePoolTokens = 512;   // decode B cap (serving: 32-256)
 
 template <uint32_t BLOCK_KV>
 struct TilePoolScheduler {
-    const uint32_t* ks;
-    const uint32_t* ke;
+    const uint32_t* lens;            // [num_tokens] per-token context length (paged)
     const uint32_t* tile_prefix;     // smem, [num_tokens + 1], built by the warp scan
-    uint32_t num_tokens, seq_len_kv;
+    uint32_t num_tokens, max_ctx;    // max_ctx = capacity clamp (max_pages * PAGE_KV)
     uint32_t chunk_cur, chunk_end;   // this CTA's global tile ids: [chunk_cur, chunk_end)
     uint32_t token;                  // current token (tile_prefix[token] <= chunk_cur)
 
     CUTLASS_DEVICE TilePoolScheduler(const uint32_t& cta_idx, const uint32_t& num_ctas,
-                                     const uint32_t& num_tokens, const uint32_t& seq_len_kv,
-                                     const uint32_t* ks, const uint32_t* ke,
-                                     const uint32_t* tile_prefix):
-            ks(ks), ke(ke), tile_prefix(tile_prefix), num_tokens(num_tokens), seq_len_kv(seq_len_kv) {
+                                     const uint32_t& num_tokens, const uint32_t& max_ctx,
+                                     const uint32_t* lens, const uint32_t* tile_prefix):
+            lens(lens), tile_prefix(tile_prefix), num_tokens(num_tokens), max_ctx(max_ctx) {
         // Balanced contiguous partition: first `total % num_ctas` CTAs take one extra tile
         const uint32_t total = tile_prefix[num_tokens];
         const uint32_t per = total / num_ctas, rem = total % num_ctas;
@@ -651,6 +654,9 @@ struct TilePoolScheduler {
     // Emits one (token, contiguous KV tile sub-range) task per call. Deterministic:
     // every warp role constructs its own scheduler and sees the SAME task sequence,
     // keeping the Q/KV/TMEM pipelines in lock-step (as with the legacy enumeration).
+    // [PAGED] kv_start is a TOKEN-LOCAL slot offset (tile index * BLOCK_KV); the
+    // physical address comes from block_table in the KV TMA role. seq_k window is
+    // [0, context_len) -- ks is identically 0 in the paged decode model.
     CUTLASS_DEVICE bool next(uint32_t& q_idx, uint32_t& kv_start, uint32_t& num_kv_blocks,
                              uint32_t& seq_k_start, uint32_t& seq_k_end) {
         while (chunk_cur < chunk_end and token < num_tokens) {
@@ -658,9 +664,9 @@ struct TilePoolScheduler {
             const uint32_t tile_end  = cute::min(tile_prefix[token + 1], chunk_end);
             if (tile_end > chunk_cur) {
                 q_idx = token;
-                seq_k_start = cute::min(ks[token], seq_len_kv);
-                seq_k_end = cute::min(ke[token], seq_len_kv);
-                kv_start = seq_k_start / 4 * 4 + (chunk_cur - tile_base) * BLOCK_KV;
+                seq_k_start = 0;
+                seq_k_end = cute::min(lens[token], max_ctx);
+                kv_start = (chunk_cur - tile_base) * BLOCK_KV;
                 num_kv_blocks = tile_end - chunk_cur;
                 chunk_cur = tile_end;
                 ++ token;
@@ -845,8 +851,7 @@ __device__ __forceinline__ void run_main_compressor_row(
 }
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits, bool kTilePool,
-          uint32_t BLOCK_Q, uint32_t BLOCK_KV,
+          uint32_t BLOCK_Q, uint32_t BLOCK_KV, uint32_t PAGE_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           // [MEGAKERNEL EDIT] `kNumSMs` template param removed; see gridDim.x below.
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
@@ -856,10 +861,14 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads + kNumTailThreads, 1)
 void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
-                          const uint32_t max_seqlen_k,
                           const uint32_t logits_stride,
-                          const uint32_t* cu_seq_len_k_start,
-                          const uint32_t* cu_seq_len_k_end,
+                          // [MEGAKERNEL EDIT / PAGED] per-token context lengths and the
+                          // page table ([seq_len, block_table_stride] physical page ids;
+                          // fused page layout, see header note 6). `seq_len_kv` carries
+                          // the CAPACITY clamp (max_pages * PAGE_KV).
+                          const uint32_t* context_lens,
+                          const uint32_t* block_table,
+                          const uint32_t block_table_stride,
                           logits_dtype_t* logits,
                           // [MEGAKERNEL EDIT] epsilon for the MAIN compressor's internal
                           // RMSNorm step (tail warps; unused when comp.kv == nullptr).
@@ -892,11 +901,6 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto sm_idx = blockIdx.x;
     // [MEGAKERNEL EDIT] was a template param; AOT build uses the launch grid.
     const uint32_t kNumSMs = gridDim.x;
-    // [MEGAKERNEL EDIT] legacy grid.y KV carve (kTilePool=false only; decode launches
-    // grid.y=1 and uses the tile-pool scheduler instead). logits[t] are per-slot
-    // independent (no cross-kv reduction / softmax), so split writes go direct — no combine.
-    const uint32_t kv_split      = blockIdx.y;
-    const uint32_t num_kv_splits = gridDim.y;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
@@ -965,7 +969,8 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     static constexpr uint32_t kRealNumSFQ = BLOCK_Q * kNumHeads;
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(BLOCK_KV == kNumMathWarpGroups * UMMA_M and BLOCK_KV % kNumUTCCPAlignedElems == 0, "Invalid `BLOCK_KV`");
-    DG_STATIC_ASSERT(not kTilePool or BLOCK_Q == 1, "Tile pool schedule assumes 1 decode token per q-block");
+    DG_STATIC_ASSERT(BLOCK_Q == 1, "Paged decode schedule assumes 1 token per q-block");
+    DG_STATIC_ASSERT(PAGE_KV > 0 and BLOCK_KV % PAGE_KV == 0, "KV tile must be whole pages");
 
     // Shared memory configs
     static constexpr uint32_t kSwizzleAlignment = 8 * (kHeadDim / 2);
@@ -1045,61 +1050,52 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
 
     // [MEGAKERNEL EDIT] tile-pool metadata: one (otherwise idle) warp builds the tile
-    // prefix sum in smem via a warp-parallel scan; the __syncthreads() below publishes
+    // prefix sum in smem via a warp-parallel scan; the NamedBarrier below publishes
     // it to all roles. Device-only — the fused equivalent of DeepGEMM's separate
     // metadata kernel launch (no host/Python in the loop; megakernel-compatible).
-    if constexpr (kTilePool) {
-        if (warp_idx == kSpecWarpStart + 3) {
-            DG_TRAP_ONLY_DEVICE_ASSERT(seq_len <= kNumMaxTilePoolTokens);
-            // [MEGAKERNEL EDIT] latency-flattened scan. The previous form fused load +
-            // scan per 32-token round; the scan's `running` carry serialized the rounds,
-            // so each round paid a FULL cold-L2/HBM ks/ke read latency (~0.4-0.5us with
-            // the bench's 8GB flush) while all 384 attention threads sat on the prologue
-            // NamedBarrier. That O(B/32) serial-latency chain was the exact B-linear
-            // deficit vs DeepGEMM's paged path at decode sizes (measured -0.5/-1.6/-3.3us
-            // at B=64/128/256, T-independent; DeepGEMM precomputes its schedule in a
-            // separate untimed metadata kernel and reads ONE uint2 per CTA).
-            // Fix: phase 1 issues ALL ks/ke loads back-to-back into registers (fully
-            // unrolled + predicated -> every load in flight, ONE latency wave); phase 2
-            // scans from registers (carry chain is shfl-only). Bit-identical prefix.
-            constexpr uint32_t kMaxScanRounds = kNumMaxTilePoolTokens / 32;   // 16
-            uint32_t sv[kMaxScanRounds], ev[kMaxScanRounds];
-            #pragma unroll
-            for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
-                const uint32_t b = r * 32 + lane_idx;
-                sv[r] = ev[r] = 0;
-                if (b < seq_len) {
-                    sv[r] = __ldg(cu_seq_len_k_start + b);
-                    ev[r] = __ldg(cu_seq_len_k_end + b);
-                }
+    if (warp_idx == kSpecWarpStart + 3) {
+        DG_TRAP_ONLY_DEVICE_ASSERT(seq_len <= kNumMaxTilePoolTokens);
+        // [MEGAKERNEL EDIT] latency-flattened scan: phase 1 issues ALL context_lens
+        // loads back-to-back into registers (fully unrolled + predicated -> every
+        // load in flight, ONE cold-L2 latency wave); phase 2 scans from registers
+        // (the `running` carry chain is shfl-only). The earlier fused load+scan
+        // form paid one full HBM latency per 32 tokens -- the measured B-linear
+        // deficit vs DeepGEMM's untimed-metadata paged path.
+        constexpr uint32_t kMaxScanRounds = kNumMaxTilePoolTokens / 32;   // 16
+        uint32_t lv[kMaxScanRounds];
+        #pragma unroll
+        for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
+            const uint32_t b = r * 32 + lane_idx;
+            lv[r] = 0;
+            if (b < seq_len)
+                lv[r] = __ldg(context_lens + b);
+        }
+        uint32_t running = 0;
+        if (lane_idx == 0)
+            smem_tile_prefix[0] = 0;
+        #pragma unroll
+        for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
+            if (r * 32 >= seq_len)
+                break;
+            const uint32_t b = r * 32 + lane_idx;
+            uint32_t num_tiles = 0;
+            if (b < seq_len) {
+                // [PAGED] tiles_b = cdiv(ctx_b, BLOCK_KV); ks == 0 and page starts
+                // are PAGE_KV-aligned, so the old /4 SF alignment fixup is gone.
+                const uint32_t e = cute::min(lv[r], seq_len_kv);
+                num_tiles = math::ceil_div(e, BLOCK_KV);
             }
-            uint32_t running = 0;
-            if (lane_idx == 0)
-                smem_tile_prefix[0] = 0;
+            // Inclusive warp scan (Hillis-Steele over shfl_up)
+            uint32_t prefix = num_tiles;
             #pragma unroll
-            for (uint32_t r = 0; r < kMaxScanRounds; ++ r) {
-                if (r * 32 >= seq_len)
-                    break;
-                const uint32_t b = r * 32 + lane_idx;
-                uint32_t num_tiles = 0;
-                if (b < seq_len) {
-                    // Same tile geometry as the legacy path: base aligned down to 4 (SF TMA)
-                    const uint32_t s = cute::min(sv[r], seq_len_kv) / 4 * 4;
-                    const uint32_t e = cute::min(ev[r], seq_len_kv);
-                    num_tiles = e > s ? math::ceil_div(e - s, BLOCK_KV) : 0u;
-                }
-                // Inclusive warp scan (Hillis-Steele over shfl_up)
-                uint32_t prefix = num_tiles;
-                #pragma unroll
-                for (uint32_t d = 1; d < 32; d <<= 1) {
-                    const uint32_t v = __shfl_up_sync(0xffffffffu, prefix, d);
-                    if (lane_idx >= d)
-                        prefix += v;
-                }
-                if (b < seq_len)
-                    smem_tile_prefix[b + 1] = running + prefix;
-                running += __shfl_sync(0xffffffffu, prefix, 31);
+            for (uint32_t d = 1; d < 32; d <<= 1) {
+                const uint32_t v = __shfl_up_sync(0xffffffffu, prefix, d);
+                if (lane_idx >= d)
+                    prefix += v;
             }
+            if (b < seq_len)
+                smem_tile_prefix[b + 1] = running + prefix;
+            running += __shfl_sync(0xffffffffu, prefix, 31);
         }
     }
     // [MEGAKERNEL EDIT] role-scoped prologue publish (barrier init / TMEM ptr /
@@ -1114,53 +1110,19 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     if (prof != nullptr and threadIdx.x == 0)
         prof[blockIdx.x * 8 + 0] = ptx::globaltimer();
 
-    // Scheduler
-    const uint32_t num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
+    // Scheduler state: per-task KV window (paged model: [0, ctx); BLOCK_Q == 1)
     uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
-    auto load_schedule = [&](const uint32_t& q_idx) -> cute::tuple<uint32_t, uint32_t> {
-        uint32_t start = cute::numeric_limits<uint32_t>::max();
-        uint32_t end = cute::numeric_limits<uint32_t>::min();
-        #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-            const auto row_idx = cute::min(q_idx * BLOCK_Q + i, seq_len - 1);
-            seq_k_start[i] = cute::min(cu_seq_len_k_start[row_idx], seq_len_kv);
-            seq_k_end[i] = cute::min(cu_seq_len_k_end[row_idx], seq_len_kv);
-            start = cute::min(start, seq_k_start[i]);
-            end = cute::max(end, seq_k_end[i]);
-        }
-        // TMA alignment requirements for SF KV
-        start = start / 4 * 4;
-        // [MEGAKERNEL EDIT] carve this CTA's contiguous KV-block sub-range out of the
-        // full [start, end) run (whole BLOCK_KV blocks -> boundaries stay aligned; a
-        // tail split with 0 blocks is safe). seq_k_start/end[i] stay the FULL per-row
-        // ranges above, so the store guard / compressed offset remain correct.
-        const uint32_t total_blocks = math::ceil_div(end - start, BLOCK_KV);
-        const uint32_t bps = math::ceil_div(total_blocks, num_kv_splits);
-        const uint32_t s0  = kv_split * bps;
-        const uint32_t s1  = cute::min((kv_split + 1) * bps, total_blocks);
-        return {start + s0 * BLOCK_KV, s1 > s0 ? (s1 - s0) : 0u};
-    };
 
-    // [MEGAKERNEL EDIT] unified task enumeration for all 4 warp roles:
-    //  - kTilePool=false: one CTA per q-block via grid.x stride + grid.y KV carve
-    //    (byte-identical schedule to the original kernel; faithful single-seq path).
-    //  - kTilePool=true: decode; gridDim.x CTAs split the GLOBAL KV tile pool into
-    //    balanced contiguous chunks (see TilePoolScheduler above). All roles see the
-    //    same task sequence, so the Q/KV/TMEM pipelines stay in lock-step.
+    // [MEGAKERNEL EDIT] unified task enumeration for all 4 warp roles: gridDim.x CTAs
+    // split the GLOBAL KV tile pool into balanced contiguous chunks (see
+    // TilePoolScheduler above). All roles construct their own scheduler and see the
+    // SAME task sequence, so the Q/KV/TMEM pipelines stay in lock-step.
     auto for_each_task = [&](auto&& fn) {
-        if constexpr (kTilePool) {
-            TilePoolScheduler<BLOCK_KV> sched(sm_idx, kNumSMs, seq_len, seq_len_kv,
-                                              cu_seq_len_k_start, cu_seq_len_k_end,
-                                              smem_tile_prefix);
-            uint32_t q_idx, kv_start, num_kv_blocks;
-            while (sched.next(q_idx, kv_start, num_kv_blocks, seq_k_start[0], seq_k_end[0]))
-                fn(q_idx, kv_start, num_kv_blocks);
-        } else {
-            for (uint32_t q_idx = sm_idx; q_idx < num_q_blocks; q_idx += kNumSMs) {
-                CUTE_TIE_DECL(load_schedule(q_idx), kv_start, num_kv_blocks);
-                fn(q_idx, kv_start, num_kv_blocks);
-            }
-        }
+        TilePoolScheduler<BLOCK_KV> sched(sm_idx, kNumSMs, seq_len, seq_len_kv,
+                                          context_lens, smem_tile_prefix);
+        uint32_t q_idx, kv_start, num_kv_blocks;
+        while (sched.next(q_idx, kv_start, num_kv_blocks, seq_k_start[0], seq_k_end[0]))
+            fn(q_idx, kv_start, num_kv_blocks);
     };
 
     // Make Q, KV and TMEM pipeline
@@ -1213,23 +1175,64 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         // TMA warp for loading KV cache
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        if (cute::elect_one_sync()) {
+        // [MEGAKERNEL EDIT / PAGED] whole-WARP task walk (DeepGEMM paged pattern):
+        // the warp cooperatively caches 32 consecutive block_table entries in ONE
+        // coalesced L2 read; per tile the BLOCK_KV/PAGE_KV page ids are register
+        // SHUFFLES instead of serial __ldg on the elect_one lane (that serial chain
+        // sits on the KV issue critical path). Every lane runs its own scheduler /
+        // pipeline copy (deterministic, same sequence); only the barrier wait + TMA
+        // issue stay elect_one-scoped.
+        {
+            constexpr uint32_t kPagesPerBlock = BLOCK_KV / PAGE_KV;
+            DG_STATIC_ASSERT(kPagesPerBlock <= 32, "tile spans more pages than a warp can cache");
+            uint32_t cached_page_base = 0, cached_page_coord = 0;
             // Enumerate assigned (token, KV tile sub-range) tasks
             for_each_task([&](const uint32_t& q_idx, const uint32_t& kv_start, const uint32_t& num_kv_blocks) {
+                const uint32_t* bt_row = block_table + q_idx * static_cast<uint64_t>(block_table_stride);
+                const uint32_t num_kv_pages = math::ceil_div(seq_k_end[0], PAGE_KV);
+                // New token row -> the cached window is stale
+                cached_page_base = cute::numeric_limits<uint32_t>::max();
                 // Enumerate KV blocks
                 for (uint32_t kv_idx = 0; kv_idx < num_kv_blocks; ++ kv_idx) {
+                    const uint32_t page_base = kv_start / PAGE_KV + kv_idx * kPagesPerBlock;
+                    // Refill the 32-entry window when the tile leaves it (whole warp,
+                    // one coalesced read; OOB offsets clamp to page 0 -- the math
+                    // store guard masks those slots)
+                    if (page_base < cached_page_base
+                        or page_base + kPagesPerBlock > cached_page_base + 32) {
+                        cached_page_base = (page_base / 32) * 32;
+                        const uint32_t po = cached_page_base + lane_idx;
+                        cached_page_coord = po < num_kv_pages ? __ldg(bt_row + po) : 0u;
+                    }
+                    uint32_t pages[kPagesPerBlock];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kPagesPerBlock; ++ i)
+                        pages[i] = __shfl_sync(0xffffffffu, cached_page_coord,
+                                               static_cast<int>(page_base - cached_page_base + i));
+
                     // Wait KV consumer release
                     CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
-                    empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
-
-                    // Issue TMA KV
-                    cute::SM90_TMA_LOAD_2D::copy(&tensor_map_kv, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
-                                                 static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                                 smem_kv[kv_stage_idx], 0, kv_start + kv_idx * BLOCK_KV);
-                    tma::copy<BLOCK_KV, 1, 0>(&tensor_map_sf_kv, full_kv_barriers[kv_stage_idx],
-                                              smem_sf_kv[kv_stage_idx],
-                                              kv_start + kv_idx * BLOCK_KV, 0);
-                    full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
+                    if (cute::elect_one_sync()) {
+                        empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
+                        // [PAGED] one TMA per PAGE_KV page. Page smem offsets are
+                        // whole SWIZZLE_64B atoms (PAGE_KV*64B), so the assembled
+                        // stage is byte-identical in layout to one contiguous load.
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kPagesPerBlock; ++ i) {
+                            cute::SM90_TMA_LOAD_3D::copy(&tensor_map_kv,
+                                reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+                                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                smem_kv[kv_stage_idx] + i * PAGE_KV * (kHeadDim / 2),
+                                0, 0, pages[i]);
+                            cute::SM90_TMA_LOAD_2D::copy(&tensor_map_sf_kv,
+                                reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+                                static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                smem_sf_kv[kv_stage_idx] + i * PAGE_KV,
+                                0, pages[i]);
+                        }
+                        full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
+                    }
+                    __syncwarp();
                 }
             });
         }
@@ -1435,12 +1438,9 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     // NOTES: we have redundant writes here, consider more carefully
                     // TODO: optimize performance
                     const auto q_offset = (q_idx * BLOCK_Q + i) * static_cast<uint64_t>(logits_stride);
-                    if constexpr (kIsCompressedLogits) {
-                        if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset - seq_k_start[i]] = result;
-                    } else {
+                    // Compressed self-clean store (paged model: window is [0, ctx))
+                    if (kv_offset < seq_k_end[i])
                         logits[q_offset + kv_offset] = result;
-                    }
                     __syncwarp();
                 }
             }
@@ -1475,13 +1475,16 @@ static constexpr int HEAD_DIM  = 128;
 // KV range, BLOCK_Q=2 -> UMMA_N=128 would pack them for 2x MMA throughput; not our case.)
 static constexpr int BLOCK_Q   = 1;                 // UMMA_N = 64
 static constexpr int BLOCK_KV  = 256;
+// [PAGED] fused-page size in tokens (RTP-LLM tokens_per_block; page layout per page:
+// [PAGE_KV * 64B fp4 | PAGE_KV * 4B packed-ue8m0 sf] -> 68B/token, stride 4352B).
+// Must divide BLOCK_KV; page smem offsets stay whole SWIZZLE_64B atoms.
+static constexpr int PAGE_KV   = 64;
 static constexpr int NUM_Q_STAGES  = 3;
-// DEFAULT KV pipeline depth (faithful single-seq path only; decode auto-selects 6,
-// with {4,6,8,10} instantiated for explicit override). B300 sweep verdict: 6 wins
-// or ties every BxT cell — depth only needs to cover the TMA latency-bandwidth
-// product (~3-4 tiles in flight); deeper costs unified-L1 carveout and HBM
-// outstanding-window pressure for zero extra coverage.
-static constexpr int NUM_KV_STAGES = 6;
+// DEFAULT KV pipeline depth. PAGED B300 sweep verdict: 8 wins at long chunks --
+// each 256-slot tile is now EIGHT page-granular TMAs (4 data + 4 SF) instead of
+// two, so the issue-latency x bandwidth product needs a deeper in-flight window
+// than the contiguous producer's 6. {4,6,8,10} stay instantiated for override.
+static constexpr int NUM_KV_STAGES = 8;
 static constexpr int NUM_TMEM_STAGES = 3;           // hardcoded in the kernel
 static constexpr int NUM_SPECIALIZED_THREADS = 128;
 static constexpr int NUM_MATH_THREADS        = 2 * 128;

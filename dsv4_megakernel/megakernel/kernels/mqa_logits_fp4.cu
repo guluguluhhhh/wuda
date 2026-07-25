@@ -3,26 +3,20 @@
 // DeepGEMM FP4 MQA-logits (DSV4 Sparse Top-K Indexer score attention).
 //
 // Kernel body + helper closure are inlined self-contained (only CUTLASS/CuTe) in
-// megakernel/include/mqa_logits_fp4.cuh (modulo 2 documented AOT edits).
+// megakernel/include/mqa_logits_fp4.cuh (see the documented AOT edits there).
 //
-// Two entry points:
-//   mqa_logits_fp4         — faithful single-sequence, NON-compressed. Returns RAW
-//                            logits [S, Skv]; caller must mask outside [ks,ke) (the
-//                            kernel writes real values across the scanned union, like
-//                            DeepGEMM before its clean_logits pass). Used for golden
-//                            parity vs ref_fp8_mqa_logits.
-//   mqa_logits_fp4_decode  — MULTI-BATCH decode, COMPRESSED + self-clean. Packs B
-//                            decode tokens as seq_len=B and the contiguous
-//                            idx_kv_cache [B,T,D] as one flat kv[B*T,D]; per-token
-//                            KV window ks[b]=b*T, ke[b]=b*T+valid_b restricts each
-//                            token to its own batch. ONE launch, grid.x = #SMs:
-//                            the kernel's tile-pool scheduler balances the global
-//                            Σ_b cdiv(window_b,256) KV tiles across all CTAs
-//                            (chunks may cross token boundaries), so B < #SMs and
-//                            mixed context lengths both fill the machine.
-//                            Output [B, T]; invalid tail (>= valid_b) is -inf.
+// PAGED decode only (RTP-LLM integration; the contiguous-KV faithful path is gone):
+//   mqa_logits_fp4_decode(_out) — MULTI-BATCH decode over a PAGED indexer cache.
+//     kv_cache = fused pages [num_blocks, PAGE_KV*(D/2+4)] bytes (per page:
+//     [PAGE_KV*64B fp4 | PAGE_KV*4B packed-ue8m0 sf]); token b reads its
+//     block_table row for the KV window [0, context_lens[b]). ONE launch,
+//     grid.x = #SMs: the kernel's IN-KERNEL tile-pool scheduler balances the
+//     global Σ_b cdiv(ctx_b, 256) KV tiles across all CTAs (no metadata kernel,
+//     no schedule_meta — host passes raw context_lens/block_table only).
+//     Output [B, max_ctx]; invalid tail (>= ctx_b) is -inf (self-clean).
 //
-// Host TMA setup mirrors DeepGEMM smxx_fp8_fp4_mqa_logits.hpp + attention.hpp;
+// Host TMA setup mirrors DeepGEMM smxx_fp8_fp4_mqa_logits.hpp + attention.hpp
+// (fused page cache split into a 3D page-granular KV view + a 2D SF view);
 // launch pattern mirrors kernels/w1_merged_fp8_gemm.cu.
 // ============================================================
 
@@ -74,14 +68,6 @@ static int get_num_sms() {
     return num_sms;
 }
 
-// TMA-aligned length (16-byte alignment for the SF vector). Mirrors DeepGEMM
-// utils/math.hpp::get_tma_aligned_size.
-static int get_tma_aligned_size(int x, int element_size) {
-    constexpr int kNumTMAAlignmentBytes = 16;
-    TORCH_CHECK(kNumTMAAlignmentBytes % element_size == 0, "bad SF element size");
-    return host_align_up(x, kNumTMAAlignmentBytes / element_size);
-}
-
 static CUtensorMapSwizzle to_swizzle(int mode) {
     switch (mode) {
         case 32:  return CU_TENSOR_MAP_SWIZZLE_32B;
@@ -122,6 +108,42 @@ static CUtensorMap make_tma_2d(const char* name, void* ptr, CUtensorMapDataType 
     return tm;
 }
 
+// Generic 3D TMA descriptor (paged KV: outermost dim = physical page id).
+// dim0 is contiguous; stride1 = bytes between rows, stride2 = bytes between pages
+// (the fused page stride, so the fp4 view simply SKIPS each page's SF tail).
+static CUtensorMap make_tma_3d(const char* name, void* ptr, CUtensorMapDataType dtype,
+                               int elem_size, int g0, int g1, int g2,
+                               int s0, int s1, int s2,
+                               int row_stride_elems, int64_t page_stride_bytes,
+                               int swizzle_mode, bool is_fp4 = false,
+                               bool fp4_unpacked_smem = true) {
+    int smem_inner = s0;
+    if (swizzle_mode != 0)
+        smem_inner = swizzle_mode / elem_size;
+    if (is_fp4 && !fp4_unpacked_smem && swizzle_mode != 0)
+        smem_inner = swizzle_mode * 2;
+
+    CUtensorMap tm{};
+    cuuint64_t gdims[3] = {(cuuint64_t)g0, (cuuint64_t)g1, (cuuint64_t)g2};
+    cuuint32_t sdims[3] = {(cuuint32_t)smem_inner, (cuuint32_t)s1, (cuuint32_t)s2};
+    cuuint64_t gstr[2]  = {(cuuint64_t)row_stride_elems * elem_size,
+                           (cuuint64_t)page_stride_bytes};
+    cuuint32_t estr[3]  = {1, 1, 1};
+    CUresult res = cuTensorMapEncodeTiled(
+        &tm, dtype, 3, ptr, gdims, gstr, sdims, estr,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, to_swizzle(swizzle_mode),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (res != CUDA_SUCCESS) {
+        const char* msg = nullptr; cuGetErrorString(res, &msg);
+        TORCH_CHECK(false, "cuTensorMapEncodeTiled(", name, ") failed: ",
+                    (msg ? msg : "unknown"), " [gmem=", g0, "x", g1, "x", g2,
+                    " smem=", smem_inner, "x", s1, "x", s2,
+                    " strides=", row_stride_elems, ",", page_stride_bytes,
+                    " swizzle=", swizzle_mode, "]");
+    }
+    return tm;
+}
+
 // Per-stage / total dynamic shared-memory bytes for a given KV pipeline depth
 // (mirrors the wrapper; KV stages are now a dispatch dimension, see pick paths below).
 static int compute_smem_bytes(int num_kv_stages) {
@@ -138,21 +160,24 @@ static int compute_smem_bytes(int num_kv_stages) {
            num_kv_stages * (smem_kv + smem_sfkv) + barriers + tmem_ptr + tile_prefix;
 }
 
-// KV pipeline depth (used when num_kv_stages=0). B300 sweep over {4,6,8,10} x the
-// full BxT grid (min-of-instances estimator, throttle excluded): 6 wins or ties
-// EVERY cell — flat at tiny chunks (depth never enters the picture), best at all
-// T >= 8192 (Little's law: ~44GB/s/SM x ~1us TMA latency needs only ~3-4 tiles in
-// flight; deeper adds no coverage but shrinks the unified L1 carveout and inflates
-// the card-wide outstanding-TMA window). 8/10 never won a single cell, falsifying
-// DeepGEMM's "deepest that fits" for our contiguous low-latency producer.
-// {4,6,8,10} stay instantiated for explicit-override experiments.
-static int auto_kv_stages(int, int, int) {
-    return 6;
+// KV pipeline depth (used when num_kv_stages=0). PAGED B300 sweep over {4,6,8,10}
+// x the full BxT grid: the winner follows the per-CTA chunk length — each
+// 256-slot tile is now EIGHT page-granular TMAs (4 data + 4 SF), so long chunks
+// need a deeper in-flight window to cover the issue latency; short chunks never
+// fill any pipeline and prefer the smaller L1 carveout.
+static int auto_kv_stages(int B, int max_context_len, int num_ctas) {
+    if (num_ctas < 1) num_ctas = get_num_sms();
+    const int64_t tiles = (int64_t)B * ((max_context_len + BLOCK_KV - 1) / BLOCK_KV);
+    const int64_t per_cta = (tiles + num_ctas - 1) / num_ctas;
+    if (per_cta <= 8)  return 4;
+    if (per_cta <= 16) return 6;
+    return 8;
 }
 
-template <typename logits_dtype_t, bool kCompressed, bool kTilePool, int kKVStages>
+template <typename logits_dtype_t, int kKVStages>
 static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
-                         const int* ks, const int* ke, void* logits,
+                         const int* context_lens, const int* block_table, int bt_stride,
+                         void* logits,
                          float comp_eps, unsigned long long* prof,
                          const deep_gemm::MainCompressorArgs& comp,
                          bool attn_mock,
@@ -161,8 +186,8 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const CUtensorMap& dW, dim3 grid, int smem,
                          cudaStream_t stream) {
     auto kernel = &deep_gemm::sm100_fp4_mqa_logits<
-        NUM_HEADS, HEAD_DIM, kCompressed, kTilePool,
-        BLOCK_Q, BLOCK_KV, NUM_Q_STAGES, kKVStages,
+        NUM_HEADS, HEAD_DIM,
+        BLOCK_Q, BLOCK_KV, PAGE_KV, NUM_Q_STAGES, kKVStages,
         NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS, logits_dtype_t>;
 
     static bool configured = false;   // per-instantiation (template static local)
@@ -175,10 +200,11 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
     }
 
     kernel<<<grid, dim3(TPB, 1, 1), smem, stream>>>(
-        (uint32_t)seq_len, (uint32_t)seq_len_kv, /*max_seqlen_k (unused)=*/0u,
+        (uint32_t)seq_len, (uint32_t)seq_len_kv,
         (uint32_t)stride_logits,
-        reinterpret_cast<const uint32_t*>(ks),
-        reinterpret_cast<const uint32_t*>(ke),
+        reinterpret_cast<const uint32_t*>(context_lens),
+        reinterpret_cast<const uint32_t*>(block_table),
+        (uint32_t)bt_stride,
         reinterpret_cast<logits_dtype_t*>(logits),
         comp_eps, prof,
         comp, attn_mock,
@@ -187,22 +213,24 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
     TORCH_CHECK(err == cudaSuccess, "mqa_logits_fp4 launch failed: ", cudaGetErrorString(err));
 }
 
-// Build the 5 TMA descriptors + grid, then dispatch (out_dtype x schedule) and
+// Build the 5 TMA descriptors + grid, then dispatch (out_dtype x KV stages) and
 // launch INTO a caller-provided logits buffer `lp`. No allocation here (so callers
 // can hoist it out of a timed loop, matching the repo's *_out convention).
-// `decode_tile_pool` selects the decode schedule (compressed + global tile pool,
-// grid.x = num_ctas CTAs); false = faithful single-seq legacy schedule.
-//   q [S,H,D/2] i8, sf_q [S,H] i32, kv [Skv,D/2] i8, sf_kv [Skv] i32, weights [S,H] f32
+//   q [B,H,D/2] i8, sf_q [B,H] i32, weights [B,H] f32
+//   kv_cache = fused pages [num_blocks, PAGE_KV*(D/2+4)] bytes
+//   context_lens [B] i32, block_table [B, max_pages] i32 (physical page ids)
 static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
-                            torch::Tensor kv, torch::Tensor sf_kv, torch::Tensor weights,
-                            const int* ks, const int* ke, int seq_len, int seq_len_kv,
-                            at::ScalarType out_dtype, bool decode_tile_pool, int stride_logits,
+                            torch::Tensor kv_cache, torch::Tensor weights,
+                            const int* context_lens, const int* block_table, int bt_stride,
+                            int num_blocks, int B, int max_context_len,
+                            at::ScalarType out_dtype, int stride_logits,
                             int num_ctas, int num_kv_stages,
                             float comp_eps, unsigned long long* prof,
                             const deep_gemm::MainCompressorArgs& comp,
                             bool attn_mock,
                             void* lp) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
+    constexpr int PAGE_STRIDE = PAGE_KV * (HEAD_DIM / 2 + 4);   // fused page bytes (4352)
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const int q_elem  = (int)q.element_size();    // 1 (int8-packed fp4)
@@ -214,192 +242,142 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
 #endif
 
     CUtensorMap dQ = make_tma_2d("q", q.data_ptr(), FP4_DT, q_elem,
-                                 D, seq_len * H, D, BLOCK_Q * H,
+                                 D, B * H, D, BLOCK_Q * H,
                                  (int)q.stride(1), D / 2, /*is_fp4=*/true, /*unpacked=*/false);
-    CUtensorMap dKV = make_tma_2d("kv", kv.data_ptr(), FP4_DT, q_elem,
-                                  D, seq_len_kv, D, BLOCK_KV,
-                                  (int)kv.stride(0), D / 2, /*is_fp4=*/true, /*unpacked=*/false);
     CUtensorMap dSFQ = make_tma_2d("sf_q", sf_q.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_INT32, sf_elem,
-                                   H, seq_len, H, BLOCK_Q, (int)sf_q.stride(0), 0);
+                                   H, B, H, BLOCK_Q, (int)sf_q.stride(0), 0);
     CUtensorMap dW = make_tma_2d("weights", weights.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4,
-                                 H, seq_len, H, BLOCK_Q, (int)weights.stride(0), 0);
-    CUtensorMap dSFKV = make_tma_2d("sf_kv", sf_kv.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_INT32, sf_elem,
-                                    get_tma_aligned_size(seq_len_kv, sf_elem), 1, BLOCK_KV, 1, 0, 0);
+                                 H, B, H, BLOCK_Q, (int)weights.stride(0), 0);
+    // Fused page cache split into strided views (DeepGEMM attention.hpp from_blob
+    // pattern): KV = 3D fp4 view (outermost dim = physical page id, page stride
+    // skips each page's SF tail); SF = 2D int32 view at byte offset PAGE_KV*(D/2).
+    CUtensorMap dKV = make_tma_3d("kv_paged", kv_cache.data_ptr(), FP4_DT, q_elem,
+                                  D, PAGE_KV, num_blocks,
+                                  D, PAGE_KV, 1,
+                                  /*row stride=*/D / 2, /*page stride=*/PAGE_STRIDE,
+                                  D / 2, /*is_fp4=*/true, /*unpacked=*/false);
+    CUtensorMap dSFKV = make_tma_2d("sf_kv_paged",
+                                    static_cast<uint8_t*>(kv_cache.data_ptr()) + (int64_t)PAGE_KV * (D / 2),
+                                    CU_TENSOR_MAP_DATA_TYPE_INT32, sf_elem,
+                                    PAGE_KV, num_blocks, PAGE_KV, 1,
+                                    PAGE_STRIDE / 4, 0);
 
-    // Grid:
-    //  - faithful single-seq (legacy): one CTA per q-block, grid.y = 1 (no KV carve).
-    //  - decode tile pool: grid.x CTAs (default = #SMs) split the global KV tile pool;
-    //    empty chunks exit immediately, so grid.x never over-subscribes.
-    dim3 grid(1, 1, 1);
-    if (decode_tile_pool) {
-        if (num_ctas < 1) num_ctas = get_num_sms();
-        grid.x = (unsigned)num_ctas;
-    } else {
-        grid.x = (unsigned)(host_align_up(seq_len, BLOCK_Q) / BLOCK_Q);
-        num_kv_stages = NUM_KV_STAGES;   // faithful path: fixed default depth
-    }
+    // Grid: num_ctas CTAs (default = #SMs) split the global KV tile pool; empty
+    // chunks exit immediately, so grid.x never over-subscribes.
+    if (num_ctas < 1) num_ctas = get_num_sms();
+    dim3 grid((unsigned)num_ctas, 1, 1);
+    if (num_kv_stages == 0)
+        num_kv_stages = auto_kv_stages(B, max_context_len, num_ctas);
     const int smem = compute_smem_bytes(num_kv_stages);
+    // Capacity clamp for context_lens: whatever the block_table can address.
+    const int seq_len_kv_cap = bt_stride * PAGE_KV;
 
-    // Instantiated combos: decode = compressed + tile pool x {4,6,8,10} KV stages
-    // (AOT stand-in for DeepGEMM's JIT per-shape configs); faithful = raw + legacy,
-    // default depth only.
-    #define MQA_LT(dtype_t, pool_, stages_) \
-        launch_typed<dtype_t, pool_, pool_, stages_>(seq_len, seq_len_kv, stride_logits, ks, ke, lp, \
-                                                     comp_eps, prof, comp, attn_mock, \
-                                                     dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
-    if (decode_tile_pool) {
-        TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
-                    "num_kv_stages must be 0 (auto) or one of 4/6/8/10, got ", num_kv_stages);
-        if (out_dtype == torch::kFloat) {
-            switch (num_kv_stages) {
-                case 4:  MQA_LT(float, true, 4);  break;
-                case 6:  MQA_LT(float, true, 6);  break;
-                case 8:  MQA_LT(float, true, 8);  break;
-                default: MQA_LT(float, true, 10); break;
-            }
-        } else {
-            switch (num_kv_stages) {
-                case 4:  MQA_LT(cutlass::bfloat16_t, true, 4);  break;
-                case 6:  MQA_LT(cutlass::bfloat16_t, true, 6);  break;
-                case 8:  MQA_LT(cutlass::bfloat16_t, true, 8);  break;
-                default: MQA_LT(cutlass::bfloat16_t, true, 10); break;
-            }
+    // Instantiated combos: {4,6,8,10} KV stages x {f32, bf16} logits (AOT stand-in
+    // for DeepGEMM's JIT per-shape configs).
+    #define MQA_LT(dtype_t, stages_) \
+        launch_typed<dtype_t, stages_>(B, seq_len_kv_cap, stride_logits, \
+                                       context_lens, block_table, bt_stride, lp, \
+                                       comp_eps, prof, comp, attn_mock, \
+                                       dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
+    TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
+                "num_kv_stages must be 0 (auto) or one of 4/6/8/10, got ", num_kv_stages);
+    if (out_dtype == torch::kFloat) {
+        switch (num_kv_stages) {
+            case 4:  MQA_LT(float, 4);  break;
+            case 6:  MQA_LT(float, 6);  break;
+            case 8:  MQA_LT(float, 8);  break;
+            default: MQA_LT(float, 10); break;
         }
     } else {
-        if (out_dtype == torch::kFloat) MQA_LT(float, false, NUM_KV_STAGES);
-        else                            MQA_LT(cutlass::bfloat16_t, false, NUM_KV_STAGES);
+        switch (num_kv_stages) {
+            case 4:  MQA_LT(cutlass::bfloat16_t, 4);  break;
+            case 6:  MQA_LT(cutlass::bfloat16_t, 6);  break;
+            case 8:  MQA_LT(cutlass::bfloat16_t, 8);  break;
+            default: MQA_LT(cutlass::bfloat16_t, 10); break;
+        }
     }
     #undef MQA_LT
 }
 
-// Allocating wrapper: makes the padded [align(seq_len,BLOCK_Q), stride_logits] buffer
-// (decode/compressed pre-filled -inf; faithful RAW) then dispatch_launch into it.
-static torch::Tensor run_mqa(torch::Tensor q, torch::Tensor sf_q,
-                             torch::Tensor kv, torch::Tensor sf_kv,
-                             torch::Tensor weights, const int* ks, const int* ke,
-                             int seq_len, int seq_len_kv, at::ScalarType out_dtype,
-                             bool decode_tile_pool, int stride_logits, int num_ctas,
-                             int num_kv_stages) {
-    const int aligned_seq_len = host_align_up(seq_len, BLOCK_Q);
-    torch::Tensor logits_buf = decode_tile_pool
-        ? torch::full({aligned_seq_len, stride_logits},
-                      -std::numeric_limits<float>::infinity(), q.options().dtype(out_dtype))
-        : torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(out_dtype));
-    dispatch_launch(q, sf_q, kv, sf_kv, weights, ks, ke, seq_len, seq_len_kv,
-                    out_dtype, decode_tile_pool, stride_logits, num_ctas, num_kv_stages,
-                    /*comp_eps=*/1e-6f, /*prof=*/nullptr,
-                    /*comp=*/deep_gemm::MainCompressorArgs{},
-                    /*attn_mock=*/false,
-                    logits_buf.data_ptr());
-    return logits_buf;
-}
-
-static void check_qkv(const torch::Tensor& q, const torch::Tensor& sf_q,
-                      const torch::Tensor& kv, const torch::Tensor& sf_kv,
-                      const torch::Tensor& weights, at::ScalarType out_dtype) {
-    constexpr int H = NUM_HEADS, D = HEAD_DIM;
-    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kInt8, "q must be CUDA int8-packed fp4");
-    TORCH_CHECK(kv.is_cuda() && kv.scalar_type() == torch::kInt8, "kv must be CUDA int8-packed fp4");
-    TORCH_CHECK(sf_q.is_cuda() && sf_q.scalar_type() == torch::kInt32, "sf_q must be CUDA int32");
-    TORCH_CHECK(sf_kv.is_cuda() && sf_kv.scalar_type() == torch::kInt32, "sf_kv must be CUDA int32");
-    TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kFloat, "weights must be CUDA float32");
+// Shared checks for the PAGED decode entries. Returns (B, num_blocks, max_pages).
+static std::tuple<int, int, int> check_paged(
+    const torch::Tensor& q, const torch::Tensor& sf_q, const torch::Tensor& kv_cache,
+    const torch::Tensor& weights, const torch::Tensor& context_lens,
+    const torch::Tensor& block_table, at::ScalarType out_dtype) {
+    constexpr int PAGE_BYTES = PAGE_KV * (HEAD_DIM / 2 + 4);   // 4352
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kInt8 && q.dim() == 3
+                && q.size(1) == NUM_HEADS && q.size(2) == HEAD_DIM / 2 && q.is_contiguous(),
+                "q must be CUDA int8-packed fp4 [B,H,D/2] contiguous");
+    const int B = (int)q.size(0);
+    TORCH_CHECK(B <= (int)deep_gemm::kNumMaxTilePoolTokens,
+                "decode B must be <= ", (int)deep_gemm::kNumMaxTilePoolTokens,
+                " (tile-pool smem prefix cap)");
+    TORCH_CHECK(sf_q.is_cuda() && sf_q.scalar_type() == torch::kInt32 && sf_q.is_contiguous()
+                && sf_q.sizes() == torch::IntArrayRef({B, NUM_HEADS}), "sf_q [B,H] i32");
+    TORCH_CHECK(weights.is_cuda() && weights.scalar_type() == torch::kFloat
+                && weights.sizes() == torch::IntArrayRef({B, NUM_HEADS})
+                && weights.stride(1) == 1, "weights [B,H] f32");
     TORCH_CHECK(out_dtype == torch::kFloat || out_dtype == torch::kBFloat16, "out_dtype float/bf16");
-    TORCH_CHECK(q.size(-1) == D / 2 && kv.size(-1) == D / 2, "last dim must be head_dim/2=", D/2);
-    (void)H;
+    TORCH_CHECK(kv_cache.is_cuda() && kv_cache.is_contiguous()
+                && (kv_cache.scalar_type() == torch::kInt8 || kv_cache.scalar_type() == torch::kUInt8),
+                "kv_cache must be CUDA (u)int8 fused pages");
+    const int num_blocks = (int)kv_cache.size(0);
+    TORCH_CHECK(kv_cache.numel() == (int64_t)num_blocks * PAGE_BYTES,
+                "kv_cache must be [num_blocks, ", PAGE_BYTES, "] bytes per page "
+                "(fused: PAGE_KV*(D/2) fp4 then PAGE_KV*4 sf)");
+    TORCH_CHECK(context_lens.is_cuda() && context_lens.scalar_type() == torch::kInt32
+                && context_lens.numel() == B && context_lens.is_contiguous(),
+                "context_lens [B] i32");
+    TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == torch::kInt32
+                && block_table.dim() == 2 && block_table.size(0) == B
+                && block_table.is_contiguous(), "block_table [B, max_pages] i32 contiguous");
+    return {B, num_blocks, (int)block_table.size(1)};
 }
 
 }  // namespace
 
 // ======================== PyTorch bindings ========================
 
-// Faithful single-sequence, NON-compressed. Returns RAW logits [S, Skv]
-// (caller masks outside [ks,ke); matches DeepGEMM before clean_logits).
-static torch::Tensor mqa_logits_fp4_forward(
-    torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
-    torch::Tensor weights, torch::Tensor cu_seq_len_k_start,
-    torch::Tensor cu_seq_len_k_end, at::ScalarType out_dtype) {
-    check_qkv(q, sf_q, kv, sf_kv, weights, out_dtype);
-    TORCH_CHECK(q.dim() == 3 && q.size(1) == NUM_HEADS, "q must be [S,H,D/2]");
-    TORCH_CHECK(kv.dim() == 2, "kv must be [Skv,D/2]");
-    TORCH_CHECK(q.is_contiguous() && kv.is_contiguous(), "q/kv must be contiguous");
-    const int seq_len = q.size(0), seq_len_kv = kv.size(0);
-    TORCH_CHECK(sf_q.sizes() == torch::IntArrayRef({seq_len, NUM_HEADS}), "sf_q [S,H]");
-    TORCH_CHECK(sf_kv.dim() == 1 && sf_kv.size(0) == seq_len_kv, "sf_kv [Skv]");
-    TORCH_CHECK(weights.sizes() == torch::IntArrayRef({seq_len, NUM_HEADS}) && weights.stride(1) == 1, "weights [S,H]");
-    TORCH_CHECK(cu_seq_len_k_start.scalar_type() == torch::kInt32 && cu_seq_len_k_start.numel() == seq_len, "ks [S] i32");
-    TORCH_CHECK(cu_seq_len_k_end.scalar_type() == torch::kInt32 && cu_seq_len_k_end.numel() == seq_len, "ke [S] i32");
-
-    const int stride_logits = host_align_up(seq_len_kv + BLOCK_KV, 8);
-    // Faithful single-sequence path: legacy per-q-block schedule, behavior unchanged.
-    auto buf = run_mqa(q, sf_q, kv, sf_kv, weights,
-                       cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
-                       seq_len, seq_len_kv, out_dtype, /*decode_tile_pool=*/false, stride_logits,
-                       /*num_ctas=*/0, /*num_kv_stages=*/NUM_KV_STAGES);
-    return buf.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
-}
-
-// Multi-batch decode, COMPRESSED + self-clean. ONE launch for all B tokens;
-// grid.x = num_ctas (default #SMs), tile-pool schedule inside the kernel.
-//   q [B,H,D/2] i8, sf_q [B,H] i32, kv [B,T,D/2] i8, sf_kv [B,T] i32, weights [B,H] f32
-//   valid_len [B] i32 optional (per-batch valid KV length; default T).
-// Returns logits [B, T]; entries >= valid_b are -inf.
+// Multi-batch PAGED decode, COMPRESSED + self-clean: allocating wrapper.
+// ONE launch for all B tokens; grid.x = num_ctas (default #SMs), tile-pool
+// schedule inside the kernel (NO metadata kernel, no schedule_meta).
+//   q [B,H,D/2] i8, sf_q [B,H] i32, weights [B,H] f32
+//   kv_cache fused pages [num_blocks, PAGE_KV*(D/2+4)] bytes
+//   context_lens [B] i32, block_table [B, max_pages] i32 (physical page ids)
+// Returns logits [B, max_context_len]; entries >= ctx_b are -inf.
 static torch::Tensor mqa_logits_fp4_decode(
-    torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
-    torch::Tensor weights, c10::optional<torch::Tensor> valid_len,
-    at::ScalarType out_dtype, int num_ctas = 0, int num_kv_stages = 0) {
-    check_qkv(q, sf_q, kv, sf_kv, weights, out_dtype);
-    TORCH_CHECK(q.dim() == 3 && q.size(1) == NUM_HEADS, "q must be [B,H,D/2]");
-    TORCH_CHECK(kv.dim() == 3, "kv must be [B,T,D/2]");
-    const int B = q.size(0), T = kv.size(1);
-    TORCH_CHECK(kv.size(0) == B, "kv batch must match q");
-    TORCH_CHECK(B <= (int)deep_gemm::kNumMaxTilePoolTokens,
-                "decode B must be <= ", (int)deep_gemm::kNumMaxTilePoolTokens,
-                " (tile-pool smem prefix cap)");
-    TORCH_CHECK(sf_q.sizes() == torch::IntArrayRef({B, NUM_HEADS}), "sf_q [B,H]");
-    TORCH_CHECK(sf_kv.sizes() == torch::IntArrayRef({B, T}), "sf_kv [B,T]");
-    TORCH_CHECK(weights.sizes() == torch::IntArrayRef({B, NUM_HEADS}) && weights.stride(1) == 1, "weights [B,H]");
+    torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv_cache,
+    torch::Tensor weights, torch::Tensor context_lens, torch::Tensor block_table,
+    int max_context_len, at::ScalarType out_dtype, int num_ctas = 0, int num_kv_stages = 0) {
+    auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
+                                                  context_lens, block_table, out_dtype);
+    TORCH_CHECK(max_context_len > 0 && max_context_len <= max_pages * PAGE_KV,
+                "max_context_len must be in (0, max_pages*PAGE_KV]");
 
-    // Flatten the contiguous [B,T,*] indexer cache into one varlen kv[B*T,*].
-    auto q_c  = q.contiguous();
-    auto kv_c = kv.reshape({B * T, HEAD_DIM / 2}).contiguous();
-    auto sfkv_c = sf_kv.reshape({B * T}).contiguous();
-    auto sfq_c  = sf_q.contiguous();
-    auto w_c    = weights.contiguous();
-
-    // Per-token KV window: token b sees kv[b*T : b*T + valid_b].
-    auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(q.device());
-    torch::Tensor ks = torch::arange(B, i32) * T;                 // [B]
-    torch::Tensor ke;
-    if (valid_len.has_value()) {
-        auto vl = valid_len.value();
-        TORCH_CHECK(vl.scalar_type() == torch::kInt32 && vl.numel() == B, "valid_len [B] i32");
-        ke = ks + vl.to(q.device());
-    } else {
-        ke = ks + T;
-    }
-
-    const int seq_len = B, seq_len_kv = B * T;
-    const int stride_logits = host_align_up(T, BLOCK_KV);   // compressed: align(max_seqlen_k, block_kv)
-    // Tile-pool schedule: the kernel balances Σ_b cdiv(window_b, BLOCK_KV) global KV
-    // tiles across num_ctas CTAs (default #SMs); chunks may cross token boundaries,
-    // so B < #SMs and mixed valid_len both keep every SM busy (imbalance <= 1 tile).
-    auto buf = run_mqa(q_c, sfq_c, kv_c, sfkv_c, w_c,
-                       ks.data_ptr<int>(), ke.data_ptr<int>(),
-                       seq_len, seq_len_kv, out_dtype, /*decode_tile_pool=*/true, stride_logits,
-                       num_ctas,
-                       num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas));
-    return buf.index({torch::indexing::Slice(0, B), torch::indexing::Slice(0, T)});
+    const int stride_logits = host_align_up(max_context_len, BLOCK_KV);
+    torch::Tensor buf = torch::full({B, stride_logits},
+                                    -std::numeric_limits<float>::infinity(),
+                                    q.options().dtype(out_dtype));
+    dispatch_launch(q, sf_q, kv_cache, weights,
+                    context_lens.data_ptr<int>(), block_table.data_ptr<int>(), max_pages,
+                    num_blocks, B, max_context_len, out_dtype, stride_logits,
+                    num_ctas, num_kv_stages,
+                    /*comp_eps=*/1e-6f, /*prof=*/nullptr,
+                    /*comp=*/deep_gemm::MainCompressorArgs{},
+                    /*attn_mock=*/false,
+                    buf.data_ptr());
+    return buf.index({torch::indexing::Slice(0, B),
+                      torch::indexing::Slice(0, max_context_len)});
 }
 
-// Preallocated-output decode (repo *_out convention): the timed region is just
-// reshape(views) + 5 descriptors + launch — no per-call alloc/-inf-fill/arange.
-// Caller provides: ks/ke [B] i32 (precomputed), and `logits` preallocated as
-// [align(B,BLOCK_Q), align(T,BLOCK_KV)] pre-filled with -inf ONCE (the kernel only
-// overwrites each row's [0,valid) so the -inf tail persists across reuse).
-// Writes into `logits` in place; caller slices [:B, :T].
+// Preallocated-output PAGED decode (repo *_out convention): the timed region is
+// just 5 descriptors + ONE launch — no per-call alloc/-inf-fill. Caller provides
+// `logits` preallocated as [>=B, align(max_ctx,BLOCK_KV)] pre-filled with -inf ONCE
+// (the kernel only overwrites each row's [0,ctx) so the -inf tail persists across
+// reuse). Writes into `logits` in place; caller slices [:B, :max_ctx].
 static void mqa_logits_fp4_decode_out(
-    torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv, torch::Tensor sf_kv,
-    torch::Tensor weights, torch::Tensor ks, torch::Tensor ke,
+    torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv_cache,
+    torch::Tensor weights, torch::Tensor context_lens, torch::Tensor block_table,
     torch::Tensor logits, int num_ctas, int num_kv_stages,
     double comp_eps, c10::optional<torch::Tensor> prof,
     c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> comp_norm,
@@ -407,16 +385,12 @@ static void mqa_logits_fp4_decode_out(
     c10::optional<torch::Tensor> comp_kv, c10::optional<torch::Tensor> comp_sc,
     c10::optional<torch::Tensor> comp_q8, c10::optional<torch::Tensor> comp_s8,
     c10::optional<torch::Tensor> comp_rope, bool mock_attn) {
-    check_qkv(q, sf_q, kv, sf_kv, weights, logits.scalar_type());
-    const int B = q.size(0), T = kv.size(1);
-    TORCH_CHECK(kv.dim() == 3 && kv.size(0) == B, "kv must be [B,T,D/2]");
-    TORCH_CHECK(B <= (int)deep_gemm::kNumMaxTilePoolTokens,
-                "decode B must be <= ", (int)deep_gemm::kNumMaxTilePoolTokens,
-                " (tile-pool smem prefix cap)");
-    TORCH_CHECK(ks.scalar_type() == torch::kInt32 && ks.numel() == B, "ks [B] i32");
-    TORCH_CHECK(ke.scalar_type() == torch::kInt32 && ke.numel() == B, "ke [B] i32");
-    TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= host_align_up(B, BLOCK_Q),
-                "logits must be [>=align(B,BLOCK_Q), stride]");
+    auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
+                                                  context_lens, block_table,
+                                                  logits.scalar_type());
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= B
+                && logits.size(1) % BLOCK_KV == 0 && logits.is_contiguous(),
+                "logits must be [>=B, k*BLOCK_KV] contiguous");
     TORCH_CHECK(num_ctas >= 0, "num_ctas must be >= 0 (0 = one CTA per SM)");
 
     // Optional globaltimer stamps [num_ctas, 8] i64 (test_complex.cu phase pattern):
@@ -468,14 +442,11 @@ static void mqa_logits_fp4_decode_out(
         comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope->data_ptr());
     }
 
-    auto kv_c   = kv.reshape({B * T, HEAD_DIM / 2});   // view (cache is contiguous)
-    auto sfkv_c = sf_kv.reshape({B * T});
-    dispatch_launch(q, sf_q, kv_c, sfkv_c, weights,
-                    ks.data_ptr<int>(), ke.data_ptr<int>(),
-                    /*seq_len=*/B, /*seq_len_kv=*/B * T, logits.scalar_type(),
-                    /*decode_tile_pool=*/true, /*stride_logits=*/(int)logits.size(1),
-                    num_ctas,
-                    num_kv_stages > 0 ? num_kv_stages : auto_kv_stages(B, T, num_ctas),
+    dispatch_launch(q, sf_q, kv_cache, weights,
+                    context_lens.data_ptr<int>(), block_table.data_ptr<int>(), max_pages,
+                    num_blocks, B, /*max_context_len=*/(int)logits.size(1),
+                    logits.scalar_type(), /*stride_logits=*/(int)logits.size(1),
+                    num_ctas, num_kv_stages,
                     (float)comp_eps, prof_ptr,
                     comp,
                     /*attn_mock=*/mock_attn,
@@ -508,25 +479,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cmp_pos"), py::arg("comp_norm"), py::arg("cos_tab"), py::arg("sin_tab"),
           py::arg("comp_kv"), py::arg("comp_sc"), py::arg("comp_q8"), py::arg("comp_s8"),
           py::arg("comp_rope"), py::arg("eps") = 1e-6);
-    m.def("mqa_logits_fp4", &mqa_logits_fp4_forward,
-          "DSV4 FP4 MQA-logits (single-seq, non-compressed RAW logits) — migrated from DeepGEMM",
-          py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"),
-          py::arg("weights"), py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-          py::arg("out_dtype"));
     m.def("mqa_logits_fp4_decode", &mqa_logits_fp4_decode,
-          "DSV4 FP4 MQA-logits (multi-batch decode, compressed, one launch, tile-pool schedule) — "
-          "varlen packing of [B,T,D] cache; num_ctas=0 -> one CTA per SM; "
+          "DSV4 FP4 MQA-logits (multi-batch PAGED decode, compressed, ONE launch, "
+          "in-kernel tile-pool schedule — no metadata kernel): fused page cache "
+          "[num_blocks, PAGE_KV*(D/2+4)]B + block_table; num_ctas=0 -> one CTA per SM; "
           "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10",
-          py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"),
-          py::arg("weights"), py::arg("valid_len") = c10::nullopt,
+          py::arg("q"), py::arg("sf_q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("max_context_len"),
           py::arg("out_dtype"), py::arg("num_ctas") = 0, py::arg("num_kv_stages") = 0);
     m.def("mqa_logits_fp4_decode_out", &mqa_logits_fp4_decode_out,
-          "DSV4 FP4 MQA-logits decode into a preallocated buffer (repo *_out convention; "
-          "hoists alloc/-inf-fill/arange out of the timed path); num_ctas=0 -> one CTA per SM; "
+          "DSV4 FP4 PAGED decode into a preallocated buffer (repo *_out convention; "
+          "hoists alloc/-inf-fill out of the timed path); num_ctas=0 -> one CTA per SM; "
           "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10; "
           "optional MAIN-indexer compressor fused into the tail warpgroup (cmp_* / comp_*)",
-          py::arg("q"), py::arg("sf_q"), py::arg("kv"), py::arg("sf_kv"), py::arg("weights"),
-          py::arg("ks"), py::arg("ke"), py::arg("logits"), py::arg("num_ctas") = 0,
+          py::arg("q"), py::arg("sf_q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("logits"),
+          py::arg("num_ctas") = 0,
           py::arg("num_kv_stages") = 0,
           py::arg("comp_eps") = 1e-6, py::arg("prof") = c10::nullopt,
           py::arg("cmp_pos") = c10::nullopt, py::arg("comp_norm") = c10::nullopt,

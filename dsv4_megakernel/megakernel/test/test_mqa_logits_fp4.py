@@ -1,16 +1,16 @@
 """Correctness (vs DeepGEMM ref_fp8_mqa_logits) + B300 benchmark for the migrated
-FP4 MQA-logits kernel (kernels/mqa_logits_fp4.cu).
+FP4 MQA-logits kernel (kernels/mqa_logits_fp4.cu), PAGED decode only.
 
 Perf metric: kernel_us only — DeepGEMM bench_kineto methodology (pure GPU kernel
 time, L2 flushed before every call); DeepGEMM's test suite reports no wall time.
 
-Covers both entry points:
-  * mqa_logits_fp4         — single-sequence, NON-compressed RAW logits (masked on host
-                             to match DeepGEMM's clean_logits, then compared to ref).
-  * mqa_logits_fp4_decode  — MULTI-BATCH decode, compressed, ONE launch (tile-pool
-                             schedule: grid.x = #SMs, global KV tiles balanced across
-                             CTAs); compared to a per-batch ref over a context-length
-                             GRADIENT (uniform + mixed per-seq valid_len).
+Entry point:
+  * mqa_logits_fp4_decode(_out) — MULTI-BATCH PAGED decode, compressed +
+    self-clean, ONE launch (IN-KERNEL tile-pool schedule: grid.x = #SMs, global
+    KV tiles balanced across CTAs — NO metadata kernel, no schedule_meta).
+    kv_cache = fused pages [num_blocks, PAGE_KV*(D/2+4)] bytes + block_table;
+    validated with SHUFFLED page tables over a context-length GRADIENT
+    (uniform + mixed per-seq context_lens).
 
 Requires: B300 (sm_100+), CUDA >= 12.8. Fully self-contained — no `deep_gemm`
 package needed (FP4 quant/dequant + calc_diff are inlined below).
@@ -180,53 +180,31 @@ def quantize_fp4(x, last_dim):
     return packed, sf.to(torch.int32), sim.view_as(x)
 
 
-# --------------------------------------------------------------------- single-seq
-def run_single(module, seq_len, seq_len_kv, out_dtype):
-    torch.manual_seed(seq_len * 131 + seq_len_kv)
-    q = torch.randn(seq_len, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(seq_len_kv, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(seq_len, NUM_HEADS, device="cuda", dtype=torch.float32)
-    # simple causal-ish ranges (disable_cp path)
-    ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
-    ke = torch.arange(seq_len, dtype=torch.int32, device="cuda") + (seq_len_kv - seq_len)
-
-    q_p, q_sf, q_sim = quantize_fp4(q, HEAD_DIM)
-    kv_p, kv_sf, kv_sim = quantize_fp4(kv, HEAD_DIM)
-    q_p = q_p.view(seq_len, NUM_HEADS, HEAD_DIM // 2).contiguous()
-    q_sf = q_sf.view(seq_len, NUM_HEADS).contiguous()
-    kv_p = kv_p.view(seq_len_kv, HEAD_DIM // 2).contiguous()
-    kv_sf = kv_sf.view(seq_len_kv).contiguous()
-
-    ref = ref_fp8_mqa_logits(q, kv, weights, ks, ke)
-    sim = ref_fp8_mqa_logits(q_sim, kv_sim, weights, ks, ke)
-    got = module.mqa_logits_fp4(q_p, q_sf, kv_p, kv_sf, weights, ks, ke, out_dtype)
-    torch.cuda.synchronize()
-
-    # forward returns RAW logits -> clean on host to the [ks,ke) mask (== DeepGEMM clean_logits)
-    valid = ref != float("-inf")
-    got_f = torch.where(valid, got.float(), torch.zeros_like(got.float()))
-    ref_f = ref.masked_fill(~valid, 0).float()
-    sim_f = sim.masked_fill(~valid, 0).float()
-    return calc_diff(got_f, ref_f), calc_diff(got_f, sim_f)
-
-
-def test_single(module):
-    print("\n[single-seq] FP4 MQA-logits (RAW, host-cleaned) vs DeepGEMM ref")
-    print(f"{'S':>6} {'Skv':>7} {'dtype':>6} {'diff_ref':>12} {'diff_sim':>12} {'result':>8}")
-    print("-" * 54)
-    ok_all = True
-    for out_dtype in (torch.float32, torch.bfloat16):
-        for s, skv in [(256, 1024), (512, 1024), (2048, 4096), (4096, 8192)]:
-            diff, sim = run_single(module, s, skv, out_dtype)
-            ok = diff < 0.02 and sim < 2e-3
-            ok_all &= ok
-            print(f"{s:6d} {skv:7d} {str(out_dtype).split('.')[-1]:>6} "
-                  f"{diff:12.4e} {sim:12.4e} {('PASS' if ok else 'FAIL'):>8}")
-    print("-" * 54)
-    return ok_all
-
-
 # ------------------------------------------------------------------ multi-batch decode
+PAGE_KV = 64      # fused-page tokens (RTP-LLM tokens_per_block); mirrors the kernel
+PAGE_BYTES = PAGE_KV * (HEAD_DIM // 2 + 4)   # 4352: fp4 bytes then per-token i32 sf
+
+
+def build_paged_cache(kv_p, kv_sf, B, T, shuffle=False):
+    """kv_p [B*T, D/2] i8 + kv_sf [B*T] i32 (logical order) -> fused page cache
+    uint8 [num_blocks, PAGE_BYTES] + block_table [B, T//PAGE_KV] i32.
+    Fused page layout (DeepGEMM kv_cache_cast_to_mxfp4-compatible):
+    [PAGE_KV*(D/2) fp4 bytes | PAGE_KV*4 sf bytes]. shuffle=True scatters logical
+    pages across the physical pool (REAL paged semantics: exercises block_table
+    indirection); False keeps identity mapping (contiguous HBM ranges, benchmark)."""
+    assert T % PAGE_KV == 0
+    num_blocks = B * T // PAGE_KV
+    perm = (torch.randperm(num_blocks, device="cuda")
+            if shuffle else torch.arange(num_blocks, device="cuda"))
+    fused = torch.empty(num_blocks, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    fused[perm, :PAGE_KV * (HEAD_DIM // 2)] = \
+        kv_p.contiguous().view(torch.uint8).view(num_blocks, PAGE_KV * (HEAD_DIM // 2))
+    fused[perm, PAGE_KV * (HEAD_DIM // 2):] = \
+        kv_sf.contiguous().view(num_blocks, PAGE_KV).view(torch.uint8).view(num_blocks, PAGE_KV * 4)
+    block_table = perm.to(torch.int32).view(B, T // PAGE_KV).contiguous()
+    return fused, block_table
+
+
 def make_valid(B, T, valid):
     """valid: None (full T) | int (uniform) | "mixed" (per-batch length gradient, to
     exercise the tile-pool scheduler's cross-token balancing). -> (list, tensor|None)"""
@@ -255,8 +233,14 @@ def run_decode(module, B, T, out_dtype, valid=None):
     kv_sim = kv_sim.view(B, T, HEAD_DIM)
 
     valid_list, valid_t = make_valid(B, T, valid)
+    ctx = (valid_t if valid_t is not None
+           else torch.full((B,), T, dtype=torch.int32, device="cuda"))
+    # SHUFFLED page table: the kernel must reassemble logical order via block_table
+    fused, block_table = build_paged_cache(kv_p.view(-1, HEAD_DIM // 2),
+                                           kv_sf.view(-1), B, T, shuffle=True)
 
-    got = module.mqa_logits_fp4_decode(q_p, q_sf, kv_p, kv_sf, weights, valid_t, out_dtype)
+    got = module.mqa_logits_fp4_decode(q_p, q_sf, fused, weights, ctx, block_table,
+                                       T, out_dtype)
     torch.cuda.synchronize()
     assert got.shape == (B, T), got.shape
 
@@ -281,7 +265,8 @@ def run_decode(module, B, T, out_dtype, valid=None):
 
 
 def test_decode(module):
-    print("\n[decode] multi-batch FP4 MQA-logits (compressed, tile-pool, one launch) vs per-batch ref")
+    print("\n[decode] multi-batch PAGED FP4 MQA-logits (fused pages + shuffled block_table,"
+          " in-kernel tile-pool, one launch) vs per-batch ref")
     print(f"{'B':>4} {'T':>7} {'valid':>6} {'dtype':>6} {'diff_ref':>12} {'diff_sim':>12} {'result':>8}")
     print("-" * 62)
     ok_all = True
@@ -339,13 +324,13 @@ def test_main_compressor(module):
     kv_p, kv_sf, _ = quantize_fp4(kv, HEAD_DIM)
     q_p = q_p.view(B, NUM_HEADS, HEAD_DIM // 2).contiguous()
     q_sf = q_sf.view(B, NUM_HEADS).contiguous()
-    kv_p = kv_p.view(B, T, HEAD_DIM // 2).contiguous()
-    kv_sf = kv_sf.view(B, T).contiguous()
+    fused_c, block_table = build_paged_cache(kv_p.view(-1, HEAD_DIM // 2),
+                                             kv_sf.view(-1), B, T, shuffle=True)
+    ctx = torch.full((B,), T, dtype=torch.int32, device="cuda")
     stride = ((T + BLOCK_KV - 1) // BLOCK_KV) * BLOCK_KV
-    ks = torch.arange(B, dtype=torch.int32, device="cuda") * T
-    ke = ks + T
     logits_base = torch.full((B, stride), float("-inf"), device="cuda", dtype=torch.float32)
-    module.mqa_logits_fp4_decode_out(q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits_base, 0, 0)
+    module.mqa_logits_fp4_decode_out(q_p, q_sf, fused_c, weights, ctx, block_table,
+                                     logits_base, 0, 0)
     torch.cuda.synchronize()
 
     # compressor inputs: rows 3 and 7 are compress rows ((pos+1)%4 == 0)
@@ -364,7 +349,7 @@ def test_main_compressor(module):
 
     logits = torch.full((B, stride), float("-inf"), device="cuda", dtype=torch.float32)
     module.mqa_logits_fp4_decode_out(
-        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, 0,
+        q_p, q_sf, fused_c, weights, ctx, block_table, logits, 0, 0,
         cmp_pos=pos, comp_norm=comp_norm, cos_tab=cos_tab, sin_tab=sin_tab,
         comp_kv=comp_kv, comp_sc=comp_sc, comp_q8=comp_q8, comp_s8=comp_s8,
         comp_rope=comp_rope)
@@ -466,22 +451,26 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
             del q, kv
             q_p = q_p.view(B, NUM_HEADS, HEAD_DIM // 2).contiguous()
             q_sf = q_sf.to(torch.int32).view(B, NUM_HEADS).contiguous()
-            kv_p = kv_p.view(B, T, HEAD_DIM // 2).contiguous()
-            kv_sf = kv_sf.view(B, T).contiguous()
+            # fused page cache with an IDENTITY block table (contiguous HBM ranges;
+            # the indirection's correctness is covered by test_decode's shuffled tables)
+            fused, block_table = build_paged_cache(kv_p, kv_sf.to(torch.int32), B, T)
+            del kv_p, kv_sf
 
             # hoist per-call host work out of the timed region (repo *_out convention)
             stride = ((T + BLOCK_KV - 1) // BLOCK_KV) * BLOCK_KV
             logits = torch.full((B, stride), float("-inf"),
                                 device="cuda", dtype=torch.float32)
-            ks = (torch.arange(B, dtype=torch.int32, device="cuda") * T)
-            ke = ks + T
+            ctx = torch.full((B,), T, dtype=torch.int32, device="cuda")
             total_tiles = B * ((T + BLOCK_KV - 1) // BLOCK_KV)
+            # mirror the host's auto rule for the printed stg column
+            per_cta = (total_tiles + num_sms - 1) // num_sms
+            auto_stg = 4 if per_cta <= 8 else (6 if per_cta <= 16 else 8)
 
             for stg in stage_opts:
                 call = lambda s=stg: module.mqa_logits_fp4_decode_out(
-                    q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s)  # ctas=0 -> per SM
+                    q_p, q_sf, fused, weights, ctx, block_table, logits, 0, s)  # ctas=0 -> per SM
                 kus = kernel_us(call)
-                eff_stg = stg if stg else 6   # 0 = auto, which resolves to 6
+                eff_stg = stg if stg else auto_stg
                 if fuse_comp:
                     # MAIN compressor, REALISTIC trigger: staggered decode positions
                     # -> (pos+1)%4==0 on exactly B/4 rows, spread one-per-CTA (aligns
@@ -496,7 +485,7 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     cs8 = torch.empty(B, 7, device="cuda")
                     crope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
                     acall = lambda s=stg: module.mqa_logits_fp4_decode_out(
-                        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s,
+                        q_p, q_sf, fused, weights, ctx, block_table, logits, 0, s,
                         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
                         comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
                     aus = kernel_us(acall)
@@ -510,7 +499,7 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     # entry), same 512-thread launch shape, only the tail warpgroup
                     # works -> the tail's uncovered wall in its real environment.
                     tcall = lambda s=stg: module.mqa_logits_fp4_decode_out(
-                        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, s,
+                        q_p, q_sf, fused, weights, ctx, block_table, logits, 0, s,
                         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
                         comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope,
                         mock_attn=True)
@@ -533,7 +522,7 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     tflops = 2 * B * T * NUM_HEADS * HEAD_DIM / 1e6 / kus
                     print(f"{B:4d} {T:7d} {4*T:8d} {total_tiles:7d} {eff_stg:5d} "
                           f"{kus:11.3f} {tflops:7.1f} {bw:9.0f}")
-            del weights, q_p, q_sf, kv_p, kv_sf, logits, ks, ke
+            del weights, q_p, q_sf, fused, block_table, logits, ctx
             torch.cuda.empty_cache()
         print("-" * 66)
 
@@ -553,12 +542,11 @@ def timeline(module, B, T, stg=0):
     del q, kv
     q_p = q_p.view(B, NUM_HEADS, HEAD_DIM // 2).contiguous()
     q_sf = q_sf.to(torch.int32).view(B, NUM_HEADS).contiguous()
-    kv_p = kv_p.view(B, T, HEAD_DIM // 2).contiguous()
-    kv_sf = kv_sf.view(B, T).contiguous()
+    fused, block_table = build_paged_cache(kv_p, kv_sf.to(torch.int32), B, T)
+    del kv_p, kv_sf
     stride = ((T + BLOCK_KV - 1) // BLOCK_KV) * BLOCK_KV
     logits = torch.full((B, stride), float("-inf"), device="cuda", dtype=torch.float32)
-    ks = torch.arange(B, dtype=torch.int32, device="cuda") * T
-    ke = ks + T
+    ctx = torch.full((B,), T, dtype=torch.int32, device="cuda")
     # MAIN compressor (realistic 1/4 trigger) so the phase stamps have work to show
     cpos = torch.arange(B, dtype=torch.int64, device="cuda")
     cnorm = torch.rand(512, device="cuda") + 0.5
@@ -572,7 +560,7 @@ def timeline(module, B, T, stg=0):
     prof_t = torch.zeros(num_sms * 8, dtype=torch.int64, device="cuda")
 
     fcall = lambda p=None: module.mqa_logits_fp4_decode_out(
-        q_p, q_sf, kv_p, kv_sf, weights, ks, ke, logits, 0, stg,
+        q_p, q_sf, fused, weights, ctx, block_table, logits, 0, stg,
         prof=p,
         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
         comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
@@ -595,9 +583,9 @@ def timeline(module, B, T, stg=0):
         e = max(s + 1, int((e_ns - t0) * WIDTH // span))
         return " " * s + "\u2588" * (e - s) + " " * (WIDTH - e)
 
-    print(f"\nTimeline B={B} T={T} stg={stg if stg else 6}: one stamped call, L2 flushed.")
+    print(f"\nTimeline B={B} T={T} stg={stg if stg else 'auto'}: one stamped call, L2 flushed.")
     print(f"t=0 = earliest stamp (CTA entry); full width = {span/1e3:.1f} us.")
-    print("attn = t0->t1 (t0 is POST-prologue: barrier init + TMEM alloc + ks/ke scan);")
+    print("attn = t0->t1 (t0 is POST-prologue: barrier init + TMEM alloc + ctx scan);")
     print("tail = t2->t3 (t2 at CTA entry -- the tail does not wait for the prologue).")
     idx = sorted(set([0, 1, num_sms // 4, num_sms // 2, 3 * num_sms // 4, num_sms - 2, num_sms - 1]))
     for i in idx:
@@ -651,7 +639,6 @@ def main():
 
     ok = True
     if not args.skip_correctness:
-        ok &= test_single(module)
         ok &= test_decode(module)
         ok &= test_main_compressor(module)
         print("\nALL PASSED" if ok else "\nCORRECTNESS FAILED")
