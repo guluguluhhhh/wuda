@@ -1,27 +1,14 @@
 #pragma once
 // ============================================================
-// wq_b_gemm.cuh
-// tcgen05 FP8 (e4m3) block-scale GEMM — shared config and PTX/TMA helpers
-// Aligned with DeepGEMM sm100_fp8_gemm_1d1d + megakernel/w1_merged_fp8_gemm.
+// wq_b_fp8_gemm.cuh — config + PTX/TMA helpers for the MERGED wq_b projection
+// (kernel/host/usage: kernels/wq_b_fp8_gemm.cu).
 //
-// Swap-path target: M=32~128 (32-aligned), K=1536, N=65536, e4m3 -> FP32 output.
-//   x_fp8[M,1536] @ w_fp8[65536,1536]^T -> y[M,65536] (FP32)
-//   A = weight (MMA A-operand, UMMA_M=256 along N), B = activation (UMMA_N=128 along M).
-//   Both K-major, 128B swizzle. Native DSV4 quantization: activation 1x128,
-//   weight 128x128, scale = UE8M0.
-//
-// swap_ab=1, 2SM MMA (cta_group::2), Cluster=(2,1,1) -> cluster_n=2, Persistent,
-// Warp-Specialized. UMMA_N = M (32-aligned, <=128): the MMA and the epilogue touch
-// EXACTLY M rows -- no padding work (verified vs DeepGEMM's config choice, which
-// picks block_m=M for this shape; the old fixed UMMA_N=128 paid a 1.04-1.13x
-// padding tax at M<128). Smaller M also frees SMEM_A -> deeper pipelines. The
-// block_scale MMA is issued by cluster_mma_fp8.cuh; this header carries the config
-// + the SF pipeline plumbing (SMEM/TMA helpers) that feeds it.
-//
-// Native SF layout:
-//   x_sf[M, K/128] and w_sf[ceil(N/128), K/128], one UE8M0 byte per K128
-//   quantization block. Warp2 expands each byte to four identical K32 scale IDs
-//   because tcgen05.mma.kind::mxf8f6f4 consumes scale factors at K32 granularity.
+// Shape: x[M,1536] e4m3 @ w[73728,1536]^T (main q ++ indexer), M_pad in
+// {32,64,96,128}. Swap-AB: MMA A = weight (UMMA_M=256 along N), B = activation
+// (UMMA_N = M_pad along M), both K-major 128B-swizzled. Native DSV4 scales:
+// activation 1x128, weight 128x128, UE8M0; warp2 expands each K128 byte to four
+// K32 scale IDs (tcgen05 mxf8f6f4 granularity). Block-scale MMA engine lives in
+// cluster_mma_fp8.cuh.
 // ============================================================
 
 #include <cuda.h>

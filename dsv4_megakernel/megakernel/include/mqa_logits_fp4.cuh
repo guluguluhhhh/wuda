@@ -1,42 +1,19 @@
 #pragma once
 // ============================================================
-// mqa_logits_fp4.cuh — SELF-CONTAINED DSV4 score-attention (Sparse Top-K
-// Indexer index-score / "lightning indexer" logits).
+// mqa_logits_fp4.cuh — DSV4 score-attention kernel (FP4 MQA-logits), PAGED
+// decode. Self-contained: DeepGEMM's sm100_fp4_mqa_logits + minimal helper
+// closure inlined, depends only on the repo's CUTLASS/CuTe.
 //
-// This is DeepGEMM's sm100_fp4_mqa_logits kernel + its minimal helper closure,
-// INLINED into a single header so it depends ONLY on the repo's CUTLASS/CuTe
-// (megakernel/cutlass) — no `deep_gemm` package, no include/dg tree — same
-// self-contained style as w1_merged_fp8_gemm.cuh. The deep_gemm::* namespaces
-// are kept verbatim (cosmetic; not a package dependency).
+// Math: logits[t] = Σ_h relu(<iq[h,:],kvc[t,:]>)·weights[h] (fp4 UMMA + reduce)
+// Host launcher / binding / usage: kernels/mqa_logits_fp4.cu.
 //
-// Three AOT edits vs upstream, marked `// [MEGAKERNEL EDIT]`:
-//   1. kernel `kNumSMs` template param -> gridDim.x
-//   2. cudaGridDependencySynchronize() (PDL-only) neutralized
-//   3. decode tile-pool scheduler: the GLOBAL pool of
-//      Σ_b cdiv(ke[b]-ks[b], BLOCK_KV) KV tiles is split into gridDim.x balanced
-//      contiguous chunks (may cross token boundaries) — inline equivalent of
-//      DeepGEMM's paged-path metadata schedule, for decode where B < #SMs.
-//   4. math register diet (224 -> <=128/thread, BIT-EXACT results): weights are
-//      read as float2 from smem inside the reduce (no register cache) and TMEM is
-//      consumed in two 32-head passes reusing one accum[32] — prepares the future
-//      TPB=512 CUDA-core tail (65536/512 = 128 architectural register cap).
-//   5. TPB 384 -> 512: CUDA-core tail warpgroup (warps 12-15) hides the MAIN-indexer
-//      compressor rows under the KV stream — the gemm_fuse_norm_b TC/CC dual-path
-//      pattern. Fully decoupled (no shared barriers); idle when comp.kv == nullptr.
-//   6. PAGED decode KV (RTP-LLM integration; the ONLY schedule — the contiguous-KV
-//      faithful path is gone): the indexer cache is read through a block_table
-//      (fused page layout, per page: [PAGE_KV*64B fp4 | PAGE_KV*4B packed-ue8m0 sf],
-//      DeepGEMM kv_cache_cast_to_mxfp4-compatible). Each 256-slot KV tile =
-//      BLOCK_KV/PAGE_KV page TMAs (3D desc, batch dim = physical page id); per-token
-//      windows are context_lens (ks==0; page starts are PAGE_KV-aligned, so the old
-//      /4 SF alignment fixup vanishes).
-//
-// Math: logits[t] = Σ_h relu(<iq[h,:],kvc[t,:]>)·weights[h]  (fp4 UMMA + cuda reduce)
-// Host launcher + PyTorch binding: kernels/mqa_logits_fp4.cu
-//
-// Only the helper symbols this kernel actually uses are inlined below. The unused
-// remainder of the vendored DeepGEMM helper closure is parked (not compiled) under
-// include/mqa_unused/ — restore from there if ever needed.
+// Deltas vs upstream, marked `// [MEGAKERNEL EDIT]` in the code: gridDim-based
+// SM count; PDL neutralized; IN-KERNEL tile-pool scheduler (global Σ KV tiles
+// balanced across CTAs -- replaces the metadata kernel); math register diet
+// (224 -> <=128, bit-exact); TPB 512 with a CUDA-core tail warpgroup (fused
+// MAIN compressor, idle when off); PAGED KV via block_table (fused pages:
+// [PAGE_KV*64B fp4 | PAGE_KV*4B sf], per-token windows = context_lens).
+// Unused remainder of the vendored closure is parked under include/mqa_unused/.
 // ============================================================
 
 #include <cuda_runtime.h>

@@ -1,23 +1,18 @@
 // ============================================================
-// mqa_logits_fp4.cu — Host launcher + PyTorch binding for the migrated
-// DeepGEMM FP4 MQA-logits (DSV4 Sparse Top-K Indexer score attention).
+// mqa_logits_fp4.cu — DSV4 score attention (FP4 MQA-logits, PAGED decode).
 //
-// Kernel body + helper closure are inlined self-contained (only CUTLASS/CuTe) in
-// megakernel/include/mqa_logits_fp4.cuh (see the documented AOT edits there).
+// logits[b,t] = Σ_h relu(<q[b,h,:], kv[b,t,:]>) · weights[b,h],  t < ctx_b
 //
-// PAGED decode only (RTP-LLM integration; the contiguous-KV faithful path is gone):
-//   mqa_logits_fp4_decode(_out) — MULTI-BATCH decode over a PAGED indexer cache.
-//     kv_cache = fused pages [num_blocks, PAGE_KV*(D/2+4)] bytes (per page:
-//     [PAGE_KV*64B fp4 | PAGE_KV*4B packed-ue8m0 sf]); token b reads its
-//     block_table row for the KV window [0, context_lens[b]). ONE launch,
-//     grid.x = #SMs: the kernel's IN-KERNEL tile-pool scheduler balances the
-//     global Σ_b cdiv(ctx_b, 256) KV tiles across all CTAs (no metadata kernel,
-//     no schedule_meta — host passes raw context_lens/block_table only).
-//     Output [B, max_ctx]; invalid tail (>= ctx_b) is -inf (self-clean).
+// Usage (one launch, in-kernel tile-pool schedule -- no metadata kernel):
+//   logits = mqa_logits_fp4_decode(
+//       q [B,64,64] i8 fp4, sf_q [B,64] i32,          # = idx_post outputs
+//       kv_cache [num_blocks, 4352] u8,               # fused pages:
+//                                                     # [64tok*64B fp4 | 64tok*4B sf]
+//       weights [B,64] f32, context_lens [B] i32, block_table [B,max_pages] i32,
+//       max_context_len, out_dtype)                   # -> [B, max_ctx], tail -inf
+//   _out variant writes a preallocated buffer; num_kv_stages=0 -> auto.
 //
-// Host TMA setup mirrors DeepGEMM smxx_fp8_fp4_mqa_logits.hpp + attention.hpp
-// (fused page cache split into a 3D page-granular KV view + a 2D SF view);
-// launch pattern mirrors kernels/w1_merged_fp8_gemm.cu.
+// Kernel body: include/mqa_logits_fp4.cuh (self-contained, CUTLASS-only).
 // ============================================================
 
 #include <cuda.h>

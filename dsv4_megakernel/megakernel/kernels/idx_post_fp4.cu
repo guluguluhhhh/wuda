@@ -1,28 +1,16 @@
 // ============================================================
-// idx_post_fp4.cu
-// Standalone DSV4 indexer-q post-processing — Host + PyTorch Binding
+// idx_post_fp4.cu — standalone DSV4 indexer-q post-processing.
 //
-// iq_f32[M,64,128] (fp32 indexer projection, e.g. the wq_b merged GEMM's
-// drained scratch) ->
-//   round bf16 -> RoPE(tail 64, per-token pos) -> Hadamard-128 (* 128^-1/2)
-//   -> per-32 MXFP4 quant (scale = 2^ceil(log2(amax/6)), ue8m0)
-// -> iq_fp4[M,64,64] i8 (packed, low nibble = even) + iq_sf[M,64] i32
-//    (packed-ue8m0) -- EXACTLY the q / sf_q layout the score-attention
-//    kernel's TMAs consume.
+// iq_f32 [M,64,128] (e.g. the wq_b merged GEMM's drained iq_ws)
+//   -> rope + hadamard-128 + MXFP4
+//   -> iq_fp4 [M,64,64] i8 + iq_sf [M,64] i32   (score-attention q/sf_q layout)
 //
-// The device chain lives in include/idx_post_fp4.cuh and is SHARED with the
-// fused path inside wq_b_fp8_gemm.cu (async transform warpgroup): identical
-// rounding, bit-identical outputs on identical inputs.
+// Usage:
+//   iq_fp4, iq_sf = idx_postprocess(iq_f32, q_pos [M] i32,
+//                                   rope_cos, rope_sin [max_pos,32] f32)
 //
-// ======================== USAGE ========================
-//   iq_fp4, iq_sf = module.idx_postprocess(
-//       iq_f32,    # [M,64,128] fp32, contiguous CUDA
-//       q_pos,     # [M] int32 rotary positions
-//       rope_cos,  # [max_pos,32] fp32
-//       rope_sin,  # [max_pos,32] fp32
-//   )
-// Any M >= 1. Grid-parallel across the whole GPU (32 rows / 256-thread CTA);
-// memory-bound: reads 32KB + writes 4.25KB per 64 rows.
+// Any M >= 1; memory-bound, grid-parallel (32 rows / 256-thread CTA). Device
+// chain shared with the wq_b fused path via idx_post_fp4.cuh.
 // ============================================================
 
 #include <torch/extension.h>

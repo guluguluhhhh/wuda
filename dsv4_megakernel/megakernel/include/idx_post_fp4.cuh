@@ -1,23 +1,16 @@
 #pragma once
 // ============================================================
-// idx_post_fp4.cuh
-// DSV4 indexer-q post-processing (CSA stage 7 tail), device-side chain + kernel.
+// idx_post_fp4.cuh — DSV4 indexer-q post-processing, device chain + kernel.
 //
-// One indexer head row (128 fp32) ->
-//   round bf16 -> RoPE(tail 64, per-token pos) -> Hadamard-128 (* 128^-1/2, bf16)
-//   -> per-32 MXFP4 quant (scale = 2^ceil(log2(amax/6)), ue8m0)
-// written in EXACTLY the q / sf_q layout the score-attention kernel consumes;
-// rounding matches the golden chain bit-for-bit.
+// One head row (128 fp32): round bf16 -> RoPE(tail 64) -> Hadamard-128
+// (* 128^-1/2, bf16) -> per-32 MXFP4 (scale = 2^ceil(log2(amax/6)), ue8m0)
+// -> packed fp4 + sf word, exactly the score-attention q/sf_q layout; rounding
+// matches the golden chain bit-for-bit.
 //
-// Work split: 8 threads per row, 16 cols per thread; the FWHT long strides are
-// 3 in-warp shfl_xor levels; each 32-col quant block spans 2 lanes (one
-// shfl_xor(1) max). LOAD / COMPUTE are split so a caller with low TLP (e.g. the
-// wq_b async transform warpgroup: 1 warp per SMSP) can software-pipeline
-// batches and hide the L2 latency.
-//
-// SHARED between the fused path (wq_b_fp8_gemm.cu, async xform warpgroup) and
-// the standalone kernel (idx_post_fp4.cu) -- single implementation, so the
-// bitwise cross-check between the two paths stays meaningful.
+// 8 threads per row, 16 cols each; FWHT long strides = 3 in-warp shfl_xor
+// levels. LOAD/COMPUTE split lets low-TLP callers software-pipeline batches.
+// SHARED single implementation: fused path (wq_b_fp8_gemm.cu xform warpgroup)
+// and standalone kernel (idx_post_fp4.cu) stay bitwise-comparable.
 // ============================================================
 
 #include <cuda.h>

@@ -1,53 +1,24 @@
 // ============================================================
-// wq_b_fp8_gemm.cu
-// MERGED wq_b projection (tcgen05 FP8 block-scale) — Kernel + Host + Binding
+// wq_b_fp8_gemm.cu — MERGED wq_b projection (tcgen05 FP8 block-scale GEMM)
 //
-// x_fp8[M,1536] @ w_fp8[73728,1536]^T (main q 65536 + indexer 8192), M in
-// [1,128] (host pads to 32-aligned), e4m3 inputs + native DSV4
-// activation-1x128 / weight-128x128 UE8M0 scales. Outputs:
-//   y[M,65536] fp32 (+ optional fused head_ssq [M,128], RMSNorm scale folding)
-//   iq_fp4[M,64,64] + iq_sf[M,64]  (indexer q: fused rope/hadamard/MXFP4)
-// Swap-AB (UMMA_N = M_pad), BN=128, 2SM MMA (cta_group::2), block_scale,
-// Persistent, Warp-Specialized + async transform warpgroup (threads 256..383).
-// SF pipeline: native global SF -> warp2 broadcast/layout -> UTCCP -> TMEM.
-// MMA (UTCCP + block_scale) delegated to cluster_mma_fp8.cuh.
-// ============================================================
+// x_fp8[M,1536] @ w_fp8[73728,1536]^T   (main q 65536 rows ++ indexer 8192)
+//   -> y [M,65536] fp32  +  ssq [M,128] fp32 (fused per-head sum-of-squares)
+//   -> indexer q: by default DRAINED as fp32 iq_ws [M,64,128] (finish it with
+//      idx_postprocess); mock_post=False fuses rope+hadamard+MXFP4 in-kernel.
 //
-// ======================== USAGE ========================
-// Build (JIT): see test/test_wq_b_fp8_gemm.py::load_module (sm_100a, CUTLASS inc).
+// Usage (default: 256 threads, GEMM + ssq):
+//   y, iq_fp4, iq_sf, ssq, iq_ws = wq_b_proj_gemm_merged(
+//       x_fp8, x_sf [M,12] ue8m0, w_fp8, w_sf [576,12] ue8m0,
+//       q_pos [M] i32, rope_cos, rope_sin [max_pos,32] f32)
+//   iq_fp4/iq_sf are GARBAGE in this mode -- run idx_postprocess(iq_ws, ...).
+//   M in [1,128] (host pads to 32-aligned). Optional kwargs: head_ssq (caller
+//   zero-init buffer), enable_ssq, mock_post. Return order:
+//   [y, iq_fp4, iq_sf, ssq?, iq_ws?, timing?] per the flags.
 //
-// DEFAULT path (256 threads; GEMM + fused head_ssq; indexer post-processing OFF):
-//
-//   y, iq_fp4, iq_sf, ssq, iq_ws = module.wq_b_proj_gemm_merged(
-//       x_fp8,     # [M,1536]  e4m3, M in [1,128] (host pads to 32-aligned)
-//       x_sf,      # [M,12]    UE8M0 (float8_e8m0fnu or raw uint8), act 1x128
-//       w_fp8,     # [73728,1536] e4m3, main-q 65536 rows ++ indexer 8192 rows
-//       w_sf,      # [576,12]  UE8M0, weight 128x128
-//       q_pos,     # [M] int32 rotary positions
-//       rope_cos,  # [max_pos,32] fp32   rope_sin,  # [max_pos,32] fp32
-//   )
-//   y      [M,65536] fp32   : main q
-//   ssq    [M,128]   fp32   : per-head sum-of-squares (RMSNorm scale folding:
-//                             consumer applies rsqrt(ssq/512 + eps))
-//   iq_ws  [M,64,128] fp32  : drained indexer q; finish it with
-//       iq_fp4, iq_sf = module.idx_postprocess_standalone(iq_ws, q_pos, rope_cos, rope_sin)
-//   (iq_fp4/iq_sf from the merged call are GARBAGE in this mode)
-//
-// Optional kwargs:
-//   head_ssq   = None : pass your own ZERO-INITIALIZED fp32 [M,128] buffer to
-//                       reuse across layers (skips the internal allocation)
-//   enable_ssq = True : False (w/o buffer) -> bit-identical plain GEMM; the ssq
-//                       slot disappears from the returned list
-//   mock_post  = True : False -> 384 threads, the async transform warpgroup
-//                       fuses rope+hadamard+fp4quant in-kernel (iq_fp4/iq_sf
-//                       become valid, no iq_ws in the returned list)
-// Return order: [y, iq_fp4, iq_sf, ssq?, iq_ws?, timing?]  (? = per the flags).
-//
-// Non-Python callers: the kernel is a plain __global__ template; replicate the
-// host duties in run_wq_b() -- TMA descs via cuTensorMapEncodeTiled (exact box/
-// swizzle params), ZERO-INIT ssq buffer, iq scratch [M,64,128] fp32, blockDim
-// 256/384 tied to mock_post, cluster (2,1,1) launch attr, dynamic smem
-// cudaFuncSetAttribute, and the 16-entry ptr_args order.
+// Swap-AB (UMMA_N = M_pad, BN=128), 2SM MMA, persistent, warp-specialized;
+// mock_post=False adds the async transform warpgroup (384 threads). Config in
+// wq_b_fp8_gemm.cuh; MMA engine in cluster_mma_fp8.cuh; indexer chain in
+// idx_post_fp4.cuh.
 // ============================================================
 
 #include <torch/extension.h>
