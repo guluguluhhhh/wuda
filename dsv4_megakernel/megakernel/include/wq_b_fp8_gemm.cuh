@@ -60,6 +60,19 @@ static constexpr int WEIGHT_QUANT_BLOCK_N = 128;
 static constexpr int NUM_WEIGHT_SF_ROWS =
     (N_TOTAL + WEIGHT_QUANT_BLOCK_N - 1) / WEIGHT_QUANT_BLOCK_N; // 512
 
+// ---- Merged indexer projection (CSA stage 7 Idx_WProj fused into this GEMM) ----
+// The indexer wq_b shares A (= qr) and K, so its weight is CONCATENATED along N:
+// w[N_TOTAL + N_IDX, K]. The iq segment is tile-aligned for the swap path
+// (N_IDX % CLUSTER_BLOCK_N == 0) and each 128-col CTA tile is exactly ONE indexer
+// head row -- the epilogue post-processes it in place (rope + hadamard + fp4
+// quant) instead of storing fp32. Swap path (M <= 128) only.
+static constexpr int IDX_NUM_HEADS = 64;
+static constexpr int IDX_HEAD_DIM  = 128;
+static constexpr int N_IDX         = IDX_NUM_HEADS * IDX_HEAD_DIM;              // 8192
+static constexpr int N_MERGED      = N_TOTAL + N_IDX;                           // 73728
+static constexpr int NUM_WEIGHT_SF_ROWS_MERGED =
+    N_MERGED / WEIGHT_QUANT_BLOCK_N;                                            // 576
+
 // ---- Element sizes (bytes) ----
 static constexpr int FP8_ELEM_SIZE = 1;   // e4m3
 
@@ -81,6 +94,9 @@ static constexpr int BLOCK_N        = 128;
 static constexpr int CLUSTER_BLOCK_N = BLOCK_N * NUM_MULTICAST;  // 256
 static constexpr int LOAD_BLOCK_N   = BLOCK_N;                    // 128
 static constexpr int NUM_N_TILES    = N_TOTAL / CLUSTER_BLOCK_N;  // 256
+static constexpr int NUM_N_TILES_MERGED = N_MERGED / CLUSTER_BLOCK_N;  // 288 (swap/kIdx only)
+static_assert(N_IDX % CLUSTER_BLOCK_N == 0, "iq segment must be whole cluster tiles");
+static_assert(BLOCK_N == IDX_HEAD_DIM, "one CTA tile must equal one indexer head row");
 
 // ---- Layout: both A(weight) and B(activation) are K-major ----
 static constexpr auto MAJOR_A = cute::UMMA::Major::K;
@@ -110,6 +126,11 @@ static constexpr int TPB                 = 256;
 static constexpr int NUM_NON_EPI_THREADS = 128;
 static constexpr int NUM_EPI_THREADS     = 128;
 static constexpr int NUM_STORE_THREADS   = 128;
+// [kIdx] async transform warpgroup (warps 8..11): merged-indexer instances launch
+// TPB_IDX threads; the extra 128 run the rope/hadamard/fp4 chain off the GEMM's
+// critical path (the epilogue warps are near-saturated by the TMEM-load train).
+static constexpr int NUM_XFORM_THREADS   = 128;
+static constexpr int TPB_IDX             = TPB + NUM_XFORM_THREADS;   // 384
 
 // ---- Epilogue store tile (swap-AB, FP32 output) ----
 static constexpr int STORE_BLOCK_M      = 16;                             // M-rows per store stage
