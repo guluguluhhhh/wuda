@@ -13,3 +13,6 @@ dsv4_megakernel/ncu_report.txt
 dsv4_megakernel/megakernel/kernels/32.csv
 dsv4_megakernel/megakernel/kernels/128.csv
 dsv4_megakernel/megakernel/kernels/fusenorm32.csv
+dsv4_megakernel/megakernel/kernels/front_bf16_production_dispatch_deepgemm_full_profile_v2
+dsv4_megakernel/megakernel/mhc+idx_post+score_attention+topk
+dsv4_megakernel/megakernel/kernels/delivery
