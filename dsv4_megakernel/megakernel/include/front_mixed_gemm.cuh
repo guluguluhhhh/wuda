@@ -482,6 +482,8 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
     const uint8_t* __restrict__ w_sf,
     float* __restrict__ q_ssq,       // [M] fp32, RED-accumulated (null=>off)
     float* __restrict__ kv_ssq,      // [M] fp32, RED-accumulated (null=>off)
+    const float* __restrict__ attn_ssq,  // [M] fp32 attn_norm ssq from MHC (null=>off)
+    float attn_eps,
     HcTailArgs hc,                   // [TC/CC] MHC post+comb tail (mix=null=>off)
     int problem_m) {
   extern __shared__ __align__(1024) uint8_t smem_raw[];
@@ -741,6 +743,21 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
         : (n_tile < N_TILES_Q ? q_ssq : kv_ssq);
     float row_ssq = 0.f;
 
+    // attn_norm fold: the MHC producer already accumulated attn_ssq[m] =
+    // sum(x_bf16^2) over the 7168-dim row; its weight is burned into THIS
+    // op's weights offline (W'[n,k] = W[n,k]*w_attn[k]), so all that remains
+    // is the per-row scalar r = rsqrt(ssq/7168 + eps), applied to the fp32
+    // accum BEFORE the bf16 round. Each lane owns one row -> one ld + rsqrt.
+    // (q_ssq/kv_ssq then fold r^2 automatically -- same semantics as the
+    // original chain where q_norm consumes attn_norm'ed values.)
+    float r_attn = 1.f;
+    if (attn_ssq != nullptr) {
+      const int orow = m_tile * BLOCK_M + rank * CTA_M + row_half * 32 + lane;
+      if (orow < problem_m) {
+        r_attn = rsqrtf(attn_ssq[orow] * (1.f / (float)K) + attn_eps);
+      }
+    }
+
     if (epi_warpgroup == 0) {
       #pragma unroll
       for (int st = 0; st < EPI_STEPS; ++st) {
@@ -750,6 +767,16 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
           uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
           tmem_load_8x(addr, v0, v1, v2, v3, v4, v5, v6, v7);
           tmem_load_fence();
+          if (attn_ssq != nullptr) {
+            v0 = __float_as_uint(__uint_as_float(v0) * r_attn);
+            v1 = __float_as_uint(__uint_as_float(v1) * r_attn);
+            v2 = __float_as_uint(__uint_as_float(v2) * r_attn);
+            v3 = __float_as_uint(__uint_as_float(v3) * r_attn);
+            v4 = __float_as_uint(__uint_as_float(v4) * r_attn);
+            v5 = __float_as_uint(__uint_as_float(v5) * r_attn);
+            v6 = __float_as_uint(__uint_as_float(v6) * r_attn);
+            v7 = __float_as_uint(__uint_as_float(v7) * r_attn);
+          }
           const int row = row_half * 32 + lane;
           const int col = col_group * EPI_COLS_PER_WARP + st * 16 + sub * 8;
           const int out_row = m_tile * BLOCK_M + rank * CTA_M + row;
@@ -866,7 +893,9 @@ inline cudaError_t launch_front_mixed(
     const CUtensorMap& desc_a8, const CUtensorMap& desc_b8,
     const CUtensorMap& desc_d,
     const uint8_t* x_sf, const uint8_t* w_sf,
-    float* q_ssq, float* kv_ssq, const HcTailArgs& hc,
+    float* q_ssq, float* kv_ssq,
+    const float* attn_ssq, float attn_eps,
+    const HcTailArgs& hc,
     int m, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   const int m_tiles = (m + BLOCK_M - 1) / BLOCK_M;
@@ -888,7 +917,7 @@ inline cudaError_t launch_front_mixed(
       const_cast<CUtensorMap*>(&desc_a8),
       const_cast<CUtensorMap*>(&desc_b8),
       const_cast<CUtensorMap*>(&desc_d),
-      &x_sf, &w_sf, &q_ssq, &kv_ssq,
+      &x_sf, &w_sf, &q_ssq, &kv_ssq, &attn_ssq, &attn_eps,
       const_cast<HcTailArgs*>(&hc), &m};
   return cudaLaunchKernelExC(
       &config, reinterpret_cast<void*>(front_mixed_kernel), args);

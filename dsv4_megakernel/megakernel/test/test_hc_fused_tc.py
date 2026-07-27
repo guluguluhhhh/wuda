@@ -45,11 +45,9 @@ def load_cuda_module():
         "--expt-relaxed-constexpr",
         "-lineinfo",
         "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
-        "-DCUTE_ARCH_TCGEN05_TMEM_ENABLED=1",
         "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
-        "-DCUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED=1",
-        # tf32 MMA enable is auto-defined by cute/arch/config.hpp for sm_10xa; do not
-        # pass -DCUTE_ARCH_TCGEN05_TF32_MMA_ENABLED (it would redefine -> warning).
+        # TMEM / F16F32 / TF32 TCGEN05 enables are auto-defined by
+        # cute/arch/config.hpp for sm_10xa; passing them again -> "redefined".
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
     ]
@@ -150,6 +148,32 @@ def test_correctness(module, positions):
                 f"{m:6d} {name:>10} {max_abs:12.4e} {mean_abs:12.4e} "
                 f"{mean_rel:12.4e} {('PASS' if ok else 'FAIL'):>8}"
             )
+
+        # attn_ssq fold (collapse-side): self-consistent reference = sum of
+        # squares of the kernel's OWN bf16 collapsed output (RED order -> rtol).
+        # Verified on BOTH variants -- the collapse warp split differs (pc:
+        # warps 1-7, no-pc/lite: all 8) and production defaults to no-pc.
+        hs2 = hidden.contiguous().view(-1, K_DIM)
+        mm = hs2.size(0)
+        for wpc, tag in ((False, "ssq(nopc)"), (True, "ssq(pc)")):
+            collapsed2 = torch.empty(mm, DIM, device="cuda", dtype=torch.bfloat16)
+            pre2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
+            post2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
+            comb2 = torch.empty(mm, HC, HC, device="cuda", dtype=torch.float32)
+            attn_ssq = torch.zeros(mm, device="cuda", dtype=torch.float32)
+            module.hc_fused_forward_out(
+                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+                collapsed2, pre2, post2, comb2, attn_ssq, with_post_comb=wpc
+            )
+            torch.cuda.synchronize()
+            ssq_ref = collapsed2.float().pow(2).sum(-1)
+            ssq_ok = torch.allclose(attn_ssq, ssq_ref, rtol=1e-4, atol=1e-6)
+            all_ok &= ssq_ok
+            print(
+                f"{m:6d} {tag:>10} "
+                f"{(attn_ssq - ssq_ref).abs().max().item():12.4e} "
+                f"{'':>12} {'':>12} {('PASS' if ssq_ok else 'FAIL'):>8}"
+            )
         del hidden, expected, actual
 
     print("-" * 68)
@@ -226,10 +250,10 @@ def benchmark(module, positions):
     print("  gemm/reduce/activ/sinkhorn/collapse = clock64 stage")
     print("  medians (exclude launch/gap); sinkhorn \u2016 collapse run concurrently.")
     print(
-        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} {'cuBLAS':>9} "
+        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} {'nopc+ssq':>8} {'cuBLAS':>9} "
         f"{'gemm':>8} {'reduce':>8} {'activ':>7} {'sinkhrn':>8} {'collapse':>9}"
     )
-    print("-" * 92)
+    print("-" * 100)
 
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
@@ -244,14 +268,24 @@ def benchmark(module, positions):
         mhc_us = time_cuda_us(
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb),
+                collapsed, pre, post, comb, None, with_post_comb=True),
             ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
         )
         # A/B: same op minus post/comb (+Sinkhorn); correctness sentinel on pre.
         nopc_us = time_cuda_us(
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, with_post_comb=False),
+                collapsed, pre, post, comb, None, with_post_comb=False),
+            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
+        )
+        # +ssq: the PRODUCTION default path (no-pc) with the attn_norm ssq fold
+        # on (RED-accumulates into attn_ssq; garbage across iters is
+        # latency-neutral). Overhead = this column minus no-pc.
+        attn_ssq = torch.zeros(m, device=dev, dtype=torch.float32)
+        ssq_us = time_cuda_us(
+            lambda: module.hc_fused_forward_out(
+                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+                collapsed, pre, post, comb, attn_ssq, with_post_comb=False),
             ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
         )
         # Baseline kernel names are shape-dependent -> probed, not guessed.
@@ -259,7 +293,8 @@ def benchmark(module, positions):
         gemm, reduce, activ, sinkhorn, collapse = profile_stages(
             module, hidden, weight, base, scale)
         print(
-            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} {cublas_us:9.3f} "
+            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} {ssq_us:8.3f} "
+            f"{cublas_us:9.3f} "
             f"{gemm:8.3f} {reduce:8.3f} {activ:7.3f} {sinkhorn:8.3f} {collapse:9.3f}"
         )
         del hidden, x, collapsed, pre, post, comb
