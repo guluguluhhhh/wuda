@@ -13,7 +13,17 @@
 //   iq_fp4/iq_sf are GARBAGE in this mode -- run idx_postprocess(iq_ws, ...).
 //   M in [1,128] (host pads to 32-aligned). Optional kwargs: head_ssq (caller
 //   zero-init buffer), enable_ssq, mock_post. Return order:
-//   [y, iq_fp4, iq_sf, ssq?, iq_ws?, timing?] per the flags.
+//   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
+//
+// Fused indexer (winkv) COMPRESSOR (optional, delivery op-B-tail port, NO
+// split-K): pass cmp_pos/idx_y4/idx_ape/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc
+// together and warps 8..11 run the state write + compress chain (softmax
+// aggregate -> shift -> RMSNorm -> RoPE -> FWHT -> fp4) fully decoupled from
+// the GEMM; appends idx_q4 [M,64] u8 + idx_s4 [M,4] u8 to the returns.
+// LOCAL KV WINDOW (optional, CSA stage 4 FULL chain): pass win_y2 [M,512] +
+// win_norm [512] (+ cmp_pos/cos_tab/sin_tab) -> RMSNorm + RoPE + per-64 fp8;
+// appends win_q8 [M,448] u8 + win_s8 [M,7] f32 + win_rope [M,64] bf16. Chains
+// in idx_comp_fp4.cuh (warp-level, one row per warp on warps 8..11).
 //
 // Swap-AB (UMMA_N = M_pad, BN=128), 2SM MMA, persistent, warp-specialized;
 // mock_post=False adds the async transform warpgroup (384 threads). Config in
@@ -31,6 +41,7 @@
 
 #include "wq_b_fp8_gemm.cuh"
 #include "idx_post_fp4.cuh"   // shared indexer post-processing chain + standalone kernel
+#include "idx_comp_fp4.cuh"   // fused indexer compressor chain (delivery port, 128-thread)
 #include "cluster_mma_fp8.cuh"   // FP8 block-scale MMA engine (leader MMA warp)
 
 using namespace wq_b;
@@ -131,6 +142,7 @@ wq_b_proj_kernel(
     const float* __restrict__ rope_cos,           // [max_pos, 32]
     const float* __restrict__ rope_sin,           // [max_pos, 32]
     int mock_post,                                 // 1 = drain only, skip the transform (baseline)
+    const __grid_constant__ idx_comp::Args comp,   // fused indexer compressor (kv==nullptr => off)
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
     using Dims = SwapDims<M_TPL>;
@@ -546,12 +558,17 @@ wq_b_proj_kernel(
     // L2 scratch -- off the GEMM's critical path; only has to finish before the
     // trailing cluster_sync.
     else if (warp_id >= (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32) {
+        // STATIC iq-tile enumeration: under the reversed schedule tile_id =
+        // (NUM_TILES_TOTAL-1) - it_t, so the iq segment (tile_id >= NUM_N_TILES)
+        // is EXACTLY it_t < NUM_IQ_TILES -- the replay loop's filter folded into
+        // the range (same formula, no second source of truth; N_IDX being whole
+        // cluster tiles is static_assert'd in the header). Non-iq CTAs skip the
+        // loop entirely.
+        constexpr int NUM_IQ_TILES = NUM_N_TILES_MERGED - NUM_N_TILES;   // 32
         if (!mock_post)
-        for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
-            const int tile_id = NUM_TILES_TOTAL - 1 - it_t;   // reversed order
+        for (int it_t = cluster_id; it_t < NUM_IQ_TILES; it_t += num_clusters) {
+            const int tile_id = NUM_TILES_TOTAL - 1 - it_t;   // >= NUM_N_TILES always
             const int base_n = tile_id * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
-            if (base_n < N_TOTAL)
-                continue;                                     // main-q tile: not ours
             const int head = (base_n - N_TOTAL) / IDX_HEAD_DIM;
 
             cutlass::arch::NamedBarrier::sync(
@@ -582,6 +599,44 @@ wq_b_proj_kernel(
                 idx_row_compute(cur, e8, clamp_m(m), head, iq_fp4, iq_sf,
                                 m < problem_m);
                 cur = nxt;
+            }
+        }
+
+        // ---- fused CUDA-core post-processing (independent of the GEMM dataflow) ----
+        // Runs AFTER the idxpost replay (store warps block on barrier 1 and must
+        // be served first when mock_post==0). WARP-LEVEL task pool: winkv rows
+        // [0,M) then compressor rows [M,2M), one row per warp, SPREAD so same-CTA
+        // warps take tasks ncta apart (issue-slot interference with the GEMM
+        // scales with active warps/SM); rows prefer the CTAs without iq tiles.
+        // Only exit sync: the trailing cluster_sync.
+        {
+            const bool win_on = comp.win_y2 != nullptr;
+            const bool cmp_on = comp.kv != nullptr;
+            if (win_on || cmp_on) {
+                const int wlocal = (int)warp_id - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32;
+                const int win_rows = win_on ? problem_m : 0;
+                const int total = win_rows + (cmp_on ? problem_m : 0);
+                int wcta = blockIdx.x, ncta = num_blocks;
+                {
+                    // Prefer the CTAs without iq tiles UNCONDITIONALLY: the iq
+                    // clusters' drain (long-latency global writes) makes them
+                    // interference-sensitive even in mock mode, and a mapping
+                    // that differs between mock/fused runs skews the d_* deltas.
+                    const int busy = min(num_clusters, NUM_IQ_TILES) * CLUSTER_SIZE;
+                    if ((num_blocks - busy) * NUM_XFORM_THREADS / 32 >= total) {
+                        wcta = blockIdx.x - busy;
+                        ncta = num_blocks - busy;
+                    }
+                }
+                if (wcta >= 0) {
+                    const int workers = ncta * (NUM_XFORM_THREADS / 32);
+                    for (int tsk = wcta + wlocal * ncta; tsk < total; tsk += workers) {
+                        if (tsk < win_rows)
+                            idx_comp::process_win_row(comp, tsk, (int)lane_id);
+                        else
+                            idx_comp::process_row(comp, tsk - win_rows, (int)lane_id);
+                    }
+                }
             }
         }
     }
@@ -667,7 +722,19 @@ static std::vector<torch::Tensor> run_wq_b(
     torch::Tensor w_fp8, torch::Tensor w_sf, bool profile,
     c10::optional<torch::Tensor> head_ssq,
     torch::Tensor q_pos, torch::Tensor rope_cos, torch::Tensor rope_sin,
-    bool mock_post = false, bool enable_ssq = true)
+    bool mock_post = false, bool enable_ssq = true,
+    // fused indexer compressor bundle (all-or-none; see idx_comp_fp4.cuh)
+    c10::optional<torch::Tensor> cmp_pos = c10::nullopt,
+    c10::optional<torch::Tensor> idx_y4  = c10::nullopt,
+    c10::optional<torch::Tensor> idx_ape = c10::nullopt,
+    c10::optional<torch::Tensor> idx_norm = c10::nullopt,
+    c10::optional<torch::Tensor> cos_tab = c10::nullopt,
+    c10::optional<torch::Tensor> sin_tab = c10::nullopt,
+    c10::optional<torch::Tensor> idx_kv  = c10::nullopt,
+    c10::optional<torch::Tensor> idx_sc  = c10::nullopt,
+    // local kv window bundle (winkv, CSA stage 4; needs cmp_pos + rope tables too)
+    c10::optional<torch::Tensor> win_y2   = c10::nullopt,
+    c10::optional<torch::Tensor> win_norm = c10::nullopt)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
@@ -788,6 +855,81 @@ static std::vector<torch::Tensor> run_wq_b(
         ssq_ptr = ssq_t.data_ptr<float>();
     }
 
+    // ---- fused indexer compressor + local kv window: validate the bundles ----
+    const bool comp_on = idx_kv.has_value();
+    const bool win_on  = win_y2.has_value();
+    idx_comp::Args comp{};
+    torch::Tensor idx_q4_t, idx_s4_t, win_q8_t, win_s8_t, win_rope_t;
+    auto ck = [](const torch::Tensor& t, torch::ScalarType ty, const char* n) {
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == ty,
+                    n, " must be contiguous CUDA ", ty);
+    };
+    if (comp_on || win_on) {
+        TORCH_CHECK(cmp_pos && cos_tab && sin_tab,
+                    "comp/win bundles need cmp_pos + cos_tab + sin_tab");
+        ck(*cmp_pos, torch::kInt64, "cmp_pos");
+        ck(*cos_tab, torch::kFloat, "cos_tab");
+        ck(*sin_tab, torch::kFloat, "sin_tab");
+        TORCH_CHECK(cmp_pos->numel() == M, "cmp_pos must be [M]");
+        TORCH_CHECK(cos_tab->dim() == 2 && cos_tab->size(1) == idx_comp::RD / 2
+                    && sin_tab->sizes() == cos_tab->sizes(),
+                    "cos_tab/sin_tab must be [S,32]");
+        comp.pos = reinterpret_cast<const long long*>(cmp_pos->data_ptr<int64_t>());
+        comp.cos_tab = cos_tab->data_ptr<float>();
+        comp.sin_tab = sin_tab->data_ptr<float>();
+    }
+    if (comp_on) {
+        TORCH_CHECK(idx_y4 && idx_ape && idx_norm && idx_sc,
+                    "indexer compressor needs ALL of idx_y4/idx_ape/idx_norm/idx_kv/idx_sc");
+        ck(*idx_y4,  torch::kFloat, "idx_y4");
+        ck(*idx_ape, torch::kFloat, "idx_ape");
+        ck(*idx_norm, torch::kFloat, "idx_norm");
+        ck(*idx_kv,  torch::kFloat, "idx_kv");
+        ck(*idx_sc,  torch::kFloat, "idx_sc");
+        TORCH_CHECK(idx_y4->dim() == 2 && idx_y4->size(0) == M
+                    && idx_y4->size(1) == 2 * idx_comp::WK_I,
+                    "idx_y4 must be [M,512] (wkv|wgate)");
+        TORCH_CHECK(idx_ape->dim() == 2 && idx_ape->size(0) == idx_comp::RATIO
+                    && idx_ape->size(1) == idx_comp::WK_I, "idx_ape must be [4,256]");
+        TORCH_CHECK(idx_norm->numel() == idx_comp::D_I, "idx_norm must be [128]");
+        const auto state_ok = [&](const torch::Tensor& t) {
+            return t.dim() == 3 && t.size(0) == M && t.size(1) == idx_comp::SROWS
+                && t.size(2) == idx_comp::WK_I;
+        };
+        TORCH_CHECK(state_ok(*idx_kv) && state_ok(*idx_sc),
+                    "idx_kv/idx_sc must be [M,8,256]");
+        idx_q4_t = torch::zeros({M, idx_comp::D_I / 2},
+                                x_fp8.options().dtype(torch::kUInt8));
+        idx_s4_t = torch::zeros({M, idx_comp::D_I / 32},
+                                x_fp8.options().dtype(torch::kUInt8));
+        comp.y4 = idx_y4->data_ptr<float>();
+        comp.ape = idx_ape->data_ptr<float>();
+        comp.norm_w = idx_norm->data_ptr<float>();
+        comp.kv = idx_kv->data_ptr<float>();
+        comp.sc = idx_sc->data_ptr<float>();
+        comp.q4 = idx_q4_t.data_ptr<uint8_t>();
+        comp.s4 = idx_s4_t.data_ptr<uint8_t>();
+    }
+    if (win_on) {
+        TORCH_CHECK(win_norm, "local kv window needs win_y2 AND win_norm");
+        ck(*win_y2,   torch::kFloat, "win_y2");
+        ck(*win_norm, torch::kFloat, "win_norm");
+        TORCH_CHECK(win_y2->dim() == 2 && win_y2->size(0) == M
+                    && win_y2->size(1) == idx_comp::D_W, "win_y2 must be [M,512]");
+        TORCH_CHECK(win_norm->numel() == idx_comp::D_W, "win_norm must be [512]");
+        win_q8_t = torch::zeros({M, idx_comp::NF8_W},
+                                x_fp8.options().dtype(torch::kUInt8));
+        win_s8_t = torch::zeros({M, idx_comp::NF8_W / 64},
+                                x_fp8.options().dtype(torch::kFloat32));
+        win_rope_t = torch::zeros({M, idx_comp::RD},
+                                  x_fp8.options().dtype(torch::kBFloat16));
+        comp.win_y2 = win_y2->data_ptr<float>();
+        comp.win_norm = win_norm->data_ptr<float>();
+        comp.win_q8 = win_q8_t.data_ptr<uint8_t>();
+        comp.win_s8 = win_s8_t.data_ptr<float>();
+        comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
+    }
+
     const bool want_ssq = ssq_ptr != nullptr;
     void* kernel_ptr = profile
         ? (want_ssq ? get_kernel_ptr<true, true>(M_pad)  : get_kernel_ptr<true, false>(M_pad))
@@ -813,8 +955,9 @@ static std::vector<torch::Tensor> run_wq_b(
         // 256 threads, keeping warps 8..11 free for future in-kernel cuda-core
         // work. Enabling the fused path launches the async transform warpgroup
         // too (384) -- the blockDim is TIED to mock_post so the drain handoff
-        // barrier can never wait on threads that were not launched.
-        dim3 block(mock_post ? TPB : TPB_IDX, 1, 1);
+        // barrier can never wait on threads that were not launched. The fused
+        // indexer compressor / winkv chains also run on warps 8..11.
+        dim3 block((mock_post && !comp_on && !win_on) ? TPB : TPB_IDX, 1, 1);
         int mock_i = mock_post ? 1 : 0;
 
         cudaLaunchConfig_t config = {};
@@ -835,7 +978,7 @@ static std::vector<torch::Tensor> run_wq_b(
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &ssq_ptr,
             &iq_fp4_ptr, &iq_sf_ptr, &iq_ws_ptr, &q_pos_ptr, &cos_ptr, &sin_ptr,
-            &mock_i, &prof_dev
+            &mock_i, &comp, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
@@ -844,6 +987,8 @@ static std::vector<torch::Tensor> run_wq_b(
     std::vector<torch::Tensor> ret = {out, iq_fp4, iq_sf};
     if (ssq_ptr) ret.push_back(ssq_t);     // present unless enable_ssq=false w/o buffer
     if (mock_post) ret.push_back(iq_ws);   // export the drained fp32 iq (bitwise test hook)
+    if (comp_on) { ret.push_back(idx_q4_t); ret.push_back(idx_s4_t); }
+    if (win_on) { ret.push_back(win_q8_t); ret.push_back(win_s8_t); ret.push_back(win_rope_t); }
     if (profile) ret.push_back(timing);
     return ret;
 }
@@ -854,22 +999,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,
              torch::Tensor q_pos, torch::Tensor rope_cos, torch::Tensor rope_sin,
-             c10::optional<torch::Tensor> head_ssq, bool mock_post, bool enable_ssq) {
+             c10::optional<torch::Tensor> head_ssq, bool mock_post, bool enable_ssq,
+             c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> idx_y4,
+             c10::optional<torch::Tensor> idx_ape, c10::optional<torch::Tensor> idx_norm,
+             c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
+             c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
+             c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
-                              q_pos, rope_cos, rope_sin, mock_post, enable_ssq);
+                              q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
+                              cmp_pos, idx_y4, idx_ape, idx_norm,
+                              cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm);
           },
           "MERGED wq_b + indexer wq_b (w [N+8192,K]), swap path, M in [1,128]. "
           "Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
-          "ssq fp32 [M,128] (unless enable_ssq=False), iq_ws (if mock_post)]. "
+          "ssq fp32 [M,128] (unless enable_ssq=False), iq_ws (if mock_post), "
+          "idx_q4 u8 [M,64] + idx_s4 u8 [M,4] (if the compressor bundle is given)]. "
           "head_ssq: optional caller-owned ZERO-INIT buffer; default None allocates. "
           "DEFAULT mock_post=True: 256 threads, GEMM+ssq only -- iq_fp4/iq_sf stay "
           "garbage; run idx_postprocess_standalone over iq_ws. mock_post=False: "
-          "384 threads, fuses rope+hadamard+fp4quant in-kernel",
+          "384 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
+          "COMPRESSOR (no split-K): pass ALL of cmp_pos [M] i64 / idx_y4 [M,512] / "
+          "idx_ape [4,256] / idx_norm [128] / cos_tab+sin_tab [S,32] / idx_kv+idx_sc "
+          "[M,8,256] (INOUT state rings) -- warps 8..11 run it beside the GEMM. "
+          "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
+          "[512] (+ cmp_pos/cos_tab/sin_tab) -> appends win_q8 [M,448] u8, win_s8 "
+          "[M,7] f32, win_rope [M,64] bf16",
           py::arg("x_fp8"), py::arg("x_sf"), py::arg("w_fp8"), py::arg("w_sf"),
           py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"),
           py::arg("head_ssq") = c10::nullopt,
           py::arg("mock_post") = true,
-          py::arg("enable_ssq") = true);
+          py::arg("enable_ssq") = true,
+          py::arg("cmp_pos") = c10::nullopt,
+          py::arg("idx_y4") = c10::nullopt,
+          py::arg("idx_ape") = c10::nullopt,
+          py::arg("idx_norm") = c10::nullopt,
+          py::arg("cos_tab") = c10::nullopt,
+          py::arg("sin_tab") = c10::nullopt,
+          py::arg("idx_kv") = c10::nullopt,
+          py::arg("idx_sc") = c10::nullopt,
+          py::arg("win_y2") = c10::nullopt,
+          py::arg("win_norm") = c10::nullopt);
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

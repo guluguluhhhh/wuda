@@ -327,6 +327,204 @@ def benchmark_merged(module):
               f"{ussq-ug:<7.2f} {us:<8.2f} {cb_s} {bw:<9.1f} {pct}")
 
 
+# ==================== fused indexer compressor (delivery port) ====================
+def make_comp_inputs(M, dev, all_compress=False):
+    """Caller-owned compressor bundle. pos >= 3 keeps rope_pos = p+1-4 >= 0."""
+    torch.manual_seed(M * 7 + 3)
+    pos = (torch.full((M,), 3, dtype=torch.int64, device=dev) if all_compress
+           else torch.randint(3, 4000, (M,), dtype=torch.int64, device=dev))
+    return dict(
+        cmp_pos=pos,
+        idx_y4=torch.randn(M, 512, device=dev),
+        idx_ape=torch.randn(4, 256, device=dev),
+        idx_norm=torch.rand(128, device=dev) + 0.5,
+        idx_kv=torch.randn(M, 8, 256, device=dev),
+        idx_sc=torch.randn(M, 8, 256, device=dev))
+
+
+def ref_comp_step(kv, sc, y4, pos, ape, norm_w, cos_tab, sin_tab, eps=1e-6):
+    """Torch reference of one fused-compressor step, kernel order & rounding:
+    fresh write (+ape) -> [compress] overlap-cat 8-slot softmax -> shift ->
+    bf16 RMSNorm -> rope(last 64, bf16) -> @H128*128^-0.5 (bf16) -> fp4 sim.
+    kv/sc are updated IN PLACE (pass clones)."""
+    M = pos.shape[0]
+    dev = y4.device
+    pmod = (pos % 4).long()
+    kv[torch.arange(M, device=dev), 4 + pmod] = y4[:, :256]
+    sc[torch.arange(M, device=dev), 4 + pmod] = y4[:, 256:] + ape[pmod]
+    compress = ((pos + 1) % 4) == 0
+    # aggregate BEFORE the shift (kernel order), overlap-cat columns
+    kv_cat = torch.cat([kv[:, :4, :128], kv[:, 4:, 128:]], dim=1)   # [M,8,128]
+    sc_cat = torch.cat([sc[:, :4, :128], sc[:, 4:, 128:]], dim=1)
+    cmp = (torch.softmax(sc_cat, dim=1) * kv_cat).sum(1)            # [M,128]
+    kv[compress, :4] = kv[compress, 4:].clone()
+    sc[compress, :4] = sc[compress, 4:].clone()
+    v = cmp.bfloat16().float()
+    rms = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
+    x = (v * rms * norm_w).bfloat16().float()
+    pr = (pos + 1 - 4).clamp_min(0)
+    c, s = cos_tab[pr], sin_tab[pr]
+    e, o = x[:, 64::2].clone(), x[:, 65::2].clone()
+    x[:, 64::2] = (e * c - o * s).bfloat16().float()
+    x[:, 65::2] = (e * s + o * c).bfloat16().float()
+    x = (x @ hadamard_128(dev) * (128.0 ** -0.5)).bfloat16().float()
+    blk = x.view(M, 4, 32)
+    sf = _ceil_to_ue8m0(blk.abs().amax(-1).clamp_min(6.0 * 2.0 ** -126) / 6.0)
+    q = _quantize_to_fp4_e2m1(blk / sf.unsqueeze(-1))
+    deq = _dequantize_from_fp4_e2m1(q) * sf.unsqueeze(-1)
+    s4 = (sf.log2() + 127).to(torch.uint8)                          # [M,4]
+    return deq.view(M, 128), s4, compress
+
+
+def test_comp(module, M, mock_post=True):
+    """H) fused indexer compressor vs the torch reference (delivery semantics):
+    state ring updates bit-exact; q4/s4 by match rate (expf/sum-order ulps can
+    flip rare fp4 ties). Random pos mixes compress and plain rows.
+    mock_post=False additionally exercises comp AND idxpost on the same
+    warpgroup (idxpost served first; checks the coexistence path)."""
+    dev = 'cuda'
+    x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    cos_tab, sin_tab = make_rope_tables()
+    q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
+    comp = make_comp_inputs(M, dev)
+    kv_ref, sc_ref = comp['idx_kv'].clone(), comp['idx_sc'].clone()
+
+    out = module.wq_b_proj_gemm_merged(
+        x, make_act_sf_ones(M, dev), w, make_weight_sf_ones(dev),
+        q_pos, cos_tab, sin_tab, mock_post=mock_post,
+        cos_tab=cos_tab, sin_tab=sin_tab, **comp)
+    q4, s4 = out[-2], out[-1]                    # [M,64] u8, [M,4] u8
+
+    ref_deq, ref_s4, cmask = ref_comp_step(
+        kv_ref, sc_ref, comp['idx_y4'], comp['cmp_pos'], comp['idx_ape'],
+        comp['idx_norm'], cos_tab, sin_tab)
+
+    state_ok = (torch.equal(kv_ref, comp['idx_kv'])
+                and torch.equal(sc_ref, comp['idx_sc']))
+    if cmask.any():
+        un = torch.zeros(M, 128, dtype=torch.int8, device=dev)
+        un[:, 0::2] = (q4 & 0x0F).to(torch.int8)
+        un[:, 1::2] = ((q4 >> 4) & 0x0F).to(torch.int8)
+        scale = torch.pow(2.0, s4.float() - 127.0)
+        ker_deq = _dequantize_from_fp4_e2m1(un) * scale.repeat_interleave(32, -1)
+        q_match = (ker_deq[cmask] == ref_deq[cmask]).float().mean().item()
+        s_match = (s4[cmask] == ref_s4[cmask]).float().mean().item()
+    else:
+        q_match = s_match = 1.0
+    ok = state_ok and q_match > 0.98 and s_match > 0.98
+    tag = 'PASS' if ok else 'FAIL'
+    mode = 'comp+idxpost' if not mock_post else 'comp        '
+    print(f"  [{tag}] {mode} M={M:<4} state={'OK' if state_ok else 'MISMATCH'} "
+          f"q4={q_match*100:.2f}% s4={s_match*100:.2f}% "
+          f"({int(cmask.sum())}/{M} compress rows)")
+    return ok
+
+
+# ==================== local kv window (winkv, CSA stage 4) ====================
+def make_win_inputs(M, dev):
+    torch.manual_seed(M * 11 + 5)
+    return dict(win_y2=torch.randn(M, 512, device=dev),
+                win_norm=torch.rand(512, device=dev) + 0.5)
+
+
+def ref_win_step(y2, pos, norm_w, cos_tab, sin_tab, eps=1e-6):
+    """Torch reference, kernel order: raw-fp32 RMSNorm -> weighted -> [0,448)
+    bf16 round + per-64 fp8 (scale=max(amax,1e-4)/448) ; [448,512) fp32 rope
+    (token's own pos) -> bf16."""
+    M = y2.shape[0]
+    v = y2.float()
+    rms = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
+    vw = v * rms * norm_w
+    b = vw[:, :448].bfloat16().float().view(M, 7, 64)
+    amax = b.abs().amax(-1).clamp_min(1e-4)
+    s8 = amax / 448.0
+    q8 = (b / s8.unsqueeze(-1)).to(torch.float8_e4m3fn).view(M, 448)
+    e, o = vw[:, 448::2], vw[:, 449::2]
+    c, s = cos_tab[pos], sin_tab[pos]
+    r = torch.empty(M, 64, device=y2.device)
+    r[:, 0::2] = e * c - o * s
+    r[:, 1::2] = e * s + o * c
+    return q8, s8, r.bfloat16()
+
+
+def test_win(module, M, mock_post=True):
+    """I) fused local-kv-window chain vs the torch reference. Match rates
+    tolerate rms ulp differences (sum-order); every row is processed."""
+    dev = 'cuda'
+    x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    cos_tab, sin_tab = make_rope_tables()
+    q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
+    pos = torch.randint(3, 4000, (M,), dtype=torch.int64, device=dev)
+    win = make_win_inputs(M, dev)
+
+    out = module.wq_b_proj_gemm_merged(
+        x, make_act_sf_ones(M, dev), w, make_weight_sf_ones(dev),
+        q_pos, cos_tab, sin_tab, mock_post=mock_post,
+        cmp_pos=pos, cos_tab=cos_tab, sin_tab=sin_tab, **win)
+    wq8, ws8, wrope = out[-3], out[-2], out[-1]
+
+    rq8, rs8, rrope = ref_win_step(win['win_y2'], pos, win['win_norm'],
+                                   cos_tab, sin_tab)
+    q_match = (wq8.view(torch.uint8) == rq8.view(torch.uint8)).float().mean().item()
+    s_match = (ws8 == rs8).float().mean().item()
+    r_match = (wrope.view(torch.uint8) == rrope.view(torch.uint8)).float().mean().item()
+    ok = q_match > 0.98 and s_match > 0.98 and r_match > 0.98
+    tag = 'PASS' if ok else 'FAIL'
+    print(f"  [{tag}] winkv        M={M:<4} q8={q_match*100:.2f}% "
+          f"s8={s_match*100:.2f}% rope={r_match*100:.2f}%")
+    return ok
+
+
+def benchmark_comp(module):
+    """Additivity check for the warp-8..11 residents (all-compress rows):
+      base  = default GEMM+ssq (256 threads)
+      d_post/d_comp/d_win = each feature alone - base
+      d_all = idxpost + compressor + winkv together - base
+    Coexistence is free iff d_all <~ sum (one row per warp, spread mapping)."""
+    print("\nFused post-processing coexistence (all-compress rows):")
+    print(f"  {'M':<5} {'base(us)':<9} {'d_post':<7} {'d_comp':<7} {'d_win':<7} "
+          f"{'d_all':<7} {'sum':<7}")
+    print("  " + "-" * 52)
+    dev = 'cuda'
+    wm = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    w_sfm = make_weight_sf_ones(dev)
+    cos_tab, sin_tab = make_rope_tables()
+    for M in [1, 16, 32, 64, 96, 128]:
+        x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+        x_sf = make_act_sf_ones(M, dev)
+        q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
+        comp = make_comp_inputs(M, dev, all_compress=True)
+        win = make_win_inputs(M, dev)
+
+        def run(mock, wc, ww):
+            kw = {}
+            if wc or ww:
+                kw.update(cmp_pos=comp['cmp_pos'], cos_tab=cos_tab, sin_tab=sin_tab)
+            if wc:
+                kw.update({k: v for k, v in comp.items() if k != 'cmp_pos'})
+            if ww:
+                kw.update(win)
+            return module.wq_b_proj_gemm_merged(
+                x, x_sf, wm, w_sfm, q_pos, cos_tab, sin_tab,
+                mock_post=mock, **kw)
+
+        t = {}
+        for name, mock, wc, ww in [('base', True, False, False),
+                                   ('post', False, False, False),
+                                   ('comp', True, True, False),
+                                   ('win', True, False, True),
+                                   ('all', False, True, True)]:
+            t[name] = 1e6 * bench_kineto(lambda: run(mock, wc, ww),
+                                         'wq_b_proj_kernel',
+                                         suppress_kineto_output=True)
+        dp, dc, dw = t['post'] - t['base'], t['comp'] - t['base'], t['win'] - t['base']
+        da = t['all'] - t['base']
+        print(f"  {M:<5} {t['base']:<9.1f} {dp:<7.2f} {dc:<7.2f} {dw:<7.2f} "
+              f"{da:<7.2f} {dp+dc+dw:<7.2f}")
+
+
 def profile_pipeline(module, M=128, clock_ghz=1.8):
     """Visualize load / MMA / epilogue overlap (merged path).
     timing[max_iters,7] = [load_s, load_e, mma_s, mma_e, epi_s, epi_e, mma_wait]
@@ -407,7 +605,17 @@ if __name__ == '__main__':
     results = [test_merged(module, M)
                for M in [1, 2, 7, 16, 31, 32, 61, 64, 96, 97, 127, 128]]
 
+    print("\nCorrectness (fused indexer compressor, delivery port):")
+    results += [test_comp(module, M) for M in [1, 2, 7, 32, 61, 128]]
+    results += [test_comp(module, M, mock_post=False) for M in [7, 61, 128]]
+
+    print("\nCorrectness (fused local kv window, CSA stage 4):")
+    results += [test_win(module, M) for M in [1, 7, 32, 61, 128]]
+    results += [test_win(module, M, mock_post=False) for M in [61, 128]]
+
     benchmark_merged(module)
+
+    benchmark_comp(module)
 
     profile_pipeline(module, M=128)
 

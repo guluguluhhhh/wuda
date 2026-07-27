@@ -172,6 +172,7 @@ template <int M_> struct SwapDims {
     // Number of pipeline stages fitting the SMEM budget.
     // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr
     //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding).
+    // (The fused indexer compressor is fully register-resident -- no smem term.)
     static constexpr int SMEM_BARRIERS = (16 * 3 + NUM_EPI_STAGES * 2) * 8;
     static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8
                                          + 4 * BM * (int)sizeof(float);
