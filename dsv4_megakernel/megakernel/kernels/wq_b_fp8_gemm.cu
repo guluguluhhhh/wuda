@@ -74,6 +74,12 @@ struct SharedStorage {
 
     // TMEM base address
     alignas(16) uint32_t tmem_base;
+
+    // Fused quant prologue: this launch's grid-barrier target (monotonic
+    // ticket counter value the x_fp8/x_sf readers spin to) + the per-row
+    // block-partial ssq scratch (rmsnorm variant).
+    alignas(16) uint32_t quant_target;
+    alignas(16) float quant_ssq[NUM_K_TILES];
 };
 
 // Compile-time guard: SwapDims::NUM_STAGES comes from an OVERHEAD ESTIMATE in
@@ -143,6 +149,7 @@ wq_b_proj_kernel(
     const float* __restrict__ rope_sin,           // [max_pos, 32]
     int mock_post,                                 // 1 = drain only, skip the transform (baseline)
     const __grid_constant__ idx_comp::Args comp,   // fused indexer compressor (kv==nullptr => off)
+    const __grid_constant__ QuantProArgs qp,       // fused activation-quant prologue (y==nullptr => off)
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
     using Dims = SwapDims<M_TPL>;
@@ -167,6 +174,51 @@ wq_b_proj_kernel(
     const uint32_t lane_id  = ptx::get_lane_idx();
     const uint32_t cta_rank = ptx::block_rank_in_cluster();
     const bool is_leader    = (cta_rank == 0);
+
+    // ================================================================
+    // FUSED ACTIVATION-QUANT (delivery opB port; AT KERNEL ENTRY so the quant
+    // memory wave overlaps barrier-init / TMEM alloc / cluster_syncs below).
+    // PLAIN 1x128 block quant: one warp per K128 block, M*12 blocks over the
+    // whole grid, single load wave. Grid-release via the monotonic ticket;
+    // ONLY the x_fp8/x_sf readers gate on it -- warp2 at its role entry,
+    // warp0 gates just its ACTIVATION TMA lazily (weight stream never waits).
+    // Padded rows (>= problem_m): no quant (TMA OOB zero-fills their loads).
+    // NOTE: reads qp.y at kernel entry -- legal ONLY while this kernel is
+    // launched WITHOUT programmatic dependent launch (GDS below is unpaired);
+    // with PDL the quant must move after cudaGridDependencySynchronize().
+    // ================================================================
+    if (qp.y != nullptr) {
+        const int nwarps = (int)(blockDim.x / 32);
+        if (qp.gamma != nullptr) {
+            // rmsnorm(gamma) + quant: one CTA per ROW, whole-CTA wide (the
+            // 12 blocks split over the warps; ONE load wave for v + gamma).
+            for (int r = (int)blockIdx.x; r < problem_m; r += num_blocks)
+                qnorm_quant_row_cta(qp.y + (size_t)r * qp.lda, qp.gamma,
+                                    qp.eps, s.quant_ssq,
+                                    (int)warp_id, (int)lane_id, nwarps,
+                                    qp.x_fp8 + (size_t)r * K_DIM,
+                                    qp.x_sf + r * NUM_K_TILES);
+        } else {
+            // PLAIN 1x128 quant (isolation path): one warp per K128 block.
+            const int gwarp = blockIdx.x * nwarps + (int)warp_id;
+            const int gwarps = num_blocks * nwarps;
+            const int nqb = problem_m * NUM_K_TILES;
+            for (int qb = gwarp; qb < nqb; qb += gwarps) {
+                const int m = qb / NUM_K_TILES, b = qb % NUM_K_TILES;
+                quant_k128_ue8m0(qp.y + (size_t)m * qp.lda + b * BLOCK_K + lane_id * 4,
+                                 (int)lane_id,
+                                 qp.x_fp8 + (size_t)m * K_DIM + b * BLOCK_K,
+                                 qp.x_sf + m * NUM_K_TILES + b);
+            }
+        }
+        __syncthreads();                   // CTA-local: all quant stores issued
+        if (threadIdx.x == 0) {
+            __threadfence();               // release the quant writes to L2 (TMA-visible)
+            const uint32_t old = atomicAdd(qp.sync, 1u);
+            s.quant_target = (old / (uint32_t)num_blocks + 1u) * (uint32_t)num_blocks;
+        }
+        __syncthreads();                   // publish s.quant_target
+    }
 
     // ================================================================
     // INITIALIZATION
@@ -213,6 +265,10 @@ wq_b_proj_kernel(
     if (warp_id == 0 && ptx::elect_one_sync()) {
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
+        // Fused quant: gate ONLY the activation load, lazily on the first
+        // issue (the weight TMA below overlaps the grid barrier).
+        const uint32_t quant_tgt = (qp.y != nullptr) ? s.quant_target : 0u;
+        bool act_synced = (qp.y == nullptr);
 
         // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
         // async transform overlap the remaining main tiles' weight stream; all
@@ -235,8 +291,13 @@ wq_b_proj_kernel(
 
                     auto* sa  = reinterpret_cast<__nv_fp8_e4m3*>(s.smem_a + stage * SA);
                     auto* sb  = reinterpret_cast<__nv_fp8_e4m3*>(s.smem_b + stage * SMEM_B_PER_STAGE);
-                    tma::copy_2d_fp8(&desc_A, &s.full_barriers[stage], sa, k_off, m_base);
+                    // WEIGHT first: quant-independent, overlaps the grid barrier.
                     tma::copy_2d_fp8(&desc_B, &s.full_barriers[stage], sb, k_off, n_base);
+                    if (!act_synced) {     // gate the activation load, once
+                        while (ptx::ld_acquire_gpu_u32(qp.sync) < quant_tgt) {}
+                        act_synced = true;
+                    }
+                    tma::copy_2d_fp8(&desc_A, &s.full_barriers[stage], sa, k_off, m_base);
 
                     constexpr uint32_t kNumArrivalBytes = SA + SMEM_B_PER_STAGE;
                     s.full_barriers[stage].arrive_and_expect_tx(kNumArrivalBytes);
@@ -262,6 +323,15 @@ wq_b_proj_kernel(
     else if (warp_id == 2) {
         uint32_t stage = 0, phase = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
+        // Fused quant: this warp reads x_sf from gmem -> block on the grid
+        // barrier before the first row (delivery opB's SF-reader gate).
+        if (qp.y != nullptr) {
+            if (ptx::elect_one_sync()) {
+                const uint32_t tgt = s.quant_target;
+                while (ptx::ld_acquire_gpu_u32(qp.sync) < tgt) {}
+            }
+            __syncwarp();
+        }
 
         // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
         // async transform overlap the remaining main tiles' weight stream; all
@@ -734,7 +804,14 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> idx_sc  = c10::nullopt,
     // local kv window bundle (winkv, CSA stage 4; needs cmp_pos + rope tables too)
     c10::optional<torch::Tensor> win_y2   = c10::nullopt,
-    c10::optional<torch::Tensor> win_norm = c10::nullopt)
+    c10::optional<torch::Tensor> win_norm = c10::nullopt,
+    // fused activation-quant prologue: q_y bf16 [M,1536] (front y[:, :1536]
+    // view OK, stride(1)==1). q_norm_w fp32 [1536] additionally fuses the
+    // rmsnorm (CTA-wide, deterministic); without it: plain 1x128 quant.
+    // When q_y is given, x_fp8/x_sf are OUTPUT buffers written by the kernel.
+    c10::optional<torch::Tensor> q_y      = c10::nullopt,
+    c10::optional<torch::Tensor> q_norm_w = c10::nullopt,
+    double q_eps = 1e-6)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
@@ -930,6 +1007,33 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
     }
 
+    // ---- fused activation-quant prologue bundle (isolation: quant ONLY) ----
+    QuantProArgs qp{};
+    static thread_local torch::Tensor quant_sync_t;   // MONOTONIC ticket: init once, never reset
+    if (q_y.has_value() && q_y->numel() > 0) {
+        TORCH_CHECK(q_y->is_cuda() && q_y->scalar_type() == torch::kBFloat16 &&
+                    q_y->dim() == 2 && q_y->size(0) == M &&
+                    q_y->size(1) == K_DIM && q_y->stride(1) == 1 &&
+                    q_y->stride(0) % 4 == 0,
+                    "q_y must be bf16 [M,", K_DIM, "] with stride(1)==1 and "
+                    "16B-aligned rows (strided views of front y are fine)");
+        if (!quant_sync_t.defined() || quant_sync_t.device() != x_fp8.device())
+            quant_sync_t = torch::zeros({1}, x_fp8.options().dtype(torch::kInt32));
+        qp.y     = reinterpret_cast<const __nv_bfloat16*>(q_y->data_ptr());
+        qp.lda   = q_y->stride(0);
+        qp.x_fp8 = const_cast<__nv_fp8_e4m3*>(x_ptr);
+        qp.x_sf  = const_cast<uint8_t*>(xsf_ptr);
+        qp.sync  = reinterpret_cast<uint32_t*>(quant_sync_t.data_ptr());
+        if (q_norm_w.has_value() && q_norm_w->numel() > 0) {
+            TORCH_CHECK(q_norm_w->is_cuda() && q_norm_w->is_contiguous() &&
+                        q_norm_w->scalar_type() == torch::kFloat32 &&
+                        q_norm_w->numel() == K_DIM,
+                        "q_norm_w must be fp32 [", K_DIM, "]");
+            qp.gamma = q_norm_w->data_ptr<float>();
+            qp.eps   = static_cast<float>(q_eps);
+        }
+    }
+
     const bool want_ssq = ssq_ptr != nullptr;
     void* kernel_ptr = profile
         ? (want_ssq ? get_kernel_ptr<true, true>(M_pad)  : get_kernel_ptr<true, false>(M_pad))
@@ -978,7 +1082,7 @@ static std::vector<torch::Tensor> run_wq_b(
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &ssq_ptr,
             &iq_fp4_ptr, &iq_sf_ptr, &iq_ws_ptr, &q_pos_ptr, &cos_ptr, &sin_ptr,
-            &mock_i, &comp, &prof_dev
+            &mock_i, &comp, &qp, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));
@@ -1004,11 +1108,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> idx_ape, c10::optional<torch::Tensor> idx_norm,
              c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
              c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
-             c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm) {
+             c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm,
+             c10::optional<torch::Tensor> q_y, c10::optional<torch::Tensor> q_norm_w,
+             double q_eps) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
                               cmp_pos, idx_y4, idx_ape, idx_norm,
-                              cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm);
+                              cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm,
+                              q_y, q_norm_w, q_eps);
           },
           "MERGED wq_b + indexer wq_b (w [N+8192,K]), swap path, M in [1,128]. "
           "Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
@@ -1038,7 +1145,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("idx_kv") = c10::nullopt,
           py::arg("idx_sc") = c10::nullopt,
           py::arg("win_y2") = c10::nullopt,
-          py::arg("win_norm") = c10::nullopt);
+          py::arg("win_norm") = c10::nullopt,
+          py::arg("q_y") = c10::nullopt,
+          py::arg("q_norm_w") = c10::nullopt,
+          py::arg("q_eps") = 1e-6);
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

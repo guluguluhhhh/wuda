@@ -171,11 +171,13 @@ template <int M_> struct SwapDims {
 
     // Number of pipeline stages fitting the SMEM budget.
     // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr
-    //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding).
+    //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding)
+    //           + the fused-quant grid-barrier target + per-row block-partial
+    //             ssq scratch (alignas(16) u32 + 12 floats -> 64B).
     // (The fused indexer compressor is fully register-resident -- no smem term.)
     static constexpr int SMEM_BARRIERS = (16 * 3 + NUM_EPI_STAGES * 2) * 8;
     static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8
-                                         + 4 * BM * (int)sizeof(float);
+                                         + 4 * BM * (int)sizeof(float) + 64;
     static constexpr int STAGES_RAW    = (SMEM_CAPACITY - SMEM_OVERHEAD) / SMEM_PER_STAGE;
     static constexpr int NUM_STAGES    = STAGES_RAW > 12 ? 12 : STAGES_RAW;
 };
@@ -276,6 +278,13 @@ __device__ __forceinline__ bool elect_one_sync() {
     return pred != 0;
 }
 
+// gpu-scope acquire load (the fused-quant grid barrier's spin read)
+__device__ __forceinline__ uint32_t ld_acquire_gpu_u32(const uint32_t* ptr) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.b32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
+
 __device__ __forceinline__ long long rdclock() {
     long long t;
     asm volatile("mov.u64 %0, %%clock64;" : "=l"(t) :: "memory");
@@ -309,3 +318,121 @@ void store_2d(void const* desc_ptr, void* smem_ptr,
 }
 
 } // namespace tma
+
+// ==================== Fused activation-quant prologue (delivery opB port) ====
+// PLAIN 1x128 block quant ONLY (no rmsnorm -- isolation experiment): one warp
+// quantizes one K128 block, single memory wave, M*12 blocks spread over the
+// whole grid. sync is a MONOTONIC ticket (never reset across launches).
+namespace wq_b {
+
+struct QuantProArgs {
+    const __nv_bfloat16* y = nullptr;   // [M, lda] bf16 (front y[:, :1536] view)
+    int64_t lda            = 0;         // row stride in ELEMENTS (lda % 4 == 0)
+    const float* gamma     = nullptr;   // [K_DIM] q_norm weight (null => plain quant)
+    float eps              = 1e-6f;
+    __nv_fp8_e4m3* x_fp8   = nullptr;   // [M, K_DIM] e4m3 out (desc_A's buffer)
+    uint8_t* x_sf          = nullptr;   // [M, NUM_K_TILES] UE8M0 out
+    uint32_t* sync         = nullptr;   // monotonic grid ticket counter
+};
+
+// fp8(e4m3) + native-UE8M0 quant of ONE K128 block, one WARP per block
+// (byte-exact port of delivery tile::quant_k128_ue8m0): 4 bf16 elems/lane ->
+// warp-shfl amax -> E=ceil(log2(amax/448)) clamped -> v*2^-E as uchar4;
+// lane 0 writes the UE8M0 exponent byte. xrow is pre-offset by lane*4.
+__device__ __forceinline__ void quant_k128_ue8m0(
+    const __nv_bfloat16* __restrict__ xrow, int lane_id,
+    __nv_fp8_e4m3* __restrict__ q_dst, uint8_t* __restrict__ sf_dst) {
+    const float v0 = __bfloat162float(xrow[0]);
+    const float v1 = __bfloat162float(xrow[1]);
+    const float v2 = __bfloat162float(xrow[2]);
+    const float v3 = __bfloat162float(xrow[3]);
+    float block_amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        block_amax = fmaxf(block_amax, __shfl_xor_sync(0xffffffffu, block_amax, o));
+    int scale_exp = (int)ceilf(log2f(fmaxf(block_amax, 1e-30f) / 448.0f));
+    scale_exp = max(-127, min(127, scale_exp));
+    const float scale_factor = exp2f(-(float)scale_exp);
+    uchar4 packed;
+    packed.x = __nv_fp8_e4m3(v0 * scale_factor).__x;
+    packed.y = __nv_fp8_e4m3(v1 * scale_factor).__x;
+    packed.z = __nv_fp8_e4m3(v2 * scale_factor).__x;
+    packed.w = __nv_fp8_e4m3(v3 * scale_factor).__x;
+    *reinterpret_cast<uchar4*>(q_dst + lane_id * 4) = packed;
+    if (lane_id == 0)
+        *sf_dst = (uint8_t)(scale_exp + 127);
+}
+
+// rmsnorm(gamma) + 1x128 quant of ONE row, whole-CTA wide (the delivery
+// block-parallel shape, NOT the slow one-warp-per-row chain): the CTA's
+// warps split the 12 K128 blocks (<= 2 each); ONE memory wave loads v AND
+// gamma together; block partial ssq (fixed shfl tree) -> ssq_smem[12] ->
+// syncthreads -> every warp sums in FIXED block order (bitwise identical)
+// -> r -> qr = bf16((v*r)*gamma) materialized round -> quant_k128 tail.
+// MUST be called by ALL threads of the CTA (contains __syncthreads).
+__device__ __forceinline__ void qnorm_quant_row_cta(
+    const __nv_bfloat16* __restrict__ yrow,      // [1536] strided row base
+    const float* __restrict__ gamma,             // [1536]
+    float eps, float* __restrict__ ssq_smem,     // [NUM_K_TILES] CTA scratch
+    int warp_id, int lane_id, int nwarps,
+    __nv_fp8_e4m3* __restrict__ qf_row,          // [1536] e4m3 out
+    uint8_t* __restrict__ qsf_row) {             // [12] UE8M0 out
+    float v[2][4], g[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int b = warp_id + i * nwarps;
+        if (b >= NUM_K_TILES) continue;
+        const uint2 raw = *reinterpret_cast<const uint2*>(
+            yrow + b * BLOCK_K + lane_id * 4);
+        const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+        const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+        const float2 f0 = __bfloat1622float2(p0);
+        const float2 f1 = __bfloat1622float2(p1);
+        v[i][0] = f0.x; v[i][1] = f0.y; v[i][2] = f1.x; v[i][3] = f1.y;
+        const float4 gg = *reinterpret_cast<const float4*>(
+            gamma + b * BLOCK_K + lane_id * 4);
+        g[i][0] = gg.x; g[i][1] = gg.y; g[i][2] = gg.z; g[i][3] = gg.w;
+        float ps = v[i][0] * v[i][0] + v[i][1] * v[i][1]
+                 + v[i][2] * v[i][2] + v[i][3] * v[i][3];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            ps += __shfl_xor_sync(0xffffffffu, ps, o);
+        if (lane_id == 0)
+            ssq_smem[b] = ps;
+    }
+    __syncthreads();                             // block partials visible
+    float ssq = 0.f;
+    #pragma unroll
+    for (int j = 0; j < NUM_K_TILES; ++j)        // FIXED order -> bitwise
+        ssq += ssq_smem[j];
+    const float rinv = rsqrtf(ssq * (1.f / (float)K_DIM) + eps);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int b = warp_id + i * nwarps;
+        if (b >= NUM_K_TILES) continue;
+        float q[4], amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            q[j] = __bfloat162float(__float2bfloat16_rn((v[i][j] * rinv) * g[i][j]));
+            amax = fmaxf(amax, fabsf(q[j]));
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        int e = (int)ceilf(log2f(fmaxf(amax, 1e-30f) / 448.0f));
+        e = max(-127, min(127, e));
+        const float inv = exp2f(-(float)e);
+        uchar4 packed;
+        packed.x = __nv_fp8_e4m3(q[0] * inv).__x;
+        packed.y = __nv_fp8_e4m3(q[1] * inv).__x;
+        packed.z = __nv_fp8_e4m3(q[2] * inv).__x;
+        packed.w = __nv_fp8_e4m3(q[3] * inv).__x;
+        *reinterpret_cast<uchar4*>(
+            reinterpret_cast<uint8_t*>(qf_row) + b * BLOCK_K + lane_id * 4) = packed;
+        if (lane_id == 0)
+            qsf_row[b] = (uint8_t)(e + 127);
+    }
+    __syncthreads();                             // ssq_smem reuse guard
+}
+
+} // namespace wq_b

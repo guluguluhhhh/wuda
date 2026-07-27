@@ -253,6 +253,77 @@ def test_merged(module, M):
     return ok
 
 
+# ==================== fused activation-quant prologue (isolation) ====================
+def ref_quant_k128(q_y):
+    """Torch twin of quant_k128_ue8m0 (plain 1x128, NO rmsnorm)."""
+    t = q_y.float().view(-1, SF_K, 128)
+    amax = t.abs().amax(-1).clamp_min(1e-30)
+    e = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
+    q = (t * torch.pow(2.0, -e).unsqueeze(-1)).view(-1, K_DIM)
+    return q.to(torch.float8_e4m3fn), (e + 127).to(torch.uint8)
+
+
+def ref_qnorm_quant(q_y, gamma, eps=1e-6):
+    """Torch twin of qnorm_quant_row_cta: rmsnorm on the bf16 row ->
+    bf16-materialized round -> plain 1x128 quant. Block-partial ssq order
+    differs in ulps from torch's row sum -> gate on byte match rate."""
+    t = q_y.float()
+    r = torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    qr = ((t * r) * gamma).bfloat16()
+    return ref_quant_k128(qr)
+
+
+def _quant_case(module, M, tag, gate_kw, ref_fn):
+    """Shared harness: run the fused prologue twice, gate on bytes vs the
+    torch twin + GEMM-consumed-fresh-quant cosine + run-to-run bitwise."""
+    dev = 'cuda'
+    torch.manual_seed(M + 31)
+    q_y = (torch.randn(M, 4672, device=dev) * 0.1).bfloat16()[:, :K_DIM]
+    w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
+    eb = torch.randint(125, 130, (N_MERGED // WEIGHT_QUANT_BLOCK_N, SF_K),
+                       device=dev, dtype=torch.uint8)
+    cos_tab, sin_tab = make_rope_tables()
+    q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
+    x_fp8 = torch.empty(M, K_DIM, device=dev, dtype=torch.float8_e4m3fn)
+    x_sf = torch.empty(M, SF_K, device=dev, dtype=torch.uint8)
+
+    def run():
+        return module.wq_b_proj_gemm_merged(
+            x_fp8, as_ue8m0(x_sf), w, as_ue8m0(eb), q_pos, cos_tab, sin_tab,
+            mock_post=True, enable_ssq=False, q_y=q_y, **gate_kw)[0]
+
+    y1 = run()
+    q1, s1 = x_fp8.clone(), x_sf.clone()
+    y2 = run()
+    det_ok = (torch.equal(q1.view(torch.uint8), x_fp8.view(torch.uint8))
+              and torch.equal(s1, x_sf) and torch.equal(y1, y2))
+
+    qr, sr = ref_fn(q_y)
+    fp8_match = (q1.view(torch.uint8) == qr.view(torch.uint8)).float().mean().item()
+    sf_match = (s1 == sr).float().mean().item()
+    ref_main = dequant_act(q1, s1) @ dequant_weight(w[:N_TOTAL], eb[:N_TOTAL // 128]).t()
+    main_cos = F.cosine_similarity(y1.flatten(), ref_main.flatten(), dim=0).item()
+
+    ok = fp8_match > 0.999 and sf_match > 0.999 and main_cos > 0.99 and det_ok
+    print(f"  [{'PASS' if ok else 'FAIL'}] {tag} M={M:<4} fp8={fp8_match*100:.2f}% "
+          f"sf={sf_match*100:.2f}% main_cos={main_cos:.6f} "
+          f"det={'OK' if det_ok else 'MISMATCH'}")
+    return ok
+
+
+def test_quant_iso(module, M):
+    """J) fused quant prologue ISOLATION (delivery opB port, no rmsnorm)."""
+    return _quant_case(module, M, 'quant_iso   ', {}, ref_quant_k128)
+
+
+def test_qnorm(module, M):
+    """K) fused rmsnorm(gamma)+quant prologue (CTA-wide, deterministic)."""
+    torch.manual_seed(M + 37)
+    gamma = torch.rand(K_DIM, device='cuda') + 0.5
+    return _quant_case(module, M, 'qnorm+quant ', {'q_norm_w': gamma},
+                       lambda q_y: ref_qnorm_quant(q_y, gamma))
+
+
 # ==================== benchmark ====================
 def benchmark_merged(module):
     """Fused vs separate-kernel accounting at the merged shape (N=73728):
@@ -262,6 +333,10 @@ def benchmark_merged(module):
       sep_post = standalone idx_post_kernel over the fp32 iq (whole-GPU parallel)
       d_ssq    = (ssq only) - gemm  : net latency of the fused head_ssq
       sep_ssq  = standalone head_ssq_kernel over the fp32 y (memory-bound floor)
+      d_quant  = (fused PLAIN quant prologue on) - gemm : isolation cost of the
+                 delivery-opB-style 1x128 quant + grid barrier (no rmsnorm)
+      d_qnorm  = (rmsnorm+quant prologue on) - gemm : the production form
+                 (CTA-wide row rmsnorm folded into the same single load wave)
       cuBLAS   = bare fp8 _scaled_mm at [M,73728] (nvjet), fp32 out
     Fusion wins iff d_post < sep_post and d_ssq < sep_ssq."""
     print("\n" + "=" * 60)
@@ -278,21 +353,24 @@ def benchmark_merged(module):
           f"[M,65536] + iq fp4+sf [M,64,68B] + ssq [M,128]")
     print(f"  (M < 32 pads to the 32-row template: GEMM time ~= M=32)")
     print(f"  {'M':<5} {'fused(us)':<10} {'gemm(us)':<9} {'d_post':<7} {'sep_post':<9} "
-          f"{'d_ssq':<7} {'sep_ssq':<8} {'cuBLAS(us)':<11} {'fused_BW':<9} {'%cuBLAS':<8}")
-    print("  " + "-" * 88)
+          f"{'d_ssq':<7} {'sep_ssq':<8} {'d_quant':<8} {'d_qnorm':<8} "
+          f"{'cuBLAS(us)':<11} {'fused_BW':<9} {'%cuBLAS':<8}")
+    print("  " + "-" * 104)
     for M in [1, 2, 7, 16, 31, 32, 61, 64, 96, 97, 127, 128]:
         x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
         x_sf = make_act_sf_ones(M, dev)
+        q_y = (torch.randn(M, 4672, device=dev) * 0.1).bfloat16()[:, :K_DIM]
+        q_gamma = torch.rand(K_DIM, device=dev) + 0.5
         q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
         iq_f32 = torch.randn(M, 64, 128, device=dev, dtype=torch.float32)
         y_f32 = torch.randn(M, N_TOTAL, device=dev, dtype=torch.float32)
         # accumulates garbage across timing iters -- irrelevant for latency
         ssqbuf = torch.zeros(M, 128, device=dev, dtype=torch.float32)
 
-        def run(ssq, mock, en_ssq):
+        def run(ssq, mock, en_ssq, **kw):
             return module.wq_b_proj_gemm_merged(
                 x, x_sf, wm, w_sfm, q_pos, cos_tab, sin_tab,
-                head_ssq=ssq, mock_post=mock, enable_ssq=en_ssq)
+                head_ssq=ssq, mock_post=mock, enable_ssq=en_ssq, **kw)
 
         uf = 1e6 * bench_kineto(lambda: run(ssqbuf, False, True),
                                 'wq_b_proj_kernel', suppress_kineto_output=True)
@@ -302,6 +380,11 @@ def benchmark_merged(module):
                                    'wq_b_proj_kernel', suppress_kineto_output=True)
         ussq = 1e6 * bench_kineto(lambda: run(ssqbuf, True, True),
                                   'wq_b_proj_kernel', suppress_kineto_output=True)
+        uq = 1e6 * bench_kineto(lambda: run(None, True, False, q_y=q_y),
+                                'wq_b_proj_kernel', suppress_kineto_output=True)
+        uqn = 1e6 * bench_kineto(
+            lambda: run(None, True, False, q_y=q_y, q_norm_w=q_gamma),
+            'wq_b_proj_kernel', suppress_kineto_output=True)
         up = 1e6 * bench_kineto(
             lambda: module.idx_postprocess_standalone(iq_f32, q_pos, cos_tab, sin_tab),
             'idx_post_kernel', suppress_kineto_output=True)
@@ -324,7 +407,8 @@ def benchmark_merged(module):
         cb_s = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
         pct  = f"{cb/uf*100:<8.1f}" if cb else f"{'-':<8}"
         print(f"  {M:<5} {uf:<10.1f} {ug:<9.1f} {upost-ug:<7.2f} {up:<9.2f} "
-              f"{ussq-ug:<7.2f} {us:<8.2f} {cb_s} {bw:<9.1f} {pct}")
+              f"{ussq-ug:<7.2f} {us:<8.2f} {uq-ug:<8.2f} {uqn-ug:<8.2f} "
+              f"{cb_s} {bw:<9.1f} {pct}")
 
 
 # ==================== fused indexer compressor (delivery port) ====================
@@ -612,6 +696,12 @@ if __name__ == '__main__':
     print("\nCorrectness (fused local kv window, CSA stage 4):")
     results += [test_win(module, M) for M in [1, 7, 32, 61, 128]]
     results += [test_win(module, M, mock_post=False) for M in [61, 128]]
+
+    print("\nCorrectness (fused quant prologue, isolation):")
+    results += [test_quant_iso(module, M) for M in [1, 7, 32, 61, 128]]
+
+    print("\nCorrectness (fused rmsnorm+quant prologue, production form):")
+    results += [test_qnorm(module, M) for M in [1, 2, 7, 32, 61, 128]]
 
     benchmark_merged(module)
 
