@@ -150,7 +150,6 @@ def main():
         out_mixed = torch.empty(Mp, N, device="cuda", dtype=torch.bfloat16)
         mixed_us = 1e6 * bench_kineto(
             lambda: mixed_mod.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                               q_ssq=None, kv_ssq=None, attn_ssq=None,
                                                hc_mix=None, hc_base=None,
                                                hc_scale=None, hc_post=None,
                                                hc_comb=None, out=out_mixed),

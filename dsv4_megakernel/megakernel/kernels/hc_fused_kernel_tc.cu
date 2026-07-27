@@ -33,7 +33,12 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
 // kWithPostComb=false (A/B lite): the split-K reduce is UNTOUCHED (full 24
 // columns -- DeepGEMM-style gather, already optimal); only the post/comb
 // activation + Sinkhorn are dropped, and ALL 8 warps run the collapse.
-template <bool kWithPostComb>
+// kFusedNorm (lite only): the collapse additionally applies the FULL attn_norm
+// in-block -- this block owns the whole 7168-dim row, so ssq/r/gamma all live
+// here (bit-exact vs a separate norm kernel reading the bf16 collapsed:
+// x_b = bf16(acc) is kept in registers, ssq sums x_b^2, and the output is
+// bf16((x_b * r) * w) with the reference multiply order).
+template <bool kWithPostComb, bool kFusedNorm = false>
 __global__ void __launch_bounds__(EPILOGUE_THREADS, 2)
 hc_reduce_and_fuse_kernel(
     const __nv_bfloat16* __restrict__ hidden_states,
@@ -50,7 +55,11 @@ hc_reduce_and_fuse_kernel(
     float* __restrict__ post_out,
     float* __restrict__ comb_out,
     float* __restrict__ attn_ssq,        // [M] attn_norm ssq fold (null=>off; zero-init)
+    const float* __restrict__ attn_norm_w,   // [7168] attn_norm gamma (kFusedNorm)
+    float attn_norm_eps,
     int64_t* __restrict__ prof) {
+    static_assert(!(kWithPostComb && kFusedNorm),
+                  "fused attn_norm needs ALL warps in the collapse (lite only)");
     const int pos = static_cast<int>(blockIdx.x);
     if (pos >= num_positions) return;
     // clock64 phase stamps on block 0 only (see PROF_SLOTS layout in the header).
@@ -190,6 +199,72 @@ hc_reduce_and_fuse_kernel(
         __nv_bfloat16* collapsed = collapsed_out + static_cast<int64_t>(pos) * DIM;
         const int lane_vec = static_cast<int>(threadIdx.x) - COLLAPSE_BASE;
         constexpr int nthreads = EPILOGUE_THREADS - COLLAPSE_BASE;
+        if constexpr (kFusedNorm) {
+            // ---- Two-phase collapse + FULL fused attn_norm (lite: all 8 warps,
+            // this block owns the whole row).
+            // Phase 1: compute + KEEP the bf16-rounded x_b in registers (the
+            // exact value the reference chain would materialize) and sum x_b^2.
+            constexpr int MAX_SEGS = (DIM / VEC + nthreads - 1) / nthreads;   // 4
+            __nv_bfloat162 keep[MAX_SEGS][VEC / 2];
+            float local_ssq = 0.f;
+            int nseg = 0;
+            for (int vi = lane_vec; vi < DIM / VEC; vi += nthreads, ++nseg) {
+                const int d0 = vi * VEC;
+                float acc[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) acc[j] = 0.0f;
+                #pragma unroll
+                for (int h = 0; h < HC; ++h) {
+                    const int4 raw = *reinterpret_cast<const int4*>(src + h * DIM + d0);
+                    const __nv_bfloat162* v2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                    #pragma unroll
+                    for (int k = 0; k < VEC / 2; ++k) {
+                        const float2 f = __bfloat1622float2(v2[k]);
+                        acc[2 * k]     += pre_r[h] * f.x;
+                        acc[2 * k + 1] += pre_r[h] * f.y;
+                    }
+                }
+                #pragma unroll
+                for (int k = 0; k < VEC / 2; ++k) {
+                    const __nv_bfloat162 xb =
+                        __float22bfloat162_rn(make_float2(acc[2 * k], acc[2 * k + 1]));
+                    keep[nseg][k] = xb;
+                    const float2 f = __bfloat1622float2(xb);
+                    local_ssq += f.x * f.x + f.y * f.y;
+                }
+            }
+            // Block-wide ssq reduce (comb_smem is free in the lite variant).
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                local_ssq += __shfl_down_sync(0xffffffffu, local_ssq, o);
+            if ((threadIdx.x & 31) == 0) comb_smem[threadIdx.x >> 5] = local_ssq;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float total = 0.f;
+                #pragma unroll
+                for (int w = 0; w < EPILOGUE_THREADS / 32; ++w) total += comb_smem[w];
+                sqsum_smem[0] = rsqrtf(total / static_cast<float>(DIM) + attn_norm_eps);
+                if (attn_ssq != nullptr) attn_ssq[pos] = total;   // exact, no atomics
+            }
+            __syncthreads();
+            const float r = sqsum_smem[0];
+            // Phase 2: out = bf16( (x_b * r) * w )  -- reference multiply order.
+            nseg = 0;
+            for (int vi = lane_vec; vi < DIM / VEC; vi += nthreads, ++nseg) {
+                const int d0 = vi * VEC;
+                const float4 w0 = *reinterpret_cast<const float4*>(attn_norm_w + d0);
+                const float4 w1 = *reinterpret_cast<const float4*>(attn_norm_w + d0 + 4);
+                const float wv[VEC] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+                alignas(16) __nv_bfloat162 out2[VEC / 2];
+                #pragma unroll
+                for (int k = 0; k < VEC / 2; ++k) {
+                    const float2 f = __bfloat1622float2(keep[nseg][k]);
+                    out2[k] = __floats2bfloat162_rn((f.x * r) * wv[2 * k],
+                                                    (f.y * r) * wv[2 * k + 1]);
+                }
+                *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
+            }
+        } else {
         // attn_norm ssq fold: the NEXT op (front_mixed GEMM) needs
         // sum(collapsed_bf16^2) per row for its folded attn_norm (weight burned
         // into its GEMM weights; it applies rsqrt(ssq/DIM+eps) in its epilogue).
@@ -226,13 +301,14 @@ hc_reduce_and_fuse_kernel(
             }
             *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
         }
-        if (attn_ssq != nullptr) {
+        if (attn_ssq != nullptr && !kFusedNorm) {
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1)
                 local_ssq += __shfl_down_sync(0xffffffffu, local_ssq, o);
             if ((threadIdx.x & 31) == 0)
                 atomicAdd(attn_ssq + pos, local_ssq);
         }
+        }   // !kFusedNorm (streaming collapse)
         if (prof0 && threadIdx.x == COLLAPSE_BASE) prof[7] = ptx::rdclock();  // collapse end
     }
 }
@@ -274,7 +350,8 @@ static void hc_launch_core(
     const float* base_ptr, const float* scale_ptr,
     float hc_eps, float rms_eps,
     __nv_bfloat16* collapsed_ptr, float* pre_ptr, float* post_ptr, float* comb_ptr,
-    int64_t* prof_dev, bool with_post_comb = true, float* attn_ssq_ptr = nullptr) {
+    int64_t* prof_dev, bool with_post_comb = true, float* attn_ssq_ptr = nullptr,
+    const float* attn_norm_w = nullptr, float attn_norm_eps = 1e-6f) {
     const int m = static_cast<int>(hs.size(0));
     const SplitConfig cfg = make_split_config(m);
     auto fp32_opts = hs.options().dtype(torch::kFloat32);
@@ -318,8 +395,9 @@ static void hc_launch_core(
     constexpr int fuse_smem_bytes = scratch_floats * sizeof(float);
     static bool fuse_configured = false;
     if (!fuse_configured) {
-        for (auto* fptr : {reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<true>),
-                           reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<false>)}) {
+        for (auto* fptr : {reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<true, false>),
+                           reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<false, false>),
+                           reinterpret_cast<void*>(&hc_reduce_and_fuse_kernel<false, true>)}) {
             const auto attr_err = cudaFuncSetAttribute(
                 fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, fuse_smem_bytes);
             TORCH_CHECK(attr_err == cudaSuccess,
@@ -330,15 +408,22 @@ static void hc_launch_core(
     }
 
     if (with_post_comb) {
-        hc_reduce_and_fuse_kernel<true><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
+        TORCH_CHECK(attn_norm_w == nullptr,
+                    "fused attn_norm requires the lite (no-pc) variant");
+        hc_reduce_and_fuse_kernel<true, false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
             x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
             m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
-            attn_ssq_ptr, prof_dev);
+            attn_ssq_ptr, nullptr, attn_norm_eps, prof_dev);
+    } else if (attn_norm_w != nullptr) {
+        hc_reduce_and_fuse_kernel<false, true><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
+            x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
+            m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
+            attn_ssq_ptr, attn_norm_w, attn_norm_eps, prof_dev);
     } else {
-        hc_reduce_and_fuse_kernel<false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
+        hc_reduce_and_fuse_kernel<false, false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
             x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
             m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
-            attn_ssq_ptr, prof_dev);
+            attn_ssq_ptr, nullptr, attn_norm_eps, prof_dev);
     }
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "HC reduce/fuse launch failed: ", cudaGetErrorString(cudaGetLastError()));
@@ -401,7 +486,9 @@ static void hc_fused_forward_out(
     double hc_eps, double rms_norm_eps,
     torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post, torch::Tensor comb,
     c10::optional<torch::Tensor> attn_ssq,
-    bool with_post_comb) {
+    bool with_post_comb,
+    c10::optional<torch::Tensor> attn_norm_w,
+    double attn_norm_eps) {
     hc_validate_inputs(hidden_states, attn_hc_fn, attn_hc_base, attn_hc_scale);
 
     c10::cuda::CUDAGuard device_guard(hidden_states.device());
@@ -432,11 +519,23 @@ static void hc_fused_forward_out(
         attn_ssq_ptr = attn_ssq->data_ptr<float>();
     }
 
+    const float* attn_norm_w_ptr = nullptr;
+    if (attn_norm_w.has_value() && attn_norm_w->numel() > 0) {
+        TORCH_CHECK(!with_post_comb,
+                    "fused attn_norm requires the lite (no-pc) variant");
+        TORCH_CHECK(attn_norm_w->is_cuda() && attn_norm_w->is_contiguous() &&
+                    attn_norm_w->scalar_type() == torch::kFloat32 &&
+                    attn_norm_w->numel() == DIM,
+                    "attn_norm_w must be contiguous fp32 [", DIM, "]");
+        attn_norm_w_ptr = attn_norm_w->data_ptr<float>();
+    }
+
     hc_launch_core(hs, weight, base.data_ptr<float>(), scale.data_ptr<float>(),
                    static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
                    reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
                    pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
-                   nullptr, with_post_comb, attn_ssq_ptr);
+                   nullptr, with_post_comb, attn_ssq_ptr,
+                   attn_norm_w_ptr, static_cast<float>(attn_norm_eps));
 }
 
 static std::vector<torch::Tensor> hc_fused_forward_full(
@@ -490,7 +589,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("attn_hc_scale"), py::arg("hc_eps"), py::arg("rms_norm_eps"),
           py::arg("collapsed"), py::arg("pre"), py::arg("post"), py::arg("comb"),
           py::arg("attn_ssq"),
-          py::arg("with_post_comb") = false);
+          py::arg("with_post_comb") = false,
+          py::arg("attn_norm_w") = c10::nullopt,
+          py::arg("attn_norm_eps") = 1e-6);
     m.def("hc_fused_tc_config", &hc_tc::hc_fused_tc_config,
           "Return [N tile, split-K, K tiles/split, grid, M tiles, N tiles, SMs, M tile]");
 }

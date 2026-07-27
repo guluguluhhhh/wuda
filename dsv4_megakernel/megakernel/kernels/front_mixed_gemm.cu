@@ -24,17 +24,13 @@ namespace front_mixed {
 torch::Tensor front_mixed_gemm_op(
     torch::Tensor x, torch::Tensor x_fp8, torch::Tensor x_sf,
     torch::Tensor w_bf16, torch::Tensor w_fp8, torch::Tensor w_sf,
-    c10::optional<torch::Tensor> q_ssq_opt,
-    c10::optional<torch::Tensor> kv_ssq_opt,
-    c10::optional<torch::Tensor> attn_ssq_opt,
     c10::optional<torch::Tensor> hc_mix_opt,
     c10::optional<torch::Tensor> hc_base_opt,
     c10::optional<torch::Tensor> hc_scale_opt,
     c10::optional<torch::Tensor> hc_post_opt,
     c10::optional<torch::Tensor> hc_comb_opt,
     c10::optional<torch::Tensor> out_opt,
-    double hc_eps,
-    double attn_eps) {
+    double hc_eps) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
               x.scalar_type() == torch::kBFloat16 &&
               x.dim() == 2 && x.size(1) == K, "x must be bf16 [M,", K, "]");
@@ -120,18 +116,8 @@ torch::Tensor front_mixed_gemm_op(
     configured = true;
   }
 
-  // Optional RMSNorm ssq folds (q_norm 1536-col / kv_norm 512-col segments):
-  // fp32 [M], RED-accumulated -- caller zero-initializes (head_ssq contract).
-  auto ssq_ptr = [&](c10::optional<torch::Tensor>& t,
-                     const char* what) -> float* {
-    if (!t.has_value() || t->numel() == 0) return nullptr;
-    TORCH_CHECK(t->is_cuda() && t->is_contiguous() &&
-                t->scalar_type() == torch::kFloat32 && t->numel() >= m,
-                what, " must be contiguous fp32 [M]");
-    return t->data_ptr<float>();
-  };
-  float* q_ssq = ssq_ptr(q_ssq_opt, "q_ssq");
-  float* kv_ssq = ssq_ptr(kv_ssq_opt, "kv_ssq");
+  // (q/kv ssq folds removed: the wq_b quant prologue reduces its own ssq
+  // with a deterministic warp order.)
 
   // Optional [TC/CC] MHC post+comb tail bundle: all five tensors together.
   HcTailArgs hc{};
@@ -159,22 +145,12 @@ torch::Tensor front_mixed_gemm_op(
     hc.m = static_cast<int>(hm);
   }
 
-  // Optional attn_norm fold input: per-row ssq produced by the MHC collapse
-  // (weight burned into W offline; this kernel applies r = rsqrt(ssq/K+eps)).
-  const float* attn_ssq = nullptr;
-  if (attn_ssq_opt.has_value() && attn_ssq_opt->numel() > 0) {
-    TORCH_CHECK(attn_ssq_opt->is_cuda() && attn_ssq_opt->is_contiguous() &&
-                attn_ssq_opt->scalar_type() == torch::kFloat32 &&
-                attn_ssq_opt->numel() >= m,
-                "attn_ssq must be contiguous fp32 [M]");
-    attn_ssq = attn_ssq_opt->data_ptr<float>();
-  }
-
+  // x arrives ALREADY attn_norm'ed (the MHC collapse fuses the full norm).
   cudaError_t status = launch_front_mixed(
       desc_a, desc_b, desc_a8, desc_b8, desc_d,
       reinterpret_cast<const uint8_t*>(x_sf.data_ptr()),
       reinterpret_cast<const uint8_t*>(w_sf.data_ptr()),
-      q_ssq, kv_ssq, attn_ssq, static_cast<float>(attn_eps), hc,
+      hc,
       m, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(status == cudaSuccess, "front_mixed launch failed: ",
               cudaGetErrorString(status));
@@ -186,15 +162,13 @@ torch::Tensor front_mixed_gemm_op(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("front_mixed_gemm", &front_mixed::front_mixed_gemm_op,
              "Mixed-precision front projection GEMM (fp8 cols [0,2048) + bf16 "
-             "cols [2048,4672), reordered layout) -> bf16 [M,4672]. PRODUCTION "
-             "DEFAULT = all folds ON: the ssq/attn/hc arguments are REQUIRED "
-             "(pass None explicitly to disable one, e.g. for A/B benches)",
+             "cols [2048,4672), reordered layout) -> bf16 [M,4672]. x arrives "
+             "pre-normed (MHC fuses attn_norm); q/kv ssq live in the wq_b "
+             "quant prologue. hc_* args are REQUIRED (None to disable).",
              py::arg("x"), py::arg("x_fp8"), py::arg("x_sf"),
              py::arg("w_bf16"), py::arg("w_fp8"), py::arg("w_sf"),
-             py::arg("q_ssq"), py::arg("kv_ssq"), py::arg("attn_ssq"),
              py::arg("hc_mix"), py::arg("hc_base"), py::arg("hc_scale"),
              py::arg("hc_post"), py::arg("hc_comb"),
              py::arg("out") = c10::nullopt,
-             py::arg("hc_eps") = 1e-6,
-             py::arg("attn_eps") = 1e-6);
+             py::arg("hc_eps") = 1e-6);
 }

@@ -77,9 +77,6 @@ constexpr int CTA_N_BF16 = 32;
 constexpr int N_TILES_FP8 = N_FP8 / BLOCK_N_FP8;                    // 32
 constexpr int N_TILES_BF16 = (N - N_FP8) / BLOCK_N_BF16;            // 41
 constexpr int NUM_N_TILES = N_TILES_FP8 + N_TILES_BF16;             // 73
-// ssq fold: fp8 tiles 0..23 are the wq_a segment (q_norm, 1536), 24..31 the
-// wkv segment (kv_norm, 512).
-constexpr int N_TILES_Q = 1536 / BLOCK_N_FP8;                       // 24
 constexpr int CLUSTER_SIZE = 2;
 constexpr int TPB = 256;
 
@@ -349,13 +346,6 @@ __device__ __forceinline__ void tmem_fence_before_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;");
 }
 
-// Squared value after bf16 rounding: the ssq fold must sum EXACTLY what the
-// downstream consumer reads back from the bf16 output tensor.
-__device__ __forceinline__ float bf16_round_sq(uint32_t v) {
-  const float b = __bfloat162float(__float2bfloat16_rn(__uint_as_float(v)));
-  return b * b;
-}
-
 __device__ __forceinline__ uint4 pack_bf16x8(
     uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3,
     uint32_t v4, uint32_t v5, uint32_t v6, uint32_t v7) {
@@ -480,10 +470,6 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
     const __grid_constant__ CUtensorMap desc_d,      // y      [M,4672]
     const uint8_t* __restrict__ x_sf,
     const uint8_t* __restrict__ w_sf,
-    float* __restrict__ q_ssq,       // [M] fp32, RED-accumulated (null=>off)
-    float* __restrict__ kv_ssq,      // [M] fp32, RED-accumulated (null=>off)
-    const float* __restrict__ attn_ssq,  // [M] fp32 attn_norm ssq from MHC (null=>off)
-    float attn_eps,
     HcTailArgs hc,                   // [TC/CC] MHC post+comb tail (mix=null=>off)
     int problem_m) {
   extern __shared__ __align__(1024) uint8_t smem_raw[];
@@ -732,31 +718,9 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
     const int col_group = epi_local_warp >> 1;
     constexpr int EPI_STEPS = 2;
     constexpr int EPI_COLS_PER_WARP = 32;
-
-    // q_norm / kv_norm ssq fold (fp8 segment only): sum the squares of the
-    // BF16-ROUNDED outputs -- exactly the values the downstream norm+quant
-    // kernel reads back. Each lane owns ONE row's 32-col slice across its 4
-    // iterations (row is st/sub-invariant), so a single fp32 RED per lane
-    // finishes the fold. Accumulation order is nondeterministic -- same
-    // zero-init caller contract as wq_b's head_ssq.
-    float* const ssq_dst = !is_fp8 ? nullptr
-        : (n_tile < N_TILES_Q ? q_ssq : kv_ssq);
-    float row_ssq = 0.f;
-
-    // attn_norm fold: the MHC producer already accumulated attn_ssq[m] =
-    // sum(x_bf16^2) over the 7168-dim row; its weight is burned into THIS
-    // op's weights offline (W'[n,k] = W[n,k]*w_attn[k]), so all that remains
-    // is the per-row scalar r = rsqrt(ssq/7168 + eps), applied to the fp32
-    // accum BEFORE the bf16 round. Each lane owns one row -> one ld + rsqrt.
-    // (q_ssq/kv_ssq then fold r^2 automatically -- same semantics as the
-    // original chain where q_norm consumes attn_norm'ed values.)
-    float r_attn = 1.f;
-    if (attn_ssq != nullptr) {
-      const int orow = m_tile * BLOCK_M + rank * CTA_M + row_half * 32 + lane;
-      if (orow < problem_m) {
-        r_attn = rsqrtf(attn_ssq[orow] * (1.f / (float)K) + attn_eps);
-      }
-    }
+    // (q/kv ssq folds were removed: the downstream wq_b quant prologue reads
+    // the full row anyway and reduces its own ssq with a DETERMINISTIC warp
+    // order -- strictly better than RED-atomic partial sums here.)
 
     if (epi_warpgroup == 0) {
       #pragma unroll
@@ -767,28 +731,12 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
           uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
           tmem_load_8x(addr, v0, v1, v2, v3, v4, v5, v6, v7);
           tmem_load_fence();
-          if (attn_ssq != nullptr) {
-            v0 = __float_as_uint(__uint_as_float(v0) * r_attn);
-            v1 = __float_as_uint(__uint_as_float(v1) * r_attn);
-            v2 = __float_as_uint(__uint_as_float(v2) * r_attn);
-            v3 = __float_as_uint(__uint_as_float(v3) * r_attn);
-            v4 = __float_as_uint(__uint_as_float(v4) * r_attn);
-            v5 = __float_as_uint(__uint_as_float(v5) * r_attn);
-            v6 = __float_as_uint(__uint_as_float(v6) * r_attn);
-            v7 = __float_as_uint(__uint_as_float(v7) * r_attn);
-          }
           const int row = row_half * 32 + lane;
           const int col = col_group * EPI_COLS_PER_WARP + st * 16 + sub * 8;
           const int out_row = m_tile * BLOCK_M + rank * CTA_M + row;
           const int out_col = n_col_base + col;
           if (out_row < problem_m && out_col + 7 < N) {
             uint4 packed = pack_bf16x8(v0, v1, v2, v3, v4, v5, v6, v7);
-            if (ssq_dst != nullptr) {
-              row_ssq += bf16_round_sq(v0) + bf16_round_sq(v1) +
-                         bf16_round_sq(v2) + bf16_round_sq(v3) +
-                         bf16_round_sq(v4) + bf16_round_sq(v5) +
-                         bf16_round_sq(v6) + bf16_round_sq(v7);
-            }
             const int atom_col = col % EPI_ATOM_N;
             const int swizzle_group = (atom_col / 8) ^ (row & 7);
             uint8_t* smem_row = s.smem_a +
@@ -800,13 +748,6 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
             st_shared_u32(smem_row + 8, packed.z);
             st_shared_u32(smem_row + 12, packed.w);
           }
-        }
-      }
-      if (ssq_dst != nullptr) {
-        const int out_row =
-            m_tile * BLOCK_M + rank * CTA_M + row_half * 32 + lane;
-        if (out_row < problem_m) {
-          atomicAdd(ssq_dst + out_row, row_ssq);
         }
       }
     }
@@ -893,8 +834,6 @@ inline cudaError_t launch_front_mixed(
     const CUtensorMap& desc_a8, const CUtensorMap& desc_b8,
     const CUtensorMap& desc_d,
     const uint8_t* x_sf, const uint8_t* w_sf,
-    float* q_ssq, float* kv_ssq,
-    const float* attn_ssq, float attn_eps,
     const HcTailArgs& hc,
     int m, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
@@ -917,7 +856,7 @@ inline cudaError_t launch_front_mixed(
       const_cast<CUtensorMap*>(&desc_a8),
       const_cast<CUtensorMap*>(&desc_b8),
       const_cast<CUtensorMap*>(&desc_d),
-      &x_sf, &w_sf, &q_ssq, &kv_ssq, &attn_ssq, &attn_eps,
+      &x_sf, &w_sf,
       const_cast<HcTailArgs*>(&hc), &m};
   return cudaLaunchKernelExC(
       &config, reinterpret_cast<void*>(front_mixed_kernel), args);

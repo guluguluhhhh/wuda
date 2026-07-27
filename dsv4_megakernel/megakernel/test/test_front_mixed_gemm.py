@@ -139,36 +139,20 @@ def make_hc(m, seed=1):
 
 def test_correctness(module, m):
     x, x_fp8, x_sf, w_bf16, w_fp8, w_sf = make_inputs(m, seed=m)
-    q_ssq = torch.zeros(m, device='cuda', dtype=torch.float32)
-    kv_ssq = torch.zeros(m, device='cuda', dtype=torch.float32)
     hc = make_hc(m, seed=m + 7)
-    # attn_norm fold input: in production the MHC collapse RED-accumulates
-    # sum(x_bf16^2); here we compute the same quantity directly from x.
-    attn_ssq = x.float().pow(2).sum(-1).contiguous()
-    out = module.front_mixed_gemm(x, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                  q_ssq=q_ssq, kv_ssq=kv_ssq,
-                                  attn_ssq=attn_ssq, **hc)
+    # x arrives ALREADY attn_norm'ed (the MHC collapse fuses the full norm);
+    # q/kv ssq now live in the wq_b quant prologue (deterministic warp order).
+    out = module.front_mixed_gemm(x, x_fp8, x_sf, w_bf16, w_fp8, w_sf, **hc)
     torch.cuda.synchronize()
     assert out.shape == (m, N)
 
-    # per-row attn_norm scalar (weights are treated as ALREADY burned with
-    # w_attn, so the reference is r * (x @ W'^T))
-    r = torch.rsqrt(attn_ssq / K + 1e-6).unsqueeze(-1)
-
     # fp8 segment: reference = fp32 matmul on the SAME dequantized values
     # (difference is accumulation order only)
-    ref8 = r * (dequant_fp8(x_fp8, x_sf, act=True) @ dequant_fp8(w_fp8, w_sf, act=False).t())
+    ref8 = dequant_fp8(x_fp8, x_sf, act=True) @ dequant_fp8(w_fp8, w_sf, act=False).t()
     d8 = calc_diff(out[:, :N_FP8].float(), ref8)
     # bf16 segment: reference = cuBLAS bf16 (fp32 accumulate)
-    ref16 = r * torch.mm(x, w_bf16.t()).float()
+    ref16 = torch.mm(x, w_bf16.t()).float()
     d16 = calc_diff(out[:, N_FP8:].float(), ref16)
-
-    # ssq folds: self-consistent reference = sum of squares of the kernel's
-    # OWN bf16 output segments (fp32 RED order differs -> rtol, not bitwise)
-    q_ref = out[:, :1536].float().pow(2).sum(-1)
-    kv_ref = out[:, 1536:N_FP8].float().pow(2).sum(-1)
-    ssq_ok = (torch.allclose(q_ssq, q_ref, rtol=1e-4, atol=1e-6) and
-              torch.allclose(kv_ssq, kv_ref, rtol=1e-4, atol=1e-6))
 
     # TC/CC MHC tail: post gate + Sinkhorn comb vs torch reference (__expf is
     # an approximate exp -> rtol, not bitwise)
@@ -176,12 +160,11 @@ def test_correctness(module, m):
     hc_ok = (torch.allclose(hc['hc_post'], post_ref, rtol=1e-4, atol=1e-6) and
              torch.allclose(hc['hc_comb'], comb_ref, rtol=1e-4, atol=1e-6))
 
-    ok = d8 < 1e-5 and d16 < 1e-5 and ssq_ok and hc_ok
+    ok = d8 < 1e-5 and d16 < 1e-5 and hc_ok
     if ok:
         print(f"  M={m:<4} PASS")
     else:
         print(f"  M={m:<4} FAIL  fp8_diff={d8:.3e}  bf16_diff={d16:.3e}  "
-              f"ssq={'OK' if ssq_ok else 'MISMATCH'}  "
               f"hc={'OK' if hc_ok else 'MISMATCH'}")
     return ok
 
@@ -194,11 +177,11 @@ def benchmark(module):
     bf16_bytes = N * K * 2
     print(f"  weight bytes: mixed {mixed_bytes / 1e6:.1f} MB vs all-bf16 "
           f"{bf16_bytes / 1e6:.1f} MB (x{bf16_bytes / mixed_bytes:.2f})")
-    print("  columns: mixed = bare GEMM | +norm = +attn_norm fold (attn_ssq) | "
-          "+norm+ssq+hc = +attn_norm + q/kv_ssq folds + MHC post/comb tail")
-    print(f"  {'M':<5} {'mixed(us)':<10} {'+norm':<8} {'+norm+ssq+hc':<13} "
+    print("  columns: mixed = bare GEMM | +hc = +MHC post/comb tail "
+          "(x arrives pre-normed; q/kv ssq live in the wq_b quant prologue)")
+    print(f"  {'M':<5} {'mixed(us)':<10} {'+hc(us)':<9} "
           f"{'cb_bf16(us)':<12} {'cb_fp8(us)':<11} {'mixed_BW':<9} {'x_bf16':<7}")
-    print("  " + "-" * 78)
+    print("  " + "-" * 70)
 
     one = torch.ones((), device='cuda', dtype=torch.float32)
     for m in (2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128):
@@ -220,7 +203,6 @@ def benchmark(module):
 
         # correctness gate BEFORE timing (never report perf on wrong results)
         got = module.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                      q_ssq=None, kv_ssq=None, attn_ssq=None,
                                       hc_mix=None, hc_base=None, hc_scale=None,
                                       hc_post=None, hc_comb=None, out=out)
         d8 = calc_diff(got[:m, :N_FP8].float(),
@@ -231,26 +213,14 @@ def benchmark(module):
 
         mixed = 1e6 * bench_kineto(
             lambda: module.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                            q_ssq=None, kv_ssq=None, attn_ssq=None,
                                             hc_mix=None, hc_base=None, hc_scale=None,
                                             hc_post=None, hc_comb=None, out=out),
             'front_mixed_kernel', suppress_kineto_output=True)
-        # +norm: ONLY the attn_norm fold on (isolates its overhead)
-        attn_ssq = xm.float().pow(2).sum(-1).contiguous()
-        wnorm = 1e6 * bench_kineto(
-            lambda: module.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                            q_ssq=None, kv_ssq=None, attn_ssq=attn_ssq,
-                                            hc_mix=None, hc_base=None, hc_scale=None,
-                                            hc_post=None, hc_comb=None, out=out),
-            'front_mixed_kernel', suppress_kineto_output=True)
-        # +all: ssq folds + hc tail + attn_norm fold together
-        q_ssq = torch.zeros(mp, device='cuda', dtype=torch.float32)
-        kv_ssq = torch.zeros(mp, device='cuda', dtype=torch.float32)
+        # +hc: MHC post/comb tail on (production form)
         hc = make_hc(mp, seed=m + 7)
         wssq = 1e6 * bench_kineto(
             lambda: module.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
-                                            out=out, q_ssq=q_ssq, kv_ssq=kv_ssq,
-                                            attn_ssq=attn_ssq, **hc),
+                                            out=out, **hc),
             'front_mixed_kernel', suppress_kineto_output=True)
         cb = 1e6 * sum(bench_kineto(
             lambda: torch.mm(x, w_all.t(), out=cb_out),
@@ -270,7 +240,7 @@ def benchmark(module):
 
         io_bytes = mixed_bytes + mp * (K * 2 + K + SF_K) + mp * N * 2
         bw = io_bytes / (mixed * 1e-6) / 1e9
-        print(f"  {m:<5} {mixed:<10.1f} {wnorm:<8.1f} {wssq:<13.1f} {cb:<12.1f} "
+        print(f"  {m:<5} {mixed:<10.1f} {wssq:<9.1f} {cb:<12.1f} "
               f"{cb8_s} {bw:<9.1f} {cb / mixed:<7.2f}")
 
 
