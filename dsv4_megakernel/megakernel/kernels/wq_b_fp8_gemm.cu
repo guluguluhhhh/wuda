@@ -74,12 +74,6 @@ struct SharedStorage {
 
     // TMEM base address
     alignas(16) uint32_t tmem_base;
-
-    // Fused quant prologue: this launch's grid-barrier target (monotonic
-    // ticket counter value the x_fp8/x_sf readers spin to) + the per-row
-    // block-partial ssq scratch (rmsnorm variant).
-    alignas(16) uint32_t quant_target;
-    alignas(16) float quant_ssq[NUM_K_TILES];
 };
 
 // Compile-time guard: SwapDims::NUM_STAGES comes from an OVERHEAD ESTIMATE in
@@ -124,6 +118,47 @@ head_ssq_kernel(
         ssq[h] = s;
 }
 
+// ======================== Activation quant kernel (PDL producer) ========
+// rmsnorm(gamma) + 1x128 quant (or plain quant when gamma == nullptr) of the
+// bf16 activation, launched on the SAME stream right before the merged GEMM
+// with PDL (DeepGEMM discipline). The GEMM's prologue (barrier init / TMEM
+// alloc / descriptor prefetch) overlaps this kernel; its
+// cudaGridDependencySynchronize -- already after that prologue -- provides the
+// cross-kernel ordering the old in-kernel grid ticket used to (whose sync
+// floor was ~1.5-2us on the activation-TMA critical path).
+// 192 threads = 6 warps, 2 K128 blocks each per 1536-wide row.
+__global__ void __launch_bounds__(192, 1)
+qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
+                   const float* __restrict__ gamma, float eps,
+                   __nv_fp8_e4m3* __restrict__ x_fp8,
+                   uint8_t* __restrict__ x_sf, int m_total) {
+    __shared__ float ssq_smem[NUM_K_TILES];
+    const int warp_id = (int)(threadIdx.x / 32);
+    const int lane_id = (int)(threadIdx.x % 32);
+    if (gamma != nullptr) {
+        for (int r = blockIdx.x; r < m_total; r += gridDim.x)
+            qnorm_quant_row_cta(y + (size_t)r * lda, gamma, eps, ssq_smem,
+                                warp_id, lane_id, /*nwarps=*/6,
+                                /*bar_threads=*/192, /*bar_id=*/0,
+                                x_fp8 + (size_t)r * K_DIM,
+                                x_sf + r * NUM_K_TILES);
+    } else {
+        const int gwarp = blockIdx.x * 6 + warp_id;
+        const int gwarps = gridDim.x * 6;
+        const int nqb = m_total * NUM_K_TILES;
+        for (int qb = gwarp; qb < nqb; qb += gwarps) {
+            const int m = qb / NUM_K_TILES, b = qb % NUM_K_TILES;
+            quant_k128_ue8m0(y + (size_t)m * lda + b * BLOCK_K + lane_id * 4,
+                             lane_id,
+                             x_fp8 + (size_t)m * K_DIM + b * BLOCK_K,
+                             x_sf + m * NUM_K_TILES + b);
+        }
+    }
+    // Early-launch hint for the dependent GEMM (all stores above are program-
+    // ordered before it; the GEMM's GDS gives the cross-kernel memory order).
+    asm volatile("griddepcontrol.launch_dependents;");
+}
+
 // ======================== Kernel ========================
 // MERGED-ONLY (N = 73728): the indexer wq_b weight is concatenated after the
 // main q weight. iq tiles are DRAINED by the store warps (TMEM -> L2 scratch ->
@@ -149,7 +184,6 @@ wq_b_proj_kernel(
     const float* __restrict__ rope_sin,           // [max_pos, 32]
     int mock_post,                                 // 1 = drain only, skip the transform (baseline)
     const __grid_constant__ idx_comp::Args comp,   // fused indexer compressor (kv==nullptr => off)
-    const __grid_constant__ QuantProArgs qp,       // fused activation-quant prologue (y==nullptr => off)
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
     using Dims = SwapDims<M_TPL>;
@@ -174,51 +208,6 @@ wq_b_proj_kernel(
     const uint32_t lane_id  = ptx::get_lane_idx();
     const uint32_t cta_rank = ptx::block_rank_in_cluster();
     const bool is_leader    = (cta_rank == 0);
-
-    // ================================================================
-    // FUSED ACTIVATION-QUANT (delivery opB port; AT KERNEL ENTRY so the quant
-    // memory wave overlaps barrier-init / TMEM alloc / cluster_syncs below).
-    // PLAIN 1x128 block quant: one warp per K128 block, M*12 blocks over the
-    // whole grid, single load wave. Grid-release via the monotonic ticket;
-    // ONLY the x_fp8/x_sf readers gate on it -- warp2 at its role entry,
-    // warp0 gates just its ACTIVATION TMA lazily (weight stream never waits).
-    // Padded rows (>= problem_m): no quant (TMA OOB zero-fills their loads).
-    // NOTE: reads qp.y at kernel entry -- legal ONLY while this kernel is
-    // launched WITHOUT programmatic dependent launch (GDS below is unpaired);
-    // with PDL the quant must move after cudaGridDependencySynchronize().
-    // ================================================================
-    if (qp.y != nullptr) {
-        const int nwarps = (int)(blockDim.x / 32);
-        if (qp.gamma != nullptr) {
-            // rmsnorm(gamma) + quant: one CTA per ROW, whole-CTA wide (the
-            // 12 blocks split over the warps; ONE load wave for v + gamma).
-            for (int r = (int)blockIdx.x; r < problem_m; r += num_blocks)
-                qnorm_quant_row_cta(qp.y + (size_t)r * qp.lda, qp.gamma,
-                                    qp.eps, s.quant_ssq,
-                                    (int)warp_id, (int)lane_id, nwarps,
-                                    qp.x_fp8 + (size_t)r * K_DIM,
-                                    qp.x_sf + r * NUM_K_TILES);
-        } else {
-            // PLAIN 1x128 quant (isolation path): one warp per K128 block.
-            const int gwarp = blockIdx.x * nwarps + (int)warp_id;
-            const int gwarps = num_blocks * nwarps;
-            const int nqb = problem_m * NUM_K_TILES;
-            for (int qb = gwarp; qb < nqb; qb += gwarps) {
-                const int m = qb / NUM_K_TILES, b = qb % NUM_K_TILES;
-                quant_k128_ue8m0(qp.y + (size_t)m * qp.lda + b * BLOCK_K + lane_id * 4,
-                                 (int)lane_id,
-                                 qp.x_fp8 + (size_t)m * K_DIM + b * BLOCK_K,
-                                 qp.x_sf + m * NUM_K_TILES + b);
-            }
-        }
-        __syncthreads();                   // CTA-local: all quant stores issued
-        if (threadIdx.x == 0) {
-            __threadfence();               // release the quant writes to L2 (TMA-visible)
-            const uint32_t old = atomicAdd(qp.sync, 1u);
-            s.quant_target = (old / (uint32_t)num_blocks + 1u) * (uint32_t)num_blocks;
-        }
-        __syncthreads();                   // publish s.quant_target
-    }
 
     // ================================================================
     // INITIALIZATION
@@ -265,10 +254,6 @@ wq_b_proj_kernel(
     if (warp_id == 0 && ptx::elect_one_sync()) {
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
-        // Fused quant: gate ONLY the activation load, lazily on the first
-        // issue (the weight TMA below overlaps the grid barrier).
-        const uint32_t quant_tgt = (qp.y != nullptr) ? s.quant_target : 0u;
-        bool act_synced = (qp.y == nullptr);
 
         // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
         // async transform overlap the remaining main tiles' weight stream; all
@@ -291,12 +276,7 @@ wq_b_proj_kernel(
 
                     auto* sa  = reinterpret_cast<__nv_fp8_e4m3*>(s.smem_a + stage * SA);
                     auto* sb  = reinterpret_cast<__nv_fp8_e4m3*>(s.smem_b + stage * SMEM_B_PER_STAGE);
-                    // WEIGHT first: quant-independent, overlaps the grid barrier.
                     tma::copy_2d_fp8(&desc_B, &s.full_barriers[stage], sb, k_off, n_base);
-                    if (!act_synced) {     // gate the activation load, once
-                        while (ptx::ld_acquire_gpu_u32(qp.sync) < quant_tgt) {}
-                        act_synced = true;
-                    }
                     tma::copy_2d_fp8(&desc_A, &s.full_barriers[stage], sa, k_off, m_base);
 
                     constexpr uint32_t kNumArrivalBytes = SA + SMEM_B_PER_STAGE;
@@ -323,15 +303,6 @@ wq_b_proj_kernel(
     else if (warp_id == 2) {
         uint32_t stage = 0, phase = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
-        // Fused quant: this warp reads x_sf from gmem -> block on the grid
-        // barrier before the first row (delivery opB's SF-reader gate).
-        if (qp.y != nullptr) {
-            if (ptx::elect_one_sync()) {
-                const uint32_t tgt = s.quant_target;
-                while (ptx::ld_acquire_gpu_u32(qp.sync) < tgt) {}
-            }
-            __syncwarp();
-        }
 
         // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
         // async transform overlap the remaining main tiles' weight stream; all
@@ -1007,30 +978,26 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
     }
 
-    // ---- fused activation-quant prologue bundle (isolation: quant ONLY) ----
-    QuantProArgs qp{};
-    static thread_local torch::Tensor quant_sync_t;   // MONOTONIC ticket: init once, never reset
-    if (q_y.has_value() && q_y->numel() > 0) {
+    // ---- activation quant producer (PDL; replaces the in-kernel grid ticket) ----
+    const bool quant_on = q_y.has_value() && q_y->numel() > 0;
+    const __nv_bfloat16* qy_ptr = nullptr;
+    const float* qgamma_ptr = nullptr;
+    int64_t qy_lda = 0;
+    if (quant_on) {
         TORCH_CHECK(q_y->is_cuda() && q_y->scalar_type() == torch::kBFloat16 &&
                     q_y->dim() == 2 && q_y->size(0) == M &&
                     q_y->size(1) == K_DIM && q_y->stride(1) == 1 &&
                     q_y->stride(0) % 4 == 0,
                     "q_y must be bf16 [M,", K_DIM, "] with stride(1)==1 and "
                     "16B-aligned rows (strided views of front y are fine)");
-        if (!quant_sync_t.defined() || quant_sync_t.device() != x_fp8.device())
-            quant_sync_t = torch::zeros({1}, x_fp8.options().dtype(torch::kInt32));
-        qp.y     = reinterpret_cast<const __nv_bfloat16*>(q_y->data_ptr());
-        qp.lda   = q_y->stride(0);
-        qp.x_fp8 = const_cast<__nv_fp8_e4m3*>(x_ptr);
-        qp.x_sf  = const_cast<uint8_t*>(xsf_ptr);
-        qp.sync  = reinterpret_cast<uint32_t*>(quant_sync_t.data_ptr());
+        qy_ptr = reinterpret_cast<const __nv_bfloat16*>(q_y->data_ptr());
+        qy_lda = q_y->stride(0);
         if (q_norm_w.has_value() && q_norm_w->numel() > 0) {
             TORCH_CHECK(q_norm_w->is_cuda() && q_norm_w->is_contiguous() &&
                         q_norm_w->scalar_type() == torch::kFloat32 &&
                         q_norm_w->numel() == K_DIM,
                         "q_norm_w must be fp32 [", K_DIM, "]");
-            qp.gamma = q_norm_w->data_ptr<float>();
-            qp.eps   = static_cast<float>(q_eps);
+            qgamma_ptr = q_norm_w->data_ptr<float>();
         }
     }
 
@@ -1064,25 +1031,46 @@ static std::vector<torch::Tensor> run_wq_b(
         dim3 block((mock_post && !comp_on && !win_on) ? TPB : TPB_IDX, 1, 1);
         int mock_i = mock_post ? 1 : 0;
 
+        // Activation quant producer: launched FIRST on the same stream; the
+        // GEMM below is PDL-linked (programmatic stream serialization), so its
+        // prologue overlaps the quant and its GDS provides the ordering.
+        if (quant_on) {
+            const int qgrid = qgamma_ptr
+                ? M                                             // one CTA per row
+                : (M * NUM_K_TILES + 5) / 6;                    // one warp per K128 block
+            qnorm_quant_kernel<<<qgrid, 192, 0, stream>>>(
+                qy_ptr, qy_lda, qgamma_ptr, static_cast<float>(q_eps),
+                const_cast<__nv_fp8_e4m3*>(x_ptr),
+                const_cast<uint8_t*>(xsf_ptr), M);
+        }
+
         cudaLaunchConfig_t config = {};
         config.gridDim = grid;
         config.blockDim = block;
         config.dynamicSmemBytes = smem_bytes;
         config.stream = stream;
 
-        cudaLaunchAttribute attrs[1];
+        cudaLaunchAttribute attrs[2];
         attrs[0].id = cudaLaunchAttributeClusterDimension;
         attrs[0].val.clusterDim.x = CLUSTER_SIZE;
         attrs[0].val.clusterDim.y = 1;
         attrs[0].val.clusterDim.z = 1;
         config.attrs = attrs;
         config.numAttrs = 1;
+        if (quant_on) {
+            // PDL only when a producer is in flight: an unconditional flag
+            // would let the GEMM overlap whatever ran before it (e.g. the
+            // benchmark's L2-flush kernel), skewing timings.
+            attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[config.numAttrs].val.programmaticStreamSerializationAllowed = 1;
+            config.numAttrs++;
+        }
 
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &ssq_ptr,
             &iq_fp4_ptr, &iq_sf_ptr, &iq_ws_ptr, &q_pos_ptr, &cos_ptr, &sin_ptr,
-            &mock_i, &comp, &qp, &prof_dev
+            &mock_i, &comp, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));

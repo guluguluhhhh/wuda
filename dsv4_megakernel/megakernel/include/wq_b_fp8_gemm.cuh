@@ -171,13 +171,11 @@ template <int M_> struct SwapDims {
 
     // Number of pipeline stages fitting the SMEM budget.
     // Overhead: smem_cd + barriers(full/empty/with_sf per stage + tmem full/empty) + tmem_ptr
-    //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding)
-    //           + the fused-quant grid-barrier target + per-row block-partial
-    //             ssq scratch (alignas(16) u32 + 12 floats -> 64B).
+    //           + the head_ssq per-warp scratch (4 x BM floats, RMSNorm scale folding).
     // (The fused indexer compressor is fully register-resident -- no smem term.)
     static constexpr int SMEM_BARRIERS = (16 * 3 + NUM_EPI_STAGES * 2) * 8;
     static constexpr int SMEM_OVERHEAD = SMEM_CD_TOTAL + SMEM_BARRIERS + 8
-                                         + 4 * BM * (int)sizeof(float) + 64;
+                                         + 4 * BM * (int)sizeof(float);
     static constexpr int STAGES_RAW    = (SMEM_CAPACITY - SMEM_OVERHEAD) / SMEM_PER_STAGE;
     static constexpr int NUM_STAGES    = STAGES_RAW > 12 ? 12 : STAGES_RAW;
 };
@@ -278,13 +276,6 @@ __device__ __forceinline__ bool elect_one_sync() {
     return pred != 0;
 }
 
-// gpu-scope acquire load (the fused-quant grid barrier's spin read)
-__device__ __forceinline__ uint32_t ld_acquire_gpu_u32(const uint32_t* ptr) {
-    uint32_t v;
-    asm volatile("ld.acquire.gpu.b32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
-    return v;
-}
-
 __device__ __forceinline__ long long rdclock() {
     long long t;
     asm volatile("mov.u64 %0, %%clock64;" : "=l"(t) :: "memory");
@@ -319,21 +310,12 @@ void store_2d(void const* desc_ptr, void* smem_ptr,
 
 } // namespace tma
 
-// ==================== Fused activation-quant prologue (delivery opB port) ====
-// PLAIN 1x128 block quant ONLY (no rmsnorm -- isolation experiment): one warp
-// quantizes one K128 block, single memory wave, M*12 blocks spread over the
-// whole grid. sync is a MONOTONIC ticket (never reset across launches).
+// ==================== Activation rmsnorm+quant chain (PDL producer) =========
+// Device chain for the STANDALONE qnorm_quant kernel launched right before the
+// merged GEMM with PDL (DeepGEMM discipline: the producer is its own kernel;
+// the GEMM's cudaGridDependencySynchronize -- placed AFTER its prologue --
+// replaces the old in-kernel grid ticket, whose sync floor was ~1.5-2us).
 namespace wq_b {
-
-struct QuantProArgs {
-    const __nv_bfloat16* y = nullptr;   // [M, lda] bf16 (front y[:, :1536] view)
-    int64_t lda            = 0;         // row stride in ELEMENTS (lda % 4 == 0)
-    const float* gamma     = nullptr;   // [K_DIM] q_norm weight (null => plain quant)
-    float eps              = 1e-6f;
-    __nv_fp8_e4m3* x_fp8   = nullptr;   // [M, K_DIM] e4m3 out (desc_A's buffer)
-    uint8_t* x_sf          = nullptr;   // [M, NUM_K_TILES] UE8M0 out
-    uint32_t* sync         = nullptr;   // monotonic grid ticket counter
-};
 
 // fp8(e4m3) + native-UE8M0 quant of ONE K128 block, one WARP per block
 // (byte-exact port of delivery tile::quant_k128_ue8m0): 4 bf16 elems/lane ->
@@ -363,18 +345,19 @@ __device__ __forceinline__ void quant_k128_ue8m0(
         *sf_dst = (uint8_t)(scale_exp + 127);
 }
 
-// rmsnorm(gamma) + 1x128 quant of ONE row, whole-CTA wide (the delivery
-// block-parallel shape, NOT the slow one-warp-per-row chain): the CTA's
-// warps split the 12 K128 blocks (<= 2 each); ONE memory wave loads v AND
-// gamma together; block partial ssq (fixed shfl tree) -> ssq_smem[12] ->
-// syncthreads -> every warp sums in FIXED block order (bitwise identical)
-// -> r -> qr = bf16((v*r)*gamma) materialized round -> quant_k128 tail.
-// MUST be called by ALL threads of the CTA (contains __syncthreads).
+// rmsnorm(gamma) + 1x128 quant of ONE row, QUANT-GROUP wide (warps 2..7, 192
+// threads -- warp0/1 stay OFF the quant path so the weight TMA stream starts
+// at t=0): the group's warps split the 12 K128 blocks (2 each); ONE memory
+// wave loads v AND gamma together; block partial ssq (fixed shfl tree) ->
+// ssq_smem[12] -> group barrier -> every warp sums in FIXED block order
+// (bitwise identical) -> r -> qr = bf16((v*r)*gamma) materialized round ->
+// quant_k128 tail. MUST be called by ALL bar_threads of barrier bar_id.
 __device__ __forceinline__ void qnorm_quant_row_cta(
     const __nv_bfloat16* __restrict__ yrow,      // [1536] strided row base
     const float* __restrict__ gamma,             // [1536]
     float eps, float* __restrict__ ssq_smem,     // [NUM_K_TILES] CTA scratch
     int warp_id, int lane_id, int nwarps,
+    int bar_threads, int bar_id,
     __nv_fp8_e4m3* __restrict__ qf_row,          // [1536] e4m3 out
     uint8_t* __restrict__ qsf_row) {             // [12] UE8M0 out
     float v[2][4], g[2][4];
@@ -400,7 +383,7 @@ __device__ __forceinline__ void qnorm_quant_row_cta(
         if (lane_id == 0)
             ssq_smem[b] = ps;
     }
-    __syncthreads();                             // block partials visible
+    cutlass::arch::NamedBarrier::sync(bar_threads, bar_id);   // partials visible
     float ssq = 0.f;
     #pragma unroll
     for (int j = 0; j < NUM_K_TILES; ++j)        // FIXED order -> bitwise
@@ -432,7 +415,7 @@ __device__ __forceinline__ void qnorm_quant_row_cta(
         if (lane_id == 0)
             qsf_row[b] = (uint8_t)(e + 127);
     }
-    __syncthreads();                             // ssq_smem reuse guard
+    cutlass::arch::NamedBarrier::sync(bar_threads, bar_id);   // ssq_smem reuse guard
 }
 
 } // namespace wq_b
