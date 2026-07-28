@@ -149,62 +149,47 @@ def test_correctness(module, positions):
                 f"{mean_rel:12.4e} {('PASS' if ok else 'FAIL'):>8}"
             )
 
-        # attn_ssq fold (collapse-side): self-consistent reference = sum of
-        # squares of the kernel's OWN bf16 collapsed output (RED order -> rtol).
-        # Verified on BOTH variants -- the collapse warp split differs (pc:
-        # warps 1-7, no-pc/lite: all 8) and production defaults to no-pc.
+        # fused attn_norm (lite only, the PRODUCTION form): reference =
+        # separate-norm chain applied to the kernel's OWN raw bf16 collapsed
+        # (from a plain lite run). The in-block ssq order differs from torch's
+        # sum -> r may differ by ~1ulp fp32; report the bitwise match rate and
+        # gate on allclose. (The old attn_ssq RED fold was deleted: the fused
+        # norm computes its ssq in-block and nothing consumes it anymore.)
         hs2 = hidden.contiguous().view(-1, K_DIM)
         mm = hs2.size(0)
-        for wpc, tag in ((False, "ssq(nopc)"), (True, "ssq(pc)")):
-            collapsed2 = torch.empty(mm, DIM, device="cuda", dtype=torch.bfloat16)
-            pre2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
-            post2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
-            comb2 = torch.empty(mm, HC, HC, device="cuda", dtype=torch.float32)
-            attn_ssq = torch.zeros(mm, device="cuda", dtype=torch.float32)
-            module.hc_fused_forward_out(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed2, pre2, post2, comb2, attn_ssq, with_post_comb=wpc
-            )
-            torch.cuda.synchronize()
-            ssq_ref = collapsed2.float().pow(2).sum(-1)
-            ssq_ok = torch.allclose(attn_ssq, ssq_ref, rtol=1e-4, atol=1e-6)
-            all_ok &= ssq_ok
-            print(
-                f"{m:6d} {tag:>10} "
-                f"{(attn_ssq - ssq_ref).abs().max().item():12.4e} "
-                f"{'':>12} {'':>12} {('PASS' if ssq_ok else 'FAIL'):>8}"
-            )
-            if not wpc:
-                # fused attn_norm (lite only): reference = separate-norm chain
-                # applied to the kernel's OWN raw bf16 collapsed. The in-block
-                # ssq order differs from torch's sum -> r may differ by ~1ulp
-                # fp32; report the bitwise match rate and gate on allclose.
-                norm_w = (torch.rand(DIM, device="cuda", dtype=torch.float32)
-                          + 0.5)
-                collapsed3 = torch.empty(mm, DIM, device="cuda",
-                                         dtype=torch.bfloat16)
-                ssq3 = torch.zeros(mm, device="cuda", dtype=torch.float32)
-                module.hc_fused_forward_out(
-                    hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                    collapsed3, pre2, post2, comb2, ssq3,
-                    with_post_comb=False, attn_norm_w=norm_w,
-                    attn_norm_eps=RMS_NORM_EPS)
-                torch.cuda.synchronize()
-                xb = collapsed2.float()                      # raw bf16 collapsed
-                r = torch.rsqrt(xb.pow(2).sum(-1, keepdim=True) / DIM
-                                + RMS_NORM_EPS)
-                nref = ((xb * r) * norm_w).to(torch.bfloat16)
-                bitmatch = (collapsed3.view(torch.int16) ==
-                            nref.view(torch.int16)).float().mean().item()
-                nrm_ok = torch.allclose(collapsed3.float(), nref.float(),
-                                        rtol=1e-2, atol=1e-3)
-                all_ok &= nrm_ok
-                print(
-                    f"{m:6d} {'fusednorm':>10} "
-                    f"{(collapsed3.float() - nref.float()).abs().max().item():12.4e} "
-                    f"{'bit=' + format(bitmatch, '.4f'):>12} {'':>12} "
-                    f"{('PASS' if nrm_ok else 'FAIL'):>8}"
-                )
+        collapsed2 = torch.empty(mm, DIM, device="cuda", dtype=torch.bfloat16)
+        pre2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
+        post2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
+        comb2 = torch.empty(mm, HC, HC, device="cuda", dtype=torch.float32)
+        module.hc_fused_forward_out(
+            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+            collapsed2, pre2, post2, comb2, with_post_comb=False
+        )
+        norm_w = (torch.rand(DIM, device="cuda", dtype=torch.float32)
+                  + 0.5)
+        collapsed3 = torch.empty(mm, DIM, device="cuda",
+                                 dtype=torch.bfloat16)
+        module.hc_fused_forward_out(
+            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
+            collapsed3, pre2, post2, comb2,
+            with_post_comb=False, attn_norm_w=norm_w,
+            attn_norm_eps=RMS_NORM_EPS)
+        torch.cuda.synchronize()
+        xb = collapsed2.float()                      # raw bf16 collapsed
+        r = torch.rsqrt(xb.pow(2).sum(-1, keepdim=True) / DIM
+                        + RMS_NORM_EPS)
+        nref = ((xb * r) * norm_w).to(torch.bfloat16)
+        bitmatch = (collapsed3.view(torch.int16) ==
+                    nref.view(torch.int16)).float().mean().item()
+        nrm_ok = torch.allclose(collapsed3.float(), nref.float(),
+                                rtol=1e-2, atol=1e-3)
+        all_ok &= nrm_ok
+        print(
+            f"{m:6d} {'fusednorm':>10} "
+            f"{(collapsed3.float() - nref.float()).abs().max().item():12.4e} "
+            f"{'bit=' + format(bitmatch, '.4f'):>12} {'':>12} "
+            f"{('PASS' if nrm_ok else 'FAIL'):>8}"
+        )
         del hidden, expected, actual
 
     print("-" * 68)
@@ -281,7 +266,7 @@ def benchmark(module, positions):
     print("  gemm/reduce/activ/sinkhorn/collapse = clock64 stage")
     print("  medians (exclude launch/gap); sinkhorn \u2016 collapse run concurrently.")
     print(
-        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} {'nopc+ssq':>8} "
+        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} "
         f"{'+nrm':>8} {'cuBLAS':>9} "
         f"{'gemm':>8} {'reduce':>8} {'activ':>7} {'sinkhrn':>8} {'collapse':>9}"
     )
@@ -300,33 +285,23 @@ def benchmark(module, positions):
         mhc_us = time_cuda_us(
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, None, with_post_comb=True),
+                collapsed, pre, post, comb, with_post_comb=True),
             ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
         )
         # A/B: same op minus post/comb (+Sinkhorn); correctness sentinel on pre.
         nopc_us = time_cuda_us(
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, None, with_post_comb=False),
-            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
-        )
-        # +ssq: the PRODUCTION default path (no-pc) with the attn_norm ssq fold
-        # on (RED-accumulates into attn_ssq; garbage across iters is
-        # latency-neutral). Overhead = this column minus no-pc.
-        attn_ssq = torch.zeros(m, device=dev, dtype=torch.float32)
-        ssq_us = time_cuda_us(
-            lambda: module.hc_fused_forward_out(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, attn_ssq, with_post_comb=False),
+                collapsed, pre, post, comb, with_post_comb=False),
             ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
         )
         # +nrm: lite + FULLY fused attn_norm (two-phase collapse; gamma+r+ssq
-        # all in-block). Overhead = this column minus no-pc.
+        # all in-block) -- the PRODUCTION form. Overhead = this minus no-pc.
         norm_w = torch.rand(DIM, device=dev, dtype=torch.float32) + 0.5
         nrm_us = time_cuda_us(
             lambda: module.hc_fused_forward_out(
                 hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, attn_ssq,
+                collapsed, pre, post, comb,
                 with_post_comb=False, attn_norm_w=norm_w,
                 attn_norm_eps=RMS_NORM_EPS),
             ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
@@ -336,7 +311,7 @@ def benchmark(module, positions):
         gemm, reduce, activ, sinkhorn, collapse = profile_stages(
             module, hidden, weight, base, scale)
         print(
-            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} {ssq_us:8.3f} "
+            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} "
             f"{nrm_us:8.3f} {cublas_us:9.3f} "
             f"{gemm:8.3f} {reduce:8.3f} {activ:7.3f} {sinkhorn:8.3f} {collapse:9.3f}"
         )

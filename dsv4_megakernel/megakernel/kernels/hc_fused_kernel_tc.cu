@@ -54,7 +54,6 @@ hc_reduce_and_fuse_kernel(
     float* __restrict__ pre_out,
     float* __restrict__ post_out,
     float* __restrict__ comb_out,
-    float* __restrict__ attn_ssq,        // [M] attn_norm ssq fold (null=>off; zero-init)
     const float* __restrict__ attn_norm_w,   // [7168] attn_norm gamma (kFusedNorm)
     float attn_norm_eps,
     int64_t* __restrict__ prof) {
@@ -244,7 +243,6 @@ hc_reduce_and_fuse_kernel(
                 #pragma unroll
                 for (int w = 0; w < EPILOGUE_THREADS / 32; ++w) total += comb_smem[w];
                 sqsum_smem[0] = rsqrtf(total / static_cast<float>(DIM) + attn_norm_eps);
-                if (attn_ssq != nullptr) attn_ssq[pos] = total;   // exact, no atomics
             }
             __syncthreads();
             const float r = sqsum_smem[0];
@@ -265,13 +263,9 @@ hc_reduce_and_fuse_kernel(
                 *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
             }
         } else {
-        // attn_norm ssq fold: the NEXT op (front_mixed GEMM) needs
-        // sum(collapsed_bf16^2) per row for its folded attn_norm (weight burned
-        // into its GEMM weights; it applies rsqrt(ssq/DIM+eps) in its epilogue).
-        // Accumulate the BF16-ROUNDED values we are about to store -- exactly
-        // what the consumer reads back -- and finish with one warp-reduced
-        // atomic per warp (no extra barrier; runs concurrently with Sinkhorn).
-        float local_ssq = 0.f;
+        // Streaming collapse: out = bf16(sum_h pre_r[h] * x_h), no norm (the
+        // fused attn_norm variant above is the production form; the old
+        // attn_ssq RED fold was deleted with its last consumer).
         for (int vi = lane_vec; vi < DIM / VEC; vi += nthreads) {
             const int d0 = vi * VEC;
             float acc[VEC];
@@ -292,21 +286,7 @@ hc_reduce_and_fuse_kernel(
             #pragma unroll
             for (int k = 0; k < VEC / 2; ++k)
                 out2[k] = __float22bfloat162_rn(make_float2(acc[2 * k], acc[2 * k + 1]));
-            if (attn_ssq != nullptr) {
-                #pragma unroll
-                for (int k = 0; k < VEC / 2; ++k) {
-                    const float2 f = __bfloat1622float2(out2[k]);
-                    local_ssq += f.x * f.x + f.y * f.y;
-                }
-            }
             *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
-        }
-        if (attn_ssq != nullptr && !kFusedNorm) {
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1)
-                local_ssq += __shfl_down_sync(0xffffffffu, local_ssq, o);
-            if ((threadIdx.x & 31) == 0)
-                atomicAdd(attn_ssq + pos, local_ssq);
         }
         }   // !kFusedNorm (streaming collapse)
         if (prof0 && threadIdx.x == COLLAPSE_BASE) prof[7] = ptx::rdclock();  // collapse end
@@ -350,7 +330,7 @@ static void hc_launch_core(
     const float* base_ptr, const float* scale_ptr,
     float hc_eps, float rms_eps,
     __nv_bfloat16* collapsed_ptr, float* pre_ptr, float* post_ptr, float* comb_ptr,
-    int64_t* prof_dev, bool with_post_comb = true, float* attn_ssq_ptr = nullptr,
+    int64_t* prof_dev, bool with_post_comb = true,
     const float* attn_norm_w = nullptr, float attn_norm_eps = 1e-6f) {
     const int m = static_cast<int>(hs.size(0));
     const SplitConfig cfg = make_split_config(m);
@@ -413,17 +393,17 @@ static void hc_launch_core(
         hc_reduce_and_fuse_kernel<true, false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
             x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
             m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
-            attn_ssq_ptr, nullptr, attn_norm_eps, prof_dev);
+            nullptr, attn_norm_eps, prof_dev);
     } else if (attn_norm_w != nullptr) {
         hc_reduce_and_fuse_kernel<false, true><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
             x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
             m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
-            attn_ssq_ptr, attn_norm_w, attn_norm_eps, prof_dev);
+            attn_norm_w, attn_norm_eps, prof_dev);
     } else {
         hc_reduce_and_fuse_kernel<false, false><<<m, EPILOGUE_THREADS, fuse_smem_bytes, stream>>>(
             x_ptr, workspace_ptr, sqr_sum_ptr, base_ptr, scale_ptr, hc_eps, rms_eps,
             m, cfg.num_splits, collapsed_ptr, pre_ptr, post_ptr, comb_ptr,
-            attn_ssq_ptr, nullptr, attn_norm_eps, prof_dev);
+            nullptr, attn_norm_eps, prof_dev);
     }
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "HC reduce/fuse launch failed: ", cudaGetErrorString(cudaGetLastError()));
@@ -485,7 +465,6 @@ static void hc_fused_forward_out(
     torch::Tensor attn_hc_base, torch::Tensor attn_hc_scale,
     double hc_eps, double rms_norm_eps,
     torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post, torch::Tensor comb,
-    c10::optional<torch::Tensor> attn_ssq,
     bool with_post_comb,
     c10::optional<torch::Tensor> attn_norm_w,
     double attn_norm_eps) {
@@ -510,15 +489,6 @@ static void hc_fused_forward_out(
                 comb.scalar_type() == torch::kFloat32,
                 "pre/post/comb must be contiguous fp32 [m,HC]/[m,HC]/[m,HC,HC]");
 
-    float* attn_ssq_ptr = nullptr;
-    if (attn_ssq.has_value() && attn_ssq->numel() > 0) {
-        TORCH_CHECK(attn_ssq->is_cuda() && attn_ssq->is_contiguous() &&
-                    attn_ssq->scalar_type() == torch::kFloat32 &&
-                    attn_ssq->numel() >= m,
-                    "attn_ssq must be contiguous fp32 [m] (caller zero-inits)");
-        attn_ssq_ptr = attn_ssq->data_ptr<float>();
-    }
-
     const float* attn_norm_w_ptr = nullptr;
     if (attn_norm_w.has_value() && attn_norm_w->numel() > 0) {
         TORCH_CHECK(!with_post_comb,
@@ -534,7 +504,7 @@ static void hc_fused_forward_out(
                    static_cast<float>(hc_eps), static_cast<float>(rms_norm_eps),
                    reinterpret_cast<__nv_bfloat16*>(collapsed.data_ptr()),
                    pre.data_ptr<float>(), post.data_ptr<float>(), comb.data_ptr<float>(),
-                   nullptr, with_post_comb, attn_ssq_ptr,
+                   nullptr, with_post_comb,
                    attn_norm_w_ptr, static_cast<float>(attn_norm_eps));
 }
 
@@ -583,12 +553,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MHC fused forward into preallocated {collapsed,pre,post,comb} (no alloc, no return); "
           "with_post_comb=False (DEFAULT, production) = lite: full reduce, but post/comb "
           "activation + Sinkhorn dropped (they run in front_mixed's TC/CC tail warp) and "
-          "ALL warps collapse; attn_ssq is REQUIRED (production default ON; pass None "
-          "explicitly to disable the attn_norm ssq fold)",
+          "ALL warps collapse; attn_norm_w (lite only) fuses the FULL attn_norm -- the "
+          "production form (the old attn_ssq fold was deleted with its last consumer)",
           py::arg("hidden_states"), py::arg("attn_hc_fn"), py::arg("attn_hc_base"),
           py::arg("attn_hc_scale"), py::arg("hc_eps"), py::arg("rms_norm_eps"),
           py::arg("collapsed"), py::arg("pre"), py::arg("post"), py::arg("comb"),
-          py::arg("attn_ssq"),
           py::arg("with_post_comb") = false,
           py::arg("attn_norm_w") = c10::nullopt,
           py::arg("attn_norm_eps") = 1e-6);
