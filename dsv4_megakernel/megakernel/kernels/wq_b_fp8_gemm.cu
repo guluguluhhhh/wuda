@@ -777,7 +777,17 @@ static std::vector<torch::Tensor> run_wq_b(
     // When q_y is given, x_fp8/x_sf are OUTPUT buffers written by the kernel.
     c10::optional<torch::Tensor> q_y      = c10::nullopt,
     c10::optional<torch::Tensor> q_norm_w = c10::nullopt,
-    double q_eps = 1e-6)
+    double q_eps = 1e-6,
+    // kvcache design (kccache_design.png): persistent-slot state + DIRECT
+    // paged-pool writes. slot_map [M] i32 lets idx_kv/idx_sc be POOLS
+    // [capacity,8,256]; idx_cache/idx_dst scatter the compress rows into the
+    // indexer fused pages; swa_cache/swa_dst scatter every winkv row into the
+    // SWA MODEL1 pages. dst[m] = page*64+off, -1 = skip.
+    c10::optional<torch::Tensor> slot_map  = c10::nullopt,
+    c10::optional<torch::Tensor> idx_cache = c10::nullopt,
+    c10::optional<torch::Tensor> idx_dst   = c10::nullopt,
+    c10::optional<torch::Tensor> swa_cache = c10::nullopt,
+    c10::optional<torch::Tensor> swa_dst   = c10::nullopt)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
@@ -936,8 +946,11 @@ static std::vector<torch::Tensor> run_wq_b(
                     && idx_ape->size(1) == idx_comp::WK_I, "idx_ape must be [4,256]");
         TORCH_CHECK(idx_norm->numel() == idx_comp::D_I, "idx_norm must be [128]");
         const auto state_ok = [&](const torch::Tensor& t) {
-            return t.dim() == 3 && t.size(0) == M && t.size(1) == idx_comp::SROWS
-                && t.size(2) == idx_comp::WK_I;
+            // Legacy per-step state [M,8,256], or a persistent-slot POOL
+            // [capacity,8,256] when slot_map is given (kvcache design).
+            return t.dim() == 3 && t.size(1) == idx_comp::SROWS
+                && t.size(2) == idx_comp::WK_I
+                && (slot_map.has_value() ? true : t.size(0) == M);
         };
         TORCH_CHECK(state_ok(*idx_kv) && state_ok(*idx_sc),
                     "idx_kv/idx_sc must be [M,8,256]");
@@ -971,6 +984,33 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.win_q8 = win_q8_t.data_ptr<uint8_t>();
         comp.win_s8 = win_s8_t.data_ptr<float>();
         comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
+    }
+    // ---- kvcache design plumbing (slot indirection + direct pool writes) ----
+    auto i32m = [&](const torch::Tensor& t, const char* n) {
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
+                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
+                    n, " must be CUDA i32 [M]");
+        return t.data_ptr<int>();
+    };
+    if (slot_map.has_value() && slot_map->numel() > 0)
+        comp.slot_map = i32m(*slot_map, "slot_map");
+    if (idx_cache.has_value() && idx_cache->numel() > 0) {
+        TORCH_CHECK(idx_dst.has_value(), "idx_cache requires idx_dst");
+        TORCH_CHECK(idx_cache->is_cuda() && idx_cache->is_contiguous() &&
+                    idx_cache->numel() % idx_comp::IDX_PAGE_BYTES == 0,
+                    "idx_cache must be fused pages [P,",
+                    idx_comp::IDX_PAGE_BYTES, "]B");
+        comp.idx_cache = reinterpret_cast<uint8_t*>(idx_cache->data_ptr());
+        comp.idx_dst = i32m(*idx_dst, "idx_dst");
+    }
+    if (swa_cache.has_value() && swa_cache->numel() > 0) {
+        TORCH_CHECK(swa_dst.has_value(), "swa_cache requires swa_dst");
+        TORCH_CHECK(swa_cache->is_cuda() && swa_cache->is_contiguous() &&
+                    swa_cache->numel() % idx_comp::M1_PAGE_BYTES == 0,
+                    "swa_cache must be MODEL1 pages [P,",
+                    idx_comp::M1_PAGE_BYTES, "]B");
+        comp.swa_cache = reinterpret_cast<uint8_t*>(swa_cache->data_ptr());
+        comp.swa_dst = i32m(*swa_dst, "swa_dst");
     }
 
     // ---- activation quant producer (PDL; replaces the in-kernel grid ticket) ----
@@ -1093,12 +1133,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
              c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm,
              c10::optional<torch::Tensor> q_y, c10::optional<torch::Tensor> q_norm_w,
-             double q_eps) {
+             double q_eps,
+             c10::optional<torch::Tensor> slot_map,
+             c10::optional<torch::Tensor> idx_cache, c10::optional<torch::Tensor> idx_dst,
+             c10::optional<torch::Tensor> swa_cache, c10::optional<torch::Tensor> swa_dst) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
                               cmp_pos, idx_y4, idx_ape, idx_norm,
                               cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm,
-                              q_y, q_norm_w, q_eps);
+                              q_y, q_norm_w, q_eps,
+                              slot_map, idx_cache, idx_dst, swa_cache, swa_dst);
           },
           "MERGED wq_b + indexer wq_b (w [N+8192,K]), swap path, M in [1,128]. "
           "Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
@@ -1131,7 +1175,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("win_norm") = c10::nullopt,
           py::arg("q_y") = c10::nullopt,
           py::arg("q_norm_w") = c10::nullopt,
-          py::arg("q_eps") = 1e-6);
+          py::arg("q_eps") = 1e-6,
+          py::arg("slot_map") = c10::nullopt,
+          py::arg("idx_cache") = c10::nullopt,
+          py::arg("idx_dst") = c10::nullopt,
+          py::arg("swa_cache") = c10::nullopt,
+          py::arg("swa_dst") = c10::nullopt);
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

@@ -379,7 +379,13 @@ static void mqa_logits_fp4_decode_out(
     c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
     c10::optional<torch::Tensor> comp_kv, c10::optional<torch::Tensor> comp_sc,
     c10::optional<torch::Tensor> comp_q8, c10::optional<torch::Tensor> comp_s8,
-    c10::optional<torch::Tensor> comp_rope, bool mock_attn) {
+    c10::optional<torch::Tensor> comp_rope, bool mock_attn,
+    // kvcache design: comp_kv/comp_sc become persistent-slot POOLS
+    // [capacity,8,1024] addressed via slot_map [B] i32; cmp_cache/cmp_dst
+    // DIRECT-write the compress rows into Main-compressed MODEL1 pages
+    // (dst[b] = page*64+off, -1 skip).
+    c10::optional<torch::Tensor> slot_map, c10::optional<torch::Tensor> cmp_cache,
+    c10::optional<torch::Tensor> cmp_dst) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
                                                   context_lens, block_table,
                                                   logits.scalar_type());
@@ -419,8 +425,9 @@ static void mqa_logits_fp4_decode_out(
         chk(*comp_q8, torch::kUInt8, "comp_q8");   chk(*comp_s8, torch::kFloat, "comp_s8");
         chk(*comp_rope, torch::kBFloat16, "comp_rope");
         TORCH_CHECK(cmp_pos->numel() >= B && comp_norm->numel() == 512
-                    && comp_kv->numel() >= (int64_t)B * 8 * 1024
-                    && comp_sc->numel() >= (int64_t)B * 8 * 1024
+                    && (slot_map.has_value() ||
+                        (comp_kv->numel() >= (int64_t)B * 8 * 1024
+                         && comp_sc->numel() >= (int64_t)B * 8 * 1024))
                     && comp_q8->numel() >= (int64_t)B * 448
                     && comp_s8->numel() >= (int64_t)B * 7
                     && comp_rope->numel() >= (int64_t)B * 64,
@@ -435,6 +442,25 @@ static void mqa_logits_fp4_decode_out(
         comp.q8 = comp_q8->data_ptr<uint8_t>();
         comp.s8 = comp_s8->data_ptr<float>();
         comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope->data_ptr());
+        // kvcache design plumbing (slot indirection + direct MODEL1 writes)
+        if (slot_map.has_value() && slot_map->numel() > 0) {
+            TORCH_CHECK(slot_map->is_cuda() && slot_map->is_contiguous() &&
+                        slot_map->scalar_type() == torch::kInt32 &&
+                        slot_map->numel() >= B, "slot_map must be i32 [B]");
+            comp.slot_map = slot_map->data_ptr<int>();
+        }
+        if (cmp_cache.has_value() && cmp_cache->numel() > 0) {
+            TORCH_CHECK(cmp_dst.has_value(), "cmp_cache requires cmp_dst");
+            TORCH_CHECK(cmp_cache->is_cuda() && cmp_cache->is_contiguous() &&
+                        cmp_cache->numel() % deep_gemm::M1_PAGE_BYTES == 0,
+                        "cmp_cache must be MODEL1 pages [P,",
+                        deep_gemm::M1_PAGE_BYTES, "]B");
+            TORCH_CHECK(cmp_dst->is_cuda() && cmp_dst->is_contiguous() &&
+                        cmp_dst->scalar_type() == torch::kInt32 &&
+                        cmp_dst->numel() >= B, "cmp_dst must be i32 [B]");
+            comp.cmp_cache = reinterpret_cast<uint8_t*>(cmp_cache->data_ptr());
+            comp.cmp_dst = cmp_dst->data_ptr<int>();
+        }
     }
 
     dispatch_launch(q, sf_q, kv_cache, weights,
@@ -496,5 +522,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cos_tab") = c10::nullopt, py::arg("sin_tab") = c10::nullopt,
           py::arg("comp_kv") = c10::nullopt, py::arg("comp_sc") = c10::nullopt,
           py::arg("comp_q8") = c10::nullopt, py::arg("comp_s8") = c10::nullopt,
-          py::arg("comp_rope") = c10::nullopt, py::arg("mock_attn") = false);
+          py::arg("comp_rope") = c10::nullopt, py::arg("mock_attn") = false,
+          py::arg("slot_map") = c10::nullopt, py::arg("cmp_cache") = c10::nullopt,
+          py::arg("cmp_dst") = c10::nullopt);
 }

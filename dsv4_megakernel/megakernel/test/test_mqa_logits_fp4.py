@@ -384,7 +384,9 @@ def test_main_compressor(module):
         ro[448::2] = (ev * cos_tab[ri] - ov * sin_tab[ri]).bfloat16().float()
         ro[449::2] = (ev * sin_tab[ri] + ov * cos_tab[ri]).bfloat16().float()
         blk = ro[:448].view(7, 64)
-        scale_ref = (blk.abs().max(1).values.clamp_min(1e-4)) / 448.0
+        # MODEL1 scale: pow2-ceil(clamp(amax/448, 1e-4)) -- e8m0-exact
+        scale_ref = torch.pow(2.0, (blk.abs().max(1).values / 448.0)
+                              .clamp_min(1e-4).log2().ceil())
         # checks (reduce-order ulps -> tolerances; B1: state must be UNTOUCHED)
         state_ok = torch.equal(comp_kv[m], kv0[m]) and torch.equal(comp_sc[m], sc0[m])
         s8_diff = ((comp_s8[m] - scale_ref).abs() / scale_ref).max().item()

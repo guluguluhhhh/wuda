@@ -514,15 +514,16 @@ def make_win_inputs(M, dev):
 
 def ref_win_step(y2, pos, norm_w, cos_tab, sin_tab, eps=1e-6):
     """Torch reference, kernel order: raw-fp32 RMSNorm -> weighted -> [0,448)
-    bf16 round + per-64 fp8 (scale=max(amax,1e-4)/448) ; [448,512) fp32 rope
+    bf16 round + per-64 fp8 (MODEL1 scale = pow2-ceil(clamp(amax/448, 1e-4)),
+    e8m0-exact) ; [448,512) fp32 rope
     (token's own pos) -> bf16."""
     M = y2.shape[0]
     v = y2.float()
     rms = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
     vw = v * rms * norm_w
     b = vw[:, :448].bfloat16().float().view(M, 7, 64)
-    amax = b.abs().amax(-1).clamp_min(1e-4)
-    s8 = amax / 448.0
+    amax = b.abs().amax(-1)
+    s8 = torch.pow(2.0, (amax / 448.0).clamp_min(1e-4).log2().ceil())
     q8 = (b / s8.unsqueeze(-1)).to(torch.float8_e4m3fn).view(M, 448)
     e, o = vw[:, 448::2], vw[:, 449::2]
     c, s = cos_tab[pos], sin_tab[pos]

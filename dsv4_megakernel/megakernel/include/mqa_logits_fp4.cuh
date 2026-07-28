@@ -676,9 +676,32 @@ struct MainCompressorArgs {
     const float* kv;           // [M, 8, 1024] state (aggregate reads only)
     const float* sc;           // [M, 8, 1024] state scores
     uint8_t* q8;               // [M, 448] e4m3 output
-    float* s8;                 // [M, 7]   per-block-64 scales
+    float* s8;                 // [M, 7]   per-block-64 scales (pow2, e8m0-exact)
     nv_bfloat16* rope;         // [M, 64]  bf16 rope-tail output
+    // ---- kvcache design (kccache_design.png): persistent-slot state + DIRECT
+    // Main-compressed MODEL1 page writes. slot_map[m] turns kv/sc into POOLS
+    // [capacity,8,1024]; cmp_dst[m] = compressed-token page*64+off (-1 skip).
+    const int* slot_map = nullptr;   // [M]
+    uint8_t* cmp_cache  = nullptr;   // MODEL1 pages [P, 37440]B
+    const int* cmp_dst  = nullptr;   // [M]
 };
+
+// MODEL1_FP8Sparse page geometry (FlashMLA quant.py, d=512): body = 64 x
+// (448B e4m3 nope + 128B bf16 rope), tail = 64 x 8B (7 e8m0 scales + pad),
+// page padded to a 576B multiple.
+constexpr int M1_TOK_BODY   = 576;
+constexpr int M1_TAIL_OFF   = 64 * M1_TOK_BODY;                    // 36864
+constexpr int M1_PAGE_BYTES = (64 * (M1_TOK_BODY + 8) + 575) / 576 * 576;
+
+// pow2-ceil scale helpers (bit-exact, delivery tile/quant.cuh semantics).
+__device__ __forceinline__ int m1_flog2_ceil(float x) {
+    const unsigned bits = __float_as_uint(x);
+    const int exp_field = (int)((bits >> 23) & 0xFF);
+    return exp_field - 127 + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+}
+__device__ __forceinline__ float m1_fpow2(int e) {
+    return __uint_as_float((unsigned)(e + 127) << 23);
+}
 
 // [C1] Cooperative MAIN-compressor row chain (d=512): FOUR warps split one row by
 // 128-col group (g = warp index 0-3; lane owns cols g*128 + lane*4 .. +3), vs the
@@ -700,8 +723,10 @@ __device__ __forceinline__ void run_main_compressor_row(
     uint32_t barrier_id, unsigned long long* prof) {
     constexpr uint32_t D_M = 512, WK_M = 1024, RD = 64, RATIO = 4;
     __shared__ float ssq_sm[4];    // static smem, coexists with the extern dynamic smem
-    const float* bkv = comp.kv + (uint64_t)m * 8 * WK_M;
-    const float* bsc = comp.sc + (uint64_t)m * 8 * WK_M;
+    // kvcache design: state pool addressed by the persistent request slot.
+    const uint32_t srow = comp.slot_map ? (uint32_t)comp.slot_map[m] : m;
+    const float* bkv = comp.kv + (uint64_t)srow * 8 * WK_M;
+    const float* bsc = comp.sc + (uint64_t)srow * 8 * WK_M;
     // Ping-pong base: window index k = ⌊p/4⌋ (p is a compress step, p%4==3);
     // logical row rr lives at physical row (base + rr) & 7.
     const uint32_t base = 4u * ((uint32_t)(p >> 2) & 1u);
@@ -798,8 +823,20 @@ __device__ __forceinline__ void run_main_compressor_row(
         for (uint32_t o = 1; o < 16; o <<= 1)      // all lanes participate
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, 16));
         const uint32_t col0 = g * 128 + lane_idx * 4;
+        // kvcache design: optional DIRECT write into the Main-compressed
+        // MODEL1 page (same bytes/scales as the compact outputs).
+        uint8_t* m1 = nullptr;
+        if (comp.cmp_cache != nullptr && comp.cmp_dst != nullptr
+            && comp.cmp_dst[m] >= 0)
+            m1 = comp.cmp_cache
+                + (uint64_t)(comp.cmp_dst[m] / 64) * M1_PAGE_BYTES;
+        const int m1_off = (comp.cmp_dst != nullptr && comp.cmp_dst[m] >= 0)
+            ? (comp.cmp_dst[m] % 64) : 0;
         if (col0 < D_M - RD) {                     // quant half-warps
-            const float scale = fmaxf(mx, 1e-4f) * (1.0f / 448.0f);
+            // MODEL1 scale: pow2-ceil(clamp(amax/448, 1e-4)) -- e8m0-exact
+            // (was fp32 amax/448 pre-kvcache; FlashMLA MODEL1 contract).
+            const int se = m1_flog2_ceil(fmaxf(mx * (1.0f / 448.0f), 1e-4f));
+            const float scale = m1_fpow2(se);
             uint32_t packed = 0;
             #pragma unroll
             for (uint32_t e = 0; e < 4; ++ e) {
@@ -810,6 +847,13 @@ __device__ __forceinline__ void run_main_compressor_row(
                 comp.q8 + (uint64_t)m * (D_M - RD) + col0) = packed;
             if ((lane_idx & 15) == 0)
                 comp.s8[(uint64_t)m * 7 + (col0 >> 6)] = scale;
+            if (m1 != nullptr) {
+                *reinterpret_cast<uint32_t*>(
+                    m1 + m1_off * M1_TOK_BODY + col0) = packed;
+                if ((lane_idx & 15) == 0)
+                    m1[M1_TAIL_OFF + m1_off * 8 + (col0 >> 6)] =
+                        (uint8_t)(se + 127);
+            }
         } else {                                   // rope tail: pack 2 bf16 -> u32
             #pragma unroll
             for (uint32_t e = 0; e < 4; e += 2) {
@@ -817,6 +861,11 @@ __device__ __forceinline__ void run_main_compressor_row(
                 *reinterpret_cast<uint32_t*>(
                     comp.rope + (uint64_t)m * RD + (col0 - (D_M - RD)) + e) =
                     *reinterpret_cast<const uint32_t*>(&b2);
+                if (m1 != nullptr)
+                    *reinterpret_cast<uint32_t*>(
+                        m1 + m1_off * M1_TOK_BODY + (D_M - RD)
+                        + ((col0 - (D_M - RD)) + e) * 2) =
+                        *reinterpret_cast<const uint32_t*>(&b2);
             }
         }
     }

@@ -30,6 +30,17 @@ constexpr int WK_I  = 256;    // wkv / wgate width each (overlap-cat halves)
 constexpr int D_W   = 512;    // local-window kv dim (winkv row width)
 constexpr int NF8_W = D_W - RD;   // 448 fp8-quantized cols (rope tail stays bf16)
 
+// ---- kvcache-design paged pools (kccache_design.png) ----
+// Indexer fused page (mqa_logits contract): [64tok*64B fp4 | 64tok*4B sf].
+constexpr int IDX_PAGE_TOK   = 64;
+constexpr int IDX_PAGE_BYTES = IDX_PAGE_TOK * (D_I / 2 + 4);          // 4352
+// MODEL1_FP8Sparse page (FlashMLA quant.py, d=512): per token 448B e4m3 nope
+// + 128B bf16 rope packed in the body, 7 e8m0 pow2 scales (+1 pad) in the
+// page tail; page padded to a 576B multiple.
+constexpr int M1_TOK_BODY    = NF8_W + 2 * RD;                        // 576
+constexpr int M1_PAGE_BYTES  = (IDX_PAGE_TOK * (M1_TOK_BODY + 8) + 575) / 576 * 576;
+constexpr int M1_TAIL_OFF    = IDX_PAGE_TOK * M1_TOK_BODY;            // 36864
+
 // All DEVICE pointers, caller-owned. kv == nullptr disables the compressor;
 // win_y2 == nullptr disables the local-window chain. pos/cos_tab/sin_tab are
 // shared by both chains.
@@ -48,8 +59,18 @@ struct Args {
     const float* win_y2   = nullptr;  // [M, D_W] pre-reduced wkv projection
     const float* win_norm = nullptr;  // [D_W] kv RMSNorm weight
     uint8_t* win_q8   = nullptr;      // [M, NF8_W] e4m3
-    float*   win_s8   = nullptr;      // [M, NF8_W/64] per-64 fp32 scales
+    float*   win_s8   = nullptr;      // [M, NF8_W/64] per-64 fp32 scales (pow2)
     __nv_bfloat16* win_rope = nullptr;// [M, RD] rope tail (bf16)
+    // ---- kvcache design: persistent-slot state + paged-pool DIRECT writes ----
+    // slot_map[m] = this row's persistent request slot: kv/sc become POOLS
+    // [capacity, SROWS, WK_I] addressed by slot (null => legacy row-m).
+    // idx_dst/swa_dst[m] = page*64+off in the respective pool (-1 => skip);
+    // the chains store the SAME bytes as the compact outputs, in cache layout.
+    const int* slot_map = nullptr;    // [M] state slot per row
+    uint8_t* idx_cache  = nullptr;    // indexer fused pages [P, 4352]B
+    const int* idx_dst  = nullptr;    // [M] compressed-token dst (compress rows)
+    uint8_t* swa_cache  = nullptr;    // SWA MODEL1 pages [P, M1_PAGE_BYTES]B
+    const int* swa_dst  = nullptr;    // [M] token dst (every row)
 };
 
 // bf16 round-trip via intrinsics (torch extensions define
@@ -73,6 +94,8 @@ __device__ inline void process_row(const Args& a, int m, int lane,
                                    float eps = 1e-6f) {
     const long long p = a.pos[m];
     const int pmod = (int)(p & (RATIO - 1));
+    // kvcache design: the state ring lives in a PERSISTENT-slot pool.
+    const int srow = a.slot_map ? a.slot_map[m] : m;
 
     // ---- y4 state write: fresh slot = RATIO + pos%RATIO, ape folded into sc.
     // The fresh vectors are KEPT IN REGISTERS: lane l's j=1 vector holds cols
@@ -82,9 +105,9 @@ __device__ inline void process_row(const Args& a, int m, int lane,
     float4 fkv1, fsc1;
     {
         float4* kv_slot = reinterpret_cast<float4*>(
-            a.kv + ((size_t)m * SROWS + RATIO + pmod) * WK_I);
+            a.kv + ((size_t)srow * SROWS + RATIO + pmod) * WK_I);
         float4* sc_slot = reinterpret_cast<float4*>(
-            a.sc + ((size_t)m * SROWS + RATIO + pmod) * WK_I);
+            a.sc + ((size_t)srow * SROWS + RATIO + pmod) * WK_I);
         const float4* y4kv = reinterpret_cast<const float4*>(a.y4 + (size_t)m * 2 * WK_I);
         const float4* y4sc = y4kv + WK_I / 4;
         const float4* ape4 = reinterpret_cast<const float4*>(a.ape + (size_t)pmod * WK_I);
@@ -103,8 +126,8 @@ __device__ inline void process_row(const Args& a, int m, int lane,
     if (((p + 1) & (RATIO - 1)) != 0)
         return;                            // not a compress row (row-uniform)
 
-    float* skv = a.kv + (size_t)m * SROWS * WK_I;
-    float* ssc = a.sc + (size_t)m * SROWS * WK_I;
+    float* skv = a.kv + (size_t)srow * SROWS * WK_I;
+    float* ssc = a.sc + (size_t)srow * SROWS * WK_I;
     const int c0 = 4 * lane;
 
     // ---- aggregate: per-col 8-slot softmax weighted sum (overlap-cat cols).
@@ -234,6 +257,18 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         const __nv_fp4x2_e2m1 hi(make_float2(v[2] / scale, v[3] / scale));
         const uint16_t packed = (uint16_t)((uint8_t)lo.__x | ((uint16_t)(uint8_t)hi.__x << 8));
         *reinterpret_cast<uint16_t*>(a.q4 + (size_t)m * (D_I / 2) + lane * 2) = packed;
+        // kvcache design: DIRECT store into the indexer fused page (same bytes
+        // as q4/s4, cache layout: [64tok*64B fp4 | 64tok*4B sf]).
+        if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
+            const int dst = a.idx_dst[m];
+            uint8_t* page = a.idx_cache
+                + (size_t)(dst / IDX_PAGE_TOK) * IDX_PAGE_BYTES;
+            const int off = dst % IDX_PAGE_TOK;
+            *reinterpret_cast<uint16_t*>(page + off * (D_I / 2) + lane * 2) = packed;
+            if ((lane & 7) == 0)
+                page[IDX_PAGE_TOK * (D_I / 2) + off * 4 + (lane >> 3)] =
+                    (uint8_t)(se + 127);
+        }
     }
 }
 
@@ -285,8 +320,10 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         #pragma unroll
         for (int x = 2; x >= 1; x >>= 1)        // 4-lane group == one 64 block
             amax = fmaxf(amax, __shfl_xor_sync(0x0fffffffu, amax, x));
-        amax = fmaxf(amax, 1e-4f);
-        const float scale = amax * (1.0f / 448.0f);
+        // MODEL1 scale: pow2-ceil of clamp(amax/448, 1e-4) -- e8m0-exact (the
+        // FlashMLA MODEL1_FP8Sparse contract; was fp32 amax/448 pre-kvcache).
+        const int se = flog2_ceil(fmaxf(amax * (1.0f / 448.0f), 1e-4f));
+        const float scale = fpow2(se);
         if ((lane & 3) == 0)
             a.win_s8[(size_t)m * (NF8_W / 64) + (lane >> 2)] = scale;
         alignas(16) uint8_t q[16];
@@ -295,6 +332,18 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
             q[j] = __nv_fp8_e4m3(v[j] / scale).__x;
         *reinterpret_cast<uint4*>(a.win_q8 + (size_t)m * NF8_W + lane * 16) =
             *reinterpret_cast<const uint4*>(q);
+        // kvcache design: DIRECT store into the SWA MODEL1 page (body nope
+        // bytes + tail e8m0 scale; same quant chain as the compact outputs).
+        if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
+            const int dst = a.swa_dst[m];
+            uint8_t* page = a.swa_cache
+                + (size_t)(dst / IDX_PAGE_TOK) * M1_PAGE_BYTES;
+            const int off = dst % IDX_PAGE_TOK;
+            *reinterpret_cast<uint4*>(page + off * M1_TOK_BODY + lane * 16) =
+                *reinterpret_cast<const uint4*>(q);
+            if ((lane & 3) == 0)
+                page[M1_TAIL_OFF + off * 8 + (lane >> 2)] = (uint8_t)(se + 127);
+        }
     } else {                                    // lanes 28..31: rope tail (bf16)
         const long long p = a.pos[m];
         const float* cos_row = a.cos_tab + (size_t)p * (RD / 2);
@@ -312,6 +361,17 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
             *reinterpret_cast<const uint4*>(out);
         *reinterpret_cast<uint4*>(a.win_rope + (size_t)m * RD + j0 * 2 + 8) =
             *reinterpret_cast<const uint4*>(out + 8);
+        // kvcache design: rope tail into the SWA MODEL1 body (cols 448..511).
+        if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
+            const int dst = a.swa_dst[m];
+            uint8_t* base = a.swa_cache
+                + (size_t)(dst / IDX_PAGE_TOK) * M1_PAGE_BYTES
+                + (dst % IDX_PAGE_TOK) * M1_TOK_BODY + NF8_W;
+            *reinterpret_cast<uint4*>(base + j0 * 4) =
+                *reinterpret_cast<const uint4*>(out);
+            *reinterpret_cast<uint4*>(base + j0 * 4 + 16) =
+                *reinterpret_cast<const uint4*>(out + 8);
+        }
     }
 }
 
