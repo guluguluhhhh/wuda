@@ -843,9 +843,11 @@ __device__ __forceinline__ void run_main_compressor_row(
                 const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(cmp[e] / scale);
                 packed |= (uint32_t)f8.__x << (8 * e);
             }
-            *reinterpret_cast<uint32_t*>(
-                comp.q8 + (uint64_t)m * (D_M - RD) + col0) = packed;
-            if ((lane_idx & 15) == 0)
+            // COMPACT outputs optional in cache mode (double-write saver).
+            if (comp.q8 != nullptr)
+                *reinterpret_cast<uint32_t*>(
+                    comp.q8 + (uint64_t)m * (D_M - RD) + col0) = packed;
+            if ((lane_idx & 15) == 0 && comp.s8 != nullptr)
                 comp.s8[(uint64_t)m * 7 + (col0 >> 6)] = scale;
             if (m1 != nullptr) {
                 *reinterpret_cast<uint32_t*>(
@@ -858,9 +860,10 @@ __device__ __forceinline__ void run_main_compressor_row(
             #pragma unroll
             for (uint32_t e = 0; e < 4; e += 2) {
                 const auto b2 = __floats2bfloat162_rn(cmp[e], cmp[e + 1]);
-                *reinterpret_cast<uint32_t*>(
-                    comp.rope + (uint64_t)m * RD + (col0 - (D_M - RD)) + e) =
-                    *reinterpret_cast<const uint32_t*>(&b2);
+                if (comp.rope != nullptr)
+                    *reinterpret_cast<uint32_t*>(
+                        comp.rope + (uint64_t)m * RD + (col0 - (D_M - RD)) + e) =
+                        *reinterpret_cast<const uint32_t*>(&b2);
                 if (m1 != nullptr)
                     *reinterpret_cast<uint32_t*>(
                         m1 + m1_off * M1_TOK_BODY + (D_M - RD)

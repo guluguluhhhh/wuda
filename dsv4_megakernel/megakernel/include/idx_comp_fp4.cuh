@@ -43,7 +43,9 @@ constexpr int M1_TAIL_OFF    = IDX_PAGE_TOK * M1_TOK_BODY;            // 36864
 
 // All DEVICE pointers, caller-owned. kv == nullptr disables the compressor;
 // win_y2 == nullptr disables the local-window chain. pos/cos_tab/sin_tab are
-// shared by both chains.
+// shared by both chains. COMPACT outputs (q4/s4, win_q8/s8/rope) are OPTIONAL
+// once the paged direct writes are on (null = skip: saves ~600B/row of
+// double-write bandwidth in the production form).
 struct Args {
     const long long* pos = nullptr;   // [M] absolute token positions
     const float* y4      = nullptr;   // [M, 2*WK_I] pre-reduced wkv|wgate
@@ -251,12 +253,13 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         amax = fmaxf(amax, 6.0f * 1.1754944e-38f);
         const int se = flog2_ceil(amax * (1.0f / 6.0f));
         const float scale = fpow2(se);
-        if ((lane & 7) == 0)
+        if ((lane & 7) == 0 && a.s4 != nullptr)
             a.s4[(size_t)m * (D_I / 32) + (lane >> 3)] = (uint8_t)(se + 127);
         const __nv_fp4x2_e2m1 lo(make_float2(v[0] / scale, v[1] / scale));
         const __nv_fp4x2_e2m1 hi(make_float2(v[2] / scale, v[3] / scale));
         const uint16_t packed = (uint16_t)((uint8_t)lo.__x | ((uint16_t)(uint8_t)hi.__x << 8));
-        *reinterpret_cast<uint16_t*>(a.q4 + (size_t)m * (D_I / 2) + lane * 2) = packed;
+        if (a.q4 != nullptr)
+            *reinterpret_cast<uint16_t*>(a.q4 + (size_t)m * (D_I / 2) + lane * 2) = packed;
         // kvcache design: DIRECT store into the indexer fused page (same bytes
         // as q4/s4, cache layout: [64tok*64B fp4 | 64tok*4B sf]).
         if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
@@ -324,14 +327,15 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         // FlashMLA MODEL1_FP8Sparse contract; was fp32 amax/448 pre-kvcache).
         const int se = flog2_ceil(fmaxf(amax * (1.0f / 448.0f), 1e-4f));
         const float scale = fpow2(se);
-        if ((lane & 3) == 0)
+        if ((lane & 3) == 0 && a.win_s8 != nullptr)
             a.win_s8[(size_t)m * (NF8_W / 64) + (lane >> 2)] = scale;
         alignas(16) uint8_t q[16];
         #pragma unroll
         for (int j = 0; j < 16; ++j)
             q[j] = __nv_fp8_e4m3(v[j] / scale).__x;
-        *reinterpret_cast<uint4*>(a.win_q8 + (size_t)m * NF8_W + lane * 16) =
-            *reinterpret_cast<const uint4*>(q);
+        if (a.win_q8 != nullptr)
+            *reinterpret_cast<uint4*>(a.win_q8 + (size_t)m * NF8_W + lane * 16) =
+                *reinterpret_cast<const uint4*>(q);
         // kvcache design: DIRECT store into the SWA MODEL1 page (body nope
         // bytes + tail e8m0 scale; same quant chain as the compact outputs).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
@@ -357,10 +361,12 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
             out[2 * k]     = __float2bfloat16(e * c - o * s);
             out[2 * k + 1] = __float2bfloat16(e * s + o * c);
         }
-        *reinterpret_cast<uint4*>(a.win_rope + (size_t)m * RD + j0 * 2) =
-            *reinterpret_cast<const uint4*>(out);
-        *reinterpret_cast<uint4*>(a.win_rope + (size_t)m * RD + j0 * 2 + 8) =
-            *reinterpret_cast<const uint4*>(out + 8);
+        if (a.win_rope != nullptr) {
+            *reinterpret_cast<uint4*>(a.win_rope + (size_t)m * RD + j0 * 2) =
+                *reinterpret_cast<const uint4*>(out);
+            *reinterpret_cast<uint4*>(a.win_rope + (size_t)m * RD + j0 * 2 + 8) =
+                *reinterpret_cast<const uint4*>(out + 8);
+        }
         // kvcache design: rope tail into the SWA MODEL1 body (cols 448..511).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
             const int dst = a.swa_dst[m];

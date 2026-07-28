@@ -412,8 +412,10 @@ static void mqa_logits_fp4_decode_out(
     // All-or-none: gated on comp_kv like the original (comp_kv==null => disabled).
     deep_gemm::MainCompressorArgs comp{};
     if (comp_kv.has_value()) {
+        const bool cache_mode = cmp_cache.has_value() && cmp_cache->numel() > 0;
+        // Compact q8/s8/rope optional in cache mode (double-write saver).
         TORCH_CHECK(cmp_pos && comp_norm && cos_tab && sin_tab && comp_sc
-                    && comp_q8 && comp_s8 && comp_rope,
+                    && (cache_mode || (comp_q8 && comp_s8 && comp_rope)),
                     "main-compressor tensors must be given together");
         auto chk = [](const torch::Tensor& t, at::ScalarType ty, const char* n) {
             TORCH_CHECK(t.is_cuda() && t.scalar_type() == ty && t.is_contiguous(),
@@ -422,16 +424,26 @@ static void mqa_logits_fp4_decode_out(
         chk(*cmp_pos, torch::kInt64, "cmp_pos");   chk(*comp_norm, torch::kFloat, "comp_norm");
         chk(*cos_tab, torch::kFloat, "cos_tab");   chk(*sin_tab, torch::kFloat, "sin_tab");
         chk(*comp_kv, torch::kFloat, "comp_kv");   chk(*comp_sc, torch::kFloat, "comp_sc");
-        chk(*comp_q8, torch::kUInt8, "comp_q8");   chk(*comp_s8, torch::kFloat, "comp_s8");
-        chk(*comp_rope, torch::kBFloat16, "comp_rope");
         TORCH_CHECK(cmp_pos->numel() >= B && comp_norm->numel() == 512
                     && (slot_map.has_value() ||
                         (comp_kv->numel() >= (int64_t)B * 8 * 1024
-                         && comp_sc->numel() >= (int64_t)B * 8 * 1024))
-                    && comp_q8->numel() >= (int64_t)B * 448
-                    && comp_s8->numel() >= (int64_t)B * 7
-                    && comp_rope->numel() >= (int64_t)B * 64,
+                         && comp_sc->numel() >= (int64_t)B * 8 * 1024)),
                     "main-compressor tensor shapes");
+        if (comp_q8.has_value() && comp_q8->numel() > 0) {
+            chk(*comp_q8, torch::kUInt8, "comp_q8");
+            TORCH_CHECK(comp_q8->numel() >= (int64_t)B * 448, "comp_q8 shape");
+            comp.q8 = comp_q8->data_ptr<uint8_t>();
+        }
+        if (comp_s8.has_value() && comp_s8->numel() > 0) {
+            chk(*comp_s8, torch::kFloat, "comp_s8");
+            TORCH_CHECK(comp_s8->numel() >= (int64_t)B * 7, "comp_s8 shape");
+            comp.s8 = comp_s8->data_ptr<float>();
+        }
+        if (comp_rope.has_value() && comp_rope->numel() > 0) {
+            chk(*comp_rope, torch::kBFloat16, "comp_rope");
+            TORCH_CHECK(comp_rope->numel() >= (int64_t)B * 64, "comp_rope shape");
+            comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope->data_ptr());
+        }
         // int64_t is `long` on linux; the device struct uses `long long` (same width)
         comp.pos = reinterpret_cast<const long long*>(cmp_pos->data_ptr<int64_t>());
         comp.norm = comp_norm->data_ptr<float>();
@@ -439,9 +451,6 @@ static void mqa_logits_fp4_decode_out(
         comp.sin_tab = sin_tab->data_ptr<float>();
         comp.kv = comp_kv->data_ptr<float>();
         comp.sc = comp_sc->data_ptr<float>();
-        comp.q8 = comp_q8->data_ptr<uint8_t>();
-        comp.s8 = comp_s8->data_ptr<float>();
-        comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope->data_ptr());
         // kvcache design plumbing (slot indirection + direct MODEL1 writes)
         if (slot_map.has_value() && slot_map->numel() > 0) {
             TORCH_CHECK(slot_map->is_cuda() && slot_map->is_contiguous() &&

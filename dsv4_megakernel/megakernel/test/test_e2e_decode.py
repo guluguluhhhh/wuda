@@ -21,7 +21,8 @@ states and final outputs bitwise identical (run-to-run determinism).
 
 flash_mla is optional (import-guarded): without it stages A-D still run.
 """
-import os, sys, math, torch
+import os, sys, math, time, warnings, torch
+warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kv_cache_manager import (KVCacheManager, PAGE, WIN, RATIO,
@@ -247,19 +248,23 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats):
     #       reads the state POOL via slot_map and writes the Main-compressed
     #       MODEL1 pages directly ------------------------------------------
     ncmp = mgr.n_compressed(slots, pos)
-    comp_q8 = torch.zeros(B, 448, device=DEV, dtype=torch.uint8)
-    comp_s8 = torch.zeros(B, 7, device=DEV, dtype=torch.float32)
-    comp_rope = torch.zeros(B, 64, device=DEV, dtype=torch.bfloat16)
     weights64 = y[:, 4608:4672].float().contiguous()
     logits_buf.fill_(float("-inf"))
+    # PRODUCTION form: compact comp_q8/s8/rope OMITTED (cache mode writes the
+    # MODEL1 pages directly; compact would double-write ~600B/row).
     mqm.mqa_logits_fp4_decode_out(
         iq_fp4, iq_sf, mgr.idx_pool, weights64, ncmp,
         mgr.block_table("idx", slots), logits_buf,
         cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
         sin_tab=w["sin"], comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
-        comp_q8=comp_q8, comp_s8=comp_s8, comp_rope=comp_rope,
         slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
         cmp_dst=st["cmp_dst"])
+    # zero-row robustness: the fp4 chain's se has NO clamp (amax=0 -> sf byte
+    # 0, codes 0); assert the consumer stays finite (no NaN/+inf in logits).
+    torch.cuda.synchronize()
+    lg = logits_buf[:, : max(int(ncmp.max()), 1)]
+    stats["G_finite"] = stats.get("G_finite", True) and \
+        bool((torch.isnan(lg) | (lg == float("inf"))).sum().item() == 0)
 
     kv_rows = deq_idx_pool(mgr, slots, pos)
     refs = ref_mqa_logits(iq_fp4, iq_sf, weights64, kv_rows)
@@ -398,11 +403,18 @@ def time_wall(fn, warmup=3, iters=20):
     return 1e3 * ts[len(ts) // 2]
 
 
-def benchmark(mods, w, ncmp=4096):
-    """Per-operator kernel latency along the decode chain (bench_kineto:
-    8GB L2 flush, kineto device time, probed names summed). Context ops
-    (mqa/topk/flashMLA) run at a FABRICATED long context: page tables and
-    lens are real, cache bytes arbitrary -- latency-neutral."""
+def benchmark(mods, w, ncmp=2048):
+    """vLLM-style HOT measurement (the comparison target): weights/caches
+    warm, decode steps BACK-TO-BACK, no L2 flush.
+      per-stage : kineto device time over R hot chain iters, kernels
+                  bucketed by stage (wq_b bucket = qnorm + merged GEMM;
+                  device-sum slightly double-counts their PDL overlap)
+      eager     : wall/step of the hot eager loop (launch overhead visible)
+      graph     : wall/step of CUDA-graph replay (vLLM serving form; THE
+                  end-to-end number)
+    Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
+    and lens real, cache bytes arbitrary -- latency-neutral. Chain ends at
+    flashMLA (no o-proj etc. yet, matching the comparison scope)."""
     hcm, fmm, wqm, mqm, tkm = mods
     print("\n" + "=" * 76)
     print(f"Per-operator latency (us) -- compress-row step, ncmp={ncmp} "
@@ -411,14 +423,13 @@ def benchmark(mods, w, ncmp=4096):
     S = 4 * ncmp + 8
     ang = torch.rand(S, 32, device=DEV) * 6.28
     cosl, sinl = ang.cos().contiguous(), ang.sin().contiguous()
-    cols = ["mhc", "front", "wq_b*", "mqa", "topk"] + \
-        (["mla"] if HAS_FLASH_MLA else []) + ["sum"]
-    print("  wq_b* = WALL span of the PDL pair (qnorm_quant -> merged GEMM):")
-    print("  kineto kernel-sum double-counts the overlap + the GDS wait.")
-    print("  front: M<16 uses the 16-row pad contract (TMA tiny-desc pathology).")
+    cols = ["mhc", "front", "wq_b", "mqa", "topk"] + \
+        (["mla"] if HAS_FLASH_MLA else []) + ["stages", "eager", "graph"]
+    print("  hot, no-flush; stages = kineto device us; eager/graph = wall/step")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
     print("  " + "-" * (5 + 9 * len(cols)))
-    for B in (1, 16, 64, 128):
+    notes = []      # ablation/trace lines buffered AFTER the main table
+    for B in (1, 16, 32, 48, 64, 80, 96, 112, 128):
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
                              + 4 * B, max_pages_per_req=ncmp // PAGE)
         slots = [mgr.alloc_request() for _ in range(B)]
@@ -476,14 +487,11 @@ def benchmark(mods, w, ncmp=4096):
         idx_bt = mgr.block_table("idx", slots)
         logits = torch.full((B, (ncmp + 255) // 256 * 256), float("-inf"),
                             device=DEV)
-        comp_q8 = torch.zeros(B, 448, device=DEV, dtype=torch.uint8)
-        comp_s8 = torch.zeros(B, 7, device=DEV, dtype=torch.float32)
-        comp_rp = torch.zeros(B, 64, device=DEV, dtype=torch.bfloat16)
+        # PRODUCTION form: compact comp outputs omitted (cache direct write).
         run_mqa = lambda: mqm.mqa_logits_fp4_decode_out(
             iq_fp4, iq_sf, mgr.idx_pool, weights64, nc, idx_bt, logits,
             cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
             sin_tab=sinl, comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
-            comp_q8=comp_q8, comp_s8=comp_s8, comp_rope=comp_rp,
             slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
             cmp_dst=st["cmp_dst"])
         run_mqa()
@@ -494,8 +502,8 @@ def benchmark(mods, w, ncmp=4096):
             logits[:, :ncmp], nc, cmp_bt, page_idx, PAGE, meta, None)
         run_topk()
 
-        ts = [time_op(run_hc), time_op(run_front), time_wall(run_wqb),
-              time_op(run_mqa), time_op(run_topk)]
+        stage_fns = [("mhc", run_hc), ("front", run_front),
+                     ("wq_b", run_wqb), ("mqa", run_mqa), ("topk", run_topk)]
         if HAS_FLASH_MLA:
             q_raw = yq.view(B, 1, Q_HEADS, Q_DIM).bfloat16()
             sum_sq = ssq.view(B, 1, Q_HEADS)
@@ -523,11 +531,95 @@ def benchmark(mods, w, ncmp=4096):
                     extra_indices_in_kvcache=ext_idx,
                     extra_topk_length=cmp_len, **fq)
             run_mla()
-            ts.append(time_op(run_mla))
+            stage_fns.append(("mla", run_mla))
+
+        chain_fns = [f for _, f in stage_fns]
+
+        def chain():
+            for f in chain_fns:
+                f()
+
+        # ---- vLLM-style hot measurement --------------------------------
+        def hot_wall(f, warmup=5, iters=50):   # back-to-back wall/step
+            for _ in range(warmup):
+                f()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                f()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / iters * 1e6
+
+        # per-stage: bucket kineto device time of a HOT R-iter chain loop
+        name2stage = {}
+        for sname, f in stage_fns:
+            for n in probe_kernel_names(f):
+                name2stage.setdefault(n, sname)
+        from torch.profiler import profile as _prof, ProfilerActivity
+        R = 10
+        for _ in range(3):
+            chain()
+        torch.cuda.synchronize()
+        try:
+            pctx = _prof(activities=[ProfilerActivity.CUDA], acc_events=True)
+        except TypeError:
+            pctx = _prof(activities=[ProfilerActivity.CUDA])
+        with pctx as prof:
+            for _ in range(R):
+                chain()
+            torch.cuda.synchronize()
+        acc = {sname: 0.0 for sname, _ in stage_fns}
+        for e in prof.events():
+            sname = name2stage.get(e.name[:80])
+            if sname is None:
+                continue
+            d = getattr(e, "device_time", None)
+            if d is None:
+                d = getattr(e, "cuda_time", 0.0)
+            acc[sname] += d
+        ts = [acc[sname] / R for sname, _ in stage_fns]
+
+        t_eager = hot_wall(chain)
+
+        # ---- CUDA-graph envelope: the whole chain in ONE replay ----------
+        t_graph = float("nan")
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):     # allocator warmup off-capture
+                chain(); chain()
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                chain()
+            t_graph = hot_wall(g.replay)
+        except Exception as err:
+            print(f"  (graph capture failed at B={B}: {err})")
+
+        # ---- perfetto timeline: 3x HOT eager chain + 1x graph replay.
+        # Drop the json onto ui.perfetto.dev / chrome://tracing.
+        if B in (16, 128):
+            with _prof(activities=[ProfilerActivity.CPU,
+                                   ProfilerActivity.CUDA]) as prof:
+                for _ in range(3):
+                    chain()
+                if not math.isnan(t_graph):
+                    g.replay()
+                torch.cuda.synchronize()
+            tp = f"/tmp/e2e_trace_B{B}.json"
+            prof.export_chrome_trace(tp)
+            notes.append(f"  B={B:<4} perfetto trace -> {tp} (3x hot eager + "
+                         f"{'1x graph' if not math.isnan(t_graph) else 'no graph'})")
+            del prof
+
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
-              + f"{sum(ts):>9.1f}")
+              + f"{sum(ts):>9.1f}{t_eager:>9.1f}{t_graph:>9.1f}")
         del mgr
         torch.cuda.empty_cache()
+    if notes:
+        print()
+        for ln in notes:
+            print(ln)
 
 
 # ==================== simulation ====================
@@ -544,6 +636,8 @@ def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
             slots[0] = mgr.alloc_request()     # KV=0 / score=-inf re-init
         hidden = torch.randn(B, HC, DIM, device=DEV,
                              dtype=torch.bfloat16) * 0.1
+        if t == 3:      # ALL-ZERO row on a COMPRESS step (pos=3): the fp4
+            hidden[1].zero_()   # se-no-clamp path must stay consumer-safe
         finals = decode_step(mods, w, mgr, slots, hidden, logits_buf, stats)
     snap = (finals.clone(), mgr.swa_pool.clone(), mgr.cmp_pool.clone(),
             mgr.idx_pool.clone(), mgr.main_kv.clone(), mgr.idx_kv.clone())
@@ -573,6 +667,8 @@ if __name__ == "__main__":
          stats.get("C_mqa_rel", 1) < 5e-2),
         ("D topk set match", stats.get("D_topk_ok", False), "== True",
          stats.get("D_topk_ok", False)),
+        ("G zero-row logits finite", stats.get("G_finite", False), "== True",
+         stats.get("G_finite", False)),
         ("F run-to-run bitwise", det, "== True", det),
     ]
     if HAS_FLASH_MLA:

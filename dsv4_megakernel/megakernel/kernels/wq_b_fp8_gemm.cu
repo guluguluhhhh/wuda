@@ -954,17 +954,23 @@ static std::vector<torch::Tensor> run_wq_b(
         };
         TORCH_CHECK(state_ok(*idx_kv) && state_ok(*idx_sc),
                     "idx_kv/idx_sc must be [M,8,256]");
-        idx_q4_t = torch::zeros({M, idx_comp::D_I / 2},
-                                x_fp8.options().dtype(torch::kUInt8));
-        idx_s4_t = torch::zeros({M, idx_comp::D_I / 32},
-                                x_fp8.options().dtype(torch::kUInt8));
+        // Compact q4/s4 SKIPPED in cache mode (double-write bandwidth saver);
+        // the paged direct write below is the production output. PURE outputs
+        // -> empty, not zeros (a zeros fill kernel lands in wall timings;
+        // non-compress rows are garbage by contract, consumers gate on pos).
+        if (!(idx_cache.has_value() && idx_cache->numel() > 0)) {
+            idx_q4_t = torch::empty({M, idx_comp::D_I / 2},
+                                    x_fp8.options().dtype(torch::kUInt8));
+            idx_s4_t = torch::empty({M, idx_comp::D_I / 32},
+                                    x_fp8.options().dtype(torch::kUInt8));
+            comp.q4 = idx_q4_t.data_ptr<uint8_t>();
+            comp.s4 = idx_s4_t.data_ptr<uint8_t>();
+        }
         comp.y4 = idx_y4->data_ptr<float>();
         comp.ape = idx_ape->data_ptr<float>();
         comp.norm_w = idx_norm->data_ptr<float>();
         comp.kv = idx_kv->data_ptr<float>();
         comp.sc = idx_sc->data_ptr<float>();
-        comp.q4 = idx_q4_t.data_ptr<uint8_t>();
-        comp.s4 = idx_s4_t.data_ptr<uint8_t>();
     }
     if (win_on) {
         TORCH_CHECK(win_norm, "local kv window needs win_y2 AND win_norm");
@@ -973,17 +979,20 @@ static std::vector<torch::Tensor> run_wq_b(
         TORCH_CHECK(win_y2->dim() == 2 && win_y2->size(0) == M
                     && win_y2->size(1) == idx_comp::D_W, "win_y2 must be [M,512]");
         TORCH_CHECK(win_norm->numel() == idx_comp::D_W, "win_norm must be [512]");
-        win_q8_t = torch::zeros({M, idx_comp::NF8_W},
-                                x_fp8.options().dtype(torch::kUInt8));
-        win_s8_t = torch::zeros({M, idx_comp::NF8_W / 64},
-                                x_fp8.options().dtype(torch::kFloat32));
-        win_rope_t = torch::zeros({M, idx_comp::RD},
-                                  x_fp8.options().dtype(torch::kBFloat16));
+        // Compact win outputs SKIPPED in cache mode (see idx note above).
+        if (!(swa_cache.has_value() && swa_cache->numel() > 0)) {
+            win_q8_t = torch::empty({M, idx_comp::NF8_W},
+                                    x_fp8.options().dtype(torch::kUInt8));
+            win_s8_t = torch::empty({M, idx_comp::NF8_W / 64},
+                                    x_fp8.options().dtype(torch::kFloat32));
+            win_rope_t = torch::empty({M, idx_comp::RD},
+                                      x_fp8.options().dtype(torch::kBFloat16));
+            comp.win_q8 = win_q8_t.data_ptr<uint8_t>();
+            comp.win_s8 = win_s8_t.data_ptr<float>();
+            comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
+        }
         comp.win_y2 = win_y2->data_ptr<float>();
         comp.win_norm = win_norm->data_ptr<float>();
-        comp.win_q8 = win_q8_t.data_ptr<uint8_t>();
-        comp.win_s8 = win_s8_t.data_ptr<float>();
-        comp.win_rope = reinterpret_cast<__nv_bfloat16*>(win_rope_t.data_ptr());
     }
     // ---- kvcache design plumbing (slot indirection + direct pool writes) ----
     auto i32m = [&](const torch::Tensor& t, const char* n) {
@@ -1114,8 +1123,10 @@ static std::vector<torch::Tensor> run_wq_b(
     std::vector<torch::Tensor> ret = {out, iq_fp4, iq_sf};
     if (ssq_ptr) ret.push_back(ssq_t);     // present unless enable_ssq=false w/o buffer
     if (mock_post) ret.push_back(iq_ws);   // export the drained fp32 iq (bitwise test hook)
-    if (comp_on) { ret.push_back(idx_q4_t); ret.push_back(idx_s4_t); }
-    if (win_on) { ret.push_back(win_q8_t); ret.push_back(win_s8_t); ret.push_back(win_rope_t); }
+    if (comp_on && idx_q4_t.defined()) { ret.push_back(idx_q4_t); ret.push_back(idx_s4_t); }
+    if (win_on && win_q8_t.defined()) {
+        ret.push_back(win_q8_t); ret.push_back(win_s8_t); ret.push_back(win_rope_t);
+    }
     if (profile) ret.push_back(timing);
     return ret;
 }
