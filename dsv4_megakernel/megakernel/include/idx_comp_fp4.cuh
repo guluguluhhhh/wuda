@@ -74,7 +74,12 @@ __device__ inline void process_row(const Args& a, int m, int lane,
     const long long p = a.pos[m];
     const int pmod = (int)(p & (RATIO - 1));
 
-    // ---- y4 state write: fresh slot = RATIO + pos%RATIO, ape folded into sc ----
+    // ---- y4 state write: fresh slot = RATIO + pos%RATIO, ape folded into sc.
+    // The fresh vectors are KEPT IN REGISTERS: lane l's j=1 vector holds cols
+    // {128+4l..128+4l+3} -- exactly the overlap-cat upper-half columns the
+    // aggregate below needs from the fresh row, so the fresh slot is register-
+    // forwarded (no write->read round trip, no pre-aggregate __syncwarp). ----
+    float4 fkv1, fsc1;
     {
         float4* kv_slot = reinterpret_cast<float4*>(
             a.kv + ((size_t)m * SROWS + RATIO + pmod) * WK_I);
@@ -84,14 +89,16 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         const float4* y4sc = y4kv + WK_I / 4;
         const float4* ape4 = reinterpret_cast<const float4*>(a.ape + (size_t)pmod * WK_I);
         #pragma unroll
-        for (int i = lane; i < WK_I / 4; i += 32) {          // 2 float4 per lane
-            kv_slot[i] = y4kv[i];
+        for (int j = 0; j < 2; ++j) {              // i = lane, lane+32
+            const int i = lane + j * 32;
+            const float4 kv4 = y4kv[i];
             float4 g = y4sc[i];
             const float4 ap = ape4[i];
             g.x += ap.x; g.y += ap.y; g.z += ap.z; g.w += ap.w;
+            kv_slot[i] = kv4;
             sc_slot[i] = g;
+            if (j == 1) { fkv1 = kv4; fsc1 = g; }
         }
-        __syncwarp();
     }
     if (((p + 1) & (RATIO - 1)) != 0)
         return;                            // not a compress row (row-uniform)
@@ -101,15 +108,22 @@ __device__ inline void process_row(const Args& a, int m, int lane,
     const int c0 = 4 * lane;
 
     // ---- aggregate: per-col 8-slot softmax weighted sum (overlap-cat cols).
-    // All 16 float4 loads issued back-to-back (single latency wave). ----
+    // 7 historical slots load as float4 (all in flight at once); the fresh
+    // slot comes from the forwarded registers. ----
     float v[4];
     {
         float4 sc8[SROWS], kv8[SROWS];
+        const int fresh = RATIO + pmod;
         #pragma unroll
         for (int rr = 0; rr < SROWS; ++rr) {
-            const int col = (rr < RATIO) ? c0 : (D_I + c0);
-            sc8[rr] = *reinterpret_cast<const float4*>(ssc + (size_t)rr * WK_I + col);
-            kv8[rr] = *reinterpret_cast<const float4*>(skv + (size_t)rr * WK_I + col);
+            if (rr == fresh) {
+                sc8[rr] = fsc1;
+                kv8[rr] = fkv1;
+            } else {
+                const int col = (rr < RATIO) ? c0 : (D_I + c0);
+                sc8[rr] = *reinterpret_cast<const float4*>(ssc + (size_t)rr * WK_I + col);
+                kv8[rr] = *reinterpret_cast<const float4*>(skv + (size_t)rr * WK_I + col);
+            }
         }
         #pragma unroll
         for (int j = 0; j < 4; ++j) {

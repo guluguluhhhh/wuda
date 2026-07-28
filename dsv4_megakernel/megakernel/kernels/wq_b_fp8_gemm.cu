@@ -645,39 +645,34 @@ wq_b_proj_kernel(
 
         // ---- fused CUDA-core post-processing (independent of the GEMM dataflow) ----
         // Runs AFTER the idxpost replay (store warps block on barrier 1 and must
-        // be served first when mock_post==0). WARP-LEVEL task pool: winkv rows
-        // [0,M) then compressor rows [M,2M), one row per warp, SPREAD so same-CTA
-        // warps take tasks ncta apart (issue-slot interference with the GEMM
-        // scales with active warps/SM); rows prefer the CTAs without iq tiles.
-        // Only exit sync: the trailing cluster_sync.
+        // be served first when mock_post==0). WARP-LEVEL task pool, ONE task per
+        // token row (winkv pass then compressor pass -- separate loops keep the
+        // two chains' register live ranges disjoint). Worker order = ALL FOUR
+        // warp levels of the iq-FREE CTAs first, iq CTAs only as a last resort:
+        // measured across three schedules, a second warp on a free CTA costs
+        // ~2.5us total at M=128 while ANY row on an iq CTA (which also carries
+        // idxpost when fused) blows d_all to 9-11us. M <= 4*(num_blocks-busy)
+        // = 320 rows never touch an iq CTA. Only exit sync: trailing cluster_sync.
         {
             const bool win_on = comp.win_y2 != nullptr;
             const bool cmp_on = comp.kv != nullptr;
             if (win_on || cmp_on) {
                 const int wlocal = (int)warp_id - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32;
-                const int win_rows = win_on ? problem_m : 0;
-                const int total = win_rows + (cmp_on ? problem_m : 0);
-                int wcta = blockIdx.x, ncta = num_blocks;
-                {
-                    // Prefer the CTAs without iq tiles UNCONDITIONALLY: the iq
-                    // clusters' drain (long-latency global writes) makes them
-                    // interference-sensitive even in mock mode, and a mapping
-                    // that differs between mock/fused runs skews the d_* deltas.
-                    const int busy = min(num_clusters, NUM_IQ_TILES) * CLUSTER_SIZE;
-                    if ((num_blocks - busy) * NUM_XFORM_THREADS / 32 >= total) {
-                        wcta = blockIdx.x - busy;
-                        ncta = num_blocks - busy;
-                    }
-                }
-                if (wcta >= 0) {
-                    const int workers = ncta * (NUM_XFORM_THREADS / 32);
-                    for (int tsk = wcta + wlocal * ncta; tsk < total; tsk += workers) {
-                        if (tsk < win_rows)
-                            idx_comp::process_win_row(comp, tsk, (int)lane_id);
-                        else
-                            idx_comp::process_row(comp, tsk - win_rows, (int)lane_id);
-                    }
-                }
+                const int busy = min(num_clusters, NUM_IQ_TILES) * CLUSTER_SIZE;
+                const int nfree = num_blocks - busy;
+                const int rank = ((int)blockIdx.x >= busy)
+                    ? ((int)blockIdx.x - busy)                  // iq-free CTAs: rank 0..nfree-1
+                    : (nfree + (int)blockIdx.x);                // iq CTAs after them
+                const int wid = (rank < nfree)
+                    ? wlocal * nfree + rank                     // free CTAs, levels 0..3 first
+                    : 4 * nfree + wlocal * busy + (rank - nfree);   // then iq CTAs
+                const int stride = num_blocks * (NUM_XFORM_THREADS / 32);
+                if (win_on)
+                    for (int m = wid; m < problem_m; m += stride)
+                        idx_comp::process_win_row(comp, m, (int)lane_id);
+                if (cmp_on)
+                    for (int m = wid; m < problem_m; m += stride)
+                        idx_comp::process_row(comp, m, (int)lane_id);
             }
         }
     }
