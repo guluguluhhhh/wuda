@@ -326,21 +326,16 @@ def test_qnorm(module, M):
 
 # ==================== benchmark ====================
 def benchmark_merged(module):
-    """Fused vs separate-kernel accounting at the merged shape (N=73728):
-      fused    = merged GEMM with BOTH fused extras on (head_ssq + post)
-      gemm     = same kernel, mock_post=True, no head_ssq -> the pure merged GEMM
-      d_post   = (post only) - gemm : net latency of the fused post-processing
-      sep_post = standalone idx_post_kernel over the fp32 iq (whole-GPU parallel)
-      d_ssq    = (ssq only) - gemm  : net latency of the fused head_ssq
-      sep_ssq  = standalone head_ssq_kernel over the fp32 y (memory-bound floor)
-      d_quant  = (fused PLAIN quant prologue on) - gemm : isolation cost of the
-                 delivery-opB-style 1x128 quant + grid barrier (no rmsnorm)
-      d_qnorm  = (rmsnorm+quant prologue on) - gemm : the production form
-                 (CTA-wide row rmsnorm folded into the same single load wave)
-      cuBLAS   = bare fp8 _scaled_mm at [M,73728] (nvjet), fp32 out
-    Fusion wins iff d_post < sep_post and d_ssq < sep_ssq."""
+    """Single-table accounting at the merged shape (N=73728):
+      gemm     = plain merged GEMM (mock_post, no ssq/comp/win/quant)
+      d_*      = (that ONE feature on) - gemm : each feature's net latency
+      fused    = EVERYTHING ON in one real run (idxpost + ssq + compressor +
+                 winkv + rmsnorm-quant prologue) -- NOT a sum of the d_ columns
+      d_all    = fused - gemm (measured total net cost of all fusions)
+    comp/win rows use all-compress positions (upper bound; production is 1-in-4).
+    cuBLAS = bare fp8 _scaled_mm at [M,73728] (nvjet); fused_BW uses fused."""
     print("\n" + "=" * 60)
-    print("Benchmark: MERGED indexer projection (N=73728)")
+    print("Benchmark: MERGED wq_b projection (N=73728), all fusions")
     print("=" * 60)
     dev = 'cuda'
     wm = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
@@ -349,48 +344,53 @@ def benchmark_merged(module):
     one = torch.ones((), device=dev, dtype=torch.float32)
     cos_tab, sin_tab = make_rope_tables()
     weight_bytes = N_MERGED * K_DIM
-    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); fused outputs: y fp32 "
-          f"[M,65536] + iq fp4+sf [M,64,68B] + ssq [M,128]")
-    print(f"  (M < 32 pads to the 32-row template: GEMM time ~= M=32)")
-    print(f"  {'M':<5} {'fused(us)':<10} {'gemm(us)':<9} {'d_post':<7} {'sep_post':<9} "
-          f"{'d_ssq':<7} {'sep_ssq':<8} {'d_quant':<8} {'d_qnorm':<8} "
+    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); M < 32 pads to the "
+          f"32-row template (GEMM time ~= M=32)")
+    print(f"  {'M':<5} {'gemm(us)':<9} {'fused(us)':<10} {'d_post':<7} {'d_ssq':<7} "
+          f"{'d_comp':<7} {'d_win':<7} {'d_quant':<8} {'d_q+norm':<9} {'d_all':<7} "
           f"{'cuBLAS(us)':<11} {'fused_BW':<9} {'%cuBLAS':<8}")
-    print("  " + "-" * 104)
+    print("  " + "-" * 116)
     for M in [1, 2, 7, 16, 31, 32, 61, 64, 96, 97, 127, 128]:
         x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
         x_sf = make_act_sf_ones(M, dev)
         q_y = (torch.randn(M, 4672, device=dev) * 0.1).bfloat16()[:, :K_DIM]
         q_gamma = torch.rand(K_DIM, device=dev) + 0.5
         q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
-        iq_f32 = torch.randn(M, 64, 128, device=dev, dtype=torch.float32)
-        y_f32 = torch.randn(M, N_TOTAL, device=dev, dtype=torch.float32)
+        comp = make_comp_inputs(M, dev, all_compress=True)
+        win = make_win_inputs(M, dev)
         # accumulates garbage across timing iters -- irrelevant for latency
         ssqbuf = torch.zeros(M, 128, device=dev, dtype=torch.float32)
 
-        def run(ssq, mock, en_ssq, **kw):
+        def run(mock=True, ssq=None, en_ssq=False, wc=False, ww=False,
+                qy=False, qn=False):
+            kw = {}
+            if wc or ww:
+                kw.update(cmp_pos=comp['cmp_pos'], cos_tab=cos_tab, sin_tab=sin_tab)
+            if wc:
+                kw.update({k: v for k, v in comp.items() if k != 'cmp_pos'})
+            if ww:
+                kw.update(win)
+            if qy:
+                kw['q_y'] = q_y
+            if qn:
+                kw['q_norm_w'] = q_gamma
             return module.wq_b_proj_gemm_merged(
                 x, x_sf, wm, w_sfm, q_pos, cos_tab, sin_tab,
                 head_ssq=ssq, mock_post=mock, enable_ssq=en_ssq, **kw)
 
-        uf = 1e6 * bench_kineto(lambda: run(ssqbuf, False, True),
-                                'wq_b_proj_kernel', suppress_kineto_output=True)
-        ug = 1e6 * bench_kineto(lambda: run(None, True, False),
-                                'wq_b_proj_kernel', suppress_kineto_output=True)
-        upost = 1e6 * bench_kineto(lambda: run(None, False, False),
-                                   'wq_b_proj_kernel', suppress_kineto_output=True)
-        ussq = 1e6 * bench_kineto(lambda: run(ssqbuf, True, True),
-                                  'wq_b_proj_kernel', suppress_kineto_output=True)
-        uq = 1e6 * bench_kineto(lambda: run(None, True, False, q_y=q_y),
-                                'wq_b_proj_kernel', suppress_kineto_output=True)
-        uqn = 1e6 * bench_kineto(
-            lambda: run(None, True, False, q_y=q_y, q_norm_w=q_gamma),
-            'wq_b_proj_kernel', suppress_kineto_output=True)
-        up = 1e6 * bench_kineto(
-            lambda: module.idx_postprocess_standalone(iq_f32, q_pos, cos_tab, sin_tab),
-            'idx_post_kernel', suppress_kineto_output=True)
-        us = 1e6 * bench_kineto(
-            lambda: module.head_ssq_standalone(y_f32),
-            'head_ssq_kernel', suppress_kineto_output=True)
+        def bench(**kw):
+            return 1e6 * bench_kineto(lambda: run(**kw), 'wq_b_proj_kernel',
+                                      suppress_kineto_output=True)
+
+        ug     = bench()
+        upost  = bench(mock=False)
+        ussq   = bench(ssq=ssqbuf, en_ssq=True)
+        ucomp  = bench(wc=True)
+        uwin   = bench(ww=True)
+        uq     = bench(qy=True)
+        uqn    = bench(qy=True, qn=True)
+        uf     = bench(mock=False, ssq=ssqbuf, en_ssq=True, wc=True, ww=True,
+                       qy=True, qn=True)
         try:
             cb_pair = bench_kineto(
                 lambda: torch._scaled_mm(x, wm_t, scale_a=one, scale_b=one,
@@ -406,9 +406,9 @@ def benchmark_merged(module):
         bw = obytes / (uf * 1e-6) / 1e9
         cb_s = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
         pct  = f"{cb/uf*100:<8.1f}" if cb else f"{'-':<8}"
-        print(f"  {M:<5} {uf:<10.1f} {ug:<9.1f} {upost-ug:<7.2f} {up:<9.2f} "
-              f"{ussq-ug:<7.2f} {us:<8.2f} {uq-ug:<8.2f} {uqn-ug:<8.2f} "
-              f"{cb_s} {bw:<9.1f} {pct}")
+        print(f"  {M:<5} {ug:<9.1f} {uf:<10.1f} {upost-ug:<7.2f} {ussq-ug:<7.2f} "
+              f"{ucomp-ug:<7.2f} {uwin-ug:<7.2f} {uq-ug:<8.2f} {uqn-ug:<9.2f} "
+              f"{uf-ug:<7.2f} {cb_s} {bw:<9.1f} {pct}")
 
 
 # ==================== fused indexer compressor (delivery port) ====================
@@ -561,54 +561,6 @@ def test_win(module, M, mock_post=True):
     return ok
 
 
-def benchmark_comp(module):
-    """Additivity check for the warp-8..11 residents (all-compress rows):
-      base  = default GEMM+ssq (256 threads)
-      d_post/d_comp/d_win = each feature alone - base
-      d_all = idxpost + compressor + winkv together - base
-    Coexistence is free iff d_all <~ sum (one row per warp, spread mapping)."""
-    print("\nFused post-processing coexistence (all-compress rows):")
-    print(f"  {'M':<5} {'base(us)':<9} {'d_post':<7} {'d_comp':<7} {'d_win':<7} "
-          f"{'d_all':<7} {'sum':<7}")
-    print("  " + "-" * 52)
-    dev = 'cuda'
-    wm = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(torch.float8_e4m3fn)
-    w_sfm = make_weight_sf_ones(dev)
-    cos_tab, sin_tab = make_rope_tables()
-    for M in [1, 16, 32, 64, 96, 128]:
-        x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
-        x_sf = make_act_sf_ones(M, dev)
-        q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
-        comp = make_comp_inputs(M, dev, all_compress=True)
-        win = make_win_inputs(M, dev)
-
-        def run(mock, wc, ww):
-            kw = {}
-            if wc or ww:
-                kw.update(cmp_pos=comp['cmp_pos'], cos_tab=cos_tab, sin_tab=sin_tab)
-            if wc:
-                kw.update({k: v for k, v in comp.items() if k != 'cmp_pos'})
-            if ww:
-                kw.update(win)
-            return module.wq_b_proj_gemm_merged(
-                x, x_sf, wm, w_sfm, q_pos, cos_tab, sin_tab,
-                mock_post=mock, **kw)
-
-        t = {}
-        for name, mock, wc, ww in [('base', True, False, False),
-                                   ('post', False, False, False),
-                                   ('comp', True, True, False),
-                                   ('win', True, False, True),
-                                   ('all', False, True, True)]:
-            t[name] = 1e6 * bench_kineto(lambda: run(mock, wc, ww),
-                                         'wq_b_proj_kernel',
-                                         suppress_kineto_output=True)
-        dp, dc, dw = t['post'] - t['base'], t['comp'] - t['base'], t['win'] - t['base']
-        da = t['all'] - t['base']
-        print(f"  {M:<5} {t['base']:<9.1f} {dp:<7.2f} {dc:<7.2f} {dw:<7.2f} "
-              f"{da:<7.2f} {dp+dc+dw:<7.2f}")
-
-
 def profile_pipeline(module, M=128, clock_ghz=1.8):
     """Visualize load / MMA / epilogue overlap (merged path).
     timing[max_iters,7] = [load_s, load_e, mma_s, mma_e, epi_s, epi_e, mma_wait]
@@ -704,8 +656,6 @@ if __name__ == '__main__':
     results += [test_qnorm(module, M) for M in [1, 2, 7, 32, 61, 128]]
 
     benchmark_merged(module)
-
-    benchmark_comp(module)
 
     profile_pipeline(module, M=128)
 
