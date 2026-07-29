@@ -112,7 +112,9 @@ def make_weights(seed=7):
     w["hc_fn"] = torch.randn(24, HC * DIM, device=DEV) * 0.01
     w["hc_base"] = torch.randn(24, device=DEV) * 0.1
     w["hc_scale"] = torch.rand(3, device=DEV) + 0.5
-    w["attn_norm"] = torch.rand(DIM, device=DEV) + 0.5
+    # attn_norm gamma: BF16 = the CHECKPOINT dtype (model.py L188); the
+    # kernel widens to fp32 in-flight (lossless, official compute chain).
+    w["attn_norm"] = (torch.rand(DIM, device=DEV) + 0.5).bfloat16()
     fw = torch.randn(N_FRONT, DIM, device=DEV, dtype=torch.bfloat16) * 0.02
     w["front_fp8"], w["front_sf"] = t_fm.quant_weight_fp8(fw[:2048])
     w["front_bf16"] = fw[2048:].contiguous()
@@ -192,21 +194,54 @@ def ref_flash_attn(qn, swa_rows, cmp_rows, scale):
 
 
 # ==================== one decode step ====================
+def get_dg():
+    """deep_gemm (hard dep for the hybrid mhc): shared resolver in
+    bench_utils (env DEEP_GEMM_DIR > installed wheel > sibling checkout),
+    PDL enabled once."""
+    from bench_utils import get_deep_gemm
+    dg = get_deep_gemm()
+    assert hasattr(dg, "tf32_hc_prenorm_gemm"), \
+        "deep_gemm build lacks tf32_hc_prenorm_gemm"
+    return dg
+
+
+def hc_n_splits(m):
+    """vLLM compute_num_split(block_k=64, k=28672, grid=cdiv(m,64)) for
+    deep_gemm.tf32_hc_prenorm_gemm."""
+    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return max(min(n_sms // max((m + 63) // 64, 1), (HC * DIM // 64) // 4), 1)
+
+
+def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
+                   ws=None, sq=None):
+    """HYBRID mhc (measured B300: beats both parents by ~2us): deep_gemm's
+    tf32 split-K GEMM (4.4-6.4us vs our splitk ~8) + OUR fused epilogue
+    (6.2us vs vLLM's TileLang fuse ~9-10). Workspace layout is identical on
+    both sides: mul [S,M,24] + sqrsum [S,M]."""
+    B = hidden.size(0)
+    S = hc_n_splits(B)
+    if ws is None:
+        ws = torch.empty(S, B, 24, device=DEV, dtype=torch.float32)
+        sq = torch.empty(S, B, device=DEV, dtype=torch.float32)
+    dg.tf32_hc_prenorm_gemm(hidden.view(B, HC * DIM), w["hc_fn"], ws, sq, S)
+    hcm.hc_reduce_fuse_out(hidden, ws, sq, w["hc_base"], w["hc_scale"],
+                           EPS, EPS, collapsed, pre, po, cb,
+                           with_post_comb=False, attn_norm_w=w["attn_norm"],
+                           attn_norm_eps=EPS)
+
+
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats):
     hcm, fmm, wqm, mqm, tkm = mods
     B = len(slots)
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
 
-    # -- 1. MHC (nopc + fused attn_norm) -> normed collapsed --------------
+    # -- 1. MHC hybrid (deep_gemm tf32 GEMM + our nopc+norm epilogue) -----
     collapsed = torch.empty(B, DIM, device=DEV, dtype=torch.bfloat16)
     pre = torch.empty(B, HC, device=DEV, dtype=torch.float32)
     po = torch.empty(B, HC, device=DEV, dtype=torch.float32)
     cb = torch.empty(B, HC, HC, device=DEV, dtype=torch.float32)
-    hcm.hc_fused_forward_out(hidden, w["hc_fn"], w["hc_base"], w["hc_scale"],
-                             EPS, EPS, collapsed, pre, po, cb,
-                             with_post_comb=False, attn_norm_w=w["attn_norm"],
-                             attn_norm_eps=EPS)
+    run_mhc_hybrid(get_dg(), hcm, hidden, w, collapsed, pre, po, cb)
 
     # -- 2. front_mixed (+hc tail; hc_mix random side-channel, P1 note) ---
     x_fp8, x_sf = t_fm.quant_act_fp8(collapsed)
@@ -445,10 +480,11 @@ def benchmark(mods, w, ncmp=2048):
         collapsed = torch.empty(B, DIM, device=DEV, dtype=torch.bfloat16)
         pre = torch.empty(B, HC, device=DEV, dtype=torch.float32)
         po, cb = pre.clone(), torch.empty(B, HC, HC, device=DEV)
-        run_hc = lambda: hcm.hc_fused_forward_out(
-            hidden, w["hc_fn"], w["hc_base"], w["hc_scale"], EPS, EPS,
-            collapsed, pre, po, cb, with_post_comb=False,
-            attn_norm_w=w["attn_norm"], attn_norm_eps=EPS)
+        S = hc_n_splits(B)     # hybrid mhc: preallocated split-K workspace
+        hws = torch.empty(S, B, 24, device=DEV, dtype=torch.float32)
+        hsq = torch.empty(S, B, device=DEV, dtype=torch.float32)
+        run_hc = lambda: run_mhc_hybrid(get_dg(), hcm, hidden, w,
+                                        collapsed, pre, po, cb, hws, hsq)
         run_hc()
         # front: PRODUCTION pad16 contract for B<16 (test_front discipline);
         # downstream consumes y[:B].

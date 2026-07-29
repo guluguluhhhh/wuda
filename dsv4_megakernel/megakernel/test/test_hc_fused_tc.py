@@ -1,4 +1,13 @@
-"""Correctness and B300 benchmark for hc_fused_kernel_tc.cu."""
+"""Correctness and B300 benchmark for the HYBRID mhc op:
+
+    deep_gemm.tf32_hc_prenorm_gemm   (split-K tf32 GEMM + sum(x^2) partials)
+  + hc_reduce_fuse_out               (OUR epilogue: reduce + RMSNorm + gates
+                                      + Sinkhorn + collapse [+ attn_norm],
+                                      PDL secondary)
+
+The old in-house tcgen05 split-K GEMM path was DELETED (deep_gemm measured
+2-3us faster on B300, while our epilogue beats vLLM's TileLang fuse by
+3-4us). deep_gemm is a HARD dep here now."""
 
 import argparse
 import os
@@ -18,9 +27,28 @@ N_OUT = (2 + HC) * HC
 HC_EPS = 1e-6
 RMS_NORM_EPS = 1e-6
 SINKHORN_ITERS = 20
-# decode regime only (M<=256): all 32-aligned M plus 1/4/16 edge cases. M>256 is out
-# of scope (the kernel has two configs: NT=8/splitK=18 for M<=128, NT=32/splitK=35 above).
+# decode regime only (M<=256): all 32-aligned M plus 1/4/16 edge cases.
 PROFILE_M = [1, 4, 16, 32, 64, 96, 128, 160, 192, 224, 256]
+
+DG = None
+
+
+def get_dg():
+    """deep_gemm (HARD dep): shared resolver in bench_utils (env
+    DEEP_GEMM_DIR > installed wheel > sibling checkout), PDL enabled once."""
+    global DG
+    if DG is None:
+        from bench_utils import get_deep_gemm
+        DG = get_deep_gemm()
+        assert hasattr(DG, "tf32_hc_prenorm_gemm"), \
+            "deep_gemm build lacks tf32_hc_prenorm_gemm"
+    return DG
+
+
+def hc_n_splits(m):
+    """vLLM compute_num_split(block_k=64, k=K_DIM, grid=cdiv(m,64))."""
+    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return max(min(n_sms // max((m + 63) // 64, 1), (K_DIM // 64) // 4), 1)
 
 
 def load_cuda_module():
@@ -46,8 +74,6 @@ def load_cuda_module():
         "-lineinfo",
         "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
         "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
-        # TMEM / F16F32 / TF32 TCGEN05 enables are auto-defined by
-        # cute/arch/config.hpp for sm_10xa; passing them again -> "redefined".
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
     ]
@@ -63,6 +89,34 @@ def load_cuda_module():
         extra_ldflags=["-lcuda"],
         verbose=True,
     )
+
+
+def run_hybrid(module, hidden, weight, base, scale, with_post_comb=False,
+               norm_w=None, bufs=None):
+    """The production call pair. bufs (optional) = dict of preallocated
+    ws/sq/collapsed/pre/post/comb for allocation-free hot loops."""
+    dg = get_dg()
+    hs2 = hidden.contiguous().view(-1, K_DIM)
+    m = hs2.size(0)
+    if bufs is None:
+        S = hc_n_splits(m)
+        bufs = dict(
+            ws=torch.empty(S, m, N_OUT, device="cuda"),
+            sq=torch.empty(S, m, device="cuda"),
+            collapsed=torch.empty(m, DIM, device="cuda",
+                                  dtype=torch.bfloat16),
+            pre=torch.empty(m, HC, device="cuda"),
+            post=torch.empty(m, HC, device="cuda"),
+            comb=torch.empty(m, HC, HC, device="cuda"))
+    dg.tf32_hc_prenorm_gemm(hs2, weight, bufs["ws"], bufs["sq"],
+                            bufs["ws"].size(0))
+    module.hc_reduce_fuse_out(hidden, bufs["ws"], bufs["sq"], base, scale,
+                              HC_EPS, RMS_NORM_EPS, bufs["collapsed"],
+                              bufs["pre"], bufs["post"], bufs["comb"],
+                              with_post_comb=with_post_comb,
+                              attn_norm_w=norm_w,
+                              attn_norm_eps=RMS_NORM_EPS)
+    return bufs
 
 
 def hc_reference(hidden_states, weight, base, scale):
@@ -95,7 +149,7 @@ def make_inputs(m, weight=None, base=None, scale=None):
     if m == 1:
         hidden = hidden[0]
     if weight is None:
-        # tf32 GEMM path: weight is fp32 (read as tf32 by the MMA), matching the
+        # fp32 weight (deep_gemm's tf32 GEMM reads it as tf32), matching the
         # official DeepSeek-V4 hc_attn_fn / hc_ffn_fn fp32 parameters.
         weight = (
             torch.randn(N_OUT, K_DIM, device=device, dtype=torch.float32) * 0.01
@@ -114,7 +168,7 @@ def error_stats(actual, expected):
 
 
 def test_correctness(module, positions):
-    print("\nCorrectness: full RMSNorm + GEMM + HC epilogue")
+    print("\nCorrectness: deep_gemm prenorm GEMM + our fused epilogue")
     print(
         f"{'M':>6} {'output':>10} {'max abs':>12} {'mean abs':>12} "
         f"{'mean rel':>12} {'result':>8}"
@@ -132,65 +186,49 @@ def test_correctness(module, positions):
         torch.manual_seed(1000 + m)
         hidden, weight, base, scale = make_inputs(m)
         expected = hc_reference(hidden, weight, base, scale)
-        actual = module.hc_fused_forward_full(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS
-        )
-        torch.cuda.synchronize()
 
+        # full variant (post/comb + Sinkhorn in-kernel)
+        b = run_hybrid(module, hidden, weight, base, scale,
+                       with_post_comb=True)
+        torch.cuda.synchronize()
+        mm = b["pre"].size(0)
+        actual = (b["collapsed"], b["pre"], b["post"], b["comb"])
         for name, got, ref in zip(
             ("collapsed", "pre", "post", "comb"), actual, expected
         ):
             atol, rtol = tolerances[name]
-            max_abs, mean_abs, mean_rel = error_stats(got, ref)
-            ok = torch.allclose(got.float(), ref.float(), atol=atol, rtol=rtol)
+            ref2 = ref.reshape(got.shape)
+            max_abs, mean_abs, mean_rel = error_stats(got, ref2)
+            ok = torch.allclose(got.float(), ref2.float(), atol=atol, rtol=rtol)
             all_ok &= ok
             print(
                 f"{m:6d} {name:>10} {max_abs:12.4e} {mean_abs:12.4e} "
                 f"{mean_rel:12.4e} {('PASS' if ok else 'FAIL'):>8}"
             )
 
-        # fused attn_norm (lite only, the PRODUCTION form): reference =
-        # separate-norm chain applied to the kernel's OWN raw bf16 collapsed
-        # (from a plain lite run). The in-block ssq order differs from torch's
-        # sum -> r may differ by ~1ulp fp32; report the bitwise match rate and
-        # gate on allclose. (The old attn_ssq RED fold was deleted: the fused
-        # norm computes its ssq in-block and nothing consumes it anymore.)
-        hs2 = hidden.contiguous().view(-1, K_DIM)
-        mm = hs2.size(0)
-        collapsed2 = torch.empty(mm, DIM, device="cuda", dtype=torch.bfloat16)
-        pre2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
-        post2 = torch.empty(mm, HC, device="cuda", dtype=torch.float32)
-        comb2 = torch.empty(mm, HC, HC, device="cuda", dtype=torch.float32)
-        module.hc_fused_forward_out(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-            collapsed2, pre2, post2, comb2, with_post_comb=False
-        )
-        norm_w = (torch.rand(DIM, device="cuda", dtype=torch.float32)
-                  + 0.5)
-        collapsed3 = torch.empty(mm, DIM, device="cuda",
-                                 dtype=torch.bfloat16)
-        module.hc_fused_forward_out(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-            collapsed3, pre2, post2, comb2,
-            with_post_comb=False, attn_norm_w=norm_w,
-            attn_norm_eps=RMS_NORM_EPS)
+        # fused attn_norm (lite, the PRODUCTION form): reference = the
+        # separate-norm chain applied to the hybrid's OWN raw lite collapsed
+        # (same in-block ssq order -> near-bitwise).
+        b_lite = run_hybrid(module, hidden, weight, base, scale)
+        # gamma BF16 = the checkpoint dtype (model.py: "stored in bf16")
+        norm_w = (torch.rand(DIM, device="cuda") + 0.5).bfloat16()
+        b_nrm = run_hybrid(module, hidden, weight, base, scale, norm_w=norm_w)
         torch.cuda.synchronize()
-        xb = collapsed2.float()                      # raw bf16 collapsed
-        r = torch.rsqrt(xb.pow(2).sum(-1, keepdim=True) / DIM
-                        + RMS_NORM_EPS)
+        xb = b_lite["collapsed"].float()
+        r = torch.rsqrt(xb.pow(2).sum(-1, keepdim=True) / DIM + RMS_NORM_EPS)
         nref = ((xb * r) * norm_w).to(torch.bfloat16)
-        bitmatch = (collapsed3.view(torch.int16) ==
+        bitmatch = (b_nrm["collapsed"].view(torch.int16) ==
                     nref.view(torch.int16)).float().mean().item()
-        nrm_ok = torch.allclose(collapsed3.float(), nref.float(),
+        nrm_ok = torch.allclose(b_nrm["collapsed"].float(), nref.float(),
                                 rtol=1e-2, atol=1e-3)
         all_ok &= nrm_ok
         print(
             f"{m:6d} {'fusednorm':>10} "
-            f"{(collapsed3.float() - nref.float()).abs().max().item():12.4e} "
+            f"{(b_nrm['collapsed'].float() - nref.float()).abs().max().item():12.4e} "
             f"{'bit=' + format(bitmatch, '.4f'):>12} {'':>12} "
             f"{('PASS' if nrm_ok else 'FAIL'):>8}"
         )
-        del hidden, expected, actual
+        del hidden, expected, b, b_lite, b_nrm
 
     print("-" * 68)
     print("ALL PASSED" if all_ok else "CORRECTNESS FAILED")
@@ -198,27 +236,22 @@ def test_correctness(module, positions):
 
 
 def time_cuda_us(fn, kernel_names):
-    """DeepGEMM bench_kineto (see bench_utils.py): 8GB L2 flush before EVERY
-    call, kineto kernel device-time only, warmup cycle discarded, MEAN over
-    instances; tuple names are summed (one MHC call = gemm + reduce kernels).
-    NOTE: switched from CUDA-Event wall time over a hot-L2 200-call burst --
-    expect different (launch-free, cold-L2) numbers than historical tables."""
-    t = bench_kineto(fn, kernel_names, suppress_kineto_output=True)
+    """DeepGEMM bench_kineto: 8GB L2 flush before EVERY call, kineto kernel
+    device time only, warmup cycle discarded, MEAN over instances; tuple
+    names are summed. NOTE with PDL the epilogue's device time includes its
+    griddepcontrol wait -> the kernel-sum slightly overstates the wall."""
+    t = bench_kineto(fn, kernel_names, suppress_kineto_output=True,
+                     with_multiple_kernels=True)
     return 1e6 * (sum(t) if isinstance(t, tuple) else t)
 
 
 def probe_kernel_names(fn):
-    """One mini kineto pass -> tuple of ALL kernel names fn launches (flush/
-    memset/memcpy families excluded). cuBLAS picks DIFFERENT kernels per shape
-    (gemv / sgemm / nvjet ...), so guessing name substrings makes bench_kineto
-    silently return 0 for unmatched names (measured: the fp32 column read
-    0.000 at M=1). Probe the names, then time with the standard estimator."""
     from torch.profiler import profile, ProfilerActivity
     fn()
     torch.cuda.synchronize()
-    try:   # acc_events silences torch's clears-events-per-cycle warning on prof.events()
+    try:
         prof_ctx = profile(activities=[ProfilerActivity.CUDA], acc_events=True)
-    except TypeError:  # older torch without acc_events
+    except TypeError:
         prof_ctx = profile(activities=[ProfilerActivity.CUDA])
     with prof_ctx as prof:
         fn()
@@ -233,7 +266,7 @@ def probe_kernel_names(fn):
         if d is None:
             d = getattr(e, 'cuda_time', 0.0)
         if d and d > 0:
-            n = n[:80]   # bench_kineto's table truncates names at 100 chars
+            n = n[:80]
             if n not in names:
                 names.append(n)
     assert names, 'probe found no kernels'
@@ -248,116 +281,54 @@ def benchmark(module, positions):
     torch.manual_seed(42)
     _, weight, base, scale = make_inputs(1)
     dev = "cuda"
-    # cuBLAS = the MIDDLE GEMM only ([m,K]@[K,24], bf16, fastest vendor floor) --
-    # compare it against the 'gemm' STAGE column, not the full fused op. The
-    # fp32/tf32 path is not used: N=24 has no TF32 tensor-core coverage and falls
-    # back to pathological SIMT sgemm (measured 42-48us).
     wb = weight.to(torch.bfloat16)
-    # Config is constant across all M (single tuned config) -> print once in the header.
-    cfg0 = module.hc_fused_tc_config(positions[0])
+    norm_w = (torch.rand(DIM, device=dev) + 0.5).bfloat16()
     print(f"\nBenchmark: {torch.cuda.get_device_name()}")
-    print("Full MHC op: RMSNorm + GEMM(split-K) + activation + Sinkhorn + collapse")
-    print(f"config (all M): M_TILE={cfg0[7]}  N_TILE={cfg0[0]}  splitK={cfg0[1]}  "
-          f"K_tiles/split={cfg0[2]}")
-    print("  mhc/cuBLAS = kernel time (us), DeepGEMM bench_kineto (cold L2, launch-free).")
-    print("  no-pc = A/B: post/comb+Sinkhorn dropped, ALL 8 warps collapse (upper bound")
-    print("  for moving post/comb to the post-layer scatter). cuBLAS = middle GEMM only")
-    print("  (bf16) -> compare with the 'gemm' stage col.")
-    print("  gemm/reduce/activ/sinkhorn/collapse = clock64 stage")
-    print("  medians (exclude launch/gap); sinkhorn \u2016 collapse run concurrently.")
+    print("HYBRID mhc: deep_gemm tf32 prenorm GEMM + our fused epilogue (PDL)")
+    print("  full = with post/comb+Sinkhorn; no-pc = lite; +nrm = lite with")
+    print("  FULLY fused attn_norm (production). gemm/fuse = per-kernel split")
+    print("  of +nrm (kineto; PDL overlap double-counted). cuBLAS = middle")
+    print("  GEMM only (bf16 floor).")
     print(
-        f"{'M':>6} {'grid':>6} {'mhc us':>10} {'no-pc':>8} "
-        f"{'+nrm':>8} {'cuBLAS':>9} "
-        f"{'gemm':>8} {'reduce':>8} {'activ':>7} {'sinkhrn':>8} {'collapse':>9}"
+        f"{'M':>6} {'splits':>7} {'full':>9} {'no-pc':>8} {'+nrm':>8} "
+        f"{'gemm':>8} {'fuse':>8} {'cuBLAS':>9}"
     )
-    print("-" * 108)
+    print("-" * 70)
 
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
         x = hidden.reshape(m, K_DIM)
-        cfg = module.hc_fused_tc_config(m)
+        S = hc_n_splits(m)
+        bufs = dict(
+            ws=torch.empty(S, m, N_OUT, device=dev),
+            sq=torch.empty(S, m, device=dev),
+            collapsed=torch.empty(m, DIM, device=dev, dtype=torch.bfloat16),
+            pre=torch.empty(m, HC, device=dev),
+            post=torch.empty(m, HC, device=dev),
+            comb=torch.empty(m, HC, HC, device=dev))
 
-        # preallocate outputs so we time the op, not per-call allocation
-        collapsed = torch.empty(m, DIM, device=dev, dtype=torch.bfloat16)
-        pre = torch.empty(m, HC, device=dev, dtype=torch.float32)
-        post = torch.empty(m, HC, device=dev, dtype=torch.float32)
-        comb = torch.empty(m, HC, HC, device=dev, dtype=torch.float32)
-        mhc_us = time_cuda_us(
-            lambda: module.hc_fused_forward_out(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, with_post_comb=True),
-            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
-        )
-        # A/B: same op minus post/comb (+Sinkhorn); correctness sentinel on pre.
-        nopc_us = time_cuda_us(
-            lambda: module.hc_fused_forward_out(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb, with_post_comb=False),
-            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
-        )
-        # +nrm: lite + FULLY fused attn_norm (two-phase collapse; gamma+r+ssq
-        # all in-block) -- the PRODUCTION form. Overhead = this minus no-pc.
-        norm_w = torch.rand(DIM, device=dev, dtype=torch.float32) + 0.5
-        nrm_us = time_cuda_us(
-            lambda: module.hc_fused_forward_out(
-                hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                collapsed, pre, post, comb,
-                with_post_comb=False, attn_norm_w=norm_w,
-                attn_norm_eps=RMS_NORM_EPS),
-            ('hc_gemm_splitk', 'hc_reduce_and_fuse'),
-        )
-        # Baseline kernel names are shape-dependent -> probed, not guessed.
+        full_fn = lambda: run_hybrid(module, hidden, weight, base, scale,
+                                     with_post_comb=True, bufs=bufs)
+        lite_fn = lambda: run_hybrid(module, hidden, weight, base, scale,
+                                     bufs=bufs)
+        nrm_fn = lambda: run_hybrid(module, hidden, weight, base, scale,
+                                    norm_w=norm_w, bufs=bufs)
+        names = probe_kernel_names(nrm_fn)
+        full_us = time_cuda_us(full_fn, probe_kernel_names(full_fn))
+        lite_us = time_cuda_us(lite_fn, probe_kernel_names(lite_fn))
+        ts = bench_kineto(nrm_fn, names, suppress_kineto_output=True,
+                          with_multiple_kernels=True)
+        ts = [1e6 * v for v in (ts if isinstance(ts, tuple) else (ts,))]
+        gemm = sum(t for n, t in zip(names, ts) if "prenorm" in n.lower()
+                   or "gemm" in n.lower())
+        fuse = sum(ts) - gemm
         cublas_us = time_cuda_us_probed(lambda: F.linear(x, wb))
-        gemm, reduce, activ, sinkhorn, collapse = profile_stages(
-            module, hidden, weight, base, scale)
         print(
-            f"{m:6d} {cfg[3]:6d} {mhc_us:10.3f} {nopc_us:8.3f} "
-            f"{nrm_us:8.3f} {cublas_us:9.3f} "
-            f"{gemm:8.3f} {reduce:8.3f} {activ:7.3f} {sinkhorn:8.3f} {collapse:9.3f}"
+            f"{m:6d} {S:7d} {full_us:9.3f} {lite_us:8.3f} {sum(ts):8.3f} "
+            f"{gemm:8.3f} {fuse:8.3f} {cublas_us:9.3f}"
         )
-        del hidden, x, collapsed, pre, post, comb
-    print("-" * 92)
-
-
-def gpu_clock_mhz():
-    """SM clock in MHz for converting clock64 cycles -> us. Falls back to 2100."""
-    try:
-        khz = torch.cuda.get_device_properties(0).clock_rate  # kHz
-        if khz and khz > 0:
-            return khz / 1000.0
-    except Exception:
-        pass
-    return 2100.0
-
-
-def profile_stages(module, hidden, weight, base, scale, repeats=30, with_post_comb=True):
-    """Median per-stage us from in-kernel clock64 stamps (prof buffer, block 0).
-    Layout: [0]gemm start [1]gemm end | [2]epi start [3]reduce+rms [4]act |
-            [5]sinkhorn end (warp0) | [6]collapse start [7]collapse end (warp1).
-    Sinkhorn (warp0) \u2016 collapse (warp1) run concurrently, so collapse is timed on its
-    own warp -> [7]-[6] is the real collapse duration, not just the overhang.
-    Returns (gemm, reduce, activ, sinkhorn, collapse) in microseconds; activ =
-    [4]-[3] = the pre/post sigmoids + comb affine (one warp-wide instruction
-    burst -- previously unprinted, hidden between reduce and sinkhorn).
-    """
-    for _ in range(5):
-        module.hc_fused_forward_profiled(hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-                                         with_post_comb=with_post_comb)
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(repeats):
-        res = module.hc_fused_forward_profiled(
-            hidden, weight, base, scale, HC_EPS, RMS_NORM_EPS,
-            with_post_comb=with_post_comb)
-        torch.cuda.synchronize()
-        samples.append([int(v) for v in res[-1].cpu().tolist()])
-    clk = gpu_clock_mhz()
-
-    def med(a, b):
-        vals = sorted((s[b] - s[a]) / clk for s in samples)
-        return vals[len(vals) // 2]
-
-    return med(0, 1), med(2, 3), med(3, 4), med(4, 5), med(6, 7)  # gemm, reduce, activ, sinkhorn, collapse
+        del hidden, x, bufs
+    print("-" * 70)
 
 
 def parse_positions(value):
@@ -377,9 +348,7 @@ def main():
         print("CUDA is not available; this test must run on B300.")
         return 0
 
-    # Correctness reference stays TRUE fp32 (matmul precision 'highest', the default) so
-    # the allclose error reflects our tf32 kernel vs a perfect fp32 ground truth. The
-    # cuBLAS *perf* baseline is a bf16 GEMM-only floor inside benchmark().
+    # Correctness reference stays TRUE fp32 (matmul precision 'highest').
     torch.set_float32_matmul_precision("highest")
 
     major, minor = torch.cuda.get_device_capability()
@@ -389,6 +358,7 @@ def main():
     )
     print("JIT compiling hc_fused_kernel_tc.cu ...")
     module = load_cuda_module()
+    get_dg()
 
     if not args.skip_correctness:
         if not test_correctness(module, args.correctness_positions):

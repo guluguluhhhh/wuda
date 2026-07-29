@@ -186,8 +186,13 @@ def benchmark(module):
     one = torch.ones((), device='cuda', dtype=torch.float32)
     for m in (2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128):
         x, x_fp8, x_sf, w_bf16, w_fp8, w_sf = make_inputs(m, seed=m)
-        # production contract: M<16 runs 16-row padded (TMA tiny-desc-rows
-        # pathology); the mixed column IS the padded number.
+        # production contract: M<16 runs 16-row padded; the mixed column IS
+        # the padded number. Root cause (exp_tma_tiny_rows.py + exp_tma_micro.cu):
+        # NOT a TMA-unit descriptor slow path (grid=1 is flat at any desc rows)
+        # but an L2 hotspot -- all 146 CTAs replicate reads of a tiny in-bounds
+        # A footprint (<10 rows x 14KB), serializing on few L2 slices and
+        # doubling load completion latency (~1.3x kernel time). Measured
+        # recovery threshold is desc rows >= 10; 16 keeps margin.
         mp = max(m, 16)
         if mp != m:
             xm = torch.zeros(mp, K, device='cuda', dtype=torch.bfloat16)

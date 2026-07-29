@@ -129,3 +129,48 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
         kernel_times.append(total_time / total_num if total_num > 0 else 0)
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]
+
+
+# ---------------- shared deep_gemm resolver ----------------
+_DEEP_GEMM = None
+
+
+def get_deep_gemm(pdl: bool = True):
+    """Single deep_gemm resolver for ALL tests (no hardcoded box paths).
+    Resolution order:
+      1. $DEEP_GEMM_DIR        -- explicit checkout override (wins over a
+                                  possibly stale installed wheel)
+      2. installed wheel       -- `pip install .` inside DeepGEMM works for
+                                  anyone, no layout assumptions
+      3. sibling checkout      -- <repo-parent>/DeepGEMM (our box layout
+                                  convention), auto-detected
+    pdl=True enables PDL once (producers emit launch_dependents for our
+    PSS consumers; matches vLLM's production ENABLE_PDL form)."""
+    global _DEEP_GEMM
+    if _DEEP_GEMM is None:
+        import importlib
+        env = os.environ.get("DEEP_GEMM_DIR", "")
+        if env:
+            assert os.path.isdir(os.path.join(env, "deep_gemm")), \
+                f"DEEP_GEMM_DIR={env} has no deep_gemm/ package"
+            sys.path.insert(0, env)
+            _DEEP_GEMM = importlib.import_module("deep_gemm")
+            print(f"[deep_gemm] DEEP_GEMM_DIR: {env}")
+        else:
+            try:
+                _DEEP_GEMM = importlib.import_module("deep_gemm")
+            except ModuleNotFoundError:
+                here = os.path.dirname(os.path.abspath(__file__))
+                cand = os.path.abspath(
+                    os.path.join(here, "..", "..", "..", "DeepGEMM"))
+                if not os.path.isdir(os.path.join(cand, "deep_gemm")):
+                    raise ModuleNotFoundError(
+                        "deep_gemm not found. Either `pip install .` inside "
+                        "a DeepGEMM checkout, or set DEEP_GEMM_DIR=/path/to/"
+                        f"DeepGEMM, or place the checkout at {cand}")
+                sys.path.insert(0, cand)
+                _DEEP_GEMM = importlib.import_module("deep_gemm")
+                print(f"[deep_gemm] sibling checkout: {cand}")
+        if pdl and hasattr(_DEEP_GEMM, "set_pdl"):
+            _DEEP_GEMM.set_pdl(True)
+    return _DEEP_GEMM
