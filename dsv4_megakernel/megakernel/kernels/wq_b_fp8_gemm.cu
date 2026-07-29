@@ -131,10 +131,19 @@ __global__ void __launch_bounds__(192, 1)
 qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
                    const float* __restrict__ gamma, float eps,
                    __nv_fp8_e4m3* __restrict__ x_fp8,
-                   uint8_t* __restrict__ x_sf, int m_total) {
+                   uint8_t* __restrict__ x_sf, int m_total,
+                   float* __restrict__ ssq_zero) {
     __shared__ float ssq_smem[NUM_K_TILES];
     const int warp_id = (int)(threadIdx.x / 32);
     const int lane_id = (int)(threadIdx.x % 32);
+    // Fold the head_ssq RED-buffer zeroing in here (glue removal): the
+    // dependent GEMM's GDS orders its RED atomics after our completion.
+    if (ssq_zero != nullptr) {
+        const int tot = m_total * 128;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tot;
+             i += gridDim.x * blockDim.x)
+            ssq_zero[i] = 0.0f;
+    }
     if (gamma != nullptr) {
         for (int r = blockIdx.x; r < m_total; r += gridDim.x)
             qnorm_quant_row_cta(y + (size_t)r * lda, gamma, eps, ssq_smem,
@@ -1085,7 +1094,7 @@ static std::vector<torch::Tensor> run_wq_b(
             qnorm_quant_kernel<<<qgrid, 192, 0, stream>>>(
                 qy_ptr, qy_lda, qgamma_ptr, static_cast<float>(q_eps),
                 const_cast<__nv_fp8_e4m3*>(x_ptr),
-                const_cast<uint8_t*>(xsf_ptr), M);
+                const_cast<uint8_t*>(xsf_ptr), M, ssq_ptr);
         }
 
         cudaLaunchConfig_t config = {};

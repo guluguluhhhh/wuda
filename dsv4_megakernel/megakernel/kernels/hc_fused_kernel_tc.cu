@@ -55,6 +55,11 @@ hc_reduce_and_fuse_kernel(
     float* __restrict__ pre_out,
     float* __restrict__ post_out,
     float* __restrict__ comb_out,
+    float* __restrict__ mix_out,   // [M,24] rms-folded mix (nullable): the
+    // front_mixed hc tail consumes THIS row to compute post/comb -- exporting
+    // it makes the e2e dataflow connected (no synthetic hc_mix).
+    uint8_t* __restrict__ xq_out,    // [M,7168] fp8 x for front (nullable,
+    uint8_t* __restrict__ xsf_out,   //  kFusedNorm only) + [M,56] ue8m0 sf
     const __nv_bfloat16* __restrict__ attn_norm_w,   // [7168] gamma, BF16 --
     // the CHECKPOINT dtype (model.py L188: "stored in bf16"); the official
     // chain computes in fp32 with the bf16 gamma upcast LOSSLESSLY, so the
@@ -127,6 +132,8 @@ hc_reduce_and_fuse_kernel(
     }
     __syncthreads();                                  // mix_smem + rms_smem visible
     if (tid < N_OUT) mix_smem[tid] *= rms_smem[0];    // fold RMSNorm scale into mix
+    if (mix_out != nullptr && tid < N_OUT)
+        mix_out[pos * N_OUT + tid] = mix_smem[tid];
     __syncthreads();                                  // folded mix visible to activation
     if (prof0 && threadIdx.x == 0) prof[3] = ptx::rdclock();  // reduce + rms done
 
@@ -281,6 +288,46 @@ hc_reduce_and_fuse_kernel(
                                                     (f.y * r) * wv[2 * k + 1]);
                 }
                 *reinterpret_cast<int4*>(collapsed + d0) = *reinterpret_cast<const int4*>(out2);
+                // FUSED act quant (glue removal; one step beyond vLLM, which
+                // pays a separate quant kernel): the normed bf16 row is in
+                // registers -- emit front's fp8 x + 1x128 ue8m0 sf here.
+                // A 128-block == 16 CONSECUTIVE threads' segments (nthreads
+                // is a multiple of 16), so a width-16 shuffle gives the amax.
+                // pow2-ceil exponent via bit inspection (bit-exact), divide
+                // as the exact pow2 reciprocal, packed fp8x2 conversions.
+                // (A redux.sync.max.abs.f32 + static-unroll restructure was
+                // MEASURED perf-neutral on B300 and reverted for simplicity;
+                // the emission cost is the extra 7KB/row store traffic.)
+                if (xq_out != nullptr) {
+                    float vq[VEC];
+                    float am = 0.f;
+                    #pragma unroll
+                    for (int k = 0; k < VEC / 2; ++k) {
+                        const float2 f2 = __bfloat1622float2(out2[k]);
+                        vq[2 * k] = f2.x; vq[2 * k + 1] = f2.y;
+                        am = fmaxf(am, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+                    }
+                    #pragma unroll
+                    for (int o = 8; o > 0; o >>= 1)
+                        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+                    const int ab = __float_as_int(
+                        fmaxf(am * (1.0f / 448.0f), 1e-4f));
+                    const int e = ((ab >> 23) & 0xff) - 127
+                                + ((ab & 0x7fffff) ? 1 : 0);   // ceil(log2)
+                    const float sinv = __int_as_float((127 - e) << 23);
+                    alignas(8) __nv_fp8x2_e4m3 q2[VEC / 2];
+                    #pragma unroll
+                    for (int k = 0; k < VEC / 2; ++k)
+                        q2[k] = __nv_fp8x2_e4m3(
+                            make_float2(vq[2 * k] * sinv,
+                                        vq[2 * k + 1] * sinv));
+                    *reinterpret_cast<uint2*>(
+                        xq_out + static_cast<int64_t>(pos) * DIM + d0) =
+                        *reinterpret_cast<const uint2*>(q2);
+                    if ((threadIdx.x & 15) == 0)
+                        xsf_out[pos * (DIM / 128) + d0 / 128] =
+                            (uint8_t)(e + 127);
+                }
             }
         } else {
         // Streaming collapse: out = bf16(sum_h pre_r[h] * x_h), no norm (the
@@ -326,18 +373,21 @@ hc_reduce_and_fuse_kernel(
 using FuseKernelT = void (*)(
     const __nv_bfloat16*, const float*, const float*, const float*,
     const float*, float, float, int, int, __nv_bfloat16*, float*, float*,
-    float*, const __nv_bfloat16*, float, int64_t*);
+    float*, float*, uint8_t*, uint8_t*, const __nv_bfloat16*, float,
+    int64_t*);
 
 static void launch_fuse_variant(
     FuseKernelT k, int m, int smem_bytes, cudaStream_t stream, bool pdl,
     const __nv_bfloat16* x_ptr, const float* ws, const float* sq,
     const float* base, const float* scale, float hc_eps, float rms_eps,
     int num_splits, __nv_bfloat16* out_ptr, float* pre, float* post,
-    float* comb, const __nv_bfloat16* norm_w, float norm_eps) {
+    float* comb, float* mix_out, uint8_t* xq_out, uint8_t* xsf_out,
+    const __nv_bfloat16* norm_w, float norm_eps) {
     if (!pdl) {
         k<<<m, EPILOGUE_THREADS, smem_bytes, stream>>>(
             x_ptr, ws, sq, base, scale, hc_eps, rms_eps, m, num_splits,
-            out_ptr, pre, post, comb, norm_w, norm_eps, nullptr);
+            out_ptr, pre, post, comb, mix_out, xq_out, xsf_out, norm_w,
+            norm_eps, nullptr);
         return;
     }
     cudaLaunchConfig_t cfg = {};
@@ -353,7 +403,8 @@ static void launch_fuse_variant(
     int64_t* prof = nullptr;
     TORCH_CHECK(cudaLaunchKernelEx(&cfg, k, x_ptr, ws, sq, base, scale,
                                    hc_eps, rms_eps, m, num_splits, out_ptr,
-                                   pre, post, comb, norm_w, norm_eps,
+                                   pre, post, comb, mix_out, xq_out,
+                                   xsf_out, norm_w, norm_eps,
                                    prof) == cudaSuccess,
                 "PDL fuse launch failed");
 }
@@ -373,7 +424,8 @@ static void hc_reduce_fuse_out(
     torch::Tensor collapsed, torch::Tensor pre, torch::Tensor post,
     torch::Tensor comb, bool with_post_comb,
     c10::optional<torch::Tensor> attn_norm_w, double attn_norm_eps,
-    bool pdl) {
+    bool pdl, c10::optional<torch::Tensor> mix_out,
+    c10::optional<torch::Tensor> xq_out, c10::optional<torch::Tensor> xsf_out) {
     TORCH_CHECK(hidden_states.is_cuda() &&
                 hidden_states.scalar_type() == torch::kBFloat16,
                 "hidden_states must be CUDA bf16");
@@ -431,6 +483,28 @@ static void hc_reduce_fuse_out(
                   : (attn_norm_w_ptr != nullptr
                      ? hc_reduce_and_fuse_kernel<false, true>
                      : hc_reduce_and_fuse_kernel<false, false>);
+    float* mix_ptr = nullptr;
+    if (mix_out.has_value() && mix_out->numel() > 0) {
+        TORCH_CHECK(mix_out->is_cuda() && mix_out->is_contiguous() &&
+                    mix_out->scalar_type() == torch::kFloat32 &&
+                    mix_out->numel() == static_cast<int64_t>(m) * N_OUT,
+                    "mix_out must be contiguous fp32 [m,24]");
+        mix_ptr = mix_out->data_ptr<float>();
+    }
+    uint8_t* xq_ptr = nullptr;
+    uint8_t* xsf_ptr = nullptr;
+    if (xq_out.has_value() && xq_out->numel() > 0) {
+        TORCH_CHECK(attn_norm_w_ptr != nullptr,
+                    "fused act quant needs the fused-norm variant");
+        TORCH_CHECK(xsf_out.has_value() && xq_out->is_cuda() &&
+                    xq_out->is_contiguous() && xsf_out->is_cuda() &&
+                    xsf_out->is_contiguous() &&
+                    xq_out->numel() == static_cast<int64_t>(m) * DIM &&
+                    xsf_out->numel() == static_cast<int64_t>(m) * (DIM / 128),
+                    "xq_out [m,7168] + xsf_out [m,56] must be given together");
+        xq_ptr = reinterpret_cast<uint8_t*>(xq_out->data_ptr());
+        xsf_ptr = reinterpret_cast<uint8_t*>(xsf_out->data_ptr());
+    }
     launch_fuse_variant(k, m, fuse_smem_bytes, stream, pdl,
                         x_ptr, workspace.data_ptr<float>(),
                         sqr_sum.data_ptr<float>(),
@@ -439,7 +513,8 @@ static void hc_reduce_fuse_out(
                         static_cast<float>(hc_eps),
                         static_cast<float>(rms_norm_eps), num_splits,
                         out_ptr, pre.data_ptr<float>(), post.data_ptr<float>(),
-                        comb.data_ptr<float>(), attn_norm_w_ptr,
+                        comb.data_ptr<float>(), mix_ptr, xq_ptr, xsf_ptr,
+                        attn_norm_w_ptr,
                         static_cast<float>(attn_norm_eps));
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "hc_reduce_fuse launch failed");
 }
@@ -458,5 +533,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("with_post_comb") = false,
           py::arg("attn_norm_w") = c10::nullopt,
           py::arg("attn_norm_eps") = 1e-6,
-          py::arg("pdl") = true);
+          py::arg("pdl") = true,
+          py::arg("mix_out") = c10::nullopt,
+          py::arg("xq_out") = c10::nullopt,
+          py::arg("xsf_out") = c10::nullopt);
 }

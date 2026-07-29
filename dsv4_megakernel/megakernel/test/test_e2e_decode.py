@@ -97,7 +97,8 @@ except Exception as e:
 DEV = "cuda"
 HC, DIM = 4, 7168
 N_FRONT = 4672
-TOPK = 512                     # DSV4 decode index_topk (topk_v2.cu contract)
+TOPK = 1024                    # DSV4 Pro index_topk (origin/config.json;
+                               # matches the vLLM baseline's hard gate)
 SWA_TOPK = 128
 Q_HEADS, Q_DIM = 128, 512
 IDX_HEADS, IDX_D = 64, 128
@@ -213,11 +214,14 @@ def hc_n_splits(m):
 
 
 def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
-                   ws=None, sq=None):
-    """HYBRID mhc (measured B300: beats both parents by ~2us): deep_gemm's
-    tf32 split-K GEMM (4.4-6.4us vs our splitk ~8) + OUR fused epilogue
-    (6.2us vs vLLM's TileLang fuse ~9-10). Workspace layout is identical on
-    both sides: mul [S,M,24] + sqrsum [S,M]."""
+                   ws=None, sq=None, mix_out=None, xq_out=None,
+                   xsf_out=None):
+    """HYBRID mhc: deep_gemm tf32 split-K GEMM + OUR fused epilogue
+    (identical workspace layout: mul [S,M,24] + sqrsum [S,M]).
+    mix_out [M,24] exports the rms-folded mix row (front tail consumes IT
+    for post/comb); xq_out/xsf_out emit front's fp8 activation + 1x128
+    ue8m0 sf straight from the epilogue registers (fused act quant -- no
+    separate quant kernel; vLLM pays one)."""
     B = hidden.size(0)
     S = hc_n_splits(B)
     if ws is None:
@@ -227,7 +231,8 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
     hcm.hc_reduce_fuse_out(hidden, ws, sq, w["hc_base"], w["hc_scale"],
                            EPS, EPS, collapsed, pre, po, cb,
                            with_post_comb=False, attn_norm_w=w["attn_norm"],
-                           attn_norm_eps=EPS)
+                           attn_norm_eps=EPS, mix_out=mix_out,
+                           xq_out=xq_out, xsf_out=xsf_out)
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats):
@@ -236,16 +241,24 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats):
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
 
-    # -- 1. MHC hybrid (deep_gemm tf32 GEMM + our nopc+norm epilogue) -----
+    # -- 1. MHC hybrid (deep_gemm tf32 GEMM + our nopc+norm epilogue);
+    #       mix_out exports the rms-folded mix row for the front tail ------
     collapsed = torch.empty(B, DIM, device=DEV, dtype=torch.bfloat16)
     pre = torch.empty(B, HC, device=DEV, dtype=torch.float32)
     po = torch.empty(B, HC, device=DEV, dtype=torch.float32)
     cb = torch.empty(B, HC, HC, device=DEV, dtype=torch.float32)
-    run_mhc_hybrid(get_dg(), hcm, hidden, w, collapsed, pre, po, cb)
+    mix = torch.empty(B, 24, device=DEV, dtype=torch.float32)
+    x_fp8 = torch.empty(B, DIM, device=DEV, dtype=torch.float8_e4m3fn)
+    x_sf = torch.empty(B, DIM // 128, device=DEV, dtype=torch.uint8)
+    run_mhc_hybrid(get_dg(), hcm, hidden, w, collapsed, pre, po, cb,
+                   mix_out=mix, xq_out=x_fp8.view(torch.uint8), xsf_out=x_sf)
 
-    # -- 2. front_mixed (+hc tail; hc_mix random side-channel, P1 note) ---
-    x_fp8, x_sf = t_fm.quant_act_fp8(collapsed)
-    hc = t_fm.make_hc(B, seed=int(pos[0]) + 11)
+    # -- 2. front_mixed (+hc tail: post/comb from the REAL mhc mix; fp8 x
+    #       comes fused from the mhc epilogue -- no quant kernel) ---------
+    hc = {"hc_mix": mix, "hc_base": w["hc_base"], "hc_scale": w["hc_scale"],
+          "hc_post": torch.empty(B, HC, device=DEV, dtype=torch.float32),
+          "hc_comb": torch.empty(B, HC * HC, device=DEV,
+                                 dtype=torch.float32)}
     y = fmm.front_mixed_gemm(collapsed, x_fp8, x_sf, w["front_bf16"],
                              w["front_fp8"], w["front_sf"], **hc)
     d8 = t_fm.calc_diff(y[:, :2048].float(),
@@ -387,9 +400,46 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats):
 
 
 # ==================== per-operator latency ====================
+_TRI = {}
+
+
+def _tri():
+    """ONE Triton kernel for the residual per-step glue (y-row scatter to
+    the fp32 bundle inputs + main-state row publish). Act quant and ssq
+    zeroing were FUSED AWAY (mhc epilogue emits fp8+sf; the qnorm producer
+    zeroes ssq) -- parity with vLLM's dedicated fused ops, one step further
+    on the quant."""
+    if _TRI:
+        return _TRI
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def glue_step(yp, idx4p, win2p, w64p, kvp, scp, slotp,
+                  YS: tl.constexpr, ROW: tl.constexpr):
+        b = tl.program_id(0)                # one token per program
+        base = yp + b.to(tl.int64) * YS
+        k = tl.arange(0, 512)
+        tl.store(idx4p + b * 512 + k,
+                 tl.load(base + 4096 + k).to(tl.float32))
+        tl.store(win2p + b * 512 + k,
+                 tl.load(base + 1536 + k).to(tl.float32))
+        k64 = tl.arange(0, 64)
+        tl.store(w64p + b * 64 + k64,
+                 tl.load(base + 4608 + k64).to(tl.float32))
+        srow = (tl.load(slotp + b) * 8 + ROW).to(tl.int64) * 1024
+        k1 = tl.arange(0, 1024)
+        tl.store(kvp + srow + k1, tl.load(base + 2048 + k1).to(tl.float32))
+        tl.store(scp + srow + k1, tl.load(base + 3072 + k1).to(tl.float32))
+
+    _TRI.update(glue_step=glue_step)
+    return _TRI
+
+
 def probe_kernel_names(fn):
-    """All kernel names fn launches (flush/memset/aten prep excluded); the
-    benched fns below are PURE kernel calls -- inputs pre-materialized."""
+    """All kernel names fn launches (flush/memset/aten prep excluded); every
+    benched stage is a pure named-kernel call (quant/glue are single Triton/
+    CUDA kernels), so the strict filter fits all of them."""
     from torch.profiler import ProfilerActivity, profile
     fn(); torch.cuda.synchronize()
     try:
@@ -413,31 +463,6 @@ def probe_kernel_names(fn):
     return tuple(names)
 
 
-def time_op(fn):
-    from bench_utils import bench_kineto
-    t = bench_kineto(fn, probe_kernel_names(fn), suppress_kineto_output=True,
-                     with_multiple_kernels=True)
-    return 1e6 * (sum(t) if isinstance(t, tuple) else t)
-
-
-def time_wall(fn, warmup=3, iters=20):
-    """CUDA-event WALL median with an L2 flush per iter. For PDL pairs
-    (quant producer + GEMM): kineto per-kernel sums DOUBLE-COUNT the overlap
-    and the consumer's GDS wait; the wall span is the honest number."""
-    flush = torch.empty(1 << 30, dtype=torch.uint8, device=DEV)   # 1GB >> L2
-    s = [torch.cuda.Event(True) for _ in range(iters)]
-    e = [torch.cuda.Event(True) for _ in range(iters)]
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    for i in range(iters):
-        flush.zero_()
-        s[i].record(); fn(); e[i].record()
-    torch.cuda.synchronize()
-    ts = sorted(s[i].elapsed_time(e[i]) for i in range(iters))
-    return 1e3 * ts[len(ts) // 2]
-
-
 def benchmark(mods, w, ncmp=2048):
     """vLLM-style HOT measurement (the comparison target): weights/caches
     warm, decode steps BACK-TO-BACK, no L2 flush.
@@ -458,7 +483,7 @@ def benchmark(mods, w, ncmp=2048):
     S = 4 * ncmp + 8
     ang = torch.rand(S, 32, device=DEV) * 6.28
     cosl, sinl = ang.cos().contiguous(), ang.sin().contiguous()
-    cols = ["mhc", "front", "wq_b", "mqa", "topk"] + \
+    cols = ["mhc", "front", "glue", "wq_b", "mqa", "topk"] + \
         (["mla"] if HAS_FLASH_MLA else []) + ["stages", "eager", "graph"]
     print("  hot, no-flush; stages = kineto device us; eager/graph = wall/step")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
@@ -476,60 +501,98 @@ def benchmark(mods, w, ncmp=2048):
         pos, q_pos = st["pos"], st["q_pos"]
         hidden = torch.randn(B, HC, DIM, device=DEV, dtype=torch.bfloat16) * .1
 
-        # ---- materialize every op's inputs by running the chain once ----
+        # ---- CONNECTED dataflow chain (audit fix): every stage reads THIS
+        # iteration's producer outputs. Fixed-address buffers where kernels
+        # take out=; wq_b's fresh returns flow through a holder dict -- at
+        # graph capture those allocations land in the graph pool, so replay
+        # keeps the same addresses and the flow stays connected.
         collapsed = torch.empty(B, DIM, device=DEV, dtype=torch.bfloat16)
         pre = torch.empty(B, HC, device=DEV, dtype=torch.float32)
         po, cb = pre.clone(), torch.empty(B, HC, HC, device=DEV)
+        mix = torch.empty(B, 24, device=DEV, dtype=torch.float32)
         S = hc_n_splits(B)     # hybrid mhc: preallocated split-K workspace
         hws = torch.empty(S, B, 24, device=DEV, dtype=torch.float32)
         hsq = torch.empty(S, B, device=DEV, dtype=torch.float32)
-        run_hc = lambda: run_mhc_hybrid(get_dg(), hcm, hidden, w,
-                                        collapsed, pre, po, cb, hws, hsq)
-        run_hc()
-        # front: PRODUCTION pad16 contract for B<16 (test_front discipline);
-        # downstream consumes y[:B].
+        # fp8 x + sf: written by the mhc epilogue's FUSED act quant (rows
+        # [:B]); pad rows stay zero from init (front reads Bp rows).
         Bp = max(B, 16)
-        coll_p = collapsed
-        if Bp != B:
-            coll_p = torch.zeros(Bp, DIM, device=DEV, dtype=torch.bfloat16)
-            coll_p[:B] = collapsed
-        x_fp8, x_sf = t_fm.quant_act_fp8(coll_p)
-        hc_t = t_fm.make_hc(Bp, seed=3)
+        x8 = torch.zeros(Bp, DIM, device=DEV, dtype=torch.float8_e4m3fn)
+        x8v = x8.view(torch.uint8)
+        x8s = torch.zeros(Bp, DIM // 128, device=DEV, dtype=torch.uint8)
+        run_hc = lambda: run_mhc_hybrid(get_dg(), hcm, hidden, w, collapsed,
+                                        pre, po, cb, hws, hsq, mix_out=mix,
+                                        xq_out=x8v[:B], xsf_out=x8s[:B])
+        # front: pad16 contract for B<16; hc tail consumes the REAL mhc mix;
+        # fp8 x comes fused from the mhc epilogue (no quant kernel).
+        coll_p = collapsed if Bp == B else \
+            torch.zeros(Bp, DIM, device=DEV, dtype=torch.bfloat16)
+        mix_p = mix if Bp == B else \
+            torch.zeros(Bp, 24, device=DEV, dtype=torch.float32)
+        hcd = {"hc_mix": mix_p, "hc_base": w["hc_base"],
+               "hc_scale": w["hc_scale"],
+               "hc_post": torch.empty(Bp, HC, device=DEV),
+               "hc_comb": torch.empty(Bp, HC * HC, device=DEV)}
         y_p = torch.empty(Bp, N_FRONT, device=DEV, dtype=torch.bfloat16)
-        run_front = lambda: fmm.front_mixed_gemm(
-            coll_p, x_fp8, x_sf, w["front_bf16"], w["front_fp8"],
-            w["front_sf"], out=y_p, **hc_t)
-        run_front()
         y = y_p[:B]
-        idx_y4 = y[:, 4096:4608].float().contiguous()
-        win_y2 = y[:, 1536:2048].float().contiguous()
-        weights64 = y[:, 4608:4672].float().contiguous()
+        hold = {}
+        TRI = _tri()
+
+        def run_front():
+            if Bp != B:
+                coll_p[:B].copy_(collapsed)
+                mix_p[:B].copy_(mix)
+            fmm.front_mixed_gemm(coll_p, x8, x8s, w["front_bf16"],
+                                 w["front_fp8"], w["front_sf"], out=y_p,
+                                 **hcd)
+        run_hc(); run_front()
+
+        # glue: ONE Triton kernel: y slices -> fp32 bundle inputs + the
+        # main-state fresh-row publication (pending producer op; vLLM's
+        # counterpart is its save_partial_states op).
+        idx_y4 = torch.empty(B, 512, device=DEV, dtype=torch.float32)
+        win_y2 = torch.empty(B, 512, device=DEV, dtype=torch.float32)
+        weights64 = torch.empty(B, 64, device=DEV, dtype=torch.float32)
+        ssq = torch.zeros(B, Q_HEADS, device=DEV, dtype=torch.float32)
+        slot_t = torch.tensor(slots, dtype=torch.int32, device=DEV)
+        p0 = 4 * ncmp - 1                       # same pos for every request
+        phys_row = ((4 * ((p0 >> 2) & 1)) + 4 + (p0 & 3)) & 7
+
+        def run_glue():
+            TRI["glue_step"][(B,)](y_p, idx_y4, win_y2, weights64,
+                                   mgr.main_kv, mgr.main_sc, slot_t,
+                                   YS=N_FRONT, ROW=phys_row)
+        run_glue()
+
         xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
         xq_sf = t_wq.as_ue8m0(torch.empty(B, 12, device=DEV,
                                           dtype=torch.uint8))
-        ssq = torch.zeros(B, Q_HEADS, device=DEV, dtype=torch.float32)
-        run_wqb = lambda: wqm.wq_b_proj_gemm_merged(
-            xq, xq_sf, w["wq_fp8"], w["wq_sf"], q_pos, cosl, sinl,
-            head_ssq=ssq, mock_post=False, cmp_pos=pos, idx_y4=idx_y4,
-            idx_ape=w["idx_ape"], idx_norm=w["idx_norm"], cos_tab=cosl,
-            sin_tab=sinl, idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
-            win_y2=win_y2, win_norm=w["win_norm"],
-            q_y=y[:, :1536], q_norm_w=w["q_norm"], slot_map=st["slot_map"],
-            idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
-            swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"])
-        rets = run_wqb()
-        yq, iq_fp4, iq_sf = rets[0], rets[1], rets[2]
+
+        def run_wqb():
+            hold["r"] = wqm.wq_b_proj_gemm_merged(
+                xq, xq_sf, w["wq_fp8"], w["wq_sf"], q_pos, cosl, sinl,
+                head_ssq=ssq, mock_post=False, cmp_pos=pos, idx_y4=idx_y4,
+                idx_ape=w["idx_ape"], idx_norm=w["idx_norm"], cos_tab=cosl,
+                sin_tab=sinl, idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
+                win_y2=win_y2, win_norm=w["win_norm"],
+                q_y=y[:, :1536], q_norm_w=w["q_norm"],
+                slot_map=st["slot_map"],
+                idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
+                swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"])
+        run_wqb()
         nc = mgr.n_compressed(slots, pos)
         idx_bt = mgr.block_table("idx", slots)
         logits = torch.full((B, (ncmp + 255) // 256 * 256), float("-inf"),
                             device=DEV)
+
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
-        run_mqa = lambda: mqm.mqa_logits_fp4_decode_out(
-            iq_fp4, iq_sf, mgr.idx_pool, weights64, nc, idx_bt, logits,
-            cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
-            sin_tab=sinl, comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
-            slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
-            cmp_dst=st["cmp_dst"])
+        def run_mqa():
+            r = hold["r"]
+            mqm.mqa_logits_fp4_decode_out(
+                r[1], r[2], mgr.idx_pool, weights64, nc, idx_bt, logits,
+                cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                sin_tab=sinl, comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
+                slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
+                cmp_dst=st["cmp_dst"])
         run_mqa()
         cmp_bt = mgr.block_table("cmp", slots)
         page_idx = torch.empty(B, TOPK, dtype=torch.int32, device=DEV)
@@ -539,10 +602,9 @@ def benchmark(mods, w, ncmp=2048):
         run_topk()
 
         stage_fns = [("mhc", run_hc), ("front", run_front),
-                     ("wq_b", run_wqb), ("mqa", run_mqa), ("topk", run_topk)]
+                     ("glue", run_glue), ("wq_b", run_wqb),
+                     ("mqa", run_mqa), ("topk", run_topk)]
         if HAS_FLASH_MLA:
-            q_raw = yq.view(B, 1, Q_HEADS, Q_DIM).bfloat16()
-            sum_sq = ssq.view(B, 1, Q_HEADS)
             rc = cosl[pos].view(B, 1, 32).contiguous()
             rs = sinl[pos].view(B, 1, 32).contiguous()
             swa_idx, swa_len = mgr.swa_indices(slots, pos, SWA_TOPK)
@@ -552,6 +614,8 @@ def benchmark(mods, w, ncmp=2048):
             sched, _ = flash_mla.get_mla_metadata()
 
             def run_mla():
+                q_raw = hold["r"][0].view(B, 1, Q_HEADS, Q_DIM).bfloat16()
+                sum_sq = ssq.view(B, 1, Q_HEADS)
                 if FMLA_FUSED_Q:
                     qi, fq = q_raw, dict(q_rms_sum_sq=sum_sq,
                                          q_rope_cos=rc, q_rope_sin=rs)
@@ -576,23 +640,30 @@ def benchmark(mods, w, ncmp=2048):
                 f()
 
         # ---- vLLM-style hot measurement --------------------------------
-        def hot_wall(f, warmup=5, iters=50):   # back-to-back wall/step
+        def hot_wall(f, warmup=5, iters=20, reps=3):
+            """back-to-back wall/step; MIN over reps guards against one-off
+            host stalls (profiler teardown etc.) landing in the window."""
             for _ in range(warmup):
                 f()
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(iters):
-                f()
-            torch.cuda.synchronize()
-            return (time.perf_counter() - t0) / iters * 1e6
+            best = float("inf")
+            for _ in range(reps):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    f()
+                torch.cuda.synchronize()
+                best = min(best, (time.perf_counter() - t0) / iters * 1e6)
+            return best
 
         # per-stage: bucket kineto device time of a HOT R-iter chain loop
+        # (strict probe everywhere: quant/glue are single named Triton
+        # kernels now; mla's q bf16 cast stays unbucketed -> walls only)
         name2stage = {}
         for sname, f in stage_fns:
             for n in probe_kernel_names(f):
                 name2stage.setdefault(n, sname)
         from torch.profiler import profile as _prof, ProfilerActivity
-        R = 10
+        R = 30      # 30-iter stage means (n=10 was too jittery)
         for _ in range(3):
             chain()
         torch.cuda.synchronize()
@@ -603,7 +674,14 @@ def benchmark(mods, w, ncmp=2048):
         with pctx as prof:
             for _ in range(R):
                 chain()
-            torch.cuda.synchronize()
+                # STEPPED stage semantics (aligned with the vLLM baseline's
+                # per-decode-step windows): drain between iterations so every
+                # step's first op starts on a quiet GPU -- the vLLM engine
+                # has host scheduling gaps there. Without this, the previous
+                # iteration's mla tail folds into the mhc GEMM's PDL wait
+                # (+0.5..1.6us, growing with B). eager/graph walls below
+                # remain GAPLESS (graph-serving semantics).
+                torch.cuda.synchronize()
         acc = {sname: 0.0 for sname, _ in stage_fns}
         for e in prof.events():
             sname = name2stage.get(e.name[:80])
@@ -614,6 +692,9 @@ def benchmark(mods, w, ncmp=2048):
                 d = getattr(e, "cuda_time", 0.0)
             acc[sname] += d
         ts = [acc[sname] / R for sname, _ in stage_fns]
+        # (mhc chain-vs-solo diagnostic removed after the verdict: the
+        # chain-solo gemm delta matched the hidden+hc_fn L2-refetch
+        # bandwidth at every B -- real input refetch, not a timing bug.)
 
         t_eager = hot_wall(chain)
 

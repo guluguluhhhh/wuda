@@ -56,45 +56,37 @@ def load_cuda_module():
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
     proj_dir = os.path.dirname(this_dir)
-    cutlass_dir = os.path.join(proj_dir, "..", "cutlass", "include")
-    cutlass_tools_dir = os.path.join(
-        proj_dir, "..", "cutlass", "tools", "util", "include"
-    )
 
     major, minor = torch.cuda.get_device_capability()
     sm = major * 10 + minor
     if sm < 100:
-        raise RuntimeError(f"tcgen05 requires Blackwell sm_100+, got sm_{sm}")
+        raise RuntimeError(
+            f"deep_gemm tf32_hc_prenorm_gemm requires sm_100+, got sm_{sm}")
 
+    # The epilogue is plain CUDA (no CUTLASS/tcgen05 left -- the in-house
+    # GEMM engine was deleted with the deep_gemm hybrid switch).
     cuda_flags = [
         "-O3",
         "--use_fast_math",
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-lineinfo",
-        "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
-        "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
     ]
     return load(
         name="hc_fused_tc",
         sources=[os.path.join(proj_dir, "kernels", "hc_fused_kernel_tc.cu")],
-        extra_include_paths=[
-            os.path.join(proj_dir, "include"),
-            cutlass_dir,
-            cutlass_tools_dir,
-        ],
+        extra_include_paths=[os.path.join(proj_dir, "include")],
         extra_cuda_cflags=cuda_flags,
-        extra_ldflags=["-lcuda"],
         verbose=True,
     )
 
 
 def run_hybrid(module, hidden, weight, base, scale, with_post_comb=False,
-               norm_w=None, bufs=None):
+               norm_w=None, bufs=None, xq=None, xsf=None):
     """The production call pair. bufs (optional) = dict of preallocated
-    ws/sq/collapsed/pre/post/comb for allocation-free hot loops."""
+    ws/sq/collapsed/pre/post/comb for allocation-free hot loops. xq/xsf
+    (norm variant only) enable the FUSED fp8 activation emission."""
     dg = get_dg()
     hs2 = hidden.contiguous().view(-1, K_DIM)
     m = hs2.size(0)
@@ -115,7 +107,8 @@ def run_hybrid(module, hidden, weight, base, scale, with_post_comb=False,
                               bufs["pre"], bufs["post"], bufs["comb"],
                               with_post_comb=with_post_comb,
                               attn_norm_w=norm_w,
-                              attn_norm_eps=RMS_NORM_EPS)
+                              attn_norm_eps=RMS_NORM_EPS,
+                              xq_out=xq, xsf_out=xsf)
     return bufs
 
 
@@ -228,7 +221,30 @@ def test_correctness(module, positions):
             f"{'bit=' + format(bitmatch, '.4f'):>12} {'':>12} "
             f"{('PASS' if nrm_ok else 'FAIL'):>8}"
         )
-        del hidden, expected, b, b_lite, b_nrm
+        # FUSED fp8 emission ablation-correctness: bytes must match the
+        # torch golden built with the SAME bit-inspected pow2-ceil exponent
+        # (quant source = the emitted bf16 collapsed itself).
+        xq = torch.empty(mm, DIM, device="cuda", dtype=torch.uint8)
+        xsf = torch.empty(mm, DIM // 128, device="cuda", dtype=torch.uint8)
+        b_q8 = run_hybrid(module, hidden, weight, base, scale, norm_w=norm_w,
+                          xq=xq, xsf=xsf)
+        torch.cuda.synchronize()
+        v = b_q8["collapsed"].float().view(mm, DIM // 128, 128)
+        t = (v.abs().amax(-1) * (1.0 / 448.0)).clamp_min(1e-4)
+        bits = t.view(torch.int32)
+        e_ref = ((bits >> 23) & 0xff) - 127 + ((bits & 0x7fffff) != 0).int()
+        sf_ok = (xsf == (e_ref + 127).to(torch.uint8)).float().mean().item()
+        qr = (v * torch.exp2(-e_ref.float()).unsqueeze(-1)) \
+            .to(torch.float8_e4m3fn).view(torch.uint8).view(mm, DIM)
+        q_ok = (xq == qr).float().mean().item()
+        q8_ok = sf_ok == 1.0 and q_ok > 0.9999
+        all_ok &= q8_ok
+        print(
+            f"{m:6d} {'fusedq8':>10} {'sf=' + format(sf_ok, '.4f'):>12} "
+            f"{'q=' + format(q_ok, '.6f'):>12} {'':>12} "
+            f"{('PASS' if q8_ok else 'FAIL'):>8}"
+        )
+        del hidden, expected, b, b_lite, b_nrm, b_q8
 
     print("-" * 68)
     print("ALL PASSED" if all_ok else "CORRECTNESS FAILED")
@@ -286,14 +302,15 @@ def benchmark(module, positions):
     print(f"\nBenchmark: {torch.cuda.get_device_name()}")
     print("HYBRID mhc: deep_gemm tf32 prenorm GEMM + our fused epilogue (PDL)")
     print("  full = with post/comb+Sinkhorn; no-pc = lite; +nrm = lite with")
-    print("  FULLY fused attn_norm (production). gemm/fuse = per-kernel split")
-    print("  of +nrm (kineto; PDL overlap double-counted). cuBLAS = middle")
-    print("  GEMM only (bf16 floor).")
+    print("  FULLY fused attn_norm (production). +q8 = +nrm PLUS the fused")
+    print("  fp8 activation emission (ablation: +q8 minus +nrm = its cost).")
+    print("  gemm/fuse = per-kernel split of +q8 (kineto; PDL overlap")
+    print("  double-counted). cuBLAS = middle GEMM only (bf16 floor).")
     print(
         f"{'M':>6} {'splits':>7} {'full':>9} {'no-pc':>8} {'+nrm':>8} "
-        f"{'gemm':>8} {'fuse':>8} {'cuBLAS':>9}"
+        f"{'+q8':>8} {'gemm':>8} {'fuse':>8} {'cuBLAS':>9}"
     )
-    print("-" * 70)
+    print("-" * 78)
 
     for m in positions:
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
@@ -313,10 +330,16 @@ def benchmark(module, positions):
                                      bufs=bufs)
         nrm_fn = lambda: run_hybrid(module, hidden, weight, base, scale,
                                     norm_w=norm_w, bufs=bufs)
-        names = probe_kernel_names(nrm_fn)
+        xq8 = torch.empty(m, DIM, device=dev, dtype=torch.uint8)
+        xsf8 = torch.empty(m, DIM // 128, device=dev, dtype=torch.uint8)
+        q8_fn = lambda: run_hybrid(module, hidden, weight, base, scale,
+                                   norm_w=norm_w, bufs=bufs, xq=xq8,
+                                   xsf=xsf8)
+        names = probe_kernel_names(q8_fn)
         full_us = time_cuda_us(full_fn, probe_kernel_names(full_fn))
         lite_us = time_cuda_us(lite_fn, probe_kernel_names(lite_fn))
-        ts = bench_kineto(nrm_fn, names, suppress_kineto_output=True,
+        nrm_us = time_cuda_us(nrm_fn, probe_kernel_names(nrm_fn))
+        ts = bench_kineto(q8_fn, names, suppress_kineto_output=True,
                           with_multiple_kernels=True)
         ts = [1e6 * v for v in (ts if isinstance(ts, tuple) else (ts,))]
         gemm = sum(t for n, t in zip(names, ts) if "prenorm" in n.lower()
@@ -324,11 +347,11 @@ def benchmark(module, positions):
         fuse = sum(ts) - gemm
         cublas_us = time_cuda_us_probed(lambda: F.linear(x, wb))
         print(
-            f"{m:6d} {S:7d} {full_us:9.3f} {lite_us:8.3f} {sum(ts):8.3f} "
-            f"{gemm:8.3f} {fuse:8.3f} {cublas_us:9.3f}"
+            f"{m:6d} {S:7d} {full_us:9.3f} {lite_us:8.3f} {nrm_us:8.3f} "
+            f"{sum(ts):8.3f} {gemm:8.3f} {fuse:8.3f} {cublas_us:9.3f}"
         )
-        del hidden, x, bufs
-    print("-" * 70)
+        del hidden, x, bufs, xq8, xsf8
+    print("-" * 78)
 
 
 def parse_positions(value):
