@@ -78,6 +78,7 @@ def benchmark(module):
     print(f"  {'M':<6} {'us':<8} {'GB/s':<8}")
     print("  " + "-" * 24)
     for M in [1, 4, 16, 32, 64, 128, 256, 1024, 4096]:
+        torch.cuda.empty_cache()   # canonical allocator state per cell
         iq_f32 = torch.randn(M, 64, 128, device=dev, dtype=torch.float32)
         q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
         us = 1e6 * bench_kineto(

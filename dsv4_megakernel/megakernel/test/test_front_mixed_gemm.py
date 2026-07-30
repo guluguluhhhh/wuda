@@ -185,6 +185,7 @@ def benchmark(module):
 
     one = torch.ones((), device='cuda', dtype=torch.float32)
     for m in (2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128):
+        torch.cuda.empty_cache()   # canonical allocator state per cell
         x, x_fp8, x_sf, w_bf16, w_fp8, w_sf = make_inputs(m, seed=m)
         # production contract: M<16 runs 16-row padded; the mixed column IS
         # the padded number. Root cause (exp_tma_tiny_rows.py + exp_tma_micro.cu):

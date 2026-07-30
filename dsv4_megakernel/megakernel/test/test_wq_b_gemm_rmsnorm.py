@@ -144,6 +144,7 @@ def benchmark(module):
     print("  " + "-" * 70)
 
     for M in batch_sizes:
+        torch.cuda.empty_cache()   # canonical allocator state per cell
         x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
 
         # --- tcgen05 kernel ---
@@ -227,6 +228,7 @@ def profile_overlap(module, Ms=(32, 64, 128)):
     print("  " + "-" * 80)
 
     for M in Ms:
+        torch.cuda.empty_cache()   # canonical allocator state per cell
         x = torch.randn(M, K_DIM, device=device, dtype=torch.bfloat16) * 0.1
         for _ in range(5):
             module.wq_b_proj_gemm_profiled(x, w, rms_w, RMS_EPS)

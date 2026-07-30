@@ -350,7 +350,15 @@ def benchmark_merged(module):
           f"{'d_comp':<7} {'d_win':<7} {'d_quant':<8} {'d_q+norm':<9} {'d_all':<7} "
           f"{'cuBLAS(us)':<11} {'fused_BW':<9} {'%cuBLAS':<8}")
     print("  " + "-" * 116)
-    for M in [1, 2, 7, 16, 31, 32, 61, 64, 96, 97, 127, 128]:
+    # ADDRESS-PLACEMENT DISCRIMINATOR for the wandering d_ anomalies (they
+    # reproduce EXACTLY under a fixed sweep order and move when the order
+    # changes -> allocator-history-dependent buffer addresses colliding
+    # with the weight TMA stream, NOT kernel behavior):
+    #   - empty_cache() per cell -> canonical allocator state
+    #   - ssqbuf from a FIXED max-size pool -> same address every cell
+    ssqbuf_pool = torch.zeros(128, 128, device=dev, dtype=torch.float32)
+    for M in list(range(1, 17)) + [31, 32, 61, 64, 96, 97, 127, 128]:
+        torch.cuda.empty_cache()
         x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
         x_sf = make_act_sf_ones(M, dev)
         q_y = (torch.randn(M, 4672, device=dev) * 0.1).bfloat16()[:, :K_DIM]
@@ -359,7 +367,7 @@ def benchmark_merged(module):
         comp = make_comp_inputs(M, dev, all_compress=True)
         win = make_win_inputs(M, dev)
         # accumulates garbage across timing iters -- irrelevant for latency
-        ssqbuf = torch.zeros(M, 128, device=dev, dtype=torch.float32)
+        ssqbuf = ssqbuf_pool[:M]
 
         def run(mock=True, ssq=None, en_ssq=False, wc=False, ww=False,
                 qy=False, qn=False):

@@ -313,6 +313,10 @@ def benchmark(module, positions):
     print("-" * 78)
 
     for m in positions:
+        # canonical allocator state per cell (wq_b sweep lesson: history-
+        # dependent buffer addresses can collide with hot streams and skew
+        # WHOLE cells; ablation columns like +q8 - +nrm are extra sensitive)
+        torch.cuda.empty_cache()
         hidden, _, _, _ = make_inputs(m, weight, base, scale)
         x = hidden.reshape(m, K_DIM)
         S = hc_n_splits(m)
