@@ -436,21 +436,27 @@ def make_comp_inputs(M, dev, all_compress=False):
 
 def ref_comp_step(kv, sc, y4, pos, ape, norm_w, cos_tab, sin_tab, eps=1e-6):
     """Torch reference of one fused-compressor step, kernel order & rounding:
-    fresh write (+ape) -> [compress] overlap-cat 8-slot softmax -> shift ->
+    fresh write (+ape) -> [compress] overlap-cat 8-slot softmax ->
     bf16 RMSNorm -> rope(last 64, bf16) -> @H128*128^-0.5 (bf16) -> fp4 sim.
-    kv/sc are updated IN PLACE (pass clones)."""
+    kv/sc are updated IN PLACE (pass clones).
+    [B1] PING-PONG state (idx_comp_fp4.cuh): logical row rr of position p
+    lives at physical (4*((p>>2)&1) + rr) & 7; NO shift copy ever happens."""
     M = pos.shape[0]
     dev = y4.device
     pmod = (pos % 4).long()
-    kv[torch.arange(M, device=dev), 4 + pmod] = y4[:, :256]
-    sc[torch.arange(M, device=dev), 4 + pmod] = y4[:, 256:] + ape[pmod]
+    phase = 4 * ((pos >> 2) & 1).long()                    # [M] 0 or 4
+    ridx = torch.arange(M, device=dev)
+    fresh = (phase + 4 + pmod) & 7
+    kv[ridx, fresh] = y4[:, :256]
+    sc[ridx, fresh] = y4[:, 256:] + ape[pmod]
     compress = ((pos + 1) % 4) == 0
-    # aggregate BEFORE the shift (kernel order), overlap-cat columns
-    kv_cat = torch.cat([kv[:, :4, :128], kv[:, 4:, 128:]], dim=1)   # [M,8,128]
-    sc_cat = torch.cat([sc[:, :4, :128], sc[:, 4:, 128:]], dim=1)
+    # aggregate reads logical rows THROUGH the ping-pong mapping
+    lrow = (phase.view(M, 1) + torch.arange(8, device=dev).view(1, 8)) & 7
+    kv_l = kv[ridx.view(M, 1), lrow]                       # [M,8,256] logical
+    sc_l = sc[ridx.view(M, 1), lrow]
+    kv_cat = torch.cat([kv_l[:, :4, :128], kv_l[:, 4:, 128:]], dim=1)
+    sc_cat = torch.cat([sc_l[:, :4, :128], sc_l[:, 4:, 128:]], dim=1)
     cmp = (torch.softmax(sc_cat, dim=1) * kv_cat).sum(1)            # [M,128]
-    kv[compress, :4] = kv[compress, 4:].clone()
-    sc[compress, :4] = sc[compress, 4:].clone()
     v = cmp.bfloat16().float()
     rms = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
     x = (v * rms * norm_w).bfloat16().float()
