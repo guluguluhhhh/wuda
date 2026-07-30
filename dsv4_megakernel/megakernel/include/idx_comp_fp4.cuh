@@ -4,7 +4,9 @@
 // (warps 8..11, WARP-LEVEL: 32 threads/row, 4 rows in flight per CTA):
 //   * indexer (winkv) COMPRESSOR (CSA stage 6, delivery op_b_tail port):
 //       y4 state write (+ape) -> [compress row] 8-slot softmax aggregate ->
-//       shift -> bf16 RMSNorm(128) -> RoPE(last 64) -> FWHT-128 -> fp4 block-32
+//       bf16 RMSNorm(128) -> RoPE(last 64) -> FWHT-128 -> fp4 block-32.
+//       The 8-row overlap state uses a position-derived 4+4 ping-pong mapping,
+//       so compression never copies state[4:8] back to state[0:4].
 //   * LOCAL KV WINDOW post-processing (CSA stage 4, FULL chain -- delivery
 //     stopped at rope): weighted RMSNorm(512) -> RoPE(last 64) -> per-64 fp8
 //     e4m3 quant of [0,448) (delivery main-compressor semantics: scale =
@@ -53,6 +55,9 @@ struct Args {
     const float* norm_w  = nullptr;   // [D_I] compressor RMSNorm weight
     const float* cos_tab = nullptr;   // [S, RD/2] rope tables (S > max pos)
     const float* sin_tab = nullptr;
+    // [B1] PING-PONG state window: logical row rr at token position p lives at
+    // physical row (4*((p/4)&1) + rr) & 7. The fresh logical row is 4+p%4;
+    // switching the phase advances the previous window without a physical copy.
     float* kv = nullptr;              // [M, SROWS, WK_I] K/V state ring (INOUT)
     float* sc = nullptr;              // [M, SROWS, WK_I] score state (INOUT)
     uint8_t* q4 = nullptr;            // [M, D_I/2]  packed e2m1 (compress rows)
@@ -96,20 +101,23 @@ __device__ inline void process_row(const Args& a, int m, int lane,
                                    float eps = 1e-6f) {
     const long long p = a.pos[m];
     const int pmod = (int)(p & (RATIO - 1));
+    const int phase = RATIO * ((int)(p >> 2) & 1);
     // kvcache design: the state ring lives in a PERSISTENT-slot pool.
     const int srow = a.slot_map ? a.slot_map[m] : m;
 
-    // ---- y4 state write: fresh slot = RATIO + pos%RATIO, ape folded into sc.
+    // ---- y4 state write: fresh logical slot = RATIO + pos%RATIO; map it
+    // through the ping-pong phase, and fold ape into sc.
     // The fresh vectors are KEPT IN REGISTERS: lane l's j=1 vector holds cols
     // {128+4l..128+4l+3} -- exactly the overlap-cat upper-half columns the
     // aggregate below needs from the fresh row, so the fresh slot is register-
     // forwarded (no write->read round trip, no pre-aggregate __syncwarp). ----
     float4 fkv1, fsc1;
     {
+        const int fresh_phys = (phase + RATIO + pmod) & (SROWS - 1);
         float4* kv_slot = reinterpret_cast<float4*>(
-            a.kv + ((size_t)srow * SROWS + RATIO + pmod) * WK_I);
+            a.kv + ((size_t)srow * SROWS + fresh_phys) * WK_I);
         float4* sc_slot = reinterpret_cast<float4*>(
-            a.sc + ((size_t)srow * SROWS + RATIO + pmod) * WK_I);
+            a.sc + ((size_t)srow * SROWS + fresh_phys) * WK_I);
         const float4* y4kv = reinterpret_cast<const float4*>(a.y4 + (size_t)m * 2 * WK_I);
         const float4* y4sc = y4kv + WK_I / 4;
         const float4* ape4 = reinterpret_cast<const float4*>(a.ape + (size_t)pmod * WK_I);
@@ -145,9 +153,10 @@ __device__ inline void process_row(const Args& a, int m, int lane,
                 sc8[rr] = fsc1;
                 kv8[rr] = fkv1;
             } else {
+                const int pr = (phase + rr) & (SROWS - 1);
                 const int col = (rr < RATIO) ? c0 : (D_I + c0);
-                sc8[rr] = *reinterpret_cast<const float4*>(ssc + (size_t)rr * WK_I + col);
-                kv8[rr] = *reinterpret_cast<const float4*>(skv + (size_t)rr * WK_I + col);
+                sc8[rr] = *reinterpret_cast<const float4*>(ssc + (size_t)pr * WK_I + col);
+                kv8[rr] = *reinterpret_cast<const float4*>(skv + (size_t)pr * WK_I + col);
             }
         }
         #pragma unroll
@@ -169,19 +178,6 @@ __device__ inline void process_row(const Args& a, int m, int lane,
                 wsum  += w * k0[rr];
             }
             v[j] = wsum / denom;
-        }
-        __syncwarp();                      // all state reads done before the shift
-    }
-
-    // ---- shift: state[:RATIO] <- state[RATIO:] (float4, 8+8 vectors/lane) ----
-    {
-        float4* kv4 = reinterpret_cast<float4*>(skv);
-        float4* sc4 = reinterpret_cast<float4*>(ssc);
-        constexpr int NSH = RATIO * WK_I / 4;                // 256 float4
-        #pragma unroll
-        for (int i = lane; i < NSH; i += 32) {
-            kv4[i] = kv4[i + NSH];
-            sc4[i] = sc4[i + NSH];
         }
     }
 
