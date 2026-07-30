@@ -16,7 +16,8 @@
 //   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
 //
 // Fused indexer (winkv) COMPRESSOR (optional, delivery op-B-tail port, NO
-// split-K): pass cmp_pos/idx_y4/idx_ape/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc
+// split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc (fresh state
+// row arrives from front's FRONT-EMIT epilogue, +idx_ape)
 // together and warps 8..11 run the state write + compress chain (softmax
 // aggregate -> shift -> RMSNorm -> RoPE -> FWHT -> fp4) fully decoupled from
 // the GEMM; appends idx_q4 [M,64] u8 + idx_s4 [M,4] u8 to the returns.
@@ -768,10 +769,10 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> head_ssq,
     torch::Tensor q_pos, torch::Tensor rope_cos, torch::Tensor rope_sin,
     bool mock_post = false, bool enable_ssq = true,
-    // fused indexer compressor bundle (all-or-none; see idx_comp_fp4.cuh)
+    // fused indexer compressor bundle (all-or-none; see idx_comp_fp4.cuh).
+    // FRONT-EMIT: the fresh state row (+idx_ape) is published by front's
+    // epilogue; no idx_y4/idx_ape inputs here anymore.
     c10::optional<torch::Tensor> cmp_pos = c10::nullopt,
-    c10::optional<torch::Tensor> idx_y4  = c10::nullopt,
-    c10::optional<torch::Tensor> idx_ape = c10::nullopt,
     c10::optional<torch::Tensor> idx_norm = c10::nullopt,
     c10::optional<torch::Tensor> cos_tab = c10::nullopt,
     c10::optional<torch::Tensor> sin_tab = c10::nullopt,
@@ -941,18 +942,14 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.sin_tab = sin_tab->data_ptr<float>();
     }
     if (comp_on) {
-        TORCH_CHECK(idx_y4 && idx_ape && idx_norm && idx_sc,
-                    "indexer compressor needs ALL of idx_y4/idx_ape/idx_norm/idx_kv/idx_sc");
-        ck(*idx_y4,  torch::kFloat, "idx_y4");
-        ck(*idx_ape, torch::kFloat, "idx_ape");
+        // FRONT-EMIT: the fresh idx state row (fp32 + idx_ape on the score
+        // half) is published by front_mixed's epilogue BEFORE this kernel;
+        // the chain here only aggregates -- no y4/ape inputs anymore.
+        TORCH_CHECK(idx_norm && idx_sc,
+                    "indexer compressor needs idx_norm/idx_kv/idx_sc");
         ck(*idx_norm, torch::kFloat, "idx_norm");
         ck(*idx_kv,  torch::kFloat, "idx_kv");
         ck(*idx_sc,  torch::kFloat, "idx_sc");
-        TORCH_CHECK(idx_y4->dim() == 2 && idx_y4->size(0) == M
-                    && idx_y4->size(1) == 2 * idx_comp::WK_I,
-                    "idx_y4 must be [M,512] (wkv|wgate)");
-        TORCH_CHECK(idx_ape->dim() == 2 && idx_ape->size(0) == idx_comp::RATIO
-                    && idx_ape->size(1) == idx_comp::WK_I, "idx_ape must be [4,256]");
         TORCH_CHECK(idx_norm->numel() == idx_comp::D_I, "idx_norm must be [128]");
         const auto state_ok = [&](const torch::Tensor& t) {
             // Legacy per-step state [M,8,256], or a persistent-slot POOL
@@ -975,8 +972,6 @@ static std::vector<torch::Tensor> run_wq_b(
             comp.q4 = idx_q4_t.data_ptr<uint8_t>();
             comp.s4 = idx_s4_t.data_ptr<uint8_t>();
         }
-        comp.y4 = idx_y4->data_ptr<float>();
-        comp.ape = idx_ape->data_ptr<float>();
         comp.norm_w = idx_norm->data_ptr<float>();
         comp.kv = idx_kv->data_ptr<float>();
         comp.sc = idx_sc->data_ptr<float>();
@@ -1147,8 +1142,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              torch::Tensor w_fp8, torch::Tensor w_sf,
              torch::Tensor q_pos, torch::Tensor rope_cos, torch::Tensor rope_sin,
              c10::optional<torch::Tensor> head_ssq, bool mock_post, bool enable_ssq,
-             c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> idx_y4,
-             c10::optional<torch::Tensor> idx_ape, c10::optional<torch::Tensor> idx_norm,
+             c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> idx_norm,
              c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
              c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
              c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm,
@@ -1159,7 +1153,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> swa_cache, c10::optional<torch::Tensor> swa_dst) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
-                              cmp_pos, idx_y4, idx_ape, idx_norm,
+                              cmp_pos, idx_norm,
                               cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm,
                               q_y, q_norm_w, q_eps,
                               slot_map, idx_cache, idx_dst, swa_cache, swa_dst);
@@ -1172,9 +1166,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "DEFAULT mock_post=True: 256 threads, GEMM+ssq only -- iq_fp4/iq_sf stay "
           "garbage; run idx_postprocess_standalone over iq_ws. mock_post=False: "
           "384 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
-          "COMPRESSOR (no split-K): pass ALL of cmp_pos [M] i64 / idx_y4 [M,512] / "
-          "idx_ape [4,256] / idx_norm [128] / cos_tab+sin_tab [S,32] / idx_kv+idx_sc "
-          "[M,8,256] (INOUT state rings) -- warps 8..11 run it beside the GEMM. "
+          "COMPRESSOR (no split-K): pass cmp_pos [M] i64 / idx_norm [128] / "
+          "cos_tab+sin_tab [S,32] / idx_kv+idx_sc [M,8,256] (state rings; the "
+          "fresh row is published by front's FRONT-EMIT epilogue, +idx_ape) "
+          "-- warps 8..11 run it beside the GEMM. "
           "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
           "[512] (+ cmp_pos/cos_tab/sin_tab) -> appends win_q8 [M,448] u8, win_s8 "
           "[M,7] f32, win_rope [M,64] bf16",
@@ -1184,8 +1179,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mock_post") = true,
           py::arg("enable_ssq") = true,
           py::arg("cmp_pos") = c10::nullopt,
-          py::arg("idx_y4") = c10::nullopt,
-          py::arg("idx_ape") = c10::nullopt,
           py::arg("idx_norm") = c10::nullopt,
           py::arg("cos_tab") = c10::nullopt,
           py::arg("sin_tab") = c10::nullopt,

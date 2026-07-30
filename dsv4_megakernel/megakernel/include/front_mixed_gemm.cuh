@@ -396,6 +396,37 @@ struct HcTailArgs {
   float* comb_out = nullptr;         // [m, 4, 4] fp32
 };
 
+// [FRONT-EMIT] Direct side-channel epilogue outputs (all-or-none, gated on
+// main_kv != nullptr). The accumulators leave TMEM as fp32, so the
+// compressor-bound segments are emitted at FULL fp32 (model.py Compressor:
+// "compression need fp32") -- this REMOVES the old y-bf16 round trip AND its
+// fp32(bf16(acc)) rounding deviation. y writes are skipped for every emitted
+// tile: only the q columns [0,1536) still land in y.
+//   [1536,2048) win  -> win_y2 [M,512] as fp32(bf16(acc))  (wkv output is
+//                       bf16 in the reference -> keep that rounding)
+//   [2048,4096) main -> MAIN state pool rows, fp32; score half += ape[pos%4]
+//                       (model.py L332 score_state contract)
+//   [4096,4608) idx  -> IDX state pool rows, fp32; score half += idx_ape
+//                       (SAME [B1] ping-pong row as main: state_row[m] =
+//                       slot*8 + (4*((p>>2)&1)+4+p%4)&7; wq_b's compressor
+//                       became a pure POOL READER)
+//   [4608,4672) w64  -> w64 [M,64] as fp32(bf16(acc)) (weights_proj is bf16)
+struct FrontEmitArgs {
+  float* main_kv = nullptr;        // pool [capacity,8,1024], kv half
+  float* main_sc = nullptr;        // pool [capacity,8,1024], score half
+  const float* ape = nullptr;      // [4,1024] main-compressor ape
+  const int* state_row = nullptr;  // [M] slot*8 + pingpong row (host-folded)
+  const int* ape_phase = nullptr;  // [M] pos % 4
+  float* idx_kv = nullptr;         // pool [capacity,8,256], kv half
+  float* idx_sc = nullptr;         // pool [capacity,8,256], score half
+  const float* idx_ape = nullptr;  // [4,256] indexer-compressor ape
+  float* win_y2 = nullptr;         // [M,512]
+  float* w64 = nullptr;            // [M,64]
+};
+
+// Tile families for the epilogue store path (uniform per cluster).
+enum FrontEmitFam { FAM_Y = 0, FAM_WIN, FAM_MAIN, FAM_IDX, FAM_W64 };
+
 __device__ __forceinline__ float hc_tail_sigmoid(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -471,6 +502,7 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
     const uint8_t* __restrict__ x_sf,
     const uint8_t* __restrict__ w_sf,
     HcTailArgs hc,                   // [TC/CC] MHC post+comb tail (mix=null=>off)
+    FrontEmitArgs emit,              // [FRONT-EMIT] direct side outputs (off=null)
     int problem_m) {
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   auto& s = *reinterpret_cast<SharedStorage*>(smem_raw);
@@ -486,6 +518,15 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
   const int n_col_base = is_fp8
       ? n_tile * BLOCK_N_FP8
       : N_FP8 + (n_tile - N_TILES_FP8) * BLOCK_N_BF16;
+  // [FRONT-EMIT] store family (uniform for the whole cluster; FAM_Y when
+  // the side-emit bundle is absent -> byte-identical legacy behavior).
+  int fam = FAM_Y;
+  if (emit.main_kv != nullptr) {
+    if (n_col_base >= 4608)      fam = FAM_W64;
+    else if (n_col_base >= 4096) fam = FAM_IDX;
+    else if (n_col_base >= 2048) fam = FAM_MAIN;
+    else if (n_col_base >= 1536) fam = FAM_WIN;
+  }
   const bool elected = elect_one();
 
   if (warp == 0 && elected) {
@@ -722,9 +763,22 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
     // the full row anyway and reduces its own ssq with a DETERMINISTIC warp
     // order -- strictly better than RED-atomic partial sums here.)
 
-    if (epi_warpgroup == 0) {
+    if (epi_warpgroup == 0 || fam != FAM_Y) {
+      // [FRONT-EMIT] per-lane row constants (row = row_half*32+lane is fixed
+      // for the whole st/sub loop): state-pool indirection + ape phase.
+      // Emit tiles ALSO run on warpgroup 1 (it idles in the TMA path only
+      // to avoid duplicate smem writes; TMEM reads DO duplicate safely) --
+      // wg0 takes st=0, wg1 takes st=1, halving each warp's store chain.
+      const int erow = m_tile * BLOCK_M + rank * CTA_M + row_half * 32 + lane;
+      int e_srow = 0, e_aph = 0;
+      if ((fam == FAM_MAIN || fam == FAM_IDX) && erow < problem_m) {
+        e_srow = emit.state_row[erow];
+        e_aph = emit.ape_phase[erow];
+      }
       #pragma unroll
       for (int st = 0; st < EPI_STEPS; ++st) {
+        if (fam != FAM_Y && st != epi_warpgroup)
+          continue;
         #pragma unroll
         for (int sub = 0; sub < 2; ++sub) {
           uint32_t addr = st * 16 + sub * 8;
@@ -736,17 +790,71 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
           const int out_row = m_tile * BLOCK_M + rank * CTA_M + row;
           const int out_col = n_col_base + col;
           if (out_row < problem_m && out_col + 7 < N) {
-            uint4 packed = pack_bf16x8(v0, v1, v2, v3, v4, v5, v6, v7);
-            const int atom_col = col % EPI_ATOM_N;
-            const int swizzle_group = (atom_col / 8) ^ (row & 7);
-            uint8_t* smem_row = s.smem_a +
-                                row * (EPI_ATOM_N * sizeof(__nv_bfloat16)) +
-                                swizzle_group * 16 +
-                                (atom_col % 8) * sizeof(__nv_bfloat16);
-            st_shared_u32(smem_row + 0, packed.x);
-            st_shared_u32(smem_row + 4, packed.y);
-            st_shared_u32(smem_row + 8, packed.z);
-            st_shared_u32(smem_row + 12, packed.w);
+            if (fam == FAM_Y) {
+              uint4 packed = pack_bf16x8(v0, v1, v2, v3, v4, v5, v6, v7);
+              const int atom_col = col % EPI_ATOM_N;
+              const int swizzle_group = (atom_col / 8) ^ (row & 7);
+              uint8_t* smem_row = s.smem_a +
+                                  row * (EPI_ATOM_N * sizeof(__nv_bfloat16)) +
+                                  swizzle_group * 16 +
+                                  (atom_col % 8) * sizeof(__nv_bfloat16);
+              st_shared_u32(smem_row + 0, packed.x);
+              st_shared_u32(smem_row + 4, packed.y);
+              st_shared_u32(smem_row + 8, packed.z);
+              st_shared_u32(smem_row + 12, packed.w);
+            } else {
+              // [FRONT-EMIT] fp32 accum straight to the side buffers; each
+              // lane owns an 8-col span = ONE aligned 32B store (256-bit
+              // vector store, sm_100).
+              alignas(32) float f[8] = {
+                  __uint_as_float(v0), __uint_as_float(v1),
+                  __uint_as_float(v2), __uint_as_float(v3),
+                  __uint_as_float(v4), __uint_as_float(v5),
+                  __uint_as_float(v6), __uint_as_float(v7)};
+              float* dst;
+              if (fam == FAM_MAIN) {
+                const int seg = out_col - 2048;   // tile-uniform half select
+                if (seg < 1024) {
+                  dst = emit.main_kv + (size_t)e_srow * 1024 + seg;
+                } else {
+                  // score half: +ape[pos%4] at publish (model.py L332)
+                  const float* ap =
+                      emit.ape + (size_t)e_aph * 1024 + (seg - 1024);
+                  const float4 a0 = *reinterpret_cast<const float4*>(ap);
+                  const float4 a1 = *reinterpret_cast<const float4*>(ap + 4);
+                  f[0] += a0.x; f[1] += a0.y; f[2] += a0.z; f[3] += a0.w;
+                  f[4] += a1.x; f[5] += a1.y; f[6] += a1.z; f[7] += a1.w;
+                  dst = emit.main_sc + (size_t)e_srow * 1024 + (seg - 1024);
+                }
+              } else if (fam == FAM_IDX) {
+                // IDX state pool rows (same [B1] row as main); score half
+                // carries +idx_ape[pos%4] at publish.
+                const int seg = out_col - 4096;   // tile-uniform half select
+                if (seg < 256) {
+                  dst = emit.idx_kv + (size_t)e_srow * 256 + seg;
+                } else {
+                  const float* ap =
+                      emit.idx_ape + (size_t)e_aph * 256 + (seg - 256);
+                  const float4 a0 = *reinterpret_cast<const float4*>(ap);
+                  const float4 a1 = *reinterpret_cast<const float4*>(ap + 4);
+                  f[0] += a0.x; f[1] += a0.y; f[2] += a0.z; f[3] += a0.w;
+                  f[4] += a1.x; f[5] += a1.y; f[6] += a1.z; f[7] += a1.w;
+                  dst = emit.idx_sc + (size_t)e_srow * 256 + (seg - 256);
+                }
+              } else {
+                // WIN / W64: bf16-round first (wkv / weights_proj outputs
+                // are bf16 in the reference), then widen -- numerically
+                // identical to the old y->glue path.
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                  f[j] = __bfloat162float(__float2bfloat16(f[j]));
+                dst = (fam == FAM_WIN)
+                    ? emit.win_y2 + (size_t)out_row * 512 + (out_col - 1536)
+                    : emit.w64 + (size_t)out_row * 64 + (out_col - 4608);
+              }
+              *reinterpret_cast<ulonglong4*>(dst) =
+                  *reinterpret_cast<const ulonglong4*>(f);
+            }
           }
         }
       }
@@ -755,7 +863,7 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
   }
 
   __syncthreads();
-  if (warp == 0 && elected) {
+  if (fam == FAM_Y && warp == 0 && elected) {
     tma_store_fence();
     const int out_m = m_tile * BLOCK_M + rank * CTA_M;
     tma_store_2d(&desc_d, s.smem_a, n_col_base, out_m);
@@ -766,7 +874,7 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
   if (warp == 0) {
     tmem_dealloc_2sm(0, NUM_TMEM_COLS);
   }
-  if (warp == 0 && elected) {
+  if (fam == FAM_Y && warp == 0 && elected) {
     tma_store_wait();
   }
 }
@@ -834,7 +942,7 @@ inline cudaError_t launch_front_mixed(
     const CUtensorMap& desc_a8, const CUtensorMap& desc_b8,
     const CUtensorMap& desc_d,
     const uint8_t* x_sf, const uint8_t* w_sf,
-    const HcTailArgs& hc,
+    const HcTailArgs& hc, const FrontEmitArgs& emit,
     int m, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   const int m_tiles = (m + BLOCK_M - 1) / BLOCK_M;
@@ -857,7 +965,8 @@ inline cudaError_t launch_front_mixed(
       const_cast<CUtensorMap*>(&desc_b8),
       const_cast<CUtensorMap*>(&desc_d),
       &x_sf, &w_sf,
-      const_cast<HcTailArgs*>(&hc), &m};
+      const_cast<HcTailArgs*>(&hc),
+      const_cast<FrontEmitArgs*>(&emit), &m};
   return cudaLaunchKernelExC(
       &config, reinterpret_cast<void*>(front_mixed_kernel), args);
 }

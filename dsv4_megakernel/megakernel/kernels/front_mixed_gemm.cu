@@ -30,12 +30,25 @@ torch::Tensor front_mixed_gemm_op(
     c10::optional<torch::Tensor> hc_post_opt,
     c10::optional<torch::Tensor> hc_comb_opt,
     c10::optional<torch::Tensor> out_opt,
-    double hc_eps) {
+    double hc_eps,
+    // [FRONT-EMIT] all-or-none direct side outputs (gated on main_kv)
+    c10::optional<torch::Tensor> main_kv_opt,
+    c10::optional<torch::Tensor> main_sc_opt,
+    c10::optional<torch::Tensor> main_ape_opt,
+    c10::optional<torch::Tensor> state_row_opt,
+    c10::optional<torch::Tensor> ape_phase_opt,
+    c10::optional<torch::Tensor> idx_kv_opt,
+    c10::optional<torch::Tensor> idx_sc_opt,
+    c10::optional<torch::Tensor> idx_ape_opt,
+    c10::optional<torch::Tensor> win_y2_opt,
+    c10::optional<torch::Tensor> w64_opt) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
               x.scalar_type() == torch::kBFloat16 &&
               x.dim() == 2 && x.size(1) == K, "x must be bf16 [M,", K, "]");
   const int m = static_cast<int>(x.size(0));
-  TORCH_CHECK(m >= 1 && m <= 128, "front_mixed stage-1 supports M in [1,128]");
+  TORCH_CHECK(m >= 1 && m <= 256,
+              "front_mixed supports M in [1,256] (multi m_tile; grid = "
+              "ceil(M/128) x N tiles)");
   TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
               x_fp8.scalar_type() == torch::kFloat8_e4m3fn &&
               x_fp8.sizes() == torch::IntArrayRef({m, K}),
@@ -145,12 +158,51 @@ torch::Tensor front_mixed_gemm_op(
     hc.m = static_cast<int>(hm);
   }
 
+  // [FRONT-EMIT] validate + gather the side-output bundle (all-or-none).
+  FrontEmitArgs emit{};
+  if (main_kv_opt.has_value() && main_kv_opt->numel() > 0) {
+    TORCH_CHECK(main_sc_opt && main_ape_opt && state_row_opt &&
+                ape_phase_opt && idx_kv_opt && idx_sc_opt && idx_ape_opt &&
+                win_y2_opt && w64_opt,
+                "front-emit tensors must be given together");
+    auto f32c = [](const torch::Tensor& t, int64_t n, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
+                  t.scalar_type() == torch::kFloat32 && t.numel() >= n,
+                  what, " must be contiguous fp32 with >= ", n, " elems");
+    };
+    auto i32c = [&](const torch::Tensor& t, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
+                  t.scalar_type() == torch::kInt32 && t.numel() >= m,
+                  what, " must be contiguous i32 [>=M]");
+    };
+    f32c(*main_kv_opt, 8 * 1024, "main_kv");   // pool [cap,8,1024]
+    f32c(*main_sc_opt, 8 * 1024, "main_sc");
+    f32c(*main_ape_opt, 4 * 1024, "main_ape");
+    i32c(*state_row_opt, "state_row");
+    i32c(*ape_phase_opt, "ape_phase");
+    f32c(*idx_kv_opt, 8 * 256, "idx_kv");      // pool [cap,8,256]
+    f32c(*idx_sc_opt, 8 * 256, "idx_sc");
+    f32c(*idx_ape_opt, 4 * 256, "idx_ape");
+    f32c(*win_y2_opt, (int64_t)m * 512, "win_y2");
+    f32c(*w64_opt, (int64_t)m * 64, "w64");
+    emit.main_kv = main_kv_opt->data_ptr<float>();
+    emit.main_sc = main_sc_opt->data_ptr<float>();
+    emit.ape = main_ape_opt->data_ptr<float>();
+    emit.state_row = state_row_opt->data_ptr<int>();
+    emit.ape_phase = ape_phase_opt->data_ptr<int>();
+    emit.idx_kv = idx_kv_opt->data_ptr<float>();
+    emit.idx_sc = idx_sc_opt->data_ptr<float>();
+    emit.idx_ape = idx_ape_opt->data_ptr<float>();
+    emit.win_y2 = win_y2_opt->data_ptr<float>();
+    emit.w64 = w64_opt->data_ptr<float>();
+  }
+
   // x arrives ALREADY attn_norm'ed (the MHC collapse fuses the full norm).
   cudaError_t status = launch_front_mixed(
       desc_a, desc_b, desc_a8, desc_b8, desc_d,
       reinterpret_cast<const uint8_t*>(x_sf.data_ptr()),
       reinterpret_cast<const uint8_t*>(w_sf.data_ptr()),
-      hc,
+      hc, emit,
       m, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(status == cudaSuccess, "front_mixed launch failed: ",
               cudaGetErrorString(status));
@@ -164,11 +216,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Mixed-precision front projection GEMM (fp8 cols [0,2048) + bf16 "
              "cols [2048,4672), reordered layout) -> bf16 [M,4672]. x arrives "
              "pre-normed (MHC fuses attn_norm); q/kv ssq live in the wq_b "
-             "quant prologue. hc_* args are REQUIRED (None to disable).",
+             "quant prologue. hc_* args are REQUIRED (None to disable). "
+             "[FRONT-EMIT] main_kv..w64 given together enable direct side "
+             "outputs: main/idx state -> pools fp32 (+ape on score halves, "
+             "[B1] pingpong rows), win_y2/w64 fp32(bf16); those tiles skip y.",
              py::arg("x"), py::arg("x_fp8"), py::arg("x_sf"),
              py::arg("w_bf16"), py::arg("w_fp8"), py::arg("w_sf"),
              py::arg("hc_mix"), py::arg("hc_base"), py::arg("hc_scale"),
              py::arg("hc_post"), py::arg("hc_comb"),
              py::arg("out") = c10::nullopt,
-             py::arg("hc_eps") = 1e-6);
+             py::arg("hc_eps") = 1e-6,
+             py::arg("main_kv") = c10::nullopt,
+             py::arg("main_sc") = c10::nullopt,
+             py::arg("main_ape") = c10::nullopt,
+             py::arg("state_row") = c10::nullopt,
+             py::arg("ape_phase") = c10::nullopt,
+             py::arg("idx_kv") = c10::nullopt,
+             py::arg("idx_sc") = c10::nullopt,
+             py::arg("idx_ape") = c10::nullopt,
+             py::arg("win_y2") = c10::nullopt,
+             py::arg("w64") = c10::nullopt);
 }

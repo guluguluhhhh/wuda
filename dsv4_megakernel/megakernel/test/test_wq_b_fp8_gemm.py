@@ -375,7 +375,8 @@ def benchmark_merged(module):
             if wc or ww:
                 kw.update(cmp_pos=comp['cmp_pos'], cos_tab=cos_tab, sin_tab=sin_tab)
             if wc:
-                kw.update({k: v for k, v in comp.items() if k != 'cmp_pos'})
+                kw.update({k: v for k, v in comp.items()
+                           if k != 'cmp_pos' and not k.startswith('_')})
             if ww:
                 kw.update(win)
             if qy:
@@ -421,34 +422,46 @@ def benchmark_merged(module):
 
 # ==================== fused indexer compressor (delivery port) ====================
 def make_comp_inputs(M, dev, all_compress=False):
-    """Caller-owned compressor bundle. pos >= 3 keeps rope_pos = p+1-4 >= 0."""
+    """Caller-owned compressor bundle. pos >= 3 keeps rope_pos = p+1-4 >= 0.
+    Keys starting with '_' are TEST FIXTURES (front-emit simulation), not
+    kernel kwargs -- the fresh state row (+ape) is published by the FRONT
+    epilogue in production, so the kernel no longer takes y4/ape."""
     torch.manual_seed(M * 7 + 3)
     pos = (torch.full((M,), 3, dtype=torch.int64, device=dev) if all_compress
            else torch.randint(3, 4000, (M,), dtype=torch.int64, device=dev))
     return dict(
         cmp_pos=pos,
-        idx_y4=torch.randn(M, 512, device=dev),
-        idx_ape=torch.randn(4, 256, device=dev),
+        _y4=torch.randn(M, 512, device=dev),
+        _ape=torch.randn(4, 256, device=dev),
         idx_norm=torch.rand(128, device=dev) + 0.5,
         idx_kv=torch.randn(M, 8, 256, device=dev),
         idx_sc=torch.randn(M, 8, 256, device=dev))
 
 
-def ref_comp_step(kv, sc, y4, pos, ape, norm_w, cos_tab, sin_tab, eps=1e-6):
-    """Torch reference of one fused-compressor step, kernel order & rounding:
-    fresh write (+ape) -> [compress] overlap-cat 8-slot softmax ->
-    bf16 RMSNorm -> rope(last 64, bf16) -> @H128*128^-0.5 (bf16) -> fp4 sim.
-    kv/sc are updated IN PLACE (pass clones).
-    [B1] PING-PONG state (idx_comp_fp4.cuh): logical row rr of position p
-    lives at physical (4*((p>>2)&1) + rr) & 7; NO shift copy ever happens."""
+def publish_fresh(kv, sc, y4, pos, ape):
+    """FRONT-EMIT simulation: fresh state row at the [B1] ping-pong physical
+    row, +ape on the score half (exactly what front's epilogue does)."""
     M = pos.shape[0]
     dev = y4.device
     pmod = (pos % 4).long()
-    phase = 4 * ((pos >> 2) & 1).long()                    # [M] 0 or 4
+    phase = 4 * ((pos >> 2) & 1).long()
     ridx = torch.arange(M, device=dev)
     fresh = (phase + 4 + pmod) & 7
     kv[ridx, fresh] = y4[:, :256]
     sc[ridx, fresh] = y4[:, 256:] + ape[pmod]
+
+
+def ref_comp_step(kv, sc, pos, norm_w, cos_tab, sin_tab, eps=1e-6):
+    """Torch reference of one fused-compressor step (POOL-READER form: the
+    fresh row is ALREADY in kv/sc via publish_fresh): overlap-cat 8-slot
+    softmax -> bf16 RMSNorm -> rope(last 64, bf16) -> @H128*128^-0.5 (bf16)
+    -> fp4 sim. kv/sc are READ-ONLY here (the kernel writes nothing either).
+    [B1] PING-PONG: logical row rr of position p lives at physical
+    (4*((p>>2)&1) + rr) & 7."""
+    M = pos.shape[0]
+    dev = kv.device
+    phase = 4 * ((pos >> 2) & 1).long()                    # [M] 0 or 4
+    ridx = torch.arange(M, device=dev)
     compress = ((pos + 1) % 4) == 0
     # aggregate reads logical rows THROUGH the ping-pong mapping
     lrow = (phase.view(M, 1) + torch.arange(8, device=dev).view(1, 8)) & 7
@@ -486,16 +499,21 @@ def test_comp(module, M, mock_post=True):
     cos_tab, sin_tab = make_rope_tables()
     q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
     comp = make_comp_inputs(M, dev)
+    # FRONT-EMIT simulation: publish the fresh row into the KERNEL's pools
+    # (in production front's epilogue does this before wq_b launches).
+    publish_fresh(comp['idx_kv'], comp['idx_sc'], comp['_y4'],
+                  comp['cmp_pos'], comp['_ape'])
     kv_ref, sc_ref = comp['idx_kv'].clone(), comp['idx_sc'].clone()
+    kw = {k: v for k, v in comp.items() if not k.startswith('_')}
 
     out = module.wq_b_proj_gemm_merged(
         x, make_act_sf_ones(M, dev), w, make_weight_sf_ones(dev),
         q_pos, cos_tab, sin_tab, mock_post=mock_post,
-        cos_tab=cos_tab, sin_tab=sin_tab, **comp)
+        cos_tab=cos_tab, sin_tab=sin_tab, **kw)
     q4, s4 = out[-2], out[-1]                    # [M,64] u8, [M,4] u8
 
     ref_deq, ref_s4, cmask = ref_comp_step(
-        kv_ref, sc_ref, comp['idx_y4'], comp['cmp_pos'], comp['idx_ape'],
+        kv_ref, sc_ref, comp['cmp_pos'],
         comp['idx_norm'], cos_tab, sin_tab)
 
     state_ok = (torch.equal(kv_ref, comp['idx_kv'])

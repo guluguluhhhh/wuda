@@ -122,7 +122,9 @@ class KVCacheManager:
                                                 device=self.device)
         return bt
 
-    # ---- MAIN state fresh-row write (pending producer-op; plain relayout).
+    # ---- MAIN state fresh-row write. LEGACY host path (the production form
+    # is FRONT-EMIT: front_mixed's epilogue scatters fp32 accum + ape into
+    # the pool rows below directly; this stays for tests/fallback).
     # Ping-pong mapping (mqa_logits_fp4.cuh [B1]): fresh logical row 4+p%4,
     # physical = (4*((p>>2)&1) + 4 + p%4) & 7; kv|sc = front main_comp segment.
     def write_main_state(self, slots, pos, main_seg_f32):
@@ -131,6 +133,14 @@ class KVCacheManager:
             phys = ((4 * ((p >> 2) & 1)) + 4 + (p & 3)) & 7
             self.main_kv[s, phys] = main_seg_f32[i, :1024]
             self.main_sc[s, phys] = main_seg_f32[i, 1024:]
+
+    def main_state_rows(self, slots, pos):
+        """[B] i32 flat pool row (slot*8 + ping-pong physical row) for the
+        FRONT-EMIT direct state write."""
+        p = pos.long()
+        phys = ((4 * ((p >> 2) & 1)) + 4 + (p & 3)) & 7
+        s = torch.tensor(slots, dtype=torch.long, device=self.device)
+        return (s * SROWS + phys).int()
 
     # ---- FlashMLA-side views -------------------------------------------------
     def model1_cache_view(self, name):
