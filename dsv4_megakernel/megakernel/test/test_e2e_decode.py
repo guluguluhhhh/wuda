@@ -490,15 +490,17 @@ def benchmark(mods, w, ncmp=2048):
     print("  hot, no-flush; stages = kineto device us; eager/graph = wall/step")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
     print("  " + "-" * (5 + 9 * len(cols)))
-    notes = []      # ablation/trace lines buffered AFTER the main table
+    bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
     for B in (1, 16, 32, 48, 64, 80, 96, 112, 128):
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
                              + 4 * B, max_pages_per_req=ncmp // PAGE)
         slots = [mgr.alloc_request() for _ in range(B)]
         for s in slots:                       # fabricate history: next step is
             mgr.reqs[s]["pos"] = 4 * ncmp - 2   # pos 4*ncmp-1 (compress row)
-            for ct in range(ncmp):
-                mgr._page_of("idx", s, ct); mgr._page_of("cmp", s, ct)
+            # _page_of back-fills every page up to tok//PAGE -- ONE call per
+            # pool (the old per-token loop was 4M python calls at 64k ctx)
+            mgr._page_of("idx", s, ncmp - 1)
+            mgr._page_of("cmp", s, ncmp - 1)
         st = mgr.step_begin(slots)
         pos, q_pos = st["pos"], st["q_pos"]
         hidden = torch.randn(B, HC, DIM, device=DEV, dtype=torch.bfloat16) * .1
@@ -700,62 +702,9 @@ def benchmark(mods, w, ncmp=2048):
         # chain-solo gemm delta matched the hidden+hc_fn L2-refetch
         # bandwidth at every B -- real input refetch, not a timing bug.)
 
-        # front emit-cost ablation (note only): same solo-hot context, the
-        # SAME op with vs without the [FRONT-EMIT] side outputs. Pins down
-        # what the direct state/buffer emission costs vs the legacy full-y
-        # TMA write, and how much it wobbles.
-        def front_legacy():
-            if Bp != B:
-                coll_p[:B].copy_(collapsed)
-                mix_p[:B].copy_(mix)
-            fmm.front_mixed_gemm(coll_p, x8, x8s, w["front_bf16"],
-                                 w["front_fp8"], w["front_sf"], out=y_p,
-                                 **hcd)
-        t_emit = hot_wall(run_front, warmup=3, iters=30, reps=5)
-        t_leg = hot_wall(front_legacy, warmup=3, iters=30, reps=5)
-        notes.append(f"  B={B:<4} front solo hot: emit {t_emit:5.1f} "
-                     f"legacy {t_leg:5.1f} (+{t_emit - t_leg:4.1f})")
-
-        # wq_b B=1 anomaly diag: solo-hot WALL vs kineto per-kernel sums.
-        # The bucket is a PDL pair (qnorm producer + PSS GEMM): kineto sums
-        # both kernels' device time, DOUBLE-COUNTING their overlap and the
-        # GEMM's GDS wait spin. wall >> sum gap pins the accounting artifact.
-        try:
-            pctx3 = _prof(activities=[ProfilerActivity.CUDA],
-                          acc_events=True)
-        except TypeError:
-            pctx3 = _prof(activities=[ProfilerActivity.CUDA])
-        with pctx3 as p3:
-            for _ in range(R):
-                run_wqb()
-            torch.cuda.synchronize()
-        wq_split = {}
-        for e in p3.events():
-            if name2stage.get(e.name[:80]) == "wq_b":
-                d = getattr(e, "device_time", None)
-                if d is None:
-                    d = getattr(e, "cuda_time", 0.0)
-                k = "qnorm" if "qnorm" in e.name.lower() else "gemm"
-                wq_split[k] = wq_split.get(k, 0.0) + d
-        t_wq_wall = hot_wall(run_wqb, warmup=3, iters=30, reps=5)
-
-        def run_wqb_noq():   # diag: NO quant producer -> no PDL pair; xq
-            wqm.wq_b_proj_gemm_merged(   # holds valid bytes from run_wqb
-                xq, xq_sf, w["wq_fp8"], w["wq_sf"], q_pos, cosl, sinl,
-                head_ssq=ssq, mock_post=False, cmp_pos=pos,
-                idx_norm=w["idx_norm"], cos_tab=cosl,
-                sin_tab=sinl, idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
-                win_y2=win_y2, win_norm=w["win_norm"],
-                slot_map=st["slot_map"],
-                idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
-                swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"])
-        t_wq_noq = hot_wall(run_wqb_noq, warmup=3, iters=30, reps=5)
-        notes.append(
-            f"  B={B:<4} wq_b solo hot: wall {t_wq_wall:5.1f} | kineto "
-            f"qnorm {wq_split.get('qnorm', 0) / R:5.1f} "
-            f"gemm {wq_split.get('gemm', 0) / R:5.1f} "
-            f"sum {sum(wq_split.values()) / R:5.1f} | "
-            f"noPDL wall {t_wq_noq:5.1f}")
+        # (front emit-vs-legacy and wq_b PDL-accounting solo ablations
+        # removed after their verdicts landed: emit costs +0.1..1.1us vs
+        # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
         t_eager = hot_wall(chain)
 
@@ -786,18 +735,66 @@ def benchmark(mods, w, ncmp=2048):
                 torch.cuda.synchronize()
             tp = f"/tmp/e2e_trace_B{B}.json"
             prof.export_chrome_trace(tp)
-            notes.append(f"  B={B:<4} perfetto trace -> {tp} (3x hot eager + "
-                         f"{'1x graph' if not math.isnan(t_graph) else 'no graph'})")
             del prof
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
               + f"{sum(ts):>9.1f}{t_eager:>9.1f}{t_graph:>9.1f}")
+        bw_rows.append((B, [(sname, t) for (sname, _), t
+                            in zip(stage_fns, ts)]))
         del mgr
         torch.cuda.empty_cache()
-    if notes:
-        print()
-        for ln in notes:
-            print(ln)
+
+    # ---- Bandwidth table: per-operator traffic / stage time ------------
+    # total = ALL bytes the op moves; internal = intermediate activations
+    # (inter-op buffers). END-TO-END-effective = weights + KV-cache pools +
+    # boundary activations (hidden) -- the tokens/s-relevant bytes.
+    def op_bytes(B):
+        MB = 1e6
+        W_FRONT = (2048 * DIM + 2624 * DIM * 2) / MB          # fp8 + bf16
+        W_WQB = 73728 * 1536 / MB
+        eff_state_w = B * (1024 + 1024 + 256 + 256) * 4 / MB  # front fresh rows
+        t = {}   # stage -> (total_MB, internal_MB)
+        hid = B * HC * DIM * 2 / MB
+        mhc_int = B * (DIM * 2 + DIM + 24 * 4 + 4 * 8 + 16 * 4) / MB
+        t["mhc"] = (hid + 1.5 + mhc_int, mhc_int)
+        fr_int = (B * (DIM * 2 + DIM)            # collapsed + x8 (re)read
+                  + B * 1536 * 2 + B * 512 * 4 + B * 64 * 4) / MB
+        t["front"] = (W_FRONT + fr_int + eff_state_w, fr_int)
+        wq_int = (B * 1536 * 3                   # xq write + qnorm y read
+                  + B * 65536 * 4                # y fp32 write (q for mla)
+                  + B * 64 * 68 + B * 512 * 4) / MB
+        wq_eff = W_WQB + (B * 8 * 512 * 4 + B * (584 + 68)) / MB
+        t["wq_b"] = (wq_eff + wq_int, wq_int)
+        mqa_eff = (B * ncmp * 68 + B * 8 * 2048 * 4 + B * 584) / MB
+        mqa_int = (B * ncmp * 4 + B * 64 * 68 + B * 64 * 4) / MB
+        t["mqa"] = (mqa_eff + mqa_int, mqa_int)
+        tk_int = (B * ncmp * 4 + B * TOPK * 4) / MB
+        t["topk"] = (tk_int, tk_int)
+        mla_int = 2 * B * Q_HEADS * Q_DIM * 2 / MB            # q read + out
+        mla_eff = B * (TOPK + WIN) * 584 / MB
+        t["mla"] = (mla_eff + mla_int, mla_int)
+        return t
+
+    print("\n" + "=" * 76)
+    print(f"Per-operator bandwidth (TB/s) -- stage traffic / stage time; "
+          f"(nn%)=internal share")
+    print("  effective = weights + KV pools + boundary activations "
+          "(intermediates excluded)")
+    print("=" * 76)
+    hdr = [s for s, _ in bw_rows[0][1]]
+    print(f"  {'B':<5}" + "".join(f"{c + ' ':>13}" for c in hdr)
+          + f"{'EFF':>8}")
+    for B, stages_ts in bw_rows:
+        ob = op_bytes(B)
+        cells, eff_b, tot_t = [], 0.0, 0.0
+        for sname, us in stages_ts:
+            total, internal = ob[sname]
+            bw = total / us if us > 0 else 0.0   # MB/us == TB/s
+            cells.append(f"{bw:6.2f}({internal / total * 100:3.0f}%)")
+            eff_b += total - internal
+            tot_t += us
+        print(f"  {B:<5}" + "".join(f"{c:>13}" for c in cells)
+              + f"{eff_b / tot_t:>8.2f}")
 
 
 # ==================== simulation ====================
@@ -910,7 +907,7 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if passed else 'FAIL'}] {name:<28} = {val} ({cond})")
 
     if ok:                       # never bench on broken correctness
-        benchmark(mods, w)
+        benchmark(mods, w, ncmp=16384)    # 64k ctx (65536 tokens)
 
     print("=" * 60)
     print("E2E " + ("ALL PASS" if ok else "SOME FAILED"))
