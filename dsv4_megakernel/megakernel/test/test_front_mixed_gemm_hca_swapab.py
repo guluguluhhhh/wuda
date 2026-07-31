@@ -14,7 +14,15 @@ from test_front_mixed_gemm import (
     quant_act_fp8, quant_weight_fp8,
 )
 
-N = 3072  # HCA: fp8 [0,2048) wq_a|window-KV + bf16 [2048,3072)
+N = 4672  # CSA shape: fp8 [0,2048) wq_a|wkv + bf16 [2048,4672)
+TASKS_PER_BATCH = 29   # 8 fp8 (N256) + 21 bf16 (N128, tail tile 64 rows)
+
+
+def batch_n_for(phys_m):
+    """Host ladder: one BN16 tile at M<=16, otherwise exactly TWO tiles."""
+    return (16 if phys_m <= 32 else
+            32 if phys_m <= 64 else
+            64 if phys_m <= 128 else 128)
 
 
 def make_activations(m, seed=0):
@@ -39,7 +47,7 @@ BENCH_B = (
     63, 64, 65, 80, 96, 112, 127, 128, 129, 144, 160, 176, 192,
     208, 224, 240, 256,
 )
-TIMELINE_M = (16, 64, 65, 128, 129, 256)
+TIMELINE_M = (16, 17, 64, 65, 128, 129, 256)
 TAIL_B = (1, 16, 17, 64, 65, 128, 129, 256)
 TAIL_BENCH = (1, 4, 8, 16, 17, 24, 32, 48, 64, 65, 96, 128, 129, 160,
               192, 224, 256)
@@ -155,7 +163,7 @@ def benchmark_tail(swap, weights):
 
 def benchmark(swap, weights):
     print('\nPerformance (cold L2 kernel us; M<16 caller-padded to physical M=16)')
-    print('cuBLAS BF16/FP8 are full same-shape [M,7168] x [7168,3072] GEMMs.')
+    print(f'cuBLAS BF16/FP8 are full same-shape [M,{K}] x [{K},{N}] GEMMs.')
     print(f"  {'M':>4} {'phys':>5} {'tile':>4} {'swapAB':>8} "
           f"{'cuBLAS16':>9} {'cuBLAS8':>9} "
           f"{'cb16/swap':>9} {'cb8/swap':>8}")
@@ -172,7 +180,7 @@ def benchmark(swap, weights):
         x, x8, xsf = make_activations(physical_b, seed=5000 + b)
         out_swap = torch.empty(physical_b, N, device='cuda', dtype=torch.bfloat16)
         out_cb16 = torch.empty_like(out_swap)
-        tile_n8 = 16 if physical_b <= 64 else (32 if physical_b <= 128 else 64)
+        tile_n8 = batch_n_for(physical_b)
         swap_us = 1e6 * bench_kineto(
             lambda: run_swap(swap, x, x8, xsf, weights, out_swap),
             'swapab_kernel<',
@@ -210,8 +218,8 @@ def timeline(module, weights):
 
     for m in TIMELINE_M:
         physical_m = max(16, m)
-        batch_n = 16 if physical_m <= 64 else (32 if physical_m <= 128 else 64)
-        num_tasks = ((physical_m + batch_n - 1) // batch_n) * 16
+        batch_n = batch_n_for(physical_m)
+        num_tasks = ((physical_m + batch_n - 1) // batch_n) * TASKS_PER_BATCH
         x, x8, xsf = make_activations(physical_m, seed=7000 + m)
         out = torch.empty(physical_m, N, device='cuda', dtype=torch.bfloat16)
         times = torch.empty(
@@ -230,11 +238,11 @@ def timeline(module, weights):
             torch.cuda.synchronize()
             host = times.cpu()
             required = host[:, (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12)]
-            fp8_rows = torch.arange(num_tasks).remainder(16) < 8
+            fp8_rows = torch.arange(num_tasks).remainder(TASKS_PER_BATCH) < 8
             if (required <= 0).any() or (host[fp8_rows, 3] <= 0).any():
                 raise AssertionError(f'M={m}: invalid task timestamps')
             task_ids = torch.arange(num_tasks)
-            fp8 = task_ids.remainder(16) < 8
+            fp8 = task_ids.remainder(TASKS_PER_BATCH) < 8
             bf16 = ~fp8
             origin = host[:, 0].min()
             task_end = torch.maximum(host[:, 11], host[:, 12])

@@ -35,7 +35,7 @@ torch::Tensor run_op(
   TORCH_CHECK(w_bf16.is_cuda() && w_bf16.is_contiguous() &&
               w_bf16.scalar_type() == torch::kBFloat16 &&
               w_bf16.sizes() == torch::IntArrayRef({N - N_FP8, K}),
-              "w_bf16 must be bf16 [1024,7168]");
+              "w_bf16 must be bf16 [", N - N_FP8, ",", K, "]");
   TORCH_CHECK(w_fp8.is_cuda() && w_fp8.is_contiguous() &&
               w_fp8.scalar_type() == torch::kFloat8_e4m3fn &&
               w_fp8.sizes() == torch::IntArrayRef({N_FP8, K}),
@@ -52,17 +52,24 @@ torch::Tensor run_op(
     TORCH_CHECK(out.is_cuda() && out.is_contiguous() &&
                 out.scalar_type() == torch::kBFloat16 &&
                 out.sizes() == torch::IntArrayRef({m, N}),
-                "out must be contiguous bf16 [M,3072]");
+                "out must be contiguous bf16 [M,", N, "]");
   } else {
     out = torch::empty({m, N}, x.options().dtype(torch::kBFloat16));
   }
 
+  // Batch splits into AT MOST TWO tiles: M<=16 -> one BN16 tile; otherwise
+  // two tiles of the smallest ladder step covering ceil(M/2) -- N-side
+  // parallelism (29 feature tiles) carries the machine.
   int batch_n = batch_n_override;
   if (batch_n == 0) {
-    batch_n = m <= 64 ? 16 : (m <= 128 ? 32 : 64);
+    batch_n = m <= 16 ? 16
+            : m <= 32 ? 16
+            : m <= 64 ? 32
+            : m <= 128 ? 64 : 128;
   }
-  TORCH_CHECK(batch_n == 16 || batch_n == 32 || batch_n == 64,
-              "batch_n_override must be 0, 16, 32, or 64");
+  TORCH_CHECK(batch_n == 16 || batch_n == 32 || batch_n == 64 ||
+              batch_n == 128,
+              "batch_n_override must be 0, 16, 32, 64, or 128");
 
   uint64_t* task_times = nullptr;
   if (task_times_opt.has_value() && task_times_opt->numel() != 0) {
@@ -152,8 +159,10 @@ torch::Tensor run_op(
     const cudaError_t s16 = configure_kernel<16, false>();
     const cudaError_t s32 = configure_kernel<32, false>();
     const cudaError_t s64 = configure_kernel<64, false>();
+    const cudaError_t s128 = configure_kernel<128, false>();
     const cudaError_t status = s16 != cudaSuccess ? s16 :
-                               (s32 != cudaSuccess ? s32 : s64);
+                               (s32 != cudaSuccess ? s32 :
+                               (s64 != cudaSuccess ? s64 : s128));
     TORCH_CHECK(status == cudaSuccess, "swapAB cudaFuncSetAttribute failed: ",
                 cudaGetErrorString(status));
     configured = true;
@@ -163,8 +172,10 @@ torch::Tensor run_op(
     const cudaError_t s16 = configure_kernel<16, true>();
     const cudaError_t s32 = configure_kernel<32, true>();
     const cudaError_t s64 = configure_kernel<64, true>();
+    const cudaError_t s128 = configure_kernel<128, true>();
     const cudaError_t status = s16 != cudaSuccess ? s16 :
-                               (s32 != cudaSuccess ? s32 : s64);
+                               (s32 != cudaSuccess ? s32 :
+                               (s64 != cudaSuccess ? s64 : s128));
     TORCH_CHECK(status == cudaSuccess,
                 "swapAB timing cudaFuncSetAttribute failed: ",
                 cudaGetErrorString(status));
@@ -188,12 +199,18 @@ torch::Tensor run_op(
                            xsf, wsf, out_ptr, hc, m, task_times, stream)
         : launch<32, false>(desc_x16, desc_w16, desc_x8, desc_w8,
                             xsf, wsf, out_ptr, hc, m, nullptr, stream);
-  } else {
+  } else if (batch_n == 64) {
     status = task_times != nullptr
         ? launch<64, true>(desc_x16, desc_w16, desc_x8, desc_w8,
                            xsf, wsf, out_ptr, hc, m, task_times, stream)
         : launch<64, false>(desc_x16, desc_w16, desc_x8, desc_w8,
                             xsf, wsf, out_ptr, hc, m, nullptr, stream);
+  } else {
+    status = task_times != nullptr
+        ? launch<128, true>(desc_x16, desc_w16, desc_x8, desc_w8,
+                            xsf, wsf, out_ptr, hc, m, task_times, stream)
+        : launch<128, false>(desc_x16, desc_w16, desc_x8, desc_w8,
+                             xsf, wsf, out_ptr, hc, m, nullptr, stream);
   }
   TORCH_CHECK(status == cudaSuccess, "swapAB launch failed: ",
               cudaGetErrorString(status));

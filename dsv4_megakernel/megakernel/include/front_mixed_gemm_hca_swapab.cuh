@@ -1,8 +1,12 @@
 #pragma once
 
-// HCA front projection, swap-AB variant:
-//   Y^T[3072,M] = W[3072,7168] @ X^T[7168,M]
+// HCA front projection, swap-AB variant, CSA output shape:
+//   Y^T[4672,M] = W[4672,7168] @ X^T[7168,M]
 // FP8 uses UMMA_M=256, BF16 uses UMMA_M=128. UMMA_N is the batch tile.
+// Batch splits into AT MOST TWO tiles (M<=16 -> 1, else 2), so the batch
+// ladder is 16/16x2/32x2/64x2/128x2 and N-parallelism carries the machine:
+// 29 feature tiles (8 fp8 N256 + 21 bf16 N128, tail tile 64 valid rows)
+// x batch_tiles -> 29 or 58 clusters.
 
 #include "front_mixed_gemm_hca.cuh"
 
@@ -13,8 +17,8 @@ namespace fp8d = cluster_mma_fp8::detail;
 using Barrier = base::Barrier;
 
 constexpr int K = base::K;
-constexpr int N = base::N;
-constexpr int N_FP8 = base::N_FP8;
+constexpr int N = 4672;                  // CSA reordered layout
+constexpr int N_FP8 = 2048;
 constexpr int CLUSTER_SIZE = 2;
 constexpr int TPB = 256;
 constexpr int FP8_UMMA_M = 256;
@@ -22,8 +26,11 @@ constexpr int BF16_UMMA_M = 128;
 constexpr int FP8_CTA_N = FP8_UMMA_M / CLUSTER_SIZE;      // 128 features/CTA
 constexpr int BF16_CTA_N = BF16_UMMA_M / CLUSTER_SIZE;    // 64 features/CTA
 constexpr int FP8_FEATURE_TILES = N_FP8 / FP8_UMMA_M;     // 8 clusters
-constexpr int BF16_FEATURE_TILES = (N - N_FP8) / BF16_UMMA_M; // 8 clusters
-constexpr int TASKS_PER_BATCH = FP8_FEATURE_TILES + BF16_FEATURE_TILES;
+constexpr int BF16_FEATURE_TILES =
+    (N - N_FP8 + BF16_UMMA_M - 1) / BF16_UMMA_M;          // 21 (tail 64 rows)
+constexpr int TASKS_PER_BATCH = FP8_FEATURE_TILES + BF16_FEATURE_TILES;  // 29
+static_assert((N - N_FP8) == 20 * BF16_UMMA_M + 64,
+              "bf16 tail tile has 64 valid feature rows (OOB fill + clip)");
 
 constexpr int FP8_TMA_K = 128;
 constexpr int BF16_TMA_K = 64;
@@ -33,7 +40,7 @@ constexpr int SF_ROWS = 128;
 constexpr int SF_BYTES = SF_GROUPS * SF_ROWS * sizeof(uint32_t);
 constexpr uint32_t UE8M0_ONE4 = 0x7f7f7f7fu;
 
-constexpr int TMEM_SF_ACT = 64;
+constexpr int TMEM_SF_ACT = 64;          // BatchN<=64 layout (accum first)
 constexpr int TMEM_SF_WEIGHT = 68;
 constexpr int TMEM_COLS = 128;
 constexpr int STORE_M = 16;
@@ -42,19 +49,22 @@ constexpr int TIMING_FIELDS = 13;
 
 template <int BatchN>
 struct Config {
-  static_assert(BatchN == 16 || BatchN == 32 || BatchN == 64);
+  static_assert(BatchN == 16 || BatchN == 32 || BatchN == 64 ||
+                BatchN == 128);
   static constexpr int BATCH_N = BatchN;
-  static constexpr int FP8_BLOCK_K = BatchN == 64 ? 128 : 256;
-  static constexpr int BF16_BLOCK_K = BatchN == 64 ? 128 : 256;
+  static constexpr int FP8_BLOCK_K = BatchN >= 64 ? 128 : 256;
+  static constexpr int BF16_BLOCK_K = BatchN >= 64 ? 128 : 256;
   static constexpr int FP8_K_TILES = K / FP8_BLOCK_K;
   static constexpr int BF16_K_TILES = K / BF16_BLOCK_K;
-  static constexpr int FP8_STAGES = BatchN == 64 ? 10 : 5;
-  static constexpr int BF16_STAGES = BatchN == 64 ? 9 : 5;
+  // Stage budgets fill smem (227.5KB cap): BN128 act stages double, so the
+  // rings shrink to 8 (fp8, 24KB/st) and 7 (bf16, 32KB/st).
+  static constexpr int FP8_STAGES = BatchN == 128 ? 8 : (BatchN == 64 ? 10 : 5);
+  static constexpr int BF16_STAGES = BatchN == 128 ? 7 : (BatchN == 64 ? 9 : 5);
   static constexpr int MAX_STAGES =
       FP8_STAGES > BF16_STAGES ? FP8_STAGES : BF16_STAGES;
 
   static constexpr int FP8_ACT_DATA_BYTES = BatchN * FP8_BLOCK_K / 2;
-  static constexpr int FP8_ACT_STAGE_BYTES = BatchN == 64
+  static constexpr int FP8_ACT_STAGE_BYTES = BatchN >= 64
       ? FP8_ACT_DATA_BYTES : BatchN * FP8_BLOCK_K;
   static constexpr int FP8_WGT_STAGE_BYTES = FP8_CTA_N * FP8_BLOCK_K;
   static constexpr int BF16_ACT_STAGE_BYTES = BatchN * BF16_BLOCK_K;
@@ -68,6 +78,12 @@ struct Config {
   static constexpr int FP8_STORAGE_BYTES = FP8_PIPELINE_BYTES + 2 * SF_BYTES;
   static constexpr int STORAGE_BYTES = FP8_STORAGE_BYTES > BF16_PIPELINE_BYTES
       ? FP8_STORAGE_BYTES : BF16_PIPELINE_BYTES;
+
+  // BN128 accum spans TMEM cols 0..127 and would collide with the fixed
+  // SF columns at 64/68 -> SFs move past the accum and the alloc doubles.
+  static constexpr int SF_ACT_COL = BatchN == 128 ? 132 : TMEM_SF_ACT;
+  static constexpr int SF_WGT_COL = BatchN == 128 ? 128 : TMEM_SF_WEIGHT;
+  static constexpr int NUM_TMEM_COLS = BatchN == 128 ? 256 : TMEM_COLS;
 };
 
 template <int BatchN>
@@ -190,7 +206,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
   if (warp == 2) {
     uint32_t addr = static_cast<uint32_t>(
         __cvta_generic_to_shared(&s.tmem_base));
-    base::tmem_alloc_2sm(addr, TMEM_COLS);
+    base::tmem_alloc_2sm(addr, C::NUM_TMEM_COLS);
     if constexpr (RecordTimestamps) {
       if (rank == 0 && lane == 0) {
         task_times[static_cast<size_t>(task) * TIMING_FIELDS + 2] =
@@ -355,11 +371,11 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
               fp8d::replace_sf_desc_addr(
                   sfd, sf_weight + g * SF_ROWS * 4);
               fp8d::utccp_4x32_2cta(
-                  TMEM_SF_WEIGHT, fp8d::sf_desc_bits(sfd));
+                  C::SF_WGT_COL, fp8d::sf_desc_bits(sfd));
               fp8d::replace_sf_desc_addr(
                   sfd, sf_act + g * SF_ROWS * 4);
               fp8d::utccp_4x32_2cta(
-                  TMEM_SF_ACT, fp8d::sf_desc_bits(sfd));
+                  C::SF_ACT_COL, fp8d::sf_desc_bits(sfd));
             }
             const uint64_t rdesc = fp8d::make_runtime_idesc_with_sf_id(
                 idesc, scale_tile & 3, scale_tile & 3);
@@ -380,7 +396,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
               fp8d::mma_2sm_block_scale(
                   0, w, x, rdesc,
                   (k_tile != 0 || half != 0 || kk != 0) ? 1u : 0u,
-                  TMEM_SF_WEIGHT, TMEM_SF_ACT);
+                  C::SF_WGT_COL, C::SF_ACT_COL);
             }
           }
           base::commit_2sm(&s.empty[st], CTA_MASK);
@@ -500,24 +516,28 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     // 2SM M128 is a 2x2 quadrant layout: CTA rank selects the 64-feature
     // half, while epilogue warp pairs 0/1 and 2/3 select the two BatchN/2
     // halves. Physical warps 4..7 form the dedicated epilogue warpgroup.
+    // The bf16 TAIL tile (feature_base 4608) has 64 valid rows: rank1's
+    // columns land at >= N and are clipped.
     if (warp >= 4) {
       const int epi_warp = warp - 4;
       const int feature_lane =
           rank * BF16_CTA_N + (epi_warp & 1) * 32 + lane;
-      #pragma unroll
-      for (int c = 0; c < BatchN / CLUSTER_SIZE; c += 8) {
-        uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-        base::tmem_load_8x(c, v0, v1, v2, v3, v4, v5, v6, v7);
-        base::tmem_load_fence();
-        const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+      const int out_col = feature_base + feature_lane;
+      if (out_col < N) {
         #pragma unroll
-        for (int r = 0; r < 8; ++r) {
-          const int out_row = batch_base + (epi_warp >> 1) *
-              (BatchN / CLUSTER_SIZE) + c + r;
-          if (out_row < problem_m) {
-            out[static_cast<size_t>(out_row) * N +
-                feature_base + feature_lane] =
-                __float2bfloat16_rn(__uint_as_float(vals[r]));
+        for (int c = 0; c < BatchN / CLUSTER_SIZE; c += 8) {
+          uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+          base::tmem_load_8x(c, v0, v1, v2, v3, v4, v5, v6, v7);
+          base::tmem_load_fence();
+          const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+          #pragma unroll
+          for (int r = 0; r < 8; ++r) {
+            const int out_row = batch_base + (epi_warp >> 1) *
+                (BatchN / CLUSTER_SIZE) + c + r;
+            if (out_row < problem_m) {
+              out[static_cast<size_t>(out_row) * N + out_col] =
+                  __float2bfloat16_rn(__uint_as_float(vals[r]));
+            }
           }
         }
       }
@@ -536,7 +556,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     }
   }
   if (warp == 2) {
-    base::tmem_dealloc_2sm(0, TMEM_COLS);
+    base::tmem_dealloc_2sm(0, C::NUM_TMEM_COLS);
     if constexpr (RecordTimestamps) {
       if (rank == 0 && lane == 0) {
         task_times[static_cast<size_t>(task) * TIMING_FIELDS + 12] =
