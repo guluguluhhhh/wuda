@@ -1,7 +1,7 @@
 // ============================================================
 // wq_b_fp8_gemm.cu — MERGED wq_b projection (tcgen05 FP8 block-scale GEMM)
 //
-// x_fp8[M,1536] @ w_fp8[73728,1536]^T   (main q 65536 rows ++ indexer 8192)
+// x_fp8[M,1536] @ w_fp8[73728,1536]^T   (indexer 8192 rows ++ main q 65536)
 //   -> y [M,65536] fp32  +  ssq [M,128] fp32 (fused per-head sum-of-squares)
 //   -> indexer q: by default DRAINED as fp32 iq_ws [M,64,128] (finish it with
 //      idx_postprocess); mock_post=False fuses rope+hadamard+MXFP4 in-kernel.
@@ -47,6 +47,9 @@
 
 using namespace wq_b;
 using Barrier = mma_desc::Barrier;
+
+// Devices we keep an iq ready-flag page for (see the handoff block in run_wq_b).
+static constexpr int kMaxDevices = 16;
 
 // ======================== Shared Memory Layout ========================
 template <int M_TPL>
@@ -140,7 +143,7 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
     // Fold the head_ssq RED-buffer zeroing in here (glue removal): the
     // dependent GEMM's GDS orders its RED atomics after our completion.
     if (ssq_zero != nullptr) {
-        const int tot = m_total * 128;
+        const int tot = m_total * NUM_HEADS_OUT;
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tot;
              i += gridDim.x * blockDim.x)
             ssq_zero[i] = 0.0f;
@@ -170,10 +173,11 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
 }
 
 // ======================== Kernel ========================
-// MERGED-ONLY (N = 73728): the indexer wq_b weight is concatenated after the
-// main q weight. iq tiles are DRAINED by the store warps (TMEM -> L2 scratch ->
-// tmem_empty) and post-processed by the dedicated ASYNC TRANSFORM WARPGROUP
-// (threads 256..383), fully overlapped with the remaining weight streaming.
+// MERGED-ONLY (N = 73728): the indexer wq_b weight is concatenated BEFORE the
+// main q weight, so the plain forward tile walk hits the iq tiles first and the
+// remaining main-q weight stream shadows their post-processing. iq tiles are
+// DRAINED by the store warps (TMEM -> L2 scratch -> tmem_empty) and post-processed
+// by the dedicated ASYNC TRANSFORM WARPGROUP (threads 256..383).
 template <int M_TPL, bool kProfile, bool kSsq>
 __global__ void __launch_bounds__(TPB_IDX, 1)
 wq_b_proj_kernel(
@@ -189,6 +193,8 @@ wq_b_proj_kernel(
     uint8_t* __restrict__ iq_fp4,                  // [M, 64, 64] packed fp4
     int* __restrict__ iq_sf,                       // [M, 64] packed-ue8m0
     float* __restrict__ iq_scratch,                // [M, 64, 128] fp32 drain buffer
+    uint32_t* __restrict__ iq_ready,               // [IQ_FLAG_SLOTS] per-head ready flags
+    uint32_t iq_seq,                               // host-monotonic launch tag for them
     const int* __restrict__ q_pos,                 // [M] rotary positions
     const float* __restrict__ rope_cos,           // [max_pos, 32]
     const float* __restrict__ rope_sin,           // [max_pos, 32]
@@ -265,12 +271,12 @@ wq_b_proj_kernel(
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
 
-        // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
-        // async transform overlap the remaining main tiles' weight stream; all
-        // roles share the mapping (pipeline pairing unchanged).
+        // The iq segment is the FIRST N_IDX columns of the weight, so a plain
+        // forward tile walk already puts the tiles that need post-processing in
+        // iteration 0 -- their drain + async transform then overlap the remaining
+        // main tiles' weight stream. All roles share this mapping.
         for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
-            const int tile_id = num_tiles_total - 1 - it_t;
-            int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N; // weight N (per CTA)
+            int n_base = it_t * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N; // weight N (per CTA)
             // Inner loop over M subtiles: weight (n_base) is reused from L2.
             for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
                 int m_base = m_sub * BM_T + cta_rank * LOAD_BLOCK_M_T;  // this subtile's activation half
@@ -314,12 +320,9 @@ wq_b_proj_kernel(
         uint32_t stage = 0, phase = 0;
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
 
-        // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
-        // async transform overlap the remaining main tiles' weight stream; all
-        // roles share the mapping (pipeline pairing unchanged).
+        // iq segment first (see the producer): plain forward walk.
         for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
-            const int tile_id = num_tiles_total - 1 - it_t;
-          const int n_base = tile_id * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N;
+          const int n_base = it_t * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N;
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             const int sfa_m = m_sub * BM_T;
             for (int k = 0; k < NUM_K_TILES; ++k) {
@@ -364,8 +367,8 @@ wq_b_proj_kernel(
         auto ds = CM::init_desc(smem_a_base, smem_b_base, lane_id);
 
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
-        // REVERSED tile order (same mapping as the other roles); the MMA warp
-        // itself is tile-id agnostic -- it only paces stages/accums.
+        // Same forward mapping as the other roles; the MMA warp itself is tile-id
+        // agnostic -- it only paces stages/accums.
         for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
@@ -416,11 +419,8 @@ wq_b_proj_kernel(
         constexpr int SMEM_CD_PER_STAGE_T = SMEM_CD_PER_STAGE;                 // 8192
 
         uint32_t persistent_iter = 0;
-        // REVERSED tile order: iq tiles (the LAST 32) run FIRST so their drain +
-        // async transform overlap the remaining main tiles' weight stream; all
-        // roles share the mapping (pipeline pairing unchanged).
+        // iq segment first (see the producer): plain forward walk.
         for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
-            const int tile_id = num_tiles_total - 1 - it_t;
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
             uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
@@ -435,19 +435,21 @@ wq_b_proj_kernel(
                 prof_epi_t0 = ptx::rdclock();
 
             uint32_t tmem_base = accum_stage * UMMA_N_T;
-            int base_n = tile_id * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
+            int base_n = it_t * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
             int base_m = m_sub * BM_T;   // this subtile's output rows (TMA clips >= M)
             // Indexer tile: whole CTA tile is ONE indexer head row-block
             // (BLOCK_N == IDX_HEAD_DIM); drained + post-processed async, no fp32
-            // TMA store, no ssq, smem_cd untouched.
-            const bool is_idx = base_n >= N_TOTAL;
+            // TMA store, no ssq, smem_cd untouched. The iq segment leads the N
+            // range, so main-q columns are offset by N_IDX in the output.
+            const bool is_idx = base_n < N_IDX;
+            const int  out_n  = base_n - N_IDX;   // main-q column in y / ssq
 
             if (is_idx) {
                     // DRAIN-FIRST: nothing heavy on the TMEM-drain path (the accum
                     // stage gates the MMA). Dump the accum to the fp32 scratch
                     // (lane = col -> 128B-coalesced rows, L2-resident), release
                     // tmem_empty, hand off to the async transform warpgroup.
-                    const int head = (base_n - N_TOTAL) / IDX_HEAD_DIM;
+                    const int head = base_n / IDX_HEAD_DIM;
                     float* dst = iq_scratch
                         + ((int64_t)base_m * IDX_NUM_HEADS + head) * IDX_HEAD_DIM
                         + epi_warp_idx * 32 + lane_id;
@@ -566,7 +568,7 @@ wq_b_proj_kernel(
                     for (int i = 0; i < NUM_N_STORE_ATOMS; ++i) {
                         auto* smem_ptr = reinterpret_cast<float*>(smem_cd_ptr)
                             + i * (STORE_BLOCK_M * STORE_BLOCK_N_ATOM);
-                        int n_idx = base_n + i * STORE_BLOCK_N_ATOM;
+                        int n_idx = out_n + i * STORE_BLOCK_N_ATOM;
                         int m_idx = base_m + st * STORE_BLOCK_M;
                         tma::store_2d(&desc_D, smem_ptr, n_idx, m_idx);
                     }
@@ -586,7 +588,7 @@ wq_b_proj_kernel(
                 const float v = s.ssq_scratch[0][r] + s.ssq_scratch[1][r]
                               + s.ssq_scratch[2][r] + s.ssq_scratch[3][r];
                 if (m < problem_m)
-                    atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + base_n / HEAD_DIM_OUT, v);
+                    atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + out_n / HEAD_DIM_OUT, v);
             }
 
             }  // !is_idx (main-q tile store path)
@@ -604,72 +606,64 @@ wq_b_proj_kernel(
     }
 
     // ======== ASYNC TRANSFORM WARPGROUP (threads 256..383) ========
-    // Replays the reversed tile schedule, picks the iq tiles, waits on barrier 1
-    // (store warps arrive right after the drain) and runs the transform from the
-    // L2 scratch -- off the GEMM's critical path; only has to finish before the
-    // trailing cluster_sync.
+    // Three sections, ordered by EARLIEST POSSIBLE START:
+    //   1 HANDSHAKE  serve barrier 1 (the store warps are BLOCKED on it right
+    //                after each iq drain) and release that head's ready flag.
+    //   2 CHAINS     winkv + compressor -- no in-kernel dependency at all, so as
+    //                early as possible.
+    //   3 SPREAD     the rope/hadamard/fp4 transform. The only section that can
+    //                block on ANOTHER CTA's flag, hence last.
+    // SPREAD runs on ALL CTAs because one CTA tile in the iq segment is exactly one
+    // indexer head (BLOCK_N == IDX_HEAD_DIM), so only N_IDX/CLUSTER_BLOCK_N clusters
+    // drain one -- 16 of 72, i.e. 32 of 144 CTAs. Leaving the transform on its owner
+    // put 100% of it on 22% of the grid with 112 transform warpgroups idle, and the
+    // shadow left by the remaining GEMM absorbs only ~2.5 row batches, so the rest
+    // was exposed (4.65us at M=128 -> 1.3us spread).
     else if (warp_id >= (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32) {
-        // STATIC iq-tile enumeration: under the reversed schedule tile_id =
-        // (NUM_TILES_TOTAL-1) - it_t, so the iq segment (tile_id >= NUM_N_TILES)
-        // is EXACTLY it_t < NUM_IQ_TILES -- the replay loop's filter folded into
-        // the range (same formula, no second source of truth; N_IDX being whole
-        // cluster tiles is static_assert'd in the header). Non-iq CTAs skip the
-        // loop entirely.
-        constexpr int NUM_IQ_TILES = NUM_N_TILES_MERGED - NUM_N_TILES;   // 32
+        // The iq segment LEADS the N range, so its tiles are exactly it_t <
+        // NUM_IQ_TILES (N_IDX being whole cluster tiles is static_assert'd in the
+        // header). head = it_t * CLUSTER_SIZE + cta_rank, which at the production
+        // grid equals blockIdx.x -- so SPREAD's first task is this CTA's own head
+        // and its flag is already set.
+        constexpr int NUM_IQ_TILES = N_IDX / CLUSTER_BLOCK_N;
+        // Draining CTAs vs the rest; CHAINS ranks the draining ones last.
+        const int busy  = min(num_clusters, NUM_IQ_TILES) * CLUSTER_SIZE;
+        const int nfree = num_blocks - busy;
+
+        // ---- 1 HANDSHAKE ----
+        // Barrier arrivals must stay in lockstep with the store warps', so the loop
+        // shape is fixed; the body is only a release store, which is what keeps
+        // these CTAs from becoming the long pole.
         if (!mock_post)
-        for (int it_t = cluster_id; it_t < NUM_IQ_TILES; it_t += num_clusters) {
-            const int tile_id = NUM_TILES_TOTAL - 1 - it_t;   // >= NUM_N_TILES always
-            const int base_n = tile_id * CLUSTER_BLOCK_N + cta_rank * BLOCK_N;
-            const int head = (base_n - N_TOTAL) / IDX_HEAD_DIM;
-
+          for (int it_t = cluster_id; it_t < NUM_IQ_TILES; it_t += num_clusters) {
+            const int head = it_t * CLUSTER_SIZE + cta_rank;
             cutlass::arch::NamedBarrier::sync(
-                NUM_STORE_THREADS + NUM_XFORM_THREADS, 1);    // drain done + mem fence
-
-            const uint32_t t = threadIdx.x - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS);
-            const uint32_t r = t >> 3, e8 = t & 7;            // 16 rows x 8 lanes
-            const int num_batches = M_TPL / STORE_BLOCK_M;    // whole-tile M rows
-            // Software-pipelined: prefetch batch b+1's L2 reads while computing
-            // batch b (see IdxRowIn)
-            auto row_ptr = [&](int m) {
-                return iq_scratch + ((int64_t)m * IDX_NUM_HEADS + head) * IDX_HEAD_DIM;
-            };
-            IdxRowIn cur, nxt;
-            // padding rows (m >= problem_m) CLAMP to the last valid row: warps
-            // stay converged for the full-mask shuffles, stores are suppressed
-            const auto clamp_m = [&](int m) {
-                return m < problem_m ? m : problem_m - 1;
-            };
-            idx_row_load(row_ptr(clamp_m((int)r)), e8, clamp_m((int)r),
-                         q_pos, rope_cos, rope_sin, cur);
-            for (int b = 0; b < num_batches; ++b) {
-                const int m = b * STORE_BLOCK_M + (int)r;     // base_m == 0 (swap)
-                if (b + 1 < num_batches)
-                    idx_row_load(row_ptr(clamp_m(m + STORE_BLOCK_M)), e8,
-                                 clamp_m(m + STORE_BLOCK_M),
-                                 q_pos, rope_cos, rope_sin, nxt);
-                idx_row_compute(cur, e8, clamp_m(m), head, iq_fp4, iq_sf,
-                                m < problem_m);
-                cur = nxt;
+                NUM_STORE_THREADS + NUM_XFORM_THREADS, 1);   // drain done + CTA fence
+            // The barrier's scope is the CTA; one thread promotes the store warps'
+            // drain to device scope and publishes. Paired with ld.acquire in SPREAD.
+            if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
+                __threadfence();
+                asm volatile("st.release.gpu.global.u32 [%0], %1;"
+                             :: "l"(iq_ready + head * IQ_FLAG_STRIDE), "r"(iq_seq)
+                             : "memory");
             }
-        }
+          }
 
-        // ---- fused CUDA-core post-processing (independent of the GEMM dataflow) ----
-        // Runs AFTER the idxpost replay (store warps block on barrier 1 and must
-        // be served first when mock_post==0). WARP-LEVEL task pool, ONE task per
-        // token row (winkv pass then compressor pass -- separate loops keep the
-        // two chains' register live ranges disjoint). Worker order = ALL FOUR
-        // warp levels of the iq-FREE CTAs first, iq CTAs only as a last resort:
-        // measured across three schedules, a second warp on a free CTA costs
-        // ~2.5us total at M=128 while ANY row on an iq CTA (which also carries
-        // idxpost when fused) blows d_all to 9-11us. M <= 4*(num_blocks-busy)
-        // = 320 rows never touch an iq CTA. Only exit sync: trailing cluster_sync.
+        // ---- 2 CHAINS ----
+        // Ahead of SPREAD on purpose: these can run from t=0 while SPREAD cannot
+        // start before a drain lands. Running SPREAD first parked them behind a
+        // mid-kernel flag wait on exactly the CTAs this pool prefers -- measured
+        // d_all 0.26 -> 5.2us at M=31. WARP-LEVEL task pool, ONE task per token row
+        // (separate win/cmp loops keep the two chains' register live ranges
+        // disjoint), no atomics and no barriers -- purely static. Worker order = all
+        // four warp levels of the iq-FREE CTAs first, iq CTAs only as a last resort
+        // (a second warp on a free CTA costs ~2.5us at M=128; M <= 4*nfree = 448
+        // rows never touch an iq CTA). Only exit sync: trailing cluster_sync.
         {
             const bool win_on = comp.win_y2 != nullptr;
             const bool cmp_on = comp.kv != nullptr;
             if (win_on || cmp_on) {
                 const int wlocal = (int)warp_id - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32;
-                const int busy = min(num_clusters, NUM_IQ_TILES) * CLUSTER_SIZE;
-                const int nfree = num_blocks - busy;
                 const int rank = ((int)blockIdx.x >= busy)
                     ? ((int)blockIdx.x - busy)                  // iq-free CTAs: rank 0..nfree-1
                     : (nfree + (int)blockIdx.x);                // iq CTAs after them
@@ -683,6 +677,40 @@ wq_b_proj_kernel(
                 if (cmp_on)
                     for (int m = wid; m < problem_m; m += stride)
                         idx_comp::process_row(comp, m, (int)lane_id);
+            }
+        }
+
+        // ---- 3 SPREAD ----
+        // Flat (head, row-batch) task space over the whole grid; one batch = 16 rows
+        // x 8 lanes = all 128 threads once. At M=128 that is 32*8 = 256 batches over
+        // 144 CTAs, <= 2 each.
+        if (!mock_post) {
+            const uint32_t xtid = threadIdx.x - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS);
+            const uint32_t r = xtid >> 3, e8 = xtid & 7;
+            // Batches per head from problem_m, NOT M_TPL: padding rows run the full
+            // converged compute (only their stores are suppressed), so an
+            // all-padding batch is pure waste. Trip counts stay CTA-uniform.
+            const int nbph = (problem_m + STORE_BLOCK_M - 1) / STORE_BLOCK_M;
+            const int nb   = IDX_NUM_HEADS * nbph;
+            for (int task = (int)blockIdx.x; task < nb; task += num_blocks) {
+                const int head = task % IDX_NUM_HEADS;
+                const int m0   = (task / IDX_NUM_HEADS) * STORE_BLOCK_M;
+                uint32_t v;
+                do {   // whole warp polls ONE address -> a single broadcast read
+                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                                 : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                                 : "memory");
+                    if (v == iq_seq) break;
+                    __nanosleep(128);
+                } while (true);
+                // padding rows CLAMP to the last valid row: warps stay converged for
+                // the full-mask shuffles, stores are suppressed
+                const int m = m0 + (int)r;
+                const int mc = m < problem_m ? m : problem_m - 1;
+                idx_postprocess_row(
+                    iq_scratch + ((int64_t)mc * IDX_NUM_HEADS + head) * IDX_HEAD_DIM,
+                    e8, mc, head, q_pos, rope_cos, rope_sin, iq_fp4, iq_sf,
+                    IDX_NUM_HEADS, m < problem_m);
             }
         }
     }
@@ -752,7 +780,8 @@ static int get_smem_bytes(int M) {
     }
 }
 
-// MERGED FP8 block-scale run (N = 73728 = main q 65536 + indexer 8192). Inputs
+// MERGED FP8 block-scale run (N = 73728 = indexer 8192 ++ main q 65536; the
+// indexer segment leads N). Inputs
 // use the native DSV4 checkpoint/runtime layout:
 //   x_fp8 [M,K] e4m3 ; x_sf [M,K/128] UE8M0 (activation 1x128)
 //   w_fp8 [N_MERGED,K] e4m3 ; w_sf [N_MERGED/128,K/128] UE8M0 (weight 128x128)
@@ -856,6 +885,44 @@ static std::vector<torch::Tensor> run_wq_b(
 
     auto out = torch::empty({M, N_TOTAL}, x_fp8.options().dtype(torch::kFloat32));
     auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Ready flags for the cross-CTA idx-post handoff (one 128B line per indexer
+    // head), allocated ONCE per device.
+    // EAGER: no reset. Producers publish a host-monotonic launch tag and
+    // consumers wait for that exact value, so last launch's flags can never be
+    // mistaken for this launch's -- that is what keeps a memset off the path.
+    // CAPTURE: the host tag would be FROZEN into the graph, and on replay the
+    // flags still hold it from the capture-time run -- consumers would sail past
+    // the producers. So while capturing we emit a memset NODE (replays in stream
+    // order) and pin the tag. Assumes the graph and eager launches that share a
+    // device do not run CONCURRENTLY on different streams.
+    static uint32_t* iq_ready_dev[kMaxDevices] = {};
+    static uint32_t  iq_ready_tag[kMaxDevices] = {};
+    const int dev_id = x_fp8.device().index();
+    TORCH_CHECK(dev_id >= 0 && dev_id < kMaxDevices,
+                "wq_b: device index ", dev_id, " outside the flag table");
+    constexpr size_t kFlagBytes = IQ_FLAG_SLOTS * sizeof(uint32_t);
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    TORCH_CHECK(cudaStreamIsCapturing(stream, &cap) == cudaSuccess,
+                "wq_b: cudaStreamIsCapturing failed");
+    if (iq_ready_dev[dev_id] == nullptr) {
+        TORCH_CHECK(cap == cudaStreamCaptureStatusNone,
+                    "wq_b: run one eager launch before capturing (the iq "
+                    "ready-flag page cannot be allocated during capture)");
+        TORCH_CHECK(cudaMalloc(&iq_ready_dev[dev_id], kFlagBytes) == cudaSuccess,
+                    "wq_b: iq ready-flag alloc failed");
+        TORCH_CHECK(cudaMemsetAsync(iq_ready_dev[dev_id], 0, kFlagBytes, stream)
+                        == cudaSuccess, "wq_b: iq ready-flag zero failed");
+    }
+    uint32_t* iq_ready_ptr = iq_ready_dev[dev_id];
+    uint32_t  iq_seq;
+    if (cap == cudaStreamCaptureStatusNone) {
+        iq_seq = ++iq_ready_tag[dev_id];
+    } else {
+        iq_seq = 1u;
+        TORCH_CHECK(cudaMemsetAsync(iq_ready_ptr, 0, kFlagBytes, stream)
+                        == cudaSuccess, "wq_b: iq ready-flag reset node failed");
+    }
 
     auto x_ptr   = reinterpret_cast<const __nv_fp8_e4m3*>(x_fp8.data_ptr());
     auto w_ptr   = reinterpret_cast<const __nv_fp8_e4m3*>(w_fp8.data_ptr());
@@ -1117,7 +1184,8 @@ static std::vector<torch::Tensor> run_wq_b(
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &ssq_ptr,
-            &iq_fp4_ptr, &iq_sf_ptr, &iq_ws_ptr, &q_pos_ptr, &cos_ptr, &sin_ptr,
+            &iq_fp4_ptr, &iq_sf_ptr, &iq_ws_ptr, &iq_ready_ptr, &iq_seq,
+            &q_pos_ptr, &cos_ptr, &sin_ptr,
             &mock_i, &comp, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
@@ -1137,6 +1205,11 @@ static std::vector<torch::Tensor> run_wq_b(
 
 // ======================== PyTorch Binding ========================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.attr("n_main") = N_TOTAL;
+    m.attr("n_index") = N_IDX;
+    m.attr("n_merged") = N_MERGED;
+    m.attr("num_main_heads") = NUM_HEADS_OUT;
+    m.attr("num_index_heads") = IDX_NUM_HEADS;
     m.def("wq_b_proj_gemm_merged",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,
@@ -1158,7 +1231,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               q_y, q_norm_w, q_eps,
                               slot_map, idx_cache, idx_dst, swa_cache, swa_dst);
           },
-          "MERGED wq_b + indexer wq_b (w [N+8192,K]), swap path, M in [1,128]. "
+          "MERGED wq_b + indexer wq_b (w [8192+N,K]: indexer rows FIRST, then "
+          "main q), swap path, M in [1,128]. "
           "Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
           "ssq fp32 [M,128] (unless enable_ssq=False), iq_ws (if mock_post), "
           "idx_q4 u8 [M,64] + idx_s4 u8 [M,4] (if the compressor bundle is given)]. "
@@ -1227,7 +1301,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                   iq_f32.data_ptr<float>(), q_pos.data_ptr<int>(),
                   rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
                   reinterpret_cast<uint8_t*>(iq_fp4.data_ptr()),
-                  iq_sf.data_ptr<int>(), rows);
+                  iq_sf.data_ptr<int>(), rows, IDX_NUM_HEADS);
               return std::vector<torch::Tensor>{iq_fp4, iq_sf};
           },
           "Standalone rope+hadamard+fp4quant over fp32 iq [M,64,128] -> "

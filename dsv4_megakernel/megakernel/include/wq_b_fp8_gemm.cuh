@@ -3,7 +3,7 @@
 // wq_b_fp8_gemm.cuh — config + PTX/TMA helpers for the MERGED wq_b projection
 // (kernel/host/usage: kernels/wq_b_fp8_gemm.cu).
 //
-// Shape: x[M,1536] e4m3 @ w[73728,1536]^T (main q ++ indexer), M_pad in
+// Shape: x[M,1536] e4m3 @ w[N_MERGED,1536]^T (main q ++ indexer), M_pad in
 // {32,64,96,128}. Swap-AB: MMA A = weight (UMMA_M=256 along N), B = activation
 // (UMMA_N = M_pad along M), both K-major 128B-swizzled. Native DSV4 scales:
 // activation 1x128, weight 128x128, UE8M0; warp2 expands each K128 byte to four
@@ -30,7 +30,14 @@ namespace wq_b {
 
 // ---- Problem dimensions (fixed for wq_b projection) ----
 static constexpr int K_DIM    = 1536;
-static constexpr int N_TOTAL  = 65536;  // 128 heads x 512 dim
+#if defined(WQ_B_TP2_SINGLE_RANK)
+// TP2 benchmark/production specialization: one rank owns half of both the
+// main-Q heads and the index-Q heads. The post-idx all-to-all is outside this
+// single-rank kernel benchmark.
+static constexpr int N_TOTAL  = 32768;  // 64 main-Q heads x 512 dim
+#else
+static constexpr int N_TOTAL  = 65536;  // 128 main-Q heads x 512 dim
+#endif
 // ---- Output head geometry (per-head RMSNorm scale folding) ----
 // The epilogue can ACCUMULATE per-(row, head) sum-of-squares into an optional
 // zero-initialized head_ssq[M, NUM_HEADS_OUT] fp32 buffer (fire-and-forget f32
@@ -48,15 +55,32 @@ static constexpr int NUM_WEIGHT_SF_ROWS =
     (N_TOTAL + WEIGHT_QUANT_BLOCK_N - 1) / WEIGHT_QUANT_BLOCK_N; // 512
 
 // ---- Merged indexer projection (CSA stage 7 Idx_WProj fused into this GEMM) ----
-// The indexer wq_b shares A (= qr) and K, so its weight is CONCATENATED along N:
-// w[N_TOTAL + N_IDX, K]. The iq segment is tile-aligned for the swap path
-// (N_IDX % CLUSTER_BLOCK_N == 0) and each 128-col CTA tile is exactly ONE indexer
-// head row -- the epilogue post-processes it in place (rope + hadamard + fp4
-// quant) instead of storing fp32. Swap path (M <= 128) only.
+// The indexer wq_b shares A (= qr) and K, so its weight is CONCATENATED along N.
+// It goes FIRST: w[N_IDX + N_TOTAL, K], i.e. rows [0, N_IDX) are the indexer and
+// [N_IDX, N_MERGED) are the main q. Leading it means a plain forward tile walk
+// already schedules the tiles that need CUDA-core post-processing in iteration 0,
+// so the remaining main-q weight stream is their shadow -- no reversed schedule.
+// The iq segment is tile-aligned for the swap path (N_IDX % CLUSTER_BLOCK_N == 0)
+// and each 128-col CTA tile is exactly ONE indexer head row -- the epilogue drains
+// it to an L2 scratch (rope + hadamard + fp4 quant run async) instead of storing
+// fp32. Swap path (M <= 128) only.
+#if defined(WQ_B_TP2_SINGLE_RANK)
+static constexpr int IDX_NUM_HEADS = 32;
+#else
 static constexpr int IDX_NUM_HEADS = 64;
+#endif
 static constexpr int IDX_HEAD_DIM  = 128;
 static constexpr int N_IDX         = IDX_NUM_HEADS * IDX_HEAD_DIM;              // 8192
 static constexpr int N_MERGED      = N_TOTAL + N_IDX;                           // 73728
+// Cross-CTA handoff for the indexer post-processing: only N_IDX/CLUSTER_BLOCK_N
+// clusters own an iq tile (16 of 72 at the TP2 shape), so if the CTA that drains
+// a head also transforms it, 22% of the grid carries 100% of the transform. The
+// drain side instead RELEASES a per-head flag and every CTA pulls row batches
+// from a flat task space. One 128B line per head keeps the pollers off each
+// other; the value is a host-monotonic launch tag so no per-launch memset is
+// needed (a stale flag can never match the current tag).
+static constexpr int IQ_FLAG_STRIDE = 32;                                // 128B / u32
+static constexpr int IQ_FLAG_SLOTS  = IDX_NUM_HEADS * IQ_FLAG_STRIDE;
 static constexpr int NUM_WEIGHT_SF_ROWS_MERGED =
     N_MERGED / WEIGHT_QUANT_BLOCK_N;                                            // 576
 

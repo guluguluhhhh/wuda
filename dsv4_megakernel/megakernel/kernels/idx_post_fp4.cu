@@ -50,7 +50,7 @@ static std::vector<torch::Tensor> idx_postprocess(
         iq_f32.data_ptr<float>(), q_pos.data_ptr<int>(),
         rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
         reinterpret_cast<uint8_t*>(iq_fp4.data_ptr()),
-        iq_sf.data_ptr<int>(), rows);
+        iq_sf.data_ptr<int>(), rows, idx_post::NUM_HEADS);
     return {iq_fp4, iq_sf};
 }
 

@@ -56,6 +56,7 @@ __device__ __forceinline__ void idx_row_load(
 __device__ __forceinline__ void idx_row_compute(
     const IdxRowIn& d, uint32_t e, int m, int head,
     uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,
+    int num_heads = idx_post::NUM_HEADS,
     bool store_ok = true) {   // false = padding row: full compute (warp-converged
                               // shuffles), stores suppressed
     // Paired bf16 rounding: one cvt.rn.bf16x2.f32 per 2 elements (each component
@@ -144,7 +145,7 @@ __device__ __forceinline__ void idx_row_compute(
         packed[i] = w;
     }
     if (store_ok)
-        reinterpret_cast<uint2*>(iq_fp4 + ((int64_t)m * idx_post::NUM_HEADS + head)
+        reinterpret_cast<uint2*>(iq_fp4 + ((int64_t)m * num_heads + head)
                                           * (idx_post::HEAD_DIM / 2))[e] =
             make_uint2(packed[0], packed[1]);
 
@@ -154,7 +155,7 @@ __device__ __forceinline__ void idx_row_compute(
     sf |= __shfl_xor_sync(0xffffffffu, sf, 2);
     sf |= __shfl_xor_sync(0xffffffffu, sf, 4);
     if (e == 0 && store_ok)
-        iq_sf[(int64_t)m * idx_post::NUM_HEADS + head] = static_cast<int>(sf);
+        iq_sf[(int64_t)m * num_heads + head] = static_cast<int>(sf);
 }
 
 // load + compute in one step (no pipelining)
@@ -162,10 +163,11 @@ __device__ __forceinline__ void idx_postprocess_row(
     const float* __restrict__ src_row, uint32_t e, int m, int head,
     const int* __restrict__ q_pos,
     const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
-    uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf, bool store_ok = true) {
+    uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,
+    int num_heads = idx_post::NUM_HEADS, bool store_ok = true) {
     IdxRowIn d;
     idx_row_load(src_row, e, m, q_pos, rope_cos, rope_sin, d);
-    idx_row_compute(d, e, m, head, iq_fp4, iq_sf, store_ok);
+    idx_row_compute(d, e, m, head, iq_fp4, iq_sf, num_heads, store_ok);
 }
 
 // ======================== Standalone post-processing kernel ========================
@@ -178,13 +180,14 @@ idx_post_kernel(
     const float* __restrict__ iq_f32,   // [M, 64, 128]
     const int* __restrict__ q_pos,
     const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
-    uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf, int total_rows)
+    uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,
+    int total_rows, int num_heads)
 {
     const int raw = blockIdx.x * (256 / 8) + (int)(threadIdx.x >> 3);  // m*64+head
     const int row = raw < total_rows ? raw : total_rows - 1;
     idx_postprocess_row(iq_f32 + (int64_t)row * idx_post::HEAD_DIM,
                         threadIdx.x & 7,
-                        row / idx_post::NUM_HEADS, row % idx_post::NUM_HEADS,
+                        row / num_heads, row % num_heads,
                         q_pos, rope_cos, rope_sin, iq_fp4, iq_sf,
-                        raw < total_rows);
+                        num_heads, raw < total_rows);
 }
