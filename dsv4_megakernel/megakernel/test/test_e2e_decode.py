@@ -5,7 +5,14 @@ cache management (test/kv_cache_manager.py):
   hc_fused(nopc + fused attn_norm) -> front_mixed(+hc tail) ->
   qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + head_ssq + indexer compressor
   + winkv) -> mqa_logits(paged, + MAIN compressor tail) -> topk_v2(512, page
-  transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope).
+  transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope) ->
+  o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
+
+The tail two stages are the OFFICIAL post-attention boundary ported verbatim
+from mega_csa (Flash_DeepSeek_V4_Pro): o_proj_csa.py drives the two Triton
+quant kernels plus the DeepGEMM wo_a/wo_b pair, and mhc_post.cu closes the mHC
+residual mix. residual = THIS layer's input hidden, post/comb = the front hc
+tail's real mix -> the chain now produces the next layer's input.
 
 Multi-step decode simulation (the cache/state semantics ONLY show up across
 steps): B requests advance pos together; mid-run one request is freed and its
@@ -16,10 +23,12 @@ Stage gates per step:
   A front y (fp8/bf16 segment calc_diff)          D topk vs torch.topk+transform
   B wq_b x_fp8 quant chain (byte match)           E flashMLA vs torch attention
   C mqa logits vs torch ref over DEQUANT pools        over the DEQUANT pools
+  H o_proj + mhc_post vs the fp32 torch chain (inv-RoPE -> wo_a -> wo_b -> mix)
 Global gate: the whole simulation runs TWICE from the same seed -> all caches,
 states and final outputs bitwise identical (run-to-run determinism).
 
-flash_mla is optional (import-guarded): without it stages A-D still run.
+flash_mla is optional (import-guarded): without it stages A-D still run, and
+the o_proj/mhc_post tail (which consumes the MLA output) is skipped with it.
 """
 import os, sys, math, time, warnings, torch
 warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
@@ -31,6 +40,7 @@ from kv_cache_manager import (KVCacheManager, PAGE, WIN, RATIO,
 import test_hc_fused_tc as t_hc
 import test_front_mixed_gemm as t_fm
 import test_wq_b_fp8_gemm as t_wq
+import o_proj_csa
 
 def _import_flash_mla():
     """Import flash_mla from the SIBLING source package (identical layout on
@@ -104,6 +114,38 @@ Q_HEADS, Q_DIM = 128, 512
 IDX_HEADS, IDX_D = 64, 128
 MAX_POS = 4096
 EPS = 1e-6
+O_GROUPS, O_LORA = 16, 1024        # o_proj: 16 groups x rank 1024
+O_INTER = O_GROUPS * O_LORA        # 16384
+
+
+def load_mhc_post():
+    """mHC post kernel, ported from mega_csa: its kernel math and PDL protocol
+    are byte-for-byte upstream, merged into one .cu with the torch binding
+    (this tree has a single consumer, so upstream's cross-TU split is moot)."""
+    from torch.utils.cpp_extension import load
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.dirname(here)
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    return load(
+        name="e2e_mhc_post",
+        sources=[os.path.join(proj, "kernels", "mhc_post.cu")],
+        extra_include_paths=[os.path.join(proj, "include")],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math",
+                           f"-gencode=arch=compute_{sm}a,code=sm_{sm}a"],
+        verbose=False,
+    )
+
+
+_OPROJ_WS = {}
+
+
+def oproj_ws(B):
+    """Cached O-projection workspace (the run path is allocation-free, and a
+    stable workspace is what lets CUDA-graph replay keep its addresses)."""
+    if B not in _OPROJ_WS:
+        _OPROJ_WS[B] = o_proj_csa.prepare_o_proj_workspace(B, DEV)
+    return _OPROJ_WS[B]
 
 
 # ==================== weights (one-time, layer constants) ====================
@@ -133,6 +175,24 @@ def make_weights(seed=7):
     w["comp_norm"] = torch.rand(512, device=DEV) + 0.5
     ang = torch.rand(MAX_POS, 32, device=DEV) * 6.28
     w["cos"], w["sin"] = ang.cos().contiguous(), ang.sin().contiguous()
+    # o_proj (official DSV4 two-stage attention output): wo_a is GROUPED
+    # [16, rank 1024, heads_per_group*512], wo_b is [7168, 16384]. The bf16
+    # originals stay resident for the stage-H torch reference; the fp8 +
+    # TMA-layout scales are built ONCE here (never in the hot region).
+    # o_proj_csa imports deep_gemm PLAINLY, so the shared resolver must have
+    # put it on sys.path first; its two extra APIs are checked up front so a
+    # too-old build fails here instead of mid-chain.
+    dg = get_dg()
+    for api in ("fp8_einsum", "fp8_gemm_nt", "transform_sf_into_required_layout"):
+        assert hasattr(dg, api), f"deep_gemm build lacks {api} (o_proj needs it)"
+    w["wo_a"] = torch.randn(O_GROUPS, O_LORA, (Q_HEADS // O_GROUPS) * Q_DIM,
+                            device=DEV, dtype=torch.bfloat16) * 0.01
+    w["wo_b"] = torch.randn(DIM, O_INTER, device=DEV,
+                            dtype=torch.bfloat16) * 0.01
+    w["o_proj"] = o_proj_csa.quantize_o_proj_weights(w["wo_a"], w["wo_b"])
+    # ONE contiguous cos||sin table [max_pos,64]: what the inverse-RoPE
+    # kernel indexes by position (same angles the forward rope used).
+    w["cos_sin"] = torch.cat((w["cos"], w["sin"]), dim=-1).contiguous()
     return w
 
 
@@ -198,6 +258,28 @@ def ref_flash_attn(qn, swa_rows, cmp_rows, scale):
     return p @ k.float()                                       # [128,512]
 
 
+def ref_o_proj_mhc(mla3, pos64, cos_sin, residual, post, comb, wo_a, wo_b):
+    """fp32 torch chain for the official post-attention boundary (mega_csa
+    unit-test reference): INVERSE RoPE on the last 64 dims (note the sign
+    flip vs the forward rope) -> bf16 model boundary -> grouped wo_a ->
+    wo_b -> mHC mix. The kernel path is fp8 twice over, so the gate is the
+    official calc_diff < 2e-2."""
+    B = mla3.size(0)
+    r = mla3.float().clone()
+    rope = r[..., Q_DIM - 64:].view(B, Q_HEADS, 32, 2)
+    even, odd = rope.unbind(-1)
+    f = cos_sin.index_select(0, pos64)
+    cos, sin = f[:, :32].unsqueeze(1), f[:, 32:].unsqueeze(1)
+    r[..., Q_DIM - 64:] = torch.stack(
+        (even * cos + odd * sin, odd * cos - even * sin), dim=-1).flatten(-2)
+    rot = r.to(torch.bfloat16).float()
+    z = torch.einsum("mhr,hdr->mhd",
+                     rot.view(B, O_GROUPS, -1), wo_a.float())
+    proj = z.flatten(1) @ wo_b.float().t()
+    return (torch.einsum("mij,mih->mjh", comb, residual.float())
+            + post.unsqueeze(-1) * proj.unsqueeze(1)).to(torch.bfloat16)
+
+
 # ==================== one decode step ====================
 def get_dg():
     """deep_gemm (hard dep for the hybrid mhc): shared resolver in
@@ -240,7 +322,7 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
-    hcm, fmm, wqm, mqm, tkm = mods
+    hcm, fmm, wqm, mqm, tkm, mpm = mods
     B = len(slots)
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
@@ -426,7 +508,23 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                        yq=yq.clone(), ssq=ssq.clone(),
                        logits=logits_buf.clone(), page_idx=page_idx.clone(),
                        iq=rets[1].clone())
-        return out.reshape(B, -1)
+
+        # -- 8. o_proj + mHC post: the OFFICIAL post-attention boundary.
+        #       residual = THIS layer's input hidden, post/comb = the front
+        #       hc tail's real mix -> [B,4,7168] next-layer input. The MLA
+        #       output enters as [B,128,512] (its scope dim is 1).
+        mla3 = (out[:, 0] if out.dim() == 4 else out).contiguous()
+        pos64 = pos.to(torch.int64).contiguous()
+        post_t, comb_t = hc["hc_post"], hc["hc_comb"].view(B, HC, HC)
+        final = o_proj_csa.run_o_proj_mhc_post(
+            mla3, pos64, w["cos_sin"], hidden, post_t, comb_t,
+            w["o_proj"], oproj_ws(B), mpm, use_pdl=True)
+        ref_final = ref_o_proj_mhc(mla3, pos64, w["cos_sin"], hidden,
+                                   post_t, comb_t, w["wo_a"], w["wo_b"])
+        stats["H_oproj_diff"] = max(
+            stats.get("H_oproj_diff", 0.0),
+            t_fm.calc_diff(final.float(), ref_final.float()))
+        return final.reshape(B, -1)
     # No flash_mla: the VALID y segment only -- under FRONT-EMIT the cols
     # [1536,4672) are never written (side buffers replace them), so the
     # full-y snapshot would compare uninitialized memory.
@@ -475,9 +573,13 @@ def benchmark(mods, w, ncmp=2048):
       graph     : wall/step of CUDA-graph replay (vLLM serving form; THE
                   end-to-end number)
     Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
-    and lens real, cache bytes arbitrary -- latency-neutral. Chain ends at
-    flashMLA (no o-proj etc. yet, matching the comparison scope)."""
-    hcm, fmm, wqm, mqm, tkm = mods
+    and lens real, cache bytes arbitrary -- latency-neutral. The chain runs
+    through the official post-attention boundary, timed as TWO operators:
+    `o_proj` (inv-RoPE quant + wo_a + z quant + wo_b) and `mhc_post` (the
+    residual mix). NOTE the ported o_proj entry point runs host-side shape/
+    alias validation on every call: that lands in the EAGER wall only (graph
+    replay and kineto device time are unaffected)."""
+    hcm, fmm, wqm, mqm, tkm, mpm = mods
     print("\n" + "=" * 76)
     print(f"Per-operator latency (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
@@ -486,7 +588,8 @@ def benchmark(mods, w, ncmp=2048):
     ang = torch.rand(S, 32, device=DEV) * 6.28
     cosl, sinl = ang.cos().contiguous(), ang.sin().contiguous()
     cols = ["mhc", "front", "wq_b", "mqa", "topk"] + \
-        (["mla"] if HAS_FLASH_MLA else []) + ["stages", "eager", "graph"]
+        (["mla", "o_proj", "mhc_post"] if HAS_FLASH_MLA else []) + \
+        ["stages", "eager", "graph"]
     print("  hot, no-flush; stages = kineto device us; eager/graph = wall/step")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
     print("  " + "-" * (5 + 9 * len(cols)))
@@ -628,7 +731,7 @@ def benchmark(mods, w, ncmp=2048):
                 else:
                     qi, fq = flash_mla.query_rms_rope(q_raw, sum_sq, rc, rs,
                                                       EPS), {}
-                return flash_mla.flash_mla_with_kvcache(
+                res = flash_mla.flash_mla_with_kvcache(
                     q=qi, k_cache=swa_v, block_table=None, cache_seqlens=None,
                     head_dim_v=Q_DIM, tile_scheduler_metadata=sched,
                     num_splits=None, softmax_scale=Q_DIM ** -0.5,
@@ -636,8 +739,37 @@ def benchmark(mods, w, ncmp=2048):
                     topk_length=swa_len, extra_k_cache=cmp_v,
                     extra_indices_in_kvcache=ext_idx,
                     extra_topk_length=cmp_len, **fq)
+                hold["mla"] = res[0] if isinstance(res, tuple) else res
+                return res
             run_mla()
             stage_fns.append(("mla", run_mla))
+
+            # o_proj + mHC post: the long-context cos||sin table indexed by
+            # THIS step's positions; residual = the layer input hidden and
+            # post/comb = the front hc tail's real mix (rows [:B]). The two
+            # halves are separate stages: o_proj stops after wo_b (writing
+            # ws.projected), mhc_post is the binding call on top of it, so
+            # their kernel-name buckets stay disjoint and each is one column.
+            cos_sin_l = torch.cat((cosl, sinl), dim=-1).contiguous()
+            pos64 = pos.to(torch.int64).contiguous()
+            ows = oproj_ws(B)
+            post_b = hcd["hc_post"][:B]
+            comb_b = hcd["hc_comb"][:B].view(B, HC, HC)
+
+            def run_oproj():
+                mla_o = hold["mla"]
+                mla3 = (mla_o[:, 0] if mla_o.dim() == 4 else mla_o).contiguous()
+                return o_proj_csa.run_o_proj_mhc_post(
+                    mla3, pos64, cos_sin_l, hidden, post_b, comb_b,
+                    w["o_proj"], ows, mpm, use_pdl=True, run_mhc_post=False)
+
+            def run_mhcpost():
+                mpm.mhc_post_out(ows.projected, hidden, post_b, comb_b,
+                                 ows.mhc_output, True)
+            run_oproj()
+            run_mhcpost()
+            stage_fns.append(("o_proj", run_oproj))
+            stage_fns.append(("mhc_post", run_mhcpost))
 
         chain_fns = [f for _, f in stage_fns]
 
@@ -773,6 +905,21 @@ def benchmark(mods, w, ncmp=2048):
         mla_int = 2 * B * Q_HEADS * Q_DIM * 2 / MB            # q read + out
         mla_eff = B * (TOPK + WIN) * 584 / MB
         t["mla"] = (mla_eff + mla_int, mla_int)
+        # o_proj: the wo_a/wo_b fp8 weights are the effective traffic; the
+        # mla_out re-read and every staged intermediate (o_fp8, z, z_fp8,
+        # projected) is internal. mhc_post: residual read + output write are
+        # the boundary, its projected read is internal.
+        W_OA = O_GROUPS * O_LORA * (Q_HEADS // O_GROUPS) * Q_DIM / MB
+        W_OB = DIM * O_INTER / MB
+        op_int = (B * Q_HEADS * Q_DIM * 2          # mla_out read
+                  + 2 * B * Q_HEADS * Q_DIM        # o_fp8 write + read
+                  + 2 * B * O_INTER * 2            # z bf16 write + read
+                  + 2 * B * O_INTER                # z_fp8 write + read
+                  + B * DIM * 2) / MB              # projected write
+        t["o_proj"] = (W_OA + W_OB + op_int, op_int)
+        mp_int = (B * DIM * 2 + B * HC * 4 + B * HC * HC * 4) / MB
+        mp_eff = 2 * B * HC * DIM * 2 / MB         # residual read + out write
+        t["mhc_post"] = (mp_eff + mp_int, mp_int)
         return t
 
     print("\n" + "=" * 76)
@@ -830,7 +977,8 @@ if __name__ == "__main__":
     print(f"Device: {torch.cuda.get_device_name()}")
     mods = (t_hc.load_cuda_module(), t_fm.load_module(), t_wq.load_module(),
             __import__("test_mqa_logits_fp4").load_cuda_module(),
-            __import__("test_topk_v2").load_cuda_module())
+            __import__("test_topk_v2").load_cuda_module(),
+            load_mhc_post())
     w = make_weights()
 
     print("\nE2E decode simulation (B=16, 8 steps, slot reuse at step 5):")
@@ -901,6 +1049,11 @@ if __name__ == "__main__":
         gates.insert(4, ("E flashMLA cos vs torch ref",
                          stats.get("E_mla_cos", 0), "> 0.98",
                          stats.get("E_mla_cos", 0) > 0.98))
+        # o_proj is fp8-quantized twice (activation + both weight stages), so
+        # the official mega_csa unit-test threshold applies here too.
+        gates.insert(5, ("H o_proj+mhc_post calc_diff",
+                         stats.get("H_oproj_diff", 1), "< 2e-2",
+                         stats.get("H_oproj_diff", 1) < 2e-2))
     ok = True
     for name, val, cond, passed in gates:
         ok &= bool(passed)
