@@ -5,7 +5,8 @@ cache management (test/kv_cache_manager.py):
   hc_fused(nopc + fused attn_norm) -> front_mixed(+hc tail) ->
   qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + head_ssq + indexer compressor
   + winkv) -> mqa_logits(paged, + MAIN compressor tail) -> topk_v2(512, page
-  transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope) ->
+  transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope,
+  per-head attn_sink) ->
   o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
 
 The tail two stages are the OFFICIAL post-attention boundary ported verbatim
@@ -96,6 +97,16 @@ try:
     # standalone query_rms_rope KERNEL (same CUDA op, separate launch).
     FMLA_FUSED_Q = "q_rms_sum_sq" in inspect.signature(
         flash_mla.flash_mla_with_kvcache).parameters
+    # OFFICIAL per-head attn_sink (model.py L456 is an nn.Parameter, so it is a
+    # CHECKPOINT weight, not an option). Old wheels lack the kwarg; the torch
+    # ref then drops it too so stage E stays self-consistent -- but such a run
+    # no longer matches official inference.
+    FMLA_ATTN_SINK = "attn_sink" in inspect.signature(
+        flash_mla.flash_mla_with_kvcache).parameters
+    if not FMLA_ATTN_SINK:
+        print("[warn] flash_mla has no attn_sink kwarg -- stage E runs the "
+              "SINKLESS chain (kernel and ref both), which is NOT official "
+              "model.py semantics")
     if not FMLA_FUSED_Q and not hasattr(flash_mla, "query_rms_rope"):
         print("[warn] flash_mla has neither fused-q nor query_rms_rope -- "
               "stage E skipped (build the source package on this box)")
@@ -173,6 +184,13 @@ def make_weights(seed=7):
     w["idx_norm"] = torch.rand(128, device=DEV) + 0.5
     w["win_norm"] = torch.rand(512, device=DEV) + 0.5
     w["comp_norm"] = torch.rand(512, device=DEV) + 0.5
+    # attn_sink: per-head LEARNED logit of a virtual key whose value is 0
+    # (model.py L456 nn.Parameter[n_local_heads] fp32; convert.py shards it on
+    # dim 0). It enters the softmax DENOMINATOR only (kernel.py L346), so the
+    # real weights sum to <1 and a head can attend to nothing -- which matters
+    # for top-k sparse attention, where otherwise every head must spend its
+    # full mass on whatever the indexer picked.
+    w["attn_sink"] = torch.randn(Q_HEADS, device=DEV, dtype=torch.float32)
     ang = torch.rand(MAX_POS, 32, device=DEV) * 6.28
     w["cos"], w["sin"] = ang.cos().contiguous(), ang.sin().contiguous()
     # o_proj (official DSV4 two-stage attention output): wo_a is GROUPED
@@ -250,12 +268,22 @@ def ref_mqa_logits(iq_fp4, iq_sf, weights, kv_rows_list):
     return outs
 
 
-def ref_flash_attn(qn, swa_rows, cmp_rows, scale):
-    """softmax over [swa ++ cmp] rows; v == k row (head_dim_v = 512)."""
+def ref_flash_attn(qn, swa_rows, cmp_rows, scale, sink=None):
+    """softmax over [swa ++ cmp] rows; v == k row (head_dim_v = 512).
+
+    sink [128] fp32 = the official attn_sink. Since its value vector is 0, the
+    exact reference is a softmax over the n+1 logits [scores || sink] with the
+    sink COLUMN DROPPED from the weighted sum -- algebraically identical to
+    kernel.py L346's 'add exp(sink - max) to the denominator', but numerically
+    stabler (torch.softmax owns the max subtraction) and well-defined at n=0.
+    FlashMLA states it a third way (scale the sinkless output by
+    exp(lse)/(exp(lse)+exp(sink))); all three agree exactly."""
     k = torch.cat([swa_rows, cmp_rows])                        # [n,512]
-    lg = (qn @ k.t()) * scale                                  # [128,n]
-    p = torch.softmax(lg.float(), dim=-1)
-    return p @ k.float()                                       # [128,512]
+    lg = (qn @ k.t()).float() * scale                          # [128,n]
+    if sink is None:
+        return torch.softmax(lg, dim=-1) @ k.float()           # [128,512]
+    lg = torch.cat([lg, sink.float().view(-1, 1)], dim=-1)     # [128,n+1]
+    return torch.softmax(lg, dim=-1)[:, :-1] @ k.float()       # [128,512]
 
 
 def ref_o_proj_mhc(mla3, pos64, cos_sin, residual, post, comb, wo_a, wo_b):
@@ -460,6 +488,10 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         else:   # old wheel: standalone query_rms_rope kernel, plain q after
             q_in, fused_q = flash_mla.query_rms_rope(q_raw, sum_sq, rc, rs,
                                                      EPS), {}
+        # attn_sink is orthogonal to the fused-q prologue: it only rescales the
+        # softmax denominator, so it applies to both wheel generations.
+        sink = w["attn_sink"] if FMLA_ATTN_SINK else None
+        sink_kw = {} if sink is None else dict(attn_sink=sink)
         res = flash_mla.flash_mla_with_kvcache(
             q=q_in, k_cache=mgr.model1_cache_view("swa"),
             block_table=None, cache_seqlens=None, head_dim_v=Q_DIM,
@@ -469,7 +501,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             extra_k_cache=mgr.model1_cache_view("cmp"),
             extra_indices_in_kvcache=page_idx.view(B, 1, TOPK),
             extra_topk_length=cmp_len,
-            **fused_q)
+            **fused_q, **sink_kw)
         out = res[0] if isinstance(res, tuple) else res
         # torch reference over the DEQUANT pools
         for b in range(B):
@@ -491,7 +523,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                                              int(pi) % PAGE)
                               for pi in page_idx[b][:int(cmp_len[b])]]) \
                 if int(cmp_len[b]) else torch.zeros(0, Q_DIM, device=DEV)
-            ref = ref_flash_attn(qn.bfloat16().float(), sw, cm, Q_DIM ** -0.5)
+            ref = ref_flash_attn(qn.bfloat16().float(), sw, cm, Q_DIM ** -0.5,
+                                 sink)
             if torch.isnan(out[b]).any():   # NaN source diag (F regression)
                 print(f"  [NaN-diag] b={b} pos={p} "
                       f"out={int(torch.isnan(out[b]).sum())} "
@@ -721,6 +754,8 @@ def benchmark(mods, w, ncmp=2048):
             ext_idx = page_idx.view(B, 1, TOPK)
             swa_v, cmp_v = mgr.model1_cache_view("swa"), mgr.model1_cache_view("cmp")
             sched, _ = flash_mla.get_mla_metadata()
+            mla_sink_kw = ({} if not FMLA_ATTN_SINK
+                           else dict(attn_sink=w["attn_sink"]))
 
             def run_mla():
                 q_raw = hold["r"][0].view(B, 1, Q_HEADS, Q_DIM).bfloat16()
@@ -738,7 +773,7 @@ def benchmark(mods, w, ncmp=2048):
                     causal=False, is_fp8_kvcache=True, indices=swa_idx,
                     topk_length=swa_len, extra_k_cache=cmp_v,
                     extra_indices_in_kvcache=ext_idx,
-                    extra_topk_length=cmp_len, **fq)
+                    extra_topk_length=cmp_len, **fq, **mla_sink_kw)
                 hold["mla"] = res[0] if isinstance(res, tuple) else res
                 return res
             run_mla()

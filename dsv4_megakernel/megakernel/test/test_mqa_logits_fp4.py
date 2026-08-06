@@ -135,7 +135,9 @@ def load_cuda_module():
         # 128, raise kNumMathRegisters to that value rounded up to a multiple of 8.
         "--ptxas-options=-v",
         "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
-        "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
+        # CUTE_ARCH_* gates are NOT hand-forced: sm103_cutlass_shim.h routes
+        # sm_103a through CUTLASS's own arch table (no-op on CUTLASS >= 4.2).
+        "-include", os.path.join(proj_dir, "include", "sm103_cutlass_shim.h"),
         "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
         # NOTE: cute/arch/config.hpp auto-defines CUTE_ARCH_TCGEN05_{TMEM,F16F32_MMA}_ENABLED
         # for sm_10xa; passing them again triggers "redefined" warnings — so we don't

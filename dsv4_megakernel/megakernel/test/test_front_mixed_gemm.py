@@ -39,9 +39,10 @@ def load_module():
     cuda_flags = [
         '-O3', '-std=c++17', '--expt-relaxed-constexpr', '-lineinfo',
         '-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1',
-        '-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1',
-        # TMEM / F16F32 TCGEN05 enables are auto-defined by cute/arch/config.hpp
-        # for sm_10xa; passing them again -> "redefined" warnings.
+        # CUTE_ARCH_* gates are NOT hand-forced: sm103_cutlass_shim.h routes
+        # sm_103a through CUTLASS's own arch table (and is a no-op on >= 4.2).
+        # Force-defining them here fought that table -- see the shim header.
+        '-include', os.path.join(proj_dir, 'include', 'sm103_cutlass_shim.h'),
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
         f'-gencode=arch=compute_{sm}a,code=sm_{sm}a',
     ]

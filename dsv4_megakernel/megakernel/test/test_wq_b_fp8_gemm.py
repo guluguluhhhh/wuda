@@ -67,8 +67,11 @@ def load_module(tp2_single_rank=False):
     cuda_flags = [
         '-O3', '-std=c++17', '--expt-relaxed-constexpr', '-lineinfo',
         '-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1',
-        '-DCUTE_ARCH_TCGEN05_TMEM_ENABLED=1',
-        '-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1',
+        # CUTE_ARCH_* gates are NOT hand-forced: sm103_cutlass_shim.h routes
+        # sm_103a through CUTLASS's own arch table (no-op on CUTLASS >= 4.2).
+        # The old -DCUTE_ARCH_TCGEN05_TMEM_ENABLED here is what produced the
+        # "redefined" warning at cute/arch/config.hpp:137.
+        '-include', os.path.join(proj_dir, 'include', 'sm103_cutlass_shim.h'),
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
         f'-gencode=arch=compute_{sm}a,code=sm_{sm}a',
     ]
