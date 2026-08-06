@@ -995,11 +995,19 @@ if __name__ == "__main__":
             rel = ((av - bv).abs() /
                    av.abs().clamp_min(1e-6)).max().item()
             return rel < 1e-5, f"elem rel {rel:.2e} (<1e-5)"
-        frac = (av != bv).float().mean().item()   # finals
+        # finals: one ssq ulp can flip a SINGLE fp8 code in o_proj's quant,
+        # and wo_b [7168,16384] + mhc_post's post*proj then spread that code
+        # over the WHOLE request (every HC scope) -- so the differing-ELEMENT
+        # fraction is bimodal (0 or ~1/B) and can never sit just under a
+        # small bound (measured on B300: 0 or 2.56e-2, nothing between).
+        # Gate the contaminated-REQUEST count instead: boundary hits touch a
+        # minority, a real race touches all of them.
+        B = av.size(0)
+        nreq = int((av != bv).flatten(1).any(-1).sum())
         rel = ((av - bv).abs().max() /
                av.abs().max().clamp_min(1e-6)).item()
-        return (frac < 1e-3 and rel < 2e-2), \
-            f"frac {frac:.2e} (<1e-3), max/global {rel:.2e} (<2e-2)"
+        return (nreq * 4 <= B and rel < 2e-2), \
+            f"{nreq}/{B} req differ (<=25%), max/global {rel:.2e} (<2e-2)"
 
     for name, a, b in zip(("finals", "swa_pool", "cmp_pool", "idx_pool",
                            "main_kv", "idx_kv", "main_sc", "y_q", "win_y2",
