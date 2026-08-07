@@ -902,7 +902,12 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           // [MEGAKERNEL EDIT] cross-rank iq readiness. When
                           // iq_ready != nullptr the Q TMA warp -- and ONLY it --
                           // waits until every rank except `iq_skip` has published a
-                          // generation >= *iq_gen. Folding the wait in here instead
+                          // generation >= *iq_gen. iq_skip is unsigned, so the host's
+                          // -1 default arrives as 0xFFFFFFFF and matches no rank in
+                          // [0, iq_world) -- i.e. wait on ALL of them, ourselves
+                          // included, which is what PDL requires since this kernel
+                          // can start before the local wq_b has finished SPREAD.
+                          // Folding the wait in here instead
                           // of running a separate wait kernel is the whole point:
                           // the KV TMA warp, the tile-prefix scan and TMEM alloc do
                           // not depend on remote q, so 557MB of KV streaming starts

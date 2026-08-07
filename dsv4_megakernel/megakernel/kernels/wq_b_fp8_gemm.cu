@@ -1181,12 +1181,15 @@ static std::vector<torch::Tensor> run_wq_b(
     CUtensorMap desc_D   = make_tma_desc_fp32_2d(
         out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
 
-    // Grid: persistent, cluster of 2 CTAs.
-    static const int num_SMs = []() {
-        int n = 0;
-        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, 0);
-        return n;
-    }();
+    // Grid: persistent, cluster of 2 CTAs. PER DEVICE: the SM count is a device
+    // property, and caching device 0's for the whole process burns its grid size
+    // into every other card -- wrong the moment one process drives two GPUs, or
+    // one process drives a GPU that is not 0.
+    static int num_SMs_dev[kMaxDevices] = {};
+    if (num_SMs_dev[dev_id] == 0)
+        cudaDeviceGetAttribute(&num_SMs_dev[dev_id],
+                               cudaDevAttrMultiProcessorCount, dev_id);
+    const int num_SMs = num_SMs_dev[dev_id];
     TORCH_CHECK(num_SMs >= CLUSTER_SIZE,
                 "wq_b FP8 requires at least ", CLUSTER_SIZE, " SMs, got ", num_SMs);
     constexpr int num_tiles = NUM_N_TILES_MERGED;
@@ -1366,16 +1369,19 @@ static std::vector<torch::Tensor> run_wq_b(
     int smem_bytes = get_smem_bytes(M_pad);
     TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
 
-    static bool smem_configured[2][2][9] = {{{false}}};
+    // cudaFuncSetAttribute is PER DEVICE state, so this cache needs the device
+    // ordinal: without it the second card in a process never gets the opt-in
+    // dynamic smem raised and every launch on it fails.
+    static bool smem_configured[kMaxDevices][2][2][9] = {};
     const int m_idx = M_pad / 32;
     const int p_idx = profile ? 1 : 0;
     const int s_idx = want_ssq ? 1 : 0;
-    if (!smem_configured[p_idx][s_idx][m_idx]) {
+    if (!smem_configured[dev_id][p_idx][s_idx][m_idx]) {
         auto attr_err = cudaFuncSetAttribute(kernel_ptr,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr_err), " smem_bytes=", smem_bytes);
-        smem_configured[p_idx][s_idx][m_idx] = true;
+        smem_configured[dev_id][p_idx][s_idx][m_idx] = true;
     }
 
     {

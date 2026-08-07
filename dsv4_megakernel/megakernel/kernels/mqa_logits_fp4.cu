@@ -187,13 +187,22 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
         BLOCK_Q, BLOCK_KV, PAGE_KV, NUM_Q_STAGES, kKVStages,
         NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS, logits_dtype_t>;
 
-    static bool configured = false;   // per-instantiation (template static local)
-    if (!configured) {
+    // cudaFuncSetAttribute is PER DEVICE state, so this cache is indexed by device
+    // ordinal: a single `static bool` lets the first card configure the function and
+    // every launch on the second one fail, which is why one process could never
+    // drive two GPUs.
+    static constexpr int kMaxDevices = 16;
+    static bool configured[kMaxDevices] = {};
+    int cfg_dev = 0;
+    TORCH_CHECK(cudaGetDevice(&cfg_dev) == cudaSuccess, "cudaGetDevice failed");
+    TORCH_CHECK(cfg_dev >= 0 && cfg_dev < kMaxDevices,
+                "device ordinal ", cfg_dev, " exceeds kMaxDevices=", kMaxDevices);
+    if (!configured[cfg_dev]) {
         auto e = cudaFuncSetAttribute((void*)kernel,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         TORCH_CHECK(e == cudaSuccess, "cudaFuncSetAttribute: ", cudaGetErrorString(e),
                     " smem=", smem);
-        configured = true;
+        configured[cfg_dev] = true;
     }
 
     // PDL: allow this grid to start while the producer (wq_b) is still draining
@@ -252,7 +261,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             void* lp,
                             const unsigned int* iq_ready = nullptr,
                             const unsigned int* iq_gen = nullptr,
-                            int iq_world = 0, int iq_skip = 0) {
+                            int iq_world = 0, int iq_skip = -1) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     constexpr int PAGE_STRIDE = PAGE_KV * (HEAD_DIM / 2 + 4);   // fused page bytes (4352)
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -422,7 +431,12 @@ static void mqa_logits_fp4_decode_out(
     // than in a separate wait kernel on the critical path.
     c10::optional<torch::Tensor> iq_ready = c10::nullopt,
     c10::optional<torch::Tensor> iq_gen = c10::nullopt,
-    int64_t iq_world = 0, int64_t iq_skip = 0) {
+    // iq_skip is the rank slot NOT to wait on. It defaults to -1 (wait on every
+    // rank, including ourselves) because PDL releases this kernel before the local
+    // wq_b has finished its own SPREAD, so skipping our own slot is wrong too. A
+    // default of 0 silently made every rank skip slot 0, i.e. rank 1 never waited
+    // for rank 0's data at all.
+    int64_t iq_world = 0, int64_t iq_skip = -1) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
                                                   context_lens, block_table,
                                                   logits.scalar_type());
@@ -590,5 +604,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("slot_map") = c10::nullopt, py::arg("cmp_cache") = c10::nullopt,
           py::arg("cmp_dst") = c10::nullopt,
           py::arg("iq_ready") = c10::nullopt, py::arg("iq_gen") = c10::nullopt,
-          py::arg("iq_world") = 0, py::arg("iq_skip") = 0);
+          py::arg("iq_world") = 0, py::arg("iq_skip") = -1);
 }
