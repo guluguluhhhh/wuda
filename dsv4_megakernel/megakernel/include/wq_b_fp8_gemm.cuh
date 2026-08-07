@@ -125,6 +125,23 @@ static constexpr unsigned long long IQ_SPIN_TIMEOUT_NS = 10000000000ull;
 // graph, so on replay the flag would still hold the capture-time value and the
 // consumer would sail past before this replay's data landed. Consumers wait for
 // `>= *gen`, which re-arms itself and needs no per-step memset.
+//
+// KNOWN COST, and the one worth attacking next. `gen` is published only once the
+// LAST CTA has arrived, i.e. at the very end of this kernel, so mqa's Q TMA warp
+// cannot use its PDL head start. Paired measurement at B=128 (self-loop: one GPU
+// writing its own ready_self, so a real fence/publish/wait path but no inter-rank
+// skew):
+//   no crossing, mqa without PDL      span 72.0   (baseline)
+//   no crossing, mqa with PDL         span 69.1   (-2.9 -- the head start is real)
+//   full crossing, mqa waits          span 74.5   (+2.5 vs baseline)
+// wq_b itself grew 3.6us and only 1.1us of that hid under mqa's KV prefetch, so
+// 2.5us is exposed -- and the 2.9us of PDL overlap is forfeited on top, since the
+// Q warp now blocks until the last arrival. Measured against the PDL-but-no-
+// crossing pipeline the crossing therefore costs 5.4us, not 2.5.
+// The lever is GRANULARITY, not a cheaper fence: this kernel already keeps
+// per-head drain flags for its own SPREAD handshake, so publishing per head as
+// each head's rows land would let the Q warp start on head 0 while the last head
+// is still in flight, instead of waiting on one all-CTAs barrier.
 static constexpr int IQ_DONE_WORDS = 32;      // 128B; only word 0 is used
 struct IqDest {
     uint8_t* fp4;       int* sf;           // this rank's mqa-input buffer

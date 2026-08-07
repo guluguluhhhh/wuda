@@ -698,9 +698,8 @@ wq_b_proj_kernel(
         // x 8 lanes = all 128 threads once. At M=128 that is 32*8 = 256 batches over
         // 144 CTAs, <= 2 each.
         if (!mock_post) {
-            // [PROFILE] SPREAD entry/exit (cluster0/CTA0). The crossing's handoff is
-            // no longer in this kernel -- see iq_publish_kernel -- so what is left to
-            // stamp is the transform plus its peer stores.
+            // [PROFILE] SPREAD entry/exit (cluster0/CTA0): the transform plus its
+            // peer stores, ending before the completion handoff below.
             long long iq_t0 = 0;
             const bool iq_prof = iqd.prof != nullptr && blockIdx.x == 0 &&
                 threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS;
@@ -784,12 +783,17 @@ wq_b_proj_kernel(
             // arrivals never stall.
             //
             // This DEPENDS on full residency: CTA 0 waits on CTAs that must already
-            // be running, or it deadlocks. That is the same requirement
-            // cooperative_groups::grid.sync() has -- except there the launch API
-            // validates it and here it is implicit, so: the host caps num_clusters at
-            // min(num_SMs, total_cta) / CLUSTER_SIZE (WQ_B_CLUSTERS is clamped to the
-            // same bound), and the smem footprint pins occupancy at 1 CTA/SM, hence
-            // grid <= num_SMs and every CTA is resident.
+            // be running. The host caps num_clusters at min(num_SMs, total_cta) /
+            // CLUSTER_SIZE (WQ_B_CLUSTERS is clamped to the same bound) and the smem
+            // footprint pins occupancy at 1 CTA/SM, so grid <= num_SMs -- but that
+            // only holds if this kernel HAS the SMs. Measured on a GPU with another
+            // tenant at 100% util, the handoff went from +3.6us to +86us: the grid no
+            // longer fits, CTA 0 spins holding an SM that a pending CTA needs, and
+            // the arrival it waits for is several waves away. Not a deadlock (the
+            // timeout would catch that) but the tail latency is gone. The same
+            // requirement is why cooperative_groups::grid.sync() insists on
+            // cudaLaunchCooperativeKernel, which validates residency; here it is
+            // implicit. Treat exclusive occupancy as part of this kernel's contract.
             if (iqd.done != nullptr && blockIdx.x == 0 &&
                 threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
                 const unsigned int want =
@@ -949,11 +953,11 @@ static std::vector<torch::Tensor> run_wq_b(
     // indexer-q DESTINATION (see IqDest in the header). Default: allocate the
     // plain [M, IDX_NUM_HEADS] layout, degenerating the store math to non-TP.
     // TP/DP callers pass their mqa_logits input buffers: iq_dst/_sf hold the FULL
-    // head set over this rank's DP row share, iq_head_base is this rank's first
-    // global head, and iq_dst_peer/_sf are the peer rank's PEER-MAPPED mirror --
-    // rows past iq_dst.size(0) are stored straight into them, which IS the
-    // cross-rank exchange. The completion handoff is a SEPARATE launch (iq_publish)
-    // right after this one -- see IqDest.
+    // head set over the whole batch, iq_head_base is this rank's first global head,
+    // and iq_dst_peer/_sf are the peer rank's PEER-MAPPED mirror. Rows outside
+    // [iq_row_lo, iq_row_hi) are stored straight into the mirror at the SAME row
+    // index, which IS the cross-rank exchange. The completion handoff runs at the
+    // end of this kernel -- see IqDest for why it is not a separate launch.
     c10::optional<torch::Tensor> iq_dst         = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_sf      = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_peer    = c10::nullopt,
