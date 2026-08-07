@@ -1338,15 +1338,6 @@ static std::vector<torch::Tensor> run_wq_b(
 
     // ---- activation quant producer (PDL; replaces the in-kernel grid ticket) ----
     const bool quant_on = q_y.has_value() && q_y->numel() > 0;
-    // head_ssq is a RED-atomic accumulator, so it has to start at zero. The quant
-    // prelude does that as its first act (see qnorm_quant_kernel), which is free
-    // because that kernel already has to run and the GEMM's GDS orders its atomics
-    // after it. With no prelude nothing else zeroes it, and the epilogue would
-    // accumulate on top of the previous call's totals -- silently, since the result
-    // stays finite. Zero it here in that case: one extra launch on a path that only
-    // the ablations take (production passes q_y).
-    if (ssq_ptr != nullptr && !quant_on)
-        ssq_t.zero_();
     const __nv_bfloat16* qy_ptr = nullptr;
     const float* qgamma_ptr = nullptr;
     int64_t qy_lda = 0;
