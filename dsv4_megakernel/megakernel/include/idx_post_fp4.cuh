@@ -144,18 +144,20 @@ __device__ __forceinline__ void idx_row_compute(
         }
         packed[i] = w;
     }
-    if (store_ok)
-        reinterpret_cast<uint2*>(iq_fp4 + ((int64_t)m * num_heads + head)
-                                          * (idx_post::HEAD_DIM / 2))[e] =
-            make_uint2(packed[0], packed[1]);
+    if (store_ok) {
+        const uint2 pk = make_uint2(packed[0], packed[1]);
+        const int64_t off = ((int64_t)m * num_heads + head) * (idx_post::HEAD_DIM / 2);
+        reinterpret_cast<uint2*>(iq_fp4 + off)[e] = pk;
+    }
 
     // packed-ue8m0 SF word (byte b = 32-col block b = lane pair e/2); the two
     // xor levels fold all 4 even-lane bytes into e == 0 (odd lanes carry 0)
     uint32_t sf = (e % 2 == 0) ? (e8m0 << ((e / 2) * 8)) : 0u;
     sf |= __shfl_xor_sync(0xffffffffu, sf, 2);
     sf |= __shfl_xor_sync(0xffffffffu, sf, 4);
-    if (e == 0 && store_ok)
+    if (e == 0 && store_ok) {
         iq_sf[(int64_t)m * num_heads + head] = static_cast<int>(sf);
+    }
 }
 
 // load + compute in one step (no pipelining)

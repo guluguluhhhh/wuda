@@ -81,6 +81,67 @@ static constexpr int N_MERGED      = N_TOTAL + N_IDX;                           
 // needed (a stale flag can never match the current tag).
 static constexpr int IQ_FLAG_STRIDE = 32;                                // 128B / u32
 static constexpr int IQ_FLAG_SLOTS  = IDX_NUM_HEADS * IQ_FLAG_STRIDE;
+
+// Every spin in the iq handoff is bounded, because an unbounded one wedges the
+// whole process and says nothing: the __syncthreads that could not be reached by
+// the sibling warp roles, the `ready` page pointed at ourselves instead of the
+// peer, and the host tag frozen into a CUDA graph all presented identically as a
+// hang. DeepGEMM's nvlink_barrier does the same (60s, then printf + assert).
+// %globaltimer ticks ns, so this is 10s: far past any legitimate peer skew.
+static constexpr unsigned long long IQ_SPIN_TIMEOUT_NS = 10000000000ull;
+
+// ---- Indexer-q DESTINATION (decoupled from what this rank COMPUTES) ----
+// This rank computes IDX_NUM_HEADS heads for every problem_m token, but the
+// transform stores straight into the mqa_logits input buffer, whose geometry is
+// the FULL head set (`num_heads`) over the whole batch. Row m goes to whichever
+// rank owns it -- [row_lo, row_hi) is ours, everything else is the peer's mirror
+// -- at the SAME row index: both ranks size the buffer for the whole batch and
+// leave the rows they do not own untouched, which is what a DP consumer wants
+// since it only reads its own range. With peer-mapped (symmetric) memory that
+// store IS the cross-rank exchange: no collective, no staging pack, no
+// rank-major -> head-major repack. Corollary: iq is deliberately NOT
+// bitwise-identical across ranks.
+//   head_dst = head_base + local_head        (local_head in [0, IDX_NUM_HEADS))
+// Single-GPU default (peer == nullptr, [row_lo, row_hi) covering every row,
+// head_base == 0, num_heads == IDX_NUM_HEADS) degenerates to the plain
+// [problem_m, IDX_NUM_HEADS] layout, bit-identical to the non-TP path.
+//
+// The completion handoff is IN this kernel, on purpose. Moving it to a 1-thread
+// launch did remove it from wq_b (measured 2.8us -> 0.0 at every batch size) and
+// made the end-to-end graph SLOWER by 0..7us: an extra node, and it breaks the
+// PDL pair, since programmatic stream serialization couples a kernel to its
+// IMMEDIATE stream predecessor. The 2.8us was already covered by the other CTAs'
+// work; a launch is not.
+//
+// Arrive with `red`, not `atom`: red returns nothing, so a CTA never stalls on
+// the round trip (`atom` cost ~7us across 144 CTAs, unchanged by spreading the
+// counter over 8 cache lines -- which is how we know it was the round trip and
+// not contention). Exactly one CTA then polls, like MoK's barrier_arrive/wait.
+//
+// `ready` is the PEER's flag page and `ready_self` ours; the publish writes BOTH,
+// because under PDL the consumer starts before this rank's own SPREAD is done and
+// so must wait on this rank's iq too. The published value is the device-side
+// `gen` counter (++ per launch), never a host tag: a host tag freezes into a CUDA
+// graph, so on replay the flag would still hold the capture-time value and the
+// consumer would sail past before this replay's data landed. Consumers wait for
+// `>= *gen`, which re-arms itself and needs no per-step memset.
+static constexpr int IQ_DONE_WORDS = 32;      // 128B; only word 0 is used
+struct IqDest {
+    uint8_t* fp4;       int* sf;           // this rank's mqa-input buffer
+    uint8_t* fp4_peer;  int* sf_peer;      // peer DP rank's mirror (nullptr = none)
+    int row_lo, row_hi;                    // rows THIS rank owns; others -> peer
+    int head_base;                         // global index of this rank's head 0
+    int num_heads;                         // heads in the DESTINATION (row stride)
+    unsigned int* done;                    // [IQ_DONE_WORDS] arrival counter
+    unsigned int* ready;                   // PEER's [world] flag page
+    unsigned int* ready_self;              // OUR [world] flag page
+    unsigned int* gen;                     // [1] local launch generation
+    int rank;                              // which ready[] slot is ours
+    // Optional [2] clock64 stamps, SPREAD entry/exit from CTA 0. In-kernel
+    // because no external meter resolves it: a graph-diff over a ~170us wall
+    // carries +-3us, comparable to the whole quantity.
+    long long* prof;
+};
 static constexpr int NUM_WEIGHT_SF_ROWS_MERGED =
     N_MERGED / WEIGHT_QUANT_BLOCK_N;                                            // 576
 
@@ -306,6 +367,15 @@ __device__ __forceinline__ long long rdclock() {
     return t;
 }
 
+// %globaltimer, NOT %clock64: device-wide and in NANOSECONDS, so a timeout can be
+// stated in real time. clock64 is per-SM and its rate is not architectural, which
+// makes it fine for the relative prof stamps above and wrong for a deadline.
+__device__ __forceinline__ unsigned long long rdtimer_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory");
+    return t;
+}
+
 } // namespace ptx
 
 // ======================== TMA Copy Helpers ========================
@@ -376,6 +446,13 @@ __device__ __forceinline__ void quant_k128_ue8m0(
 // ssq_smem[12] -> group barrier -> every warp sums in FIXED block order
 // (bitwise identical) -> r -> qr = bf16((v*r)*gamma) materialized round ->
 // quant_k128 tail. MUST be called by ALL bar_threads of barrier bar_id.
+//
+// The two barriers are NOT the thing to remove. Collapsing this to one warp per
+// row (partials in registers, zero barriers) made d_q+norm go 2.8 -> 7.9us at
+// M=128 and 18us at M=1: a warp then owns all 12 blocks, so its 12 five-step
+// shfl trees serialise into ~60 dependent shuffles (and the same again for the
+// amax pass), where this split runs 2 trees per warp on 6 warps at once. The
+// barrier pair is cheap next to that.
 __device__ __forceinline__ void qnorm_quant_row_cta(
     const __nv_bfloat16* __restrict__ yrow,      // [1536] strided row base
     const float* __restrict__ gamma,             // [1536]

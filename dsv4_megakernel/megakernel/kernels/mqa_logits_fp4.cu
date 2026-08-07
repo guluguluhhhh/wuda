@@ -173,6 +173,8 @@ template <typename logits_dtype_t, int kKVStages>
 static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const int* context_lens, const int* block_table, int bt_stride,
                          void* logits,
+                         const unsigned int* iq_ready, const unsigned int* iq_gen,
+                         int iq_world, int iq_skip,
                          float comp_eps, unsigned long long* prof,
                          const deep_gemm::MainCompressorArgs& comp,
                          bool attn_mock,
@@ -194,16 +196,40 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
         configured = true;
     }
 
-    kernel<<<grid, dim3(TPB, 1, 1), smem, stream>>>(
+    // PDL: allow this grid to start while the producer (wq_b) is still draining
+    // its tail. cudaGridDependencySynchronize() inside the kernel is what actually
+    // orders the producer's stores; without the attribute that call is a no-op wait
+    // that returns immediately, and with a non-PDL predecessor it is also harmless
+    // (stream order already separates them). iq_ready != nullptr is the signal that
+    // a cross-rank producer is in play and the overlap is worth having.
+    cudaLaunchConfig_t config = {};
+    config.gridDim = grid;
+    config.blockDim = dim3(TPB, 1, 1);
+    config.dynamicSmemBytes = smem;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    int nattr = 0;
+    if (iq_ready != nullptr) {
+        attrs[nattr].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[nattr].val.programmaticStreamSerializationAllowed = 1;
+        ++nattr;
+    }
+    config.attrs = attrs;
+    config.numAttrs = nattr;
+    auto lerr = cudaLaunchKernelEx(
+        &config, kernel,
         (uint32_t)seq_len, (uint32_t)seq_len_kv,
         (uint32_t)stride_logits,
         reinterpret_cast<const uint32_t*>(context_lens),
         reinterpret_cast<const uint32_t*>(block_table),
         (uint32_t)bt_stride,
         reinterpret_cast<logits_dtype_t*>(logits),
+        iq_ready, iq_gen, (uint32_t)iq_world, (uint32_t)iq_skip,
         comp_eps, prof,
         comp, attn_mock,
         dQ, dSFQ, dKV, dSFKV, dW);
+    TORCH_CHECK(lerr == cudaSuccess, "mqa_logits_fp4 launch failed: ",
+                cudaGetErrorString(lerr));
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "mqa_logits_fp4 launch failed: ", cudaGetErrorString(err));
 }
@@ -223,7 +249,10 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             float comp_eps, unsigned long long* prof,
                             const deep_gemm::MainCompressorArgs& comp,
                             bool attn_mock,
-                            void* lp) {
+                            void* lp,
+                            const unsigned int* iq_ready = nullptr,
+                            const unsigned int* iq_gen = nullptr,
+                            int iq_world = 0, int iq_skip = 0) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     constexpr int PAGE_STRIDE = PAGE_KV * (HEAD_DIM / 2 + 4);   // fused page bytes (4352)
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -272,6 +301,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
     #define MQA_LT(dtype_t, stages_) \
         launch_typed<dtype_t, stages_>(B, seq_len_kv_cap, stride_logits, \
                                        context_lens, block_table, bt_stride, lp, \
+                                       iq_ready, iq_gen, iq_world, iq_skip, \
                                        comp_eps, prof, comp, attn_mock, \
                                        dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
     TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
@@ -385,7 +415,14 @@ static void mqa_logits_fp4_decode_out(
     // DIRECT-write the compress rows into Main-compressed MODEL1 pages
     // (dst[b] = page*64+off, -1 skip).
     c10::optional<torch::Tensor> slot_map, c10::optional<torch::Tensor> cmp_cache,
-    c10::optional<torch::Tensor> cmp_dst) {
+    c10::optional<torch::Tensor> cmp_dst,
+    // Cross-rank iq readiness (TP/DP direct-write handoff from wq_b). Only the Q
+    // TMA warp waits, so the KV pipeline (99.85% of this kernel's traffic) starts
+    // immediately and hides the peer skew -- that is why this belongs here rather
+    // than in a separate wait kernel on the critical path.
+    c10::optional<torch::Tensor> iq_ready = c10::nullopt,
+    c10::optional<torch::Tensor> iq_gen = c10::nullopt,
+    int64_t iq_world = 0, int64_t iq_skip = 0) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
                                                   context_lens, block_table,
                                                   logits.scalar_type());
@@ -393,6 +430,17 @@ static void mqa_logits_fp4_decode_out(
                 && logits.size(1) % BLOCK_KV == 0 && logits.is_contiguous(),
                 "logits must be [>=B, k*BLOCK_KV] contiguous");
     TORCH_CHECK(num_ctas >= 0, "num_ctas must be >= 0 (0 = one CTA per SM)");
+    TORCH_CHECK(iq_ready.has_value() == iq_gen.has_value(),
+                "iq_ready and iq_gen must be given together");
+    if (iq_ready.has_value()) {
+        TORCH_CHECK(iq_ready->is_cuda() && iq_ready->is_contiguous()
+                    && iq_ready->scalar_type() == torch::kInt32
+                    && iq_world > 0 && iq_world <= iq_ready->numel(),
+                    "iq_ready must be CUDA i32 [>= iq_world]");
+        TORCH_CHECK(iq_gen->is_cuda() && iq_gen->numel() == 1
+                    && iq_gen->scalar_type() == torch::kInt32,
+                    "iq_gen must be a 1-element CUDA i32");
+    }
 
     // Optional globaltimer stamps [num_ctas, 8] i64 (test_complex.cu phase pattern):
     // 0=attn start, 1=attn end, 2=tail start, 3=tail end, 4=retired (was rms end),
@@ -480,7 +528,14 @@ static void mqa_logits_fp4_decode_out(
                     (float)comp_eps, prof_ptr,
                     comp,
                     /*attn_mock=*/mock_attn,
-                    logits.data_ptr());
+                    logits.data_ptr(),
+                    iq_ready.has_value()
+                        ? reinterpret_cast<const unsigned int*>(iq_ready->data_ptr())
+                        : nullptr,
+                    iq_gen.has_value()
+                        ? reinterpret_cast<const unsigned int*>(iq_gen->data_ptr())
+                        : nullptr,
+                    (int)iq_world, (int)iq_skip);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -533,5 +588,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("comp_q8") = c10::nullopt, py::arg("comp_s8") = c10::nullopt,
           py::arg("comp_rope") = c10::nullopt, py::arg("mock_attn") = false,
           py::arg("slot_map") = c10::nullopt, py::arg("cmp_cache") = c10::nullopt,
-          py::arg("cmp_dst") = c10::nullopt);
+          py::arg("cmp_dst") = c10::nullopt,
+          py::arg("iq_ready") = c10::nullopt, py::arg("iq_gen") = c10::nullopt,
+          py::arg("iq_world") = 0, py::arg("iq_skip") = 0);
 }

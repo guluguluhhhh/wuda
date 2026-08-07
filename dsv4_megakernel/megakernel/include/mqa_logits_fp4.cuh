@@ -899,6 +899,19 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           const uint32_t* block_table,
                           const uint32_t block_table_stride,
                           logits_dtype_t* logits,
+                          // [MEGAKERNEL EDIT] cross-rank iq readiness. When
+                          // iq_ready != nullptr the Q TMA warp -- and ONLY it --
+                          // waits until every rank except `iq_skip` has published a
+                          // generation >= *iq_gen. Folding the wait in here instead
+                          // of running a separate wait kernel is the whole point:
+                          // the KV TMA warp, the tile-prefix scan and TMEM alloc do
+                          // not depend on remote q, so 557MB of KV streaming starts
+                          // immediately and hides the peer skew. Q is 0.15% of this
+                          // kernel's traffic, so delaying only it costs nothing.
+                          // Deadlock-free: the flags come from OTHER devices.
+                          const unsigned int* iq_ready,
+                          const unsigned int* iq_gen,
+                          const uint32_t iq_world, const uint32_t iq_skip,
                           // [MEGAKERNEL EDIT] epsilon for the MAIN compressor's internal
                           // RMSNorm step (tail warps; unused when comp.kv == nullptr).
                           const float comp_eps,
@@ -1177,11 +1190,52 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Wait for primary kernel completion
     // [MEGAKERNEL EDIT] PDL-only; neutralized for standalone launch.
-    // cudaGridDependencySynchronize();
+    // [MEGAKERNEL EDIT] PDL: wait for the producer's early trigger. wq_b fires
+    // griddepcontrol.launch_dependents as soon as its epilogue warps have stored
+    // the idx/swa KV pages -- while its transform warpgroup is still running
+    // SPREAD plus the cross-rank fence and publish. So this returns early and the
+    // KV pipeline (557MB, 99.85% of this kernel's traffic) streams DURING that
+    // tail, which is what stops the crossing from being exposed. The iq path is
+    // not covered by the trigger: the Q TMA warp additionally waits on the ready
+    // flags below, which are published after SPREAD.
+    cudaGridDependencySynchronize();
 
     if (warp_idx == kSpecWarpStart) {
         // TMA warp for loading Q
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+
+        // [MEGAKERNEL EDIT] cross-rank iq handoff: block ONLY this warp until the
+        // peers' idxpost stores have landed (see the iq_ready param). `>= *gen`
+        // rather than `== tag` keeps it graph-replay safe -- the device-side
+        // generation re-arms itself every launch.
+        if (iq_ready != nullptr && cute::elect_one_sync()) {
+            // Bounded, like DeepGEMM's nvlink_barrier: an unbounded spin wedges both
+            // ranks and reports nothing, and every failure mode of this handoff so
+            // far (wrong flag page, graph-frozen tag, a producer CTA that never
+            // arrived) looked exactly like a hang. %globaltimer ticks ns.
+            constexpr unsigned long long kWaitTimeoutNs = 10000000000ull;   // 10s
+            unsigned int want;
+            asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
+                         : "=r"(want) : "l"(iq_gen) : "memory");
+            for (uint32_t r = 0; r < iq_world; ++r) {
+                if (r == iq_skip) continue;
+                unsigned int v;
+                const unsigned long long t0 = ptx::globaltimer();
+                do {
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                                 : "=r"(v) : "l"(iq_ready + r) : "memory");
+                    if (v >= want) break;
+                    if (ptx::globaltimer() - t0 >= kWaitTimeoutNs) {
+                        printf("mqa iq wait timeout: rank_slot=%u flag=%u want=%u "
+                               "(world=%u skip=%u) -- producer never published\n",
+                               r, v, want, iq_world, iq_skip);
+                        __trap();
+                    }
+                    __nanosleep(128);
+                } while (true);
+            }
+            asm volatile("fence.acquire.sys;" ::: "memory");
+        }
 
         // Enumerate assigned tasks (Q/SF/weights loaded once per token per CTA)
         if (cute::elect_one_sync()) {
