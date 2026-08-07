@@ -596,15 +596,43 @@ def probe_kernel_names(fn):
     return tuple(names)
 
 
-def benchmark(mods, w, ncmp=2048):
-    """vLLM-style HOT measurement (the comparison target): weights/caches
-    warm, decode steps BACK-TO-BACK, no L2 flush.
-      per-stage : kineto device time over R hot chain iters, kernels
+def benchmark(mods, w, ncmp=2048, n_layers=4):
+    """COLD-L2 measurement, ONE full CSA layer per call: an 8GB memset (the
+    bench_utils.bench_kineto flusher, i.e. what every single-operator test in
+    this tree already uses) runs before EVERY chain call, so a layer starts
+    with none of its own weights in L2. That is the real decode situation --
+    consecutive layers hold DIFFERENT weights, so layer N never finds layer
+    N-1's 113MB wq_b / 78MB front / 130MB o_proj streams cached, and a hot
+    no-flush number would flatter every weight-bound stage.
+      per-stage : kineto device time over R cold chain iters, kernels
                   bucketed by stage (wq_b bucket = qnorm + merged GEMM;
                   device-sum slightly double-counts their PDL overlap)
-      eager     : wall/step of the hot eager loop (launch overhead visible)
-      graph     : wall/step of CUDA-graph replay (vLLM serving form; THE
-                  end-to-end number)
+      eager     : host WALL/step of the eager chain -- its serial launch
+                  cost is the POINT here (that path is launch-bound)
+      graph     : DEVICE span/step of CUDA-graph replay, via CUDA events
+                  (vLLM serving form; THE end-to-end number). Events and
+                  not a wall on purpose: per-call host launch+sync adds
+                  ~17us at B=128 that real serving never pays PER LAYER,
+                  because a whole model is ONE graph -- one launch and one
+                  sync for all 61 layers, not one each. Cross-checked
+                  against the perfetto trace's replay span at B=128.
+      gph_xN    : PRODUCTION-SHAPED per-layer average -- N layers, each with
+                  its OWN weight set, back-to-back in ONE graph, NO flush,
+                  device span / N. This is the number to compare against a
+                  real 61-layer serial decode, because all three production
+                  conditions hold at once: weights are cold (every layer
+                  reads a different 353MB set, and one set alone is 2.7x the
+                  132.6MB L2), layers OVERLAP at the tail-to-head boundary,
+                  and kernel code + rope/norm tables + the inter-layer
+                  activation stay warm -- which the 8GB memset destroys but
+                  production does not. Expect it BELOW `graph`.
+    The flush is ONE per layer (never per stage) and is EXCLUDED from every
+    reported number: the kineto buckets name only the chain's own kernels,
+    and the timed window is opened behind the flush (drained for `eager`,
+    stream-ordered for `graph`). Consequence
+    to read `eager` with: it is now PER-CALL, so its launch cost is fully
+    exposed instead of pipelining across steps -- once a ~1ms flush sits
+    between two steps, cross-step overlap stops being measurable at all.
     Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
     and lens real, cache bytes arbitrary -- latency-neutral. The chain runs
     through the official post-attention boundary, timed as TWO operators:
@@ -622,11 +650,52 @@ def benchmark(mods, w, ncmp=2048):
     cosl, sinl = ang.cos().contiguous(), ang.sin().contiguous()
     cols = ["mhc", "front", "wq_b", "mqa", "topk"] + \
         (["mla", "o_proj", "mhc_post"] if HAS_FLASH_MLA else []) + \
-        ["stages", "eager", "graph"]
-    print("  hot, no-flush; stages = kineto device us; eager/graph = wall/step")
+        ["stages", "eager", "graph"] + \
+        ([f"gph_x{n_layers}"] if n_layers > 1 else [])
+    print("  cold L2 (8GB memset per layer call, excluded from every number);"
+          " stages+graph = device us; eager = wall/step")
+    if n_layers > 1:
+        print(f"  gph_x{n_layers} = {n_layers} layers x DISTINCT weights, "
+              f"back-to-back in one graph, no flush -> device us / layer")
+        print(f"  built {n_layers} independent weight sets "
+              f"({n_layers * 353 / 1e3:.1f} GB) for it")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
     print("  " + "-" * (5 + 9 * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
+    # L2 flusher, allocated ONCE: keeps the per-B measured regions
+    # allocation-free and keeps an 8GB buffer out of any CUDA-graph pool.
+    flush_buf = torch.empty(int(8e9 // 4), dtype=torch.int, device=DEV)
+
+    def flush_l2(drain=True):
+        """Evict L2.
+        drain=True (wall path): also DRAIN. The drain is not optional there:
+          the chain's first op (deep_gemm's mhc GEMM) launches with PDL, and
+          without it that GEMM would overlap the memset tail.
+        drain=False (event path): leave the memset IN FLIGHT and enqueue
+          behind it. An event recorded next is still stream-ordered AFTER the
+          flush, so the flush stays out of the window, but the device stays
+          busy ~1ms while the host submits the replay -- otherwise the host's
+          submit latency shows up as device IDLE inside the window (~10us for
+          this 16-node graph). L2 is still cold for the data: a PSS consumer
+          may run its prologue (barrier init / descriptor prefetch) early,
+          but cudaGridDependencySynchronize blocks its loads until the
+          non-signalling memset has actually completed."""
+        flush_buf.zero_()
+        if drain:
+            torch.cuda.synchronize()
+
+    # PRODUCTION-SHAPED weight sets: n_layers INDEPENDENT sets so a
+    # back-to-back run sees DIFFERENT weights per layer -- that is what makes
+    # L2 cold in production, and unlike the memset it leaves kernel code, the
+    # rope/norm tables and the inter-layer activation warm (production leaves
+    # them warm too). Only the BIG per-set tensors matter and they are all
+    # read INSIDE the stage closures, so rebinding `w` right before a chain
+    # call is enough to switch layers (python closures are late-binding); the
+    # sub-MB shared ones (hc_base/hc_scale/attn_sink) stay common on purpose.
+    wsets = None
+    if n_layers > 1:
+        wsets = [w] + [make_weights(seed=1000 + i) for i in range(n_layers - 1)]
+
     for B in (1, 16, 32, 48, 64, 80, 96, 112, 128):
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
                              + 4 * B, max_pages_per_req=ncmp // PAGE)
@@ -812,23 +881,53 @@ def benchmark(mods, w, ncmp=2048):
             for f in chain_fns:
                 f()
 
-        # ---- vLLM-style hot measurement --------------------------------
-        def hot_wall(f, warmup=5, iters=20, reps=3):
-            """back-to-back wall/step; MIN over reps guards against one-off
-            host stalls (profiler teardown etc.) landing in the window."""
+        # ---- per-layer COLD measurement ---------------------------------
+        def cold_step(f, warmup=5, iters=20, reps=3, events=False, flush=True):
+            """Per-layer latency with a cold L2 on EVERY step. The flush and
+            its drain sit outside the timed window, so the 8GB memset
+            (~1.07ms here) never lands in the number. MIN over reps guards
+            against one-off host stalls (profiler teardown etc.).
+              events=False -> host WALL around the call (for `eager`).
+              events=True  -> DEVICE span of the call (for `graph`), which
+                drops the per-call host launch+sync -- see the benchmark
+                docstring for why that overhead is an artifact here. It also
+                skips the flush drain so the host can submit the replay while
+                the memset is still running (see flush_l2).
+              flush=False  -> no memset at all (for `gph_xN`, where the layers
+                carry DIFFERENT weights and so evict each other for real).
+                Requires events=True: with nothing queued ahead of it, a wall
+                would be mostly submit latency."""
             for _ in range(warmup):
+                if flush:
+                    flush_l2()
                 f()
             torch.cuda.synchronize()
+            evs = [(torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True))
+                   for _ in range(iters)] if events else None
             best = float("inf")
             for _ in range(reps):
-                t0 = time.perf_counter()
-                for _ in range(iters):
-                    f()
-                torch.cuda.synchronize()
-                best = min(best, (time.perf_counter() - t0) / iters * 1e6)
+                tot = 0.0
+                for i in range(iters):
+                    if events:
+                        if flush:
+                            flush_l2(drain=False)
+                        evs[i][0].record()
+                        f()
+                        evs[i][1].record()
+                    else:
+                        flush_l2()
+                        t0 = time.perf_counter()
+                        f()
+                        torch.cuda.synchronize()
+                        tot += time.perf_counter() - t0
+                if events:
+                    torch.cuda.synchronize()
+                    tot = sum(a.elapsed_time(b) for a, b in evs) / 1e3
+                best = min(best, tot / iters * 1e6)
             return best
 
-        # per-stage: bucket kineto device time of a HOT R-iter chain loop
+        # per-stage: bucket kineto device time of a COLD R-iter chain loop
         # (strict probe everywhere: quant/glue are single named Triton
         # kernels now; mla's q bf16 cast stays unbucketed -> walls only)
         name2stage = {}
@@ -838,6 +937,7 @@ def benchmark(mods, w, ncmp=2048):
         from torch.profiler import profile as _prof, ProfilerActivity
         R = 30      # 30-iter stage means (n=10 was too jittery)
         for _ in range(3):
+            flush_l2()
             chain()
         torch.cuda.synchronize()
         try:
@@ -846,6 +946,10 @@ def benchmark(mods, w, ncmp=2048):
             pctx = _prof(activities=[ProfilerActivity.CUDA])
         with pctx as prof:
             for _ in range(R):
+                # cold L2 for every layer iteration. The memset is never
+                # bucketed: name2stage holds only the chain's own kernel
+                # names, and probe_kernel_names filters memset/zero_ anyway.
+                flush_l2()
                 chain()
                 # STEPPED stage semantics (aligned with the vLLM baseline's
                 # per-decode-step windows): drain between iterations so every
@@ -873,7 +977,7 @@ def benchmark(mods, w, ncmp=2048):
         # removed after their verdicts landed: emit costs +0.1..1.1us vs
         # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
-        t_eager = hot_wall(chain)
+        t_eager = cold_step(chain)
 
         # ---- CUDA-graph envelope: the whole chain in ONE replay ----------
         t_graph = float("nan")
@@ -886,18 +990,51 @@ def benchmark(mods, w, ncmp=2048):
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 chain()
-            t_graph = hot_wall(g.replay)
+            t_graph = cold_step(g.replay, events=True)
         except Exception as err:
             print(f"  (graph capture failed at B={B}: {err})")
 
-        # ---- perfetto timeline: 3x HOT eager chain + 1x graph replay.
-        # Drop the json onto ui.perfetto.dev / chrome://tracing.
+        # ---- PRODUCTION-SHAPED envelope: n_layers layers, each with its OWN
+        # weights, back-to-back in ONE graph, NO flush. Rebinding `w` right
+        # before each chain() call is what switches the layer: every big
+        # weight is read INSIDE a stage closure, and python closures resolve
+        # free variables at CALL time, so the capture bakes set k's pointers
+        # into layer k's kernels. Output buffers stay shared across layers --
+        # that is production too (the real chain is a serial dependency).
+        t_layers = float("nan")
+        if wsets is not None and not math.isnan(t_graph):
+            try:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):   # allocator warmup off-capture
+                    for ws in wsets:
+                        w = ws
+                        chain(); chain()
+                torch.cuda.current_stream().wait_stream(side)
+                gL = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gL):
+                    for ws in wsets:
+                        w = ws
+                        chain()
+                t_layers = cold_step(gL.replay, events=True,
+                                     flush=False) / n_layers
+            except Exception as err:
+                print(f"  (x{n_layers} capture failed at B={B}: {err})")
+            finally:
+                w = wsets[0]
+
+        # ---- perfetto timeline: 3x COLD eager chain + 1x graph replay.
+        # Drop the json onto ui.perfetto.dev / chrome://tracing. The flush
+        # memsets show up too -- they are the inter-layer gaps, not part of
+        # any stage.
         if B in (16, 128):
             with _prof(activities=[ProfilerActivity.CPU,
                                    ProfilerActivity.CUDA]) as prof:
                 for _ in range(3):
+                    flush_l2()
                     chain()
                 if not math.isnan(t_graph):
+                    flush_l2()
                     g.replay()
                 torch.cuda.synchronize()
             tp = f"/tmp/e2e_trace_B{B}.json"
@@ -905,7 +1042,8 @@ def benchmark(mods, w, ncmp=2048):
             del prof
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
-              + f"{sum(ts):>9.1f}{t_eager:>9.1f}{t_graph:>9.1f}")
+              + f"{sum(ts):>9.1f}{t_eager:>9.1f}{t_graph:>9.1f}"
+              + (f"{t_layers:>9.1f}" if wsets is not None else ""))
         bw_rows.append((B, [(sname, t) for (sname, _), t
                             in zip(stage_fns, ts)]))
         del mgr
@@ -962,6 +1100,8 @@ def benchmark(mods, w, ncmp=2048):
           f"(nn%)=internal share")
     print("  effective = weights + KV pools + boundary activations "
           "(intermediates excluded)")
+    print("  cold L2: the weight traffic really does come from HBM, so these "
+          "are achieved HBM rates")
     print("=" * 76)
     hdr = [s for s, _ in bw_rows[0][1]]
     print(f"  {'B':<5}" + "".join(f"{c + ' ':>13}" for c in hdr)
