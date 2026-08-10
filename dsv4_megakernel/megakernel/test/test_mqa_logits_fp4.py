@@ -277,8 +277,10 @@ def test_decode(module):
         # 4K -> 128K ctx plus tail-clean, tile-pool balance and mixed-length cases.
         for B, T, valid in [
             (1, 1024, None), (4, 1024, None), (4, 1024, 500), (8, 512, None),
-            # context-length gradient: 8K / 32K / 128K ctx (slots = 2K / 8K / 32K)
-            (4, 2048, None), (4, 8192, None), (2, 32768, None), (4, 32768, 20000),
+            # context gradient: 8K / 32K / 64K / 128K ctx
+            # (slots = 2K / 8K / 16K / 32K)
+            (4, 2048, None), (4, 8192, None), (2, 16384, None),
+            (2, 32768, None), (4, 32768, 20000),
             # decode-realistic batch + mixed per-seq lengths (cross-token chunks)
             (32, 4096, None), (32, 4096, "mixed"), (64, 1024, "mixed"),
         ]:
@@ -422,7 +424,7 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
     print("  Tile-pool schedule: grid.x = #SMs, global KV tiles balanced across CTAs.")
     print("  kernel_us = DeepGEMM bench_kineto methodology (profiler schedule w+a, L2")
     print("  flushed with 8GB memset before EVERY call -> cold-HBM KV reads, as in real")
-    print("  decode). stg = KV pipeline depth. kernel_us = MIN of per-instance times.")
+    print("  decode). stg = KV pipeline depth. kernel_us = MEAN over profiler instances.")
     if fuse_comp:
         print("  fuse-comp: tail warpgroup hides the MAIN-indexer compressor rows under the")
         print("  KV stream (REALISTIC trigger: staggered positions -> ~B/4 compress rows per")
@@ -442,9 +444,9 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
         print("-" * 66)
     stage_opts = (4, 6, 8, 10) if sweep_stages else (0,)
     # Full B x T grid: every batch size covers the complete kv-slot gradient
-    # (T = ctx/4 for the DSV4 indexer): 4K / 32K / 128K / 1M context.
+    # (T = ctx/4 for the DSV4 indexer): 4K / 32K / 64K / 128K / 1M context.
     for B in (32, 64, 128, 256):
-        for T in (1024, 8192, 32768, 262144):
+        for T in (1024, 8192, 16384, 32768, 262144):
             torch.manual_seed(0)
             q = torch.randn(B, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
             kv = torch.randn(B, T, HEAD_DIM, device="cuda", dtype=torch.bfloat16)

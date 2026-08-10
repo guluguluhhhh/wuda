@@ -30,10 +30,8 @@ namespace wq_b {
 
 // ---- Problem dimensions (fixed for wq_b projection) ----
 static constexpr int K_DIM    = 1536;
-#if defined(WQ_B_TP2_SINGLE_RANK)
-// TP2 benchmark/production specialization: one rank owns half of both the
-// main-Q heads and the index-Q heads. The post-idx all-to-all is outside this
-// single-rank kernel benchmark.
+#if defined(WQ_B_TPDP)
+// TPDP keeps all index-Q heads replicated while sharding main-Q heads over TP2.
 static constexpr int N_TOTAL  = 32768;  // 64 main-Q heads x 512 dim
 #else
 static constexpr int N_TOTAL  = 65536;  // 128 main-Q heads x 512 dim
@@ -45,14 +43,14 @@ static constexpr int N_TOTAL  = 65536;  // 128 main-Q heads x 512 dim
 // finalizes s_h = rsqrt(ssq/512 + eps) and folds it into its own q pass -- the
 // normalized y never round-trips HBM and TMEM never has to hold a whole head.
 static constexpr int HEAD_DIM_OUT  = 512;
-static constexpr int NUM_HEADS_OUT = N_TOTAL / HEAD_DIM_OUT;   // 128
+static constexpr int NUM_HEADS_OUT = N_TOTAL / HEAD_DIM_OUT;
 static constexpr int BLOCK_K  = 128;
 static constexpr int NUM_K_TILES = K_DIM / BLOCK_K; // 12
 static constexpr int QUANT_BLOCK_K = 128; // native DSV4 FP8 quantization granularity
 static constexpr int UMMA_SF_GRAN_K = 32; // hardware block-scale consumption granularity
 static constexpr int WEIGHT_QUANT_BLOCK_N = 128;
 static constexpr int NUM_WEIGHT_SF_ROWS =
-    (N_TOTAL + WEIGHT_QUANT_BLOCK_N - 1) / WEIGHT_QUANT_BLOCK_N; // 512
+    (N_TOTAL + WEIGHT_QUANT_BLOCK_N - 1) / WEIGHT_QUANT_BLOCK_N;
 
 // ---- Merged indexer projection (CSA stage 7 Idx_WProj fused into this GEMM) ----
 // The indexer wq_b shares A (= qr) and K, so its weight is CONCATENATED along N.
@@ -62,23 +60,15 @@ static constexpr int NUM_WEIGHT_SF_ROWS =
 // so the remaining main-q weight stream is their shadow -- no reversed schedule.
 // The iq segment is tile-aligned for the swap path (N_IDX % CLUSTER_BLOCK_N == 0)
 // and each 128-col CTA tile is exactly ONE indexer head row -- the epilogue drains
-// it to an L2 scratch (rope + hadamard + fp4 quant run async) instead of storing
-// fp32. Swap path (M <= 128) only.
-#if defined(WQ_B_TP2_SINGLE_RANK)
-static constexpr int IDX_NUM_HEADS = 32;
-#else
+// it to a BF16 L2 scratch (rope + hadamard + fp4 quant run async). Swap path
+// (M <= 128) only.
 static constexpr int IDX_NUM_HEADS = 64;
-#endif
 static constexpr int IDX_HEAD_DIM  = 128;
 static constexpr int N_IDX         = IDX_NUM_HEADS * IDX_HEAD_DIM;              // 8192
-static constexpr int N_MERGED      = N_TOTAL + N_IDX;                           // 73728
-// Cross-CTA handoff for the indexer post-processing: only N_IDX/CLUSTER_BLOCK_N
-// clusters own an iq tile (16 of 72 at the TP2 shape), so if the CTA that drains
-// a head also transforms it, 22% of the grid carries 100% of the transform. The
-// drain side instead RELEASES a per-head flag and every CTA pulls row batches
-// from a flat task space. One 128B line per head keeps the pollers off each
-// other; the value is a host-monotonic launch tag so no per-launch memset is
-// needed (a stale flag can never match the current tag).
+static constexpr int N_MERGED      = N_TOTAL + N_IDX;
+// Index-tile CTAs release per-head drain flags; every CTA pulls transform row
+// batches from a flat task space. Each flag occupies its own cache line and uses
+// a launch tag, avoiding false sharing and per-launch clearing.
 static constexpr int IQ_FLAG_STRIDE = 32;                                // 128B / u32
 static constexpr int IQ_FLAG_SLOTS  = IDX_NUM_HEADS * IQ_FLAG_STRIDE;
 
@@ -215,21 +205,24 @@ static constexpr int TPB                 = 256;
 static constexpr int NUM_NON_EPI_THREADS = 128;
 static constexpr int NUM_EPI_THREADS     = 128;
 static constexpr int NUM_STORE_THREADS   = 128;
-// [kIdx] async transform warpgroup (warps 8..11): merged-indexer instances launch
-// TPB_IDX threads; the extra 128 run the rope/hadamard/fp4 chain off the GEMM's
-// critical path (the epilogue warps are near-saturated by the TMEM-load train).
-static constexpr int NUM_XFORM_THREADS   = 128;
-static constexpr int TPB_IDX             = TPB + NUM_XFORM_THREADS;   // 384
+// [kIdx] async transform workers (warps 8..15): occupancy is already fixed at
+// one CTA/SM by dynamic smem, so use the remaining thread slots to shorten the
+// rope/hadamard/fp4 tail without reducing residency.
+static constexpr int NUM_XFORM_THREADS   = 256;
+static constexpr int TPB_IDX             = TPB + NUM_XFORM_THREADS;   // 512
+static constexpr int XFORM_ROWS_PER_TASK = NUM_XFORM_THREADS / 8;     // 32 rows/task
 
-// ---- Epilogue store tile (swap-AB, FP32 output) ----
-static constexpr int STORE_BLOCK_M      = 16;                             // M-rows per store stage
-static constexpr int STORE_BLOCK_N      = BLOCK_N;                        // 128
-static constexpr int STORE_BLOCK_N_ATOM = SWIZZLE_CD / (int)sizeof(float); // 128/4 = 32
+// ---- Epilogue store tile (swap-AB, BF16 output) ----
+static constexpr int STORE_BLOCK_M      = 16;  // M-rows per store stage
+static constexpr int STORE_BLOCK_N      = BLOCK_N;
+static constexpr int STORE_BLOCK_N_ATOM =
+    SWIZZLE_CD / (int)sizeof(__nv_bfloat16);    // 128B / 2B = 64 columns
 
 // ---- Per-stage SMEM for weight B (constant); A depends on M via SwapDims ----
-static constexpr int SMEM_B_PER_STAGE  = LOAD_BLOCK_N * BLOCK_K * FP8_ELEM_SIZE;        // 128*128*1 = 16384
-static constexpr int SMEM_CD_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(float); // 16*128*4 = 8192
-static constexpr int SMEM_CD_TOTAL     = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES;      // 16384
+static constexpr int SMEM_B_PER_STAGE  = LOAD_BLOCK_N * BLOCK_K * FP8_ELEM_SIZE; // 16384
+static constexpr int SMEM_CD_PER_STAGE =
+    STORE_BLOCK_M * STORE_BLOCK_N * sizeof(__nv_bfloat16);                 // 4096
+static constexpr int SMEM_CD_TOTAL = SMEM_CD_PER_STAGE * NUM_TMA_STORE_STAGES; // 8192
 
 // SMEM capacity budget (SM100)
 static constexpr int SMEM_CAPACITY = 232448;
@@ -333,6 +326,18 @@ __device__ __forceinline__ void tmem_load_32dp32b8x(
           "=r"(v4), "=r"(v5), "=r"(v6), "=r"(v7)
         : "r"(tmem_addr));
 }
+
+// TMEM load: 16dp256b, x1 (4 FP32 per lane). Two loads, with datapaths 0/16,
+// expose an 8-row x 32-col warp tile as four same-row values per lane. That
+// layout cuts the SSQ warp reduction from 16 shuffles to 6 per 8 rows.
+__device__ __forceinline__ void tmem_load_16dp256b1x(
+    uint32_t tmem_addr,
+    uint32_t& v0, uint32_t& v1, uint32_t& v2, uint32_t& v3) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];"
+        : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+        : "r"(tmem_addr));
+}
 __device__ __forceinline__ void tmem_load_fence() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
@@ -347,6 +352,15 @@ __device__ __forceinline__ uint32_t ld_shared_u32(const uint32_t* ptr) {
 __device__ __forceinline__ void st_shared_u32(void* ptr, uint32_t v) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     asm volatile("st.shared.u32 [%0], %1;" :: "r"(addr), "r"(v) : "memory");
+}
+
+// Warp-cooperative BF16 transpose into a 128B-swizzled TMA store tile.
+__device__ __forceinline__ void stmatrix_x4_trans(
+    void* smem_ptr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+    asm volatile(
+        "stmatrix.sync.aligned.x4.m8n8.shared.b16.trans [%0], {%1,%2,%3,%4};"
+        :: "l"(__cvta_generic_to_shared(smem_ptr)),
+           "r"(r0), "r"(r1), "r"(r2), "r"(r3));
 }
 __device__ __forceinline__ void st_shared_v4_u32(void* ptr, uint32_t v0, uint32_t v1,
                                                  uint32_t v2, uint32_t v3) {
@@ -412,7 +426,6 @@ void copy_2d_fp8(void const* desc_ptr, Barrier* barrier_ptr,
         smem_ptr, k_idx, mn_idx);
 }
 
-// TMA store 2D (FP32 output)
 __device__ __forceinline__
 void store_2d(void const* desc_ptr, void* smem_ptr,
               uint32_t col_idx, uint32_t row_idx) {

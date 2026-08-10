@@ -1,9 +1,9 @@
 """Official DeepSeek-V4 O projection for the B300 decode pipeline.
 
-VERBATIM port of mega_csa python/mega_csa/o_proj.py (Flash_DeepSeek_V4_Pro).
-Only the two package-internal imports were inlined so this drops into the
-megakernel test tree standalone: the DeepGEMM runtime scopes and the handful
-of DEEPSEEK_V4_PRO_CSA constants this module reads.
+Port of mega_csa python/mega_csa/o_proj.py (Flash_DeepSeek_V4_Pro). The local
+version supports both the original full-rank geometry and the exact TP2 shard:
+64 heads map to 8 complete O groups and wo_b emits an FP32 partial. Package-
+internal imports are inlined so this remains standalone in the test tree.
 
 The ownership boundary matches vLLM's DeepSeek-V4 implementation:
 raw FlashMLA BF16 output -> inverse RoPE + FP8 quant -> DeepGEMM wo_a ->
@@ -65,35 +65,38 @@ def deepgemm_pdl_enqueue_scope(
 
 # ---- inlined from mega_csa/model_contract.py (DEEPSEEK_V4_PRO_CSA) ----
 HEADS = 128              # num_attention_heads
+TP2_HEADS = HEADS // 2
 HEAD_DIM = 512           # head_dim
 ROPE_DIM = 64            # qk_rope_head_dim
 NOPE_DIM = HEAD_DIM - ROPE_DIM
 N_GROUPS = 16            # o_groups
+TP2_GROUPS = N_GROUPS // 2
 O_LORA_RANK = 1024       # o_lora_rank
 O_INTERMEDIATE_DIM = N_GROUPS * O_LORA_RANK
 HIDDEN_DIM = 7168        # hidden_size
 QUANT_GROUP_SIZE = 128
 FP8_MAX = 448.0
+VALID_GEOMETRIES = ((HEADS, N_GROUPS), (TP2_HEADS, TP2_GROUPS))
 
 
 @dataclass(frozen=True)
 class OProjWeights:
     """Prequantized DeepGEMM weights; scale tensors are already TMA layout."""
 
-    wo_a: torch.Tensor       # FP8 [16,1024,heads_per_group*512]
-    wo_a_scale: torch.Tensor # I32 [16,1024,heads_per_group], MN-major
-    wo_b: torch.Tensor       # FP8 [7168,16384]
-    wo_b_scale: torch.Tensor # I32 [7168,32], MN-major
+    wo_a: torch.Tensor       # FP8 [groups,1024,heads_per_group*512]
+    wo_a_scale: torch.Tensor # I32 [groups,1024,heads_per_group], MN-major
+    wo_b: torch.Tensor       # FP8 [7168,groups*1024]
+    wo_b_scale: torch.Tensor # I32 [7168,groups*2], MN-major
 
 
 @dataclass(frozen=True)
 class OProjWorkspace:
-    o_fp8: torch.Tensor       # FP8 [M,16,4096]
-    o_scale: torch.Tensor     # I32 [M,16,8], MN-major within each group
-    z: torch.Tensor           # BF16 [M,16,1024]
-    z_fp8: torch.Tensor       # FP8 [M,16384]
-    z_scale: torch.Tensor     # I32 [M,32], MN-major
-    projected: torch.Tensor   # BF16 [M,7168]
+    o_fp8: torch.Tensor       # FP8 [M,groups,4096]
+    o_scale: torch.Tensor     # I32 [M,groups,8], MN-major within each group
+    z: torch.Tensor           # BF16 [M,groups,1024]
+    z_fp8: torch.Tensor       # FP8 [M,groups*1024]
+    z_scale: torch.Tensor     # I32 [M,groups*2], MN-major
+    projected: torch.Tensor   # BF16 full output or FP32 TP partial [M,7168]
     mhc_output: torch.Tensor  # BF16 [M,4,7168]
 
 
@@ -104,6 +107,15 @@ def _align(value: int, alignment: int) -> int:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def _geometry(heads: int, groups: int) -> tuple[int, int]:
+    _require((heads, groups) in VALID_GEOMETRIES,
+             f"O projection geometry must be one of {VALID_GEOMETRIES}")
+    heads_per_group = heads // groups
+    _require(heads_per_group == HEADS // N_GROUPS,
+             "TP must shard complete O groups")
+    return heads_per_group, groups * O_LORA_RANK
 
 
 def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -277,23 +289,27 @@ def _quant_o_lora_kernel(
     tl.store(scale_ptr + token + packed_block * scale_stride_k, packed)
 
 
-def _check_weights(weights: OProjWeights, heads_per_group: int) -> None:
+def _check_weights(
+    weights: OProjWeights, num_groups: int, heads_per_group: int
+) -> None:
     d = heads_per_group * HEAD_DIM
-    _require(weights.wo_a.shape == (N_GROUPS, O_LORA_RANK, d) and
+    intermediate_dim = num_groups * O_LORA_RANK
+    _require(weights.wo_a.shape == (num_groups, O_LORA_RANK, d) and
              weights.wo_a.dtype == torch.float8_e4m3fn and
              weights.wo_a.is_cuda and weights.wo_a.is_contiguous(),
-             f"wo_a must be FP8 [{N_GROUPS},{O_LORA_RANK},{d}]")
-    _require(weights.wo_a_scale.shape == (N_GROUPS, O_LORA_RANK, d // 512) and
+             f"wo_a must be FP8 [{num_groups},{O_LORA_RANK},{d}]")
+    _require(weights.wo_a_scale.shape ==
+             (num_groups, O_LORA_RANK, d // 512) and
              weights.wo_a_scale.dtype == torch.int32 and weights.wo_a_scale.is_cuda and
              weights.wo_a_scale.stride() ==
              (O_LORA_RANK * (d // 512), 1, O_LORA_RANK),
              "wo_a_scale has the wrong shape, dtype, or TMA layout")
-    _require(weights.wo_b.shape == (HIDDEN_DIM, O_INTERMEDIATE_DIM) and
+    _require(weights.wo_b.shape == (HIDDEN_DIM, intermediate_dim) and
              weights.wo_b.dtype == torch.float8_e4m3fn and
              weights.wo_b.is_cuda and weights.wo_b.is_contiguous(),
-             f"wo_b must be FP8 [{HIDDEN_DIM},{O_INTERMEDIATE_DIM}]")
+             f"wo_b must be FP8 [{HIDDEN_DIM},{intermediate_dim}]")
     _require(weights.wo_b_scale.shape ==
-             (HIDDEN_DIM, O_INTERMEDIATE_DIM // 512) and
+             (HIDDEN_DIM, intermediate_dim // 512) and
              weights.wo_b_scale.dtype == torch.int32 and weights.wo_b_scale.is_cuda and
              weights.wo_b_scale.stride() == (1, HIDDEN_DIM),
              "wo_b_scale has the wrong shape, dtype, or TMA layout")
@@ -305,32 +321,32 @@ def prepare_o_proj_workspace(
     device: torch.device | str,
     *,
     heads: int = HEADS,
+    groups: int = N_GROUPS,
 ) -> OProjWorkspace:
-    _require(1 <= m <= 128 and heads == HEADS and heads % N_GROUPS == 0,
-             f"O projection requires M in [1,128] and heads={HEADS}")
-    heads_per_group = heads // N_GROUPS
+    _require(1 <= m <= 128, "O projection requires M in [1,128]")
+    heads_per_group, intermediate_dim = _geometry(heads, groups)
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
 
     o_fp8_base = torch.empty(
-        (N_GROUPS, m, d), device=device, dtype=torch.float8_e4m3fn
+        (groups, m, d), device=device, dtype=torch.float8_e4m3fn
     )
     o_scale_base = torch.empty(
-        N_GROUPS * heads_per_group * aligned_m,
+        groups * heads_per_group * aligned_m,
         device=device,
         dtype=torch.int32,
     )
     o_scale_base = o_scale_base.as_strided(
-        (N_GROUPS, m, heads_per_group),
+        (groups, m, heads_per_group),
         (heads_per_group * aligned_m, 1, aligned_m),
     )
     z = torch.empty(
-        (m, N_GROUPS, O_LORA_RANK), device=device, dtype=torch.bfloat16
+        (m, groups, O_LORA_RANK), device=device, dtype=torch.bfloat16
     )
     z_fp8 = torch.empty(
-        (m, O_INTERMEDIATE_DIM), device=device, dtype=torch.float8_e4m3fn
+        (m, intermediate_dim), device=device, dtype=torch.float8_e4m3fn
     )
-    z_scale_blocks = O_INTERMEDIATE_DIM // 512
+    z_scale_blocks = intermediate_dim // 512
     z_scale_base = torch.empty(
         aligned_m * z_scale_blocks, device=device, dtype=torch.int32
     )
@@ -343,7 +359,10 @@ def prepare_o_proj_workspace(
         z=z,
         z_fp8=z_fp8,
         z_scale=z_scale,
-        projected=torch.empty((m, HIDDEN_DIM), device=device, dtype=torch.bfloat16),
+        projected=torch.empty(
+            (m, HIDDEN_DIM), device=device,
+            dtype=torch.float32 if groups == TP2_GROUPS else torch.bfloat16,
+        ),
         mhc_output=torch.empty(
             (m, 4, HIDDEN_DIM), device=device, dtype=torch.bfloat16
         ),
@@ -371,6 +390,7 @@ def run_o_proj_mhc_post(
     caller then owns the mHC-post launch (the e2e bench does this to time the
     two halves as separate operators). mhc_post's PDL is its own launch
     attribute, so splitting the call does not change the pipeline protocol.
+    TP2 always uses run_mhc_post=False and returns an FP32 partial for C3.
     """
 
     import deep_gemm
@@ -378,12 +398,12 @@ def run_o_proj_mhc_post(
     if mla_out.dim() == 4:
         _require(mla_out.shape[1] == 1, "4D mla_out must have singleton scope dim")
         mla_out = mla_out[:, 0]
-    _require(mla_out.dim() == 3, "mla_out must be [M,128,512] or [M,1,128,512]")
+    _require(mla_out.dim() == 3, "mla_out must be [M,H,512] or [M,1,H,512]")
     m, heads, head_dim = mla_out.shape
     _require(mla_out.dtype == torch.bfloat16 and mla_out.is_cuda and
              mla_out.is_contiguous(), "mla_out must be contiguous CUDA BF16")
-    _require(1 <= m <= 128 and heads == HEADS and head_dim == HEAD_DIM,
-             f"mla_out must be [M,{HEADS},{HEAD_DIM}] with M in [1,128]")
+    _require(1 <= m <= 128 and head_dim == HEAD_DIM,
+             f"mla_out must have M in [1,128] and head_dim={HEAD_DIM}")
     _require(positions.shape == (m,) and positions.dtype == torch.int64 and
              positions.is_cuda and positions.is_contiguous(),
              "positions must be contiguous CUDA I64 [M]")
@@ -408,38 +428,42 @@ def run_o_proj_mhc_post(
         workspace.o_fp8, workspace.o_scale, workspace.z, workspace.z_fp8,
         workspace.z_scale, workspace.projected, workspace.mhc_output,
     )), "all O-projection tensors must be on the same CUDA device")
-    heads_per_group = heads // N_GROUPS
-    _check_weights(weights, heads_per_group)
+    num_groups = weights.wo_a.size(0)
+    heads_per_group, intermediate_dim = _geometry(heads, num_groups)
+    _check_weights(weights, num_groups, heads_per_group)
     aligned_m = _align(m, 4)
     d = heads_per_group * HEAD_DIM
-    _require(workspace.o_fp8.shape == (m, N_GROUPS, d) and
+    _require(workspace.o_fp8.shape == (m, num_groups, d) and
              workspace.o_fp8.dtype == torch.float8_e4m3fn and
              workspace.o_fp8.stride() == (d, m * d, 1),
              "workspace.o_fp8 has the wrong shape, dtype, or grouped layout")
-    _require(workspace.o_scale.shape == (m, N_GROUPS, heads_per_group) and
+    _require(workspace.o_scale.shape == (m, num_groups, heads_per_group) and
              workspace.o_scale.dtype == torch.int32 and
              workspace.o_scale.stride() ==
              (1, heads_per_group * aligned_m, aligned_m),
              "workspace.o_scale has the wrong shape, dtype, or MN-major layout")
-    _require(workspace.z.shape == (m, N_GROUPS, O_LORA_RANK) and
+    _require(workspace.z.shape == (m, num_groups, O_LORA_RANK) and
              workspace.z.dtype == torch.bfloat16 and workspace.z.is_contiguous(),
-             "workspace.z must be contiguous BF16 [M,16,1024]")
-    _require(workspace.z_fp8.shape == (m, O_INTERMEDIATE_DIM) and
+             f"workspace.z must be contiguous BF16 [M,{num_groups},1024]")
+    _require(workspace.z_fp8.shape == (m, intermediate_dim) and
              workspace.z_fp8.dtype == torch.float8_e4m3fn and
              workspace.z_fp8.is_contiguous(),
-             "workspace.z_fp8 must be contiguous FP8 [M,16384]")
-    _require(workspace.z_scale.shape == (m, O_INTERMEDIATE_DIM // 512) and
+             f"workspace.z_fp8 must be contiguous FP8 [M,{intermediate_dim}]")
+    _require(workspace.z_scale.shape == (m, intermediate_dim // 512) and
              workspace.z_scale.dtype == torch.int32 and
              workspace.z_scale.stride() == (1, aligned_m),
              "workspace.z_scale has the wrong shape, dtype, or MN-major layout")
+    projected_dtype = torch.float32 if num_groups == TP2_GROUPS else torch.bfloat16
     _require(workspace.projected.shape == (m, HIDDEN_DIM) and
-             workspace.projected.dtype == torch.bfloat16 and
+             workspace.projected.dtype == projected_dtype and
              workspace.projected.is_contiguous(),
-             "workspace.projected must be contiguous BF16 [M,7168]")
+             f"workspace.projected must be contiguous {projected_dtype} [M,7168]")
     _require(workspace.mhc_output.shape == (m, 4, HIDDEN_DIM) and
              workspace.mhc_output.dtype == torch.bfloat16 and
              workspace.mhc_output.is_contiguous(),
              "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
+    _require(not run_mhc_post or num_groups == N_GROUPS,
+             "TP2 O projection returns an FP32 partial and requires C3 before mHC post")
     _validate_workspace_aliases(
         (
             ("workspace.o_fp8", workspace.o_fp8),
@@ -503,7 +527,7 @@ def run_o_proj_mhc_post(
                 recipe=(1, 1, 128),
             )
 
-            _quant_o_lora_kernel[(aligned_m, O_INTERMEDIATE_DIM // 512)](
+            _quant_o_lora_kernel[(aligned_m, intermediate_dim // 512)](
                 workspace.z,
                 workspace.z_fp8,
                 workspace.z_scale,
@@ -546,15 +570,19 @@ def quantize_o_proj_weights(
     import deep_gemm
     from deep_gemm.utils import per_block_cast_to_fp8
 
-    expected_wo_a_shape = (
-        N_GROUPS, O_LORA_RANK, (HEADS // N_GROUPS) * HEAD_DIM
-    )
+    _require(wo_a.dim() == 3 and wo_a.shape[1] == O_LORA_RANK
+             and wo_a.shape[2] % HEAD_DIM == 0,
+             "wo_a must be [groups,1024,heads_per_group*512]")
+    num_groups = wo_a.shape[0]
+    heads = num_groups * (wo_a.shape[2] // HEAD_DIM)
+    _, intermediate_dim = _geometry(heads, num_groups)
+    expected_wo_a_shape = (num_groups, O_LORA_RANK, wo_a.shape[2])
     _require(wo_a.shape == expected_wo_a_shape and
              wo_a.dtype == torch.bfloat16 and wo_a.is_cuda and wo_a.is_contiguous(),
              f"wo_a must be contiguous CUDA BF16 {expected_wo_a_shape}")
-    _require(wo_b.shape == (HIDDEN_DIM, O_INTERMEDIATE_DIM) and
+    _require(wo_b.shape == (HIDDEN_DIM, intermediate_dim) and
              wo_b.dtype == torch.bfloat16 and wo_b.is_cuda and wo_b.is_contiguous(),
-             f"wo_b must be contiguous CUDA BF16 [{HIDDEN_DIM},{O_INTERMEDIATE_DIM}]")
+             f"wo_b must be contiguous CUDA BF16 [{HIDDEN_DIM},{intermediate_dim}]")
     _require(wo_a.device == wo_b.device, "wo_a and wo_b must be on the same device")
     device = wo_a.device
     assert device.index is not None
@@ -562,11 +590,11 @@ def quantize_o_proj_weights(
         with deepgemm_device_scope(device.index):
             wo_a_fp8 = torch.empty_like(wo_a, dtype=torch.float8_e4m3fn)
             wo_a_scale = torch.empty(
-                (N_GROUPS, O_LORA_RANK // 128, wo_a.shape[2] // 128),
+                (num_groups, O_LORA_RANK // 128, wo_a.shape[2] // 128),
                 device=device,
                 dtype=torch.float32,
             )
-            for group in range(N_GROUPS):
+            for group in range(num_groups):
                 wo_a_fp8[group], wo_a_scale[group] = per_block_cast_to_fp8(
                     wo_a[group], use_ue8m0=True
                 )
@@ -575,7 +603,7 @@ def quantize_o_proj_weights(
                 O_LORA_RANK,
                 wo_a.shape[2],
                 (1, 128, 128),
-                num_groups=N_GROUPS,
+                num_groups=num_groups,
                 is_sfa=False,
             )
             wo_b_fp8, wo_b_scale = per_block_cast_to_fp8(
@@ -584,7 +612,7 @@ def quantize_o_proj_weights(
             wo_b_scale = deep_gemm.transform_sf_into_required_layout(
                 wo_b_scale,
                 HIDDEN_DIM,
-                O_INTERMEDIATE_DIM,
+                intermediate_dim,
                 (1, 128, 128),
                 is_sfa=False,
             )

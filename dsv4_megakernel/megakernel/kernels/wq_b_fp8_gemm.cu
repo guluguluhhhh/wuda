@@ -1,33 +1,33 @@
 // ============================================================
 // wq_b_fp8_gemm.cu — MERGED wq_b projection (tcgen05 FP8 block-scale GEMM)
 //
-// x_fp8[M,1536] @ w_fp8[73728,1536]^T   (indexer 8192 rows ++ main q 65536)
-//   -> y [M,65536] fp32  +  ssq [M,128] fp32 (fused per-head sum-of-squares)
-//   -> indexer q: by default DRAINED as fp32 iq_ws [M,64,128] (finish it with
+// x_fp8[M,K_DIM] @ w_fp8[N_MERGED,K_DIM]^T   (indexer rows before main Q)
+//   -> y [M,N_TOTAL] bf16 + ssq [M,NUM_HEADS_OUT] fp32
+//   -> indexer q: by default DRAINED as bf16 iq_ws [M,64,128] (finish it with
 //      idx_postprocess); mock_post=False fuses rope+hadamard+MXFP4 in-kernel.
 //
 // Usage (default: 256 threads, GEMM + ssq):
 //   y, iq_fp4, iq_sf, ssq, iq_ws = wq_b_proj_gemm_merged(
-//       x_fp8, x_sf [M,12] ue8m0, w_fp8, w_sf [576,12] ue8m0,
+//       x_fp8, x_sf [M,12] ue8m0, w_fp8, w_sf [N_MERGED/128,12] ue8m0,
 //       q_pos [M] i32, rope_cos, rope_sin [max_pos,32] f32)
 //   iq_fp4/iq_sf are GARBAGE in this mode -- run idx_postprocess(iq_ws, ...).
-//   M in [1,128] (host pads to 32-aligned). Optional kwargs: head_ssq (caller
-//   zero-init buffer), enable_ssq, mock_post. Return order:
+//   M in [1,128] dispatches to a 32-row template; TMA handles OOB rows. Optional
+//   kwargs: head_ssq (caller zero-init buffer), enable_ssq, mock_post. Return order:
 //   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
 //
 // Fused indexer (winkv) COMPRESSOR (optional, delivery op-B-tail port, NO
 // split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc (fresh state
 // row arrives from front's FRONT-EMIT epilogue, +idx_ape)
-// together and warps 8..11 run the state write + compress chain (softmax
+// together and warps 8..15 run the state write + compress chain (softmax
 // aggregate -> shift -> RMSNorm -> RoPE -> FWHT -> fp4) fully decoupled from
 // the GEMM; appends idx_q4 [M,64] u8 + idx_s4 [M,4] u8 to the returns.
 // LOCAL KV WINDOW (optional, CSA stage 4 FULL chain): pass win_y2 [M,512] +
 // win_norm [512] (+ cmp_pos/cos_tab/sin_tab) -> RMSNorm + RoPE + per-64 fp8;
 // appends win_q8 [M,448] u8 + win_s8 [M,7] f32 + win_rope [M,64] bf16. Chains
-// in idx_comp_fp4.cuh (warp-level, one row per warp on warps 8..11).
+// in idx_comp_fp4.cuh (warp-level, one row per warp on warps 8..15).
 //
 // Swap-AB (UMMA_N = M_pad, BN=128), 2SM MMA, persistent, warp-specialized;
-// mock_post=False adds the async transform warpgroup (384 threads). Config in
+// mock_post=False adds 256 async transform workers (512-thread CTA). Config in
 // wq_b_fp8_gemm.cuh; MMA engine in cluster_mma_fp8.cuh; indexer chain in
 // idx_post_fp4.cuh.
 // ============================================================
@@ -94,26 +94,25 @@ static_assert(sizeof(SharedStorage<32>)  <= wq_b::SMEM_CAPACITY &&
               "is the header stale (missing the ssq_scratch overhead term)?");
 
 // ======================== Standalone head-ssq kernel ========================
-// The SEPARATE-KERNEL baseline for the fused head_ssq accumulation: reads the
-// fp32 main-q output once and reduces per-(row, head) sum-of-squares. One warp
-// per 512-col head (float4 loads, 16 values per lane, 5-level shuffle tree) --
-// memory-bound at the read of y, i.e. as fast as this op can be standalone.
+// The separate-kernel fallback for callers that disable fused head_ssq. The
+// materialized main-Q output is BF16, so this necessarily measures the rounded
+// values; the fused path below retains the more accurate FP32 accumulators.
 __global__ void __launch_bounds__(256, 1)
 head_ssq_kernel(
-    const float* __restrict__ y,        // [M, 65536] fp32
-    float* __restrict__ ssq,            // [M, 128]
-    int total_heads)                    // M * 128
+    const __nv_bfloat16* __restrict__ y, // [M, N_TOTAL] bf16
+    float* __restrict__ ssq,             // [M, NUM_HEADS_OUT]
+    int total_heads)                     // M * NUM_HEADS_OUT
 {
-    const int h = blockIdx.x * 8 + (int)(threadIdx.x >> 5);   // row*128 + head
+    const int h = blockIdx.x * 8 + (int)(threadIdx.x >> 5);
     if (h >= total_heads)
         return;                                                // warp-uniform
     const uint32_t lane = threadIdx.x & 31;
-    const float* p = y + (int64_t)h * HEAD_DIM_OUT + lane * 4;
+    const __nv_bfloat16* p = y + (int64_t)h * HEAD_DIM_OUT + lane * 16;
     float s = 0.f;
     #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        const float4 v = *reinterpret_cast<const float4*>(p + k * 128);
-        s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    for (int k = 0; k < 16; ++k) {
+        const float v = __bfloat162float(p[k]);
+        s = fmaf(v, v, s);
     }
     #pragma unroll
     for (int x = 16; x >= 1; x >>= 1)
@@ -178,11 +177,9 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
 }
 
 // ======================== Kernel ========================
-// MERGED-ONLY (N = 73728): the indexer wq_b weight is concatenated BEFORE the
-// main q weight, so the plain forward tile walk hits the iq tiles first and the
-// remaining main-q weight stream shadows their post-processing. iq tiles are
-// DRAINED by the store warps (TMEM -> L2 scratch -> tmem_empty) and post-processed
-// by the dedicated ASYNC TRANSFORM WARPGROUP (threads 256..383).
+// The indexer weight precedes main Q, so its transform overlaps the remaining
+// main-Q weight stream. Store warps drain indexer tiles before async workers
+// post-process them.
 template <int M_TPL, bool kProfile, bool kSsq>
 __global__ void __launch_bounds__(TPB_IDX, 1)
 wq_b_proj_kernel(
@@ -190,13 +187,14 @@ wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_B,    // weight     [N,K] e4m3, K-major
     const uint8_t* __restrict__ x_sf,               // [M,K/128] UE8M0
     const uint8_t* __restrict__ w_sf,               // [N/128,K/128] UE8M0
-    const __grid_constant__ CUtensorMap desc_D,    // output [M,N] FP32 row-major
+    const __grid_constant__ CUtensorMap desc_D,    // output [M,N] BF16 row-major
     int problem_m,
-    int num_blocks,
-    float* __restrict__ head_ssq,                  // [M,128] per-head sum-of-squares (RED-accumulated; nullptr off)
+    int num_blocks,                                // physical grid size (CTAs)
+    int num_gemm_clusters,                         // clusters assigned GEMM tiles
+    float* __restrict__ head_ssq,                  // [M,NUM_HEADS_OUT] FP32; nullptr disables
     // fused indexer projection outputs + rotary metadata
     const __grid_constant__ IqDest iqd,            // indexer-q destination geometry
-    float* __restrict__ iq_scratch,                // [M, 64, 128] fp32 drain buffer
+    __nv_bfloat16* __restrict__ iq_scratch,        // [M, 64, 128] bf16 drain buffer
     uint32_t* __restrict__ iq_ready,               // [IQ_FLAG_SLOTS] per-head ready flags
     uint32_t iq_seq,                               // host-monotonic launch tag for them
     const int* __restrict__ q_pos,                 // [M] rotary positions
@@ -266,9 +264,14 @@ wq_b_proj_kernel(
     // ================================================================
     // Persistent tile scheduling (single M block; iterate N tiles)
     // ================================================================
-    int num_clusters    = num_blocks / CLUSTER_SIZE;
+    int num_clusters    = num_gemm_clusters;
     int cluster_id      = blockIdx.x / CLUSTER_SIZE;
     int num_tiles_total = NUM_TILES_TOTAL;
+    // The full physical grid gives the CUDA-core transform one CTA per SM. Only
+    // the first num_gemm_clusters clusters own GEMM tiles; the rest skip ahead
+    // to the transform phase.
+    const int gemm_begin =
+        cluster_id < num_gemm_clusters ? cluster_id : num_tiles_total;
 
     // ======== WARP 0: TMA PRODUCER (both CTAs, plain per-CTA loads) ========
     if (warp_id == 0 && ptx::elect_one_sync()) {
@@ -279,7 +282,7 @@ wq_b_proj_kernel(
         // forward tile walk already puts the tiles that need post-processing in
         // iteration 0 -- their drain + async transform then overlap the remaining
         // main tiles' weight stream. All roles share this mapping.
-        for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
+        for (int it_t = gemm_begin; it_t < num_tiles_total; it_t += num_clusters) {
             int n_base = it_t * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N; // weight N (per CTA)
             // Inner loop over M subtiles: weight (n_base) is reused from L2.
             for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
@@ -325,7 +328,7 @@ wq_b_proj_kernel(
         auto advance = [&]() { stage = (stage + 1) % NS; if (stage == 0) phase ^= 1; };
 
         // iq segment first (see the producer): plain forward walk.
-        for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
+        for (int it_t = gemm_begin; it_t < num_tiles_total; it_t += num_clusters) {
           const int n_base = it_t * CLUSTER_BLOCK_N + cta_rank * LOAD_BLOCK_N;
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             const int sfa_m = m_sub * BM_T;
@@ -373,7 +376,7 @@ wq_b_proj_kernel(
         uint32_t stage = 0, phase = 0, persistent_iter = 0;
         // Same forward mapping as the other roles; the MMA warp itself is tile-id
         // agnostic -- it only paces stages/accums.
-        for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
+        for (int it_t = gemm_begin; it_t < num_tiles_total; it_t += num_clusters) {
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
             uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
@@ -411,7 +414,7 @@ wq_b_proj_kernel(
         }
     }
 
-    // ======== EPILOGUE WARPS (both CTAs, 128 threads / 4 warps) — FP32 store, unchanged ========
+    // ======== EPILOGUE WARPS (both CTAs, 128 threads / 4 warps) ========
     else if (warp_id >= NUM_NON_EPI_THREADS / 32 &&
              warp_id < (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32) {
         uint32_t epi_warp_idx = warp_id - (NUM_NON_EPI_THREADS / 32);  // 0..3
@@ -420,11 +423,11 @@ wq_b_proj_kernel(
         constexpr int NUM_STORES         = UMMA_N_T / STORE_BLOCK_M;          // M/16 (no padding rows)
         constexpr int NUM_TMEM_SUBROWS   = STORE_BLOCK_M / 8;                  // 2
         constexpr int NUM_N_STORE_ATOMS  = STORE_BLOCK_N / STORE_BLOCK_N_ATOM; // 4
-        constexpr int SMEM_CD_PER_STAGE_T = SMEM_CD_PER_STAGE;                 // 8192
+        constexpr int SMEM_CD_PER_STAGE_T = SMEM_CD_PER_STAGE;                 // 4096
 
         uint32_t persistent_iter = 0;
         // iq segment first (see the producer): plain forward walk.
-        for (int it_t = cluster_id; it_t < num_tiles_total; it_t += num_clusters) {
+        for (int it_t = gemm_begin; it_t < num_tiles_total; it_t += num_clusters) {
           for (int m_sub = 0; m_sub < NUM_M_SUB; ++m_sub) {
             uint32_t accum_stage = persistent_iter % NUM_EPI_STAGES;
             uint32_t accum_phase = (persistent_iter / NUM_EPI_STAGES) & 1;
@@ -450,11 +453,12 @@ wq_b_proj_kernel(
 
             if (is_idx) {
                     // DRAIN-FIRST: nothing heavy on the TMEM-drain path (the accum
-                    // stage gates the MMA). Dump the accum to the fp32 scratch
-                    // (lane = col -> 128B-coalesced rows, L2-resident), release
+                    // stage gates the MMA). The transform immediately rounds every
+                    // value to bf16, so draining bf16 is bitwise equivalent while
+                    // halving the L2 scratch round trip.
                     // tmem_empty, hand off to the async transform warpgroup.
                     const int head = base_n / IDX_HEAD_DIM;
-                    float* dst = iq_scratch
+                    __nv_bfloat16* dst = iq_scratch
                         + ((int64_t)base_m * IDX_NUM_HEADS + head) * IDX_HEAD_DIM
                         + epi_warp_idx * 32 + lane_id;
                     #pragma unroll
@@ -466,11 +470,13 @@ wq_b_proj_kernel(
                             ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
                             cutlass::arch::fence_view_async_tmem_load();
                             uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
-                            float* drow = dst + (int64_t)(st * STORE_BLOCK_M + i * 8) * N_IDX;
+                            __nv_bfloat16* drow =
+                                dst + (int64_t)(st * STORE_BLOCK_M + i * 8) * N_IDX;
                             #pragma unroll
                             for (int row = 0; row < 8; ++row)
                                 if (st * STORE_BLOCK_M + i * 8 + row < problem_m)
-                                    drow[(int64_t)row * N_IDX] = __uint_as_float(vals[row]);
+                                    drow[(int64_t)row * N_IDX] =
+                                        __float2bfloat16_rn(__uint_as_float(vals[row]));
                         }
                     }
                     ptx::tcgen05_fence_before_sync();
@@ -494,68 +500,67 @@ wq_b_proj_kernel(
                     cute::tma_store_wait<NUM_TMA_STORE_STAGES - 1>();
                 cutlass::arch::NamedBarrier::sync(NUM_STORE_THREADS, 0);
 
-                // ---- Read TMEM (FP32), transpose into SMEM (DeepGEMM swap FP32 path) ----
+                // Read FP32 accumulators from TMEM. The output store rounds them
+                // once to BF16; SSQ, when enabled, still uses these FP32 values.
                 #pragma unroll
                 for (int i = 0; i < NUM_TMEM_SUBROWS; ++i) {
                     uint32_t tmem_addr = tmem_base + st * STORE_BLOCK_M + i * 8;
 
                     uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
-                    ptx::tmem_load_32dp32b8x(tmem_addr, v0, v1, v2, v3, v4, v5, v6, v7);
+                    ptx::tmem_load_16dp256b1x(tmem_addr, v0, v1, v2, v3);
+                    ptx::tmem_load_16dp256b1x(
+                        tmem_addr | 0x00100000u, v4, v5, v6, v7);
                     cutlass::arch::fence_view_async_tmem_load();
-                    uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
 
+                    const float f0 = __uint_as_float(v0);
+                    const float f1 = __uint_as_float(v1);
+                    const float f2 = __uint_as_float(v2);
+                    const float f3 = __uint_as_float(v3);
+                    const float f4 = __uint_as_float(v4);
+                    const float f5 = __uint_as_float(v5);
+                    const float f6 = __uint_as_float(v6);
+                    const float f7 = __uint_as_float(v7);
+
+                    const __nv_bfloat162 b0 = __floats2bfloat162_rn(f0, f1);
+                    const __nv_bfloat162 b1 = __floats2bfloat162_rn(f2, f3);
+                    const __nv_bfloat162 b2 = __floats2bfloat162_rn(f4, f5);
+                    const __nv_bfloat162 b3 = __floats2bfloat162_rn(f6, f7);
+                    const uint32_t row = lane_id & 7u;
+                    const uint32_t col = (epi_warp_idx & 1u) * 4u + (lane_id >> 3);
                     uint8_t* smem_base_ptr = smem_cd_ptr
-                        + epi_warp_idx * (STORE_BLOCK_M * SWIZZLE_CD)
+                        + (epi_warp_idx >> 1) * (STORE_BLOCK_M * SWIZZLE_CD)
                         + i * (8 * SWIZZLE_CD);
-                    uint32_t col = lane_id / 4;
-                    #pragma unroll
-                    for (uint32_t row = 0; row < 8; ++row) {
-                        uint8_t* smem_ptr = smem_base_ptr
-                            + row * (16 * 8)
-                            + (col ^ row) * 16
-                            + (lane_id % 4) * sizeof(float);
-                        ptx::st_shared_u32(smem_ptr, vals[row]);
-                    }
+                    uint8_t* dst = smem_base_ptr
+                        + row * (16 * 8) + ((col ^ row) * 16);
+                    ptx::stmatrix_x4_trans(
+                        dst,
+                        *reinterpret_cast<const uint32_t*>(&b0),
+                        *reinterpret_cast<const uint32_t*>(&b1),
+                        *reinterpret_cast<const uint32_t*>(&b2),
+                        *reinterpret_cast<const uint32_t*>(&b3));
 
-                    // ---- optional per-head sum-of-squares (RMSNorm scale folding) ----
-                    // vals[8] = 8 M rows; the warp's 32 lanes cover 32 cols of ONE
-                    // 512-col head. Multi-row butterfly co-reduction: 16 shuffles
-                    // for all 8 row sums (vs 8 x 5-level trees); after the xor-4
-                    // step lane l holds row (l>>2)&7. The consumer RED is order-free
-                    // (redux.sync f32 is min/max-only on sm_100a, so shuffles).
                     if constexpr (kSsq) {
-                        float v[8];
+                        // 16dp256b maps lane (a + 4*b) to rows (2*a,2*a+1)
+                        // and columns (b,b+8,b+16,b+24).
+                        const uint32_t row0 = (lane_id & 3u) * 2u;
+                        const uint32_t row1 = row0 + 1u;
+
+                        // Each lane owns four columns for each of two rows. Reduce
+                        // across the eight lanes with the same `a`: 6 shuffles for
+                        // 8 row sums, versus 16 in the 32dp32b transpose reduction.
+                        float sq0 = fmaf(f6, f6, fmaf(f4, f4, fmaf(f2, f2, f0 * f0)));
+                        float sq1 = fmaf(f7, f7, fmaf(f5, f5, fmaf(f3, f3, f1 * f1)));
                         #pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            const float f = __uint_as_float(vals[j]);
-                            v[j] = f * f;
+                        for (int off = 4; off <= 16; off *= 2) {
+                            sq0 += __shfl_xor_sync(0xffffffffu, sq0, off);
+                            sq1 += __shfl_xor_sync(0xffffffffu, sq1, off);
                         }
-                        float t8[8];
-                        #pragma unroll
-                        for (int j = 0; j < 8; ++j)
-                            t8[j] = __shfl_xor_sync(0xffffffffu, v[j], 16);
-                        const bool hi16 = (lane_id & 16) != 0;   // keep rows 4..7
-                        float w4[4];
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                            w4[j] = hi16 ? (v[j + 4] + t8[j + 4]) : (v[j] + t8[j]);
-                        float t4[4];
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j)
-                            t4[j] = __shfl_xor_sync(0xffffffffu, w4[j], 8);
-                        const bool hi8 = (lane_id & 8) != 0;     // keep back half
-                        float w2[2];
-                        #pragma unroll
-                        for (int j = 0; j < 2; ++j)
-                            w2[j] = hi8 ? (w4[j + 2] + t4[j + 2]) : (w4[j] + t4[j]);
-                        const float ta = __shfl_xor_sync(0xffffffffu, w2[0], 4);
-                        const float tb = __shfl_xor_sync(0xffffffffu, w2[1], 4);
-                        float sq = (lane_id & 4) ? (w2[1] + tb) : (w2[0] + ta);
-                        sq += __shfl_xor_sync(0xffffffffu, sq, 2);
-                        sq += __shfl_xor_sync(0xffffffffu, sq, 1);
-                        if ((lane_id & 3) == 0)
+                        if (lane_id < 4) {
                             s.ssq_scratch[epi_warp_idx]
-                                [st * STORE_BLOCK_M + i * 8 + (int)((lane_id >> 2) & 7)] = sq;
+                                [st * STORE_BLOCK_M + i * 8 + row0] = sq0;
+                            s.ssq_scratch[epi_warp_idx]
+                                [st * STORE_BLOCK_M + i * 8 + row1] = sq1;
+                        }
                     }
                 }
 
@@ -570,7 +575,7 @@ wq_b_proj_kernel(
                 if (epi_warp_idx == 0 && ptx::elect_one_sync()) {
                     #pragma unroll
                     for (int i = 0; i < NUM_N_STORE_ATOMS; ++i) {
-                        auto* smem_ptr = reinterpret_cast<float*>(smem_cd_ptr)
+                        auto* smem_ptr = reinterpret_cast<__nv_bfloat16*>(smem_cd_ptr)
                             + i * (STORE_BLOCK_M * STORE_BLOCK_N_ATOM);
                         int n_idx = out_n + i * STORE_BLOCK_N_ATOM;
                         int m_idx = base_m + st * STORE_BLOCK_M;
@@ -591,8 +596,14 @@ wq_b_proj_kernel(
                 const int m = base_m + r;
                 const float v = s.ssq_scratch[0][r] + s.ssq_scratch[1][r]
                               + s.ssq_scratch[2][r] + s.ssq_scratch[3][r];
-                if (m < problem_m)
-                    atomicAdd(head_ssq + (size_t)m * NUM_HEADS_OUT + out_n / HEAD_DIM_OUT, v);
+                if (m < problem_m) {
+                    float* dst = head_ssq
+                        + (size_t)m * NUM_HEADS_OUT + out_n / HEAD_DIM_OUT;
+                    // No return value is needed; RED avoids waiting for the global
+                    // atomic round trip. Kernel completion provides visibility.
+                    asm volatile("red.relaxed.gpu.global.add.f32 [%0], %1;"
+                                 :: "l"(dst), "f"(v) : "memory");
+                }
             }
 
             }  // !is_idx (main-q tile store path)
@@ -618,7 +629,7 @@ wq_b_proj_kernel(
         asm volatile("griddepcontrol.launch_dependents;");
     }
 
-    // ======== ASYNC TRANSFORM WARPGROUP (threads 256..383) ========
+    // ======== ASYNC TRANSFORM WORKERS (threads 256..511) ========
     // Three sections, ordered by EARLIEST POSSIBLE START:
     //   1 HANDSHAKE  serve barrier 1 (the store warps are BLOCKED on it right
     //                after each iq drain) and release that head's ready flag.
@@ -626,12 +637,8 @@ wq_b_proj_kernel(
     //                early as possible.
     //   3 SPREAD     the rope/hadamard/fp4 transform. The only section that can
     //                block on ANOTHER CTA's flag, hence last.
-    // SPREAD runs on ALL CTAs because one CTA tile in the iq segment is exactly one
-    // indexer head (BLOCK_N == IDX_HEAD_DIM), so only N_IDX/CLUSTER_BLOCK_N clusters
-    // drain one -- 16 of 72, i.e. 32 of 144 CTAs. Leaving the transform on its owner
-    // put 100% of it on 22% of the grid with 112 transform warpgroups idle, and the
-    // shadow left by the remaining GEMM absorbs only ~2.5 row batches, so the rest
-    // was exposed (4.65us at M=128 -> 1.3us spread).
+    // Only index-tile CTAs drain scratch; SPREAD distributes the transform over all
+    // resident CTAs.
     else if (warp_id >= (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32) {
         // The iq segment LEADS the N range, so its tiles are exactly it_t <
         // NUM_IQ_TILES (N_IDX being whole cluster tiles is static_assert'd in the
@@ -652,10 +659,10 @@ wq_b_proj_kernel(
             const int head = it_t * CLUSTER_SIZE + cta_rank;
             cutlass::arch::NamedBarrier::sync(
                 NUM_STORE_THREADS + NUM_XFORM_THREADS, 1);   // drain done + CTA fence
-            // The barrier's scope is the CTA; one thread promotes the store warps'
-            // drain to device scope and publishes. Paired with ld.acquire in SPREAD.
+            // The CTA barrier orders every store warp's scratch writes before this
+            // release; the release publishes that happens-before chain at GPU scope.
+            // Paired with ld.acquire in SPREAD.
             if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
-                __threadfence();
                 asm volatile("st.release.gpu.global.u32 [%0], %1;"
                              :: "l"(iq_ready + head * IQ_FLAG_STRIDE), "r"(iq_seq)
                              : "memory");
@@ -669,9 +676,8 @@ wq_b_proj_kernel(
         // d_all 0.26 -> 5.2us at M=31. WARP-LEVEL task pool, ONE task per token row
         // (separate win/cmp loops keep the two chains' register live ranges
         // disjoint), no atomics and no barriers -- purely static. Worker order = all
-        // four warp levels of the iq-FREE CTAs first, iq CTAs only as a last resort
-        // (a second warp on a free CTA costs ~2.5us at M=128; M <= 4*nfree = 448
-        // rows never touch an iq CTA). Only exit sync: trailing cluster_sync.
+        // transform warp levels of the iq-FREE CTAs first, iq CTAs only as a last
+        // resort. Only exit sync: trailing cluster_sync.
         {
             const bool win_on = comp.win_y2 != nullptr;
             const bool cmp_on = comp.kv != nullptr;
@@ -680,10 +686,11 @@ wq_b_proj_kernel(
                 const int rank = ((int)blockIdx.x >= busy)
                     ? ((int)blockIdx.x - busy)                  // iq-free CTAs: rank 0..nfree-1
                     : (nfree + (int)blockIdx.x);                // iq CTAs after them
+                constexpr int XFORM_WARPS = NUM_XFORM_THREADS / 32;
                 const int wid = (rank < nfree)
                     ? wlocal * nfree + rank                     // free CTAs, levels 0..3 first
-                    : 4 * nfree + wlocal * busy + (rank - nfree);   // then iq CTAs
-                const int stride = num_blocks * (NUM_XFORM_THREADS / 32);
+                    : XFORM_WARPS * nfree + wlocal * busy + (rank - nfree);
+                const int stride = num_blocks * XFORM_WARPS;
                 if (win_on)
                     for (int m = wid; m < problem_m; m += stride)
                         idx_comp::process_win_row(comp, m, (int)lane_id);
@@ -694,9 +701,8 @@ wq_b_proj_kernel(
         }
 
         // ---- 3 SPREAD ----
-        // Flat (head, row-batch) task space over the whole grid; one batch = 16 rows
-        // x 8 lanes = all 128 threads once. At M=128 that is 32*8 = 256 batches over
-        // 144 CTAs, <= 2 each.
+        // Flat (head, row-batch) task space over the whole grid. One task uses
+        // all transform workers: 8 lanes per row, XFORM_ROWS_PER_TASK rows.
         if (!mock_post) {
             // [PROFILE] SPREAD entry/exit (cluster0/CTA0): the transform plus its
             // peer stores, ending before the completion handoff below.
@@ -704,17 +710,19 @@ wq_b_proj_kernel(
             const bool iq_prof = iqd.prof != nullptr && blockIdx.x == 0 &&
                 threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS;
             if (iq_prof) iq_t0 = ptx::rdclock();
-            const uint32_t xtid = threadIdx.x - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS);
+            const uint32_t xtid = threadIdx.x -
+                (NUM_NON_EPI_THREADS + NUM_STORE_THREADS);
             const uint32_t r = xtid >> 3, e8 = xtid & 7;
             // Batches per head from problem_m, NOT M_TPL: padding rows run the full
             // converged compute (only their stores are suppressed), so an
             // all-padding batch is pure waste. Trip counts stay CTA-uniform.
-            const int nbph = (problem_m + STORE_BLOCK_M - 1) / STORE_BLOCK_M;
+            const int nbph =
+                (problem_m + XFORM_ROWS_PER_TASK - 1) / XFORM_ROWS_PER_TASK;
             const int nb   = IDX_NUM_HEADS * nbph;
             int my_tasks = 0;
             for (int task = (int)blockIdx.x; task < nb; task += num_blocks) {
                 const int head = task % IDX_NUM_HEADS;
-                const int m0   = (task / IDX_NUM_HEADS) * STORE_BLOCK_M;
+                const int m0   = (task / IDX_NUM_HEADS) * XFORM_ROWS_PER_TASK;
                 uint32_t v;
                 const unsigned long long spin_t0 = ptx::rdtimer_ns();
                 do {   // whole warp polls ONE address -> a single broadcast read;
@@ -730,7 +738,9 @@ wq_b_proj_kernel(
                     }
                     __nanosleep(128);
                 } while (true);
-                asm volatile("fence.acquire.gpu;" ::: "memory");
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                             : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                             : "memory");
                 // padding rows CLAMP to the last valid row: warps stay converged for
                 // the full-mask shuffles, stores are suppressed
                 const int m = m0 + (int)r;
@@ -744,10 +754,10 @@ wq_b_proj_kernel(
                 idx_row_load(
                     iq_scratch + ((int64_t)mc * IDX_NUM_HEADS + head) * IDX_HEAD_DIM,
                     e8, mc, q_pos, rope_cos, rope_sin, d);
-                idx_row_compute(d, e8, mc, iqd.head_base + head,
-                                mine ? iqd.fp4 : iqd.fp4_peer,
-                                mine ? iqd.sf  : iqd.sf_peer,
-                                iqd.num_heads, m < problem_m);
+                idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
+                                      mine ? iqd.fp4 : iqd.fp4_peer,
+                                      mine ? iqd.sf  : iqd.sf_peer,
+                                      iqd.num_heads, m < problem_m);
                 ++my_tasks;
             }
             if (iq_prof) {
@@ -764,8 +774,8 @@ wq_b_proj_kernel(
                 // Barrier id 2, scoped to the XFORM warpgroup ONLY: __syncthreads
                 // would hang here -- the TMA/MMA/SF/store warps are in sibling
                 // branches of the role dispatch and never reach this point. It has
-                // to be a barrier, because one thread arrives for all 128. ids 0/1
-                // are taken by the store warps and the drain handshake.
+                // One thread arrives on behalf of all transform workers. Barrier
+                // ids 0/1 are used by store and drain handshakes.
                 cutlass::arch::NamedBarrier::sync(NUM_XFORM_THREADS, 2);
                 if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS)
                     asm volatile("red.release.gpu.global.add.u32 [%0], 1;"
@@ -864,15 +874,15 @@ static CUtensorMap make_tma_desc_fp8_2d(
     return desc;
 }
 
-static CUtensorMap make_tma_desc_fp32_2d(
-    const float* ptr, int rows, int cols, int box_rows, int box_cols)
+static CUtensorMap make_tma_desc_bf16_2d(
+    const __nv_bfloat16* ptr, int rows, int cols, int box_rows, int box_cols)
 {
     CUtensorMap desc{};
     uint64_t globalDim[2]    = {(uint64_t)cols, (uint64_t)rows};
-    uint64_t globalStride[1] = {(uint64_t)cols * sizeof(float)};
+    uint64_t globalStride[1] = {(uint64_t)cols * sizeof(__nv_bfloat16)};
     uint32_t boxDim[2]       = {(uint32_t)box_cols, (uint32_t)box_rows};
     uint32_t elemStride[2]   = {1, 1};
-    cuTensorMapEncodeTiled(&desc, CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+    cuTensorMapEncodeTiled(&desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         2, (void*)ptr, globalDim, globalStride, boxDim, elemStride,
         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -903,16 +913,15 @@ static int get_smem_bytes(int M) {
     }
 }
 
-// MERGED FP8 block-scale run (N = 73728 = indexer 8192 ++ main q 65536; the
-// indexer segment leads N). Inputs
-// use the native DSV4 checkpoint/runtime layout:
+// Merged FP8 block-scale run with the indexer segment leading N. Inputs use the
+// native DSV4 checkpoint/runtime layout:
 //   x_fp8 [M,K] e4m3 ; x_sf [M,K/128] UE8M0 (activation 1x128)
 //   w_fp8 [N_MERGED,K] e4m3 ; w_sf [N_MERGED/128,K/128] UE8M0 (weight 128x128)
-// Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], (timing)]:
-// the last N_IDX weight rows are the indexer wq_b; their tiles are drained and
+// Returns [y bf16 [M,N_TOTAL], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], (timing)]:
+// the first N_IDX weight rows are the indexer wq_b; their tiles are drained and
 // rope+hadamard+fp4quant runs in the async transform warpgroup. Requires
 // q_pos [M] i32 and rope_cos/rope_sin [max_pos,32] f32 (CPU-precomputed).
-// head_ssq (optional): ZERO-INITIALIZED fp32 [M,128]; the epilogue
+// head_ssq (optional): ZERO-INITIALIZED fp32 [M,NUM_HEADS_OUT]; the epilogue
 // RED-accumulates per-(row, head) sum-of-squares of the MAIN q segment
 // (RMSNorm scale folding). mock_post: drain-only baseline (no transform).
 static std::vector<torch::Tensor> run_wq_b(
@@ -1088,13 +1097,14 @@ static std::vector<torch::Tensor> run_wq_b(
     // drain-first workspace: the epilogue dumps the iq accum here (L2-resident)
     // to release the TMEM stage before the transform pass
     auto iq_ws = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM},
-                              x_fp8.options().dtype(torch::kFloat32));
+                              x_fp8.options().dtype(torch::kBFloat16));
     const int* q_pos_ptr = q_pos.data_ptr<int>();
     const float* cos_ptr = rope_cos.data_ptr<float>();
     const float* sin_ptr = rope_sin.data_ptr<float>();
     uint8_t* iq_fp4_ptr = reinterpret_cast<uint8_t*>(iq_fp4.data_ptr());
     int* iq_sf_ptr = iq_sf.data_ptr<int>();
-    float* iq_ws_ptr = iq_ws.data_ptr<float>();
+    __nv_bfloat16* iq_ws_ptr =
+        reinterpret_cast<__nv_bfloat16*>(iq_ws.data_ptr());
     // No peer -> aim the peer pointers at the local buffer. The host has already
     // checked [row_lo, row_hi) covers every row in that case, so `mine` is always
     // true and the peer branch is dead.
@@ -1126,7 +1136,7 @@ static std::vector<torch::Tensor> run_wq_b(
         iqd.prof = reinterpret_cast<long long*>(iq_prof.value().data_ptr());
     }
 
-    auto out = torch::empty({M, N_TOTAL}, x_fp8.options().dtype(torch::kFloat32));
+    auto out = torch::empty({M, N_TOTAL}, x_fp8.options().dtype(torch::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     // Ready flags for the cross-CTA idx-post handoff (one 128B line per indexer
@@ -1171,14 +1181,14 @@ static std::vector<torch::Tensor> run_wq_b(
     auto w_ptr   = reinterpret_cast<const __nv_fp8_e4m3*>(w_fp8.data_ptr());
     auto xsf_ptr = reinterpret_cast<const uint8_t*>(x_sf.data_ptr());
     auto wsf_ptr = reinterpret_cast<const uint8_t*>(w_sf.data_ptr());
-    auto out_ptr = reinterpret_cast<float*>(out.data_ptr());
+    auto out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
 
     // K-major 128B-swizzled operands; desc_D covers the main q segment only
     // (iq tiles never TMA-store). desc_A/desc_D use the REAL M (globalDim) with
     // the PADDED box: TMA zero-fills OOB loads and clips OOB stores.
     CUtensorMap desc_A   = make_tma_desc_fp8_2d(x_ptr, M, K_DIM, M_pad / NUM_MULTICAST, BLOCK_K);
     CUtensorMap desc_B   = make_tma_desc_fp8_2d(w_ptr, N_MERGED, K_DIM, LOAD_BLOCK_N, BLOCK_K);
-    CUtensorMap desc_D   = make_tma_desc_fp32_2d(
+    CUtensorMap desc_D   = make_tma_desc_bf16_2d(
         out_ptr, M, N_TOTAL, STORE_BLOCK_M, STORE_BLOCK_N_ATOM);
 
     // Grid: persistent, cluster of 2 CTAs. PER DEVICE: the SM count is a device
@@ -1196,12 +1206,15 @@ static std::vector<torch::Tensor> run_wq_b(
     const int total_cta = num_tiles * CLUSTER_SIZE;
     const int max_clusters = min(num_SMs, total_cta) / CLUSTER_SIZE;
     int num_clusters = max_clusters > 0 ? max_clusters : 1;
-    while (num_clusters > 1 && num_tiles % num_clusters != 0) --num_clusters;
+    // Minimize wave count, then use the fewest clusters that achieve it; exact
+    // divisibility would unnecessarily reduce the TPDP 160-tile grid.
+    const int waves = (num_tiles + num_clusters - 1) / num_clusters;
+    num_clusters = (num_tiles + waves - 1) / waves;
     if (const char* e = std::getenv("WQ_B_CLUSTERS")) {
         const int req = atoi(e);
         if (req > 0) num_clusters = req < max_clusters ? req : max_clusters;
     }
-    int grid_size = num_clusters * CLUSTER_SIZE;   // non-const: passed via ptr_args
+    int grid_size = max_clusters * CLUSTER_SIZE;   // full grid serves transform work
     const int max_iters = ((num_tiles + num_clusters - 1) / num_clusters) * num_m_sub;
 
     int64_t* prof_dev = nullptr;
@@ -1214,7 +1227,7 @@ static std::vector<torch::Tensor> run_wq_b(
     }
 
     // head_ssq: ON by default. Callers may pass their own ZERO-INITIALIZED
-    // [M,128] buffer (reuse across layers); otherwise one is allocated here.
+    // [M,NUM_HEADS_OUT] buffer (reuse across layers); otherwise allocate one.
     // enable_ssq=false (and no buffer) -> bit-identical plain GEMM.
     torch::Tensor ssq_t;
     float* ssq_ptr = nullptr;
@@ -1387,11 +1400,11 @@ static std::vector<torch::Tensor> run_wq_b(
     {
         dim3 grid(grid_size, 1, 1);
         // Fused post-processing OFF by default (mock_post=true): launch the plain
-        // 256 threads, keeping warps 8..11 free for future in-kernel cuda-core
+        // 256 threads, keeping warps 8..15 absent when no CUDA-core chain needs them.
         // work. Enabling the fused path launches the async transform warpgroup
-        // too (384) -- the blockDim is TIED to mock_post so the drain handoff
+        // too (512) -- the blockDim is TIED to mock_post so the drain handoff
         // barrier can never wait on threads that were not launched. The fused
-        // indexer compressor / winkv chains also run on warps 8..11.
+        // indexer compressor / winkv chains also run on warps 8..15.
         dim3 block((mock_post && !comp_on && !win_on) ? TPB : TPB_IDX, 1, 1);
         int mock_i = mock_post ? 1 : 0;
 
@@ -1432,7 +1445,7 @@ static std::vector<torch::Tensor> run_wq_b(
 
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
-            &M, &grid_size, &ssq_ptr,
+            &M, &grid_size, &num_clusters, &ssq_ptr,
             &iqd, &iq_ws_ptr, &iq_ready_ptr, &iq_seq,
             &q_pos_ptr, &cos_ptr, &sin_ptr,
             &mock_i, &comp, &prof_dev
@@ -1443,7 +1456,7 @@ static std::vector<torch::Tensor> run_wq_b(
 
     std::vector<torch::Tensor> ret = {out, iq_fp4, iq_sf};
     if (ssq_ptr) ret.push_back(ssq_t);     // present unless enable_ssq=false w/o buffer
-    if (mock_post) ret.push_back(iq_ws);   // export the drained fp32 iq (bitwise test hook)
+    if (mock_post) ret.push_back(iq_ws);   // export drained bf16 iq (bitwise test hook)
     if (comp_on && idx_q4_t.defined()) { ret.push_back(idx_q4_t); ret.push_back(idx_s4_t); }
     if (win_on && win_q8_t.defined()) {
         ret.push_back(win_q8_t); ret.push_back(win_s8_t); ret.push_back(win_rope_t);
@@ -1531,17 +1544,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           "MERGED wq_b + indexer wq_b (w [8192+N,K]: indexer rows FIRST, then "
           "main q), swap path, M in [1,128]. "
-          "Returns [y fp32 [M,65536], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
-          "ssq fp32 [M,128] (unless enable_ssq=False), iq_ws (if mock_post), "
+          "Returns [y bf16 [M,n_main], iq_fp4 i8 [M,64,64], iq_sf i32 [M,64], "
+          "ssq fp32 [M,num_main_heads] (unless enable_ssq=False), iq_ws (if mock_post), "
           "idx_q4 u8 [M,64] + idx_s4 u8 [M,4] (if the compressor bundle is given)]. "
           "head_ssq: optional caller-owned ZERO-INIT buffer; default None allocates. "
           "DEFAULT mock_post=True: 256 threads, GEMM+ssq only -- iq_fp4/iq_sf stay "
           "garbage; run idx_postprocess_standalone over iq_ws. mock_post=False: "
-          "384 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
+          "512 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
           "COMPRESSOR (no split-K): pass cmp_pos [M] i64 / idx_norm [128] / "
           "cos_tab+sin_tab [S,32] / idx_kv+idx_sc [M,8,256] (state rings; the "
           "fresh row is published by front's FRONT-EMIT epilogue, +idx_ape) "
-          "-- warps 8..11 run it beside the GEMM. "
+          "-- warps 8..15 run it beside the GEMM. "
           "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
           "[512] (+ cmp_pos/cos_tab/sin_tab) -> appends win_q8 [M,448] u8, win_s8 "
           "[M,7] f32, win_rope [M,64] bf16. "
@@ -1625,10 +1638,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           [](torch::Tensor iq_f32, torch::Tensor q_pos,
              torch::Tensor rope_cos, torch::Tensor rope_sin) {
               TORCH_CHECK(iq_f32.is_cuda() && iq_f32.is_contiguous()
-                          && iq_f32.scalar_type() == torch::kFloat
+                          && (iq_f32.scalar_type() == torch::kFloat ||
+                              iq_f32.scalar_type() == torch::kBFloat16)
                           && iq_f32.dim() == 3 && iq_f32.size(1) == IDX_NUM_HEADS
                           && iq_f32.size(2) == IDX_HEAD_DIM,
-                          "iq_f32 must be contiguous CUDA fp32 [M,64,128]");
+                          "iq_f32 must be contiguous CUDA fp32/bf16 [M,64,128]");
               const int M = iq_f32.size(0);
               TORCH_CHECK(M >= 1, "empty batch");
               auto iq_fp4 = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM / 2},
@@ -1637,33 +1651,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                         iq_f32.options().dtype(torch::kInt32));
               const int rows = M * IDX_NUM_HEADS;
               auto stream = at::cuda::getCurrentCUDAStream();
-              idx_post_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
-                  iq_f32.data_ptr<float>(), q_pos.data_ptr<int>(),
-                  rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
-                  reinterpret_cast<uint8_t*>(iq_fp4.data_ptr()),
-                  iq_sf.data_ptr<int>(), rows, IDX_NUM_HEADS);
+              if (iq_f32.scalar_type() == torch::kBFloat16)
+                  idx_post_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      reinterpret_cast<const __nv_bfloat16*>(iq_f32.data_ptr()),
+                      q_pos.data_ptr<int>(), rope_cos.data_ptr<float>(),
+                      rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(iq_fp4.data_ptr()),
+                      iq_sf.data_ptr<int>(), rows, IDX_NUM_HEADS);
+              else
+                  idx_post_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      iq_f32.data_ptr<float>(), q_pos.data_ptr<int>(),
+                      rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(iq_fp4.data_ptr()),
+                      iq_sf.data_ptr<int>(), rows, IDX_NUM_HEADS);
               return std::vector<torch::Tensor>{iq_fp4, iq_sf};
           },
-          "Standalone rope+hadamard+fp4quant over fp32 iq [M,64,128] -> "
+          "Standalone rope+hadamard+fp4quant over fp32/bf16 iq [M,64,128] -> "
           "(iq_fp4 [M,64,64] i8, iq_sf [M,64] i32) -- the separate-kernel baseline",
           py::arg("iq_f32"), py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"));
     m.def("head_ssq_standalone",
           [](torch::Tensor y) {
               TORCH_CHECK(y.is_cuda() && y.is_contiguous()
-                          && y.scalar_type() == torch::kFloat
+                          && y.scalar_type() == torch::kBFloat16
                           && y.dim() == 2 && y.size(1) == N_TOTAL,
-                          "y must be contiguous CUDA fp32 [M,65536]");
+                          "y must be contiguous CUDA bf16 [M,N_MAIN]");
               const int M = y.size(0);
               auto ssq = torch::empty({M, NUM_HEADS_OUT},
                                       y.options().dtype(torch::kFloat32));
               const int total = M * NUM_HEADS_OUT;
               auto stream = at::cuda::getCurrentCUDAStream();
               head_ssq_kernel<<<(total + 7) / 8, 256, 0, stream>>>(
-                  y.data_ptr<float>(), ssq.data_ptr<float>(), total);
+                  reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()),
+                  ssq.data_ptr<float>(), total);
               return ssq;
           },
-          "Standalone per-(row, head) sum-of-squares over the fp32 main q "
-          "[M,65536] -> ssq [M,128] -- the separate-kernel baseline for the "
-          "fused head_ssq accumulation",
+          "Standalone per-(row, head) sum-of-squares over the materialized bf16 "
+          "main q [M,N_MAIN] -> ssq [M,num_heads]",
           py::arg("y"));
 }

@@ -1,22 +1,22 @@
 """
 Test & Benchmark: MERGED wq_b projection (tcgen05 FP8 block-scale, swap-AB,
 M<=128) with the sparse-indexer projection fused in. Direct execution defaults
-to the TP2 single-rank shape:
+to the full-rank shape:
 
-  x_fp8[M,1536] @ w_fp8[36864,1536].T
-    -> y[M,32768] FP32                        (64 local main-Q heads)
-    -> iq_fp4[M,32,64] i8 + iq_sf[M,32] i32   (32 local index-Q heads:
+  x_fp8[M,1536] @ w_fp8[73728,1536].T
+    -> y[M,65536] BF16                         (128 main-Q heads)
+    -> iq_fp4[M,64,64] i8 + iq_sf[M,64] i32   (64 index-Q heads:
        rope + hadamard-128 + per-32 MXFP4, run by the async xform warpgroup)
 
-Use --full-rank for the original 65536+8192 geometry. Importers keep the
-original full-rank defaults unless they explicitly request the TP2 module.
+Use --tpdp for main-Q TP2 with all 64 index-Q heads replicated; token DP is
+outside this single-rank benchmark.
 
 Requires: NVIDIA Blackwell (sm_100+), CUDA 12.8+, CUTLASS 3.x.
 
 Native DSV4 scale-factor layout expected by the kernel:
   - dtype float8_e8m0fnu (raw uint8 is also accepted).
   - x_sf: [M, K/128] = [M, 12], one scale per token/K128.
-  - w_sf: [N/128, K/128] = [288, 12] for TP2, one scale per N128xK128 block.
+  - w_sf: [N/128, K/128], one scale per N128xK128 block.
   - UE8M0 byte e encodes scale 2^(e-127); e=127 (0x7F) => scale 1.0.
 """
 import argparse
@@ -29,12 +29,10 @@ from bench_utils import bench_kineto   # DeepGEMM's bench_kineto, vendored verba
 K_DIM   = 1536
 FULL_N_TOTAL = 65536
 FULL_N_IDX = 64 * 128
-TP2_N_TOTAL = 32768
-TP2_N_IDX = 32 * 128
+TPDP_N_TOTAL = 32768
 
-# Importers (notably test_e2e_decode.py) retain the existing full-rank defaults.
-# The standalone test entry point switches these globals before constructing any
-# tensors so the same correctness/ablation harness measures a TP2 single rank.
+# Importers retain full-rank defaults. Entry points call configure_geometry()
+# before constructing tensors when they need the TPDP idx-replicated geometry.
 N_TOTAL = FULL_N_TOTAL
 N_IDX = FULL_N_IDX
 N_MERGED = N_TOTAL + N_IDX
@@ -44,16 +42,15 @@ SF_K    = K_DIM // QUANT_BLOCK_K          # 12
 UE8M0_ONE = 0x7F                    # exponent 127 -> 2^0 = 1.0
 
 
-def configure_geometry(tp2_single_rank):
+def configure_geometry(tpdp=False):
+    """Select full rank or TP2 main-Q with replicated index-Q."""
     global N_TOTAL, N_IDX, N_MERGED
-    if tp2_single_rank:
-        N_TOTAL, N_IDX = TP2_N_TOTAL, TP2_N_IDX
-    else:
-        N_TOTAL, N_IDX = FULL_N_TOTAL, FULL_N_IDX
+    N_TOTAL = TPDP_N_TOTAL if tpdp else FULL_N_TOTAL
+    N_IDX = FULL_N_IDX
     N_MERGED = N_TOTAL + N_IDX
 
 
-def load_module(tp2_single_rank=False):
+def load_module(tpdp=False):
     from torch.utils.cpp_extension import load
     this_dir = os.path.dirname(os.path.abspath(__file__))
     proj_dir = os.path.dirname(this_dir)
@@ -75,10 +72,11 @@ def load_module(tp2_single_rank=False):
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
         f'-gencode=arch=compute_{sm}a,code=sm_{sm}a',
     ]
-    if tp2_single_rank:
-        cuda_flags.append('-DWQ_B_TP2_SINGLE_RANK=1')
+    if tpdp:
+        cuda_flags.append('-DWQ_B_TPDP=1')
+    name = 'wq_b_fp8_gemm_tpdp' if tpdp else 'wq_b_fp8_gemm'
     return load(
-        name='wq_b_fp8_gemm_tp2_rank' if tp2_single_rank else 'wq_b_fp8_gemm',
+        name=name,
         sources=[os.path.join(proj_dir, 'kernels', 'wq_b_fp8_gemm.cu')],
         extra_include_paths=[os.path.join(proj_dir, 'include'), cutlass_dir, cutlass_tools_dir],
         extra_cuda_cflags=cuda_flags,
@@ -201,13 +199,13 @@ def dequant_kernel_iq(iq_fp4, iq_sf):
 # ==================== correctness ====================
 def test_merged(module, M):
     """One shot per M, quiet on PASS:
-      A) main q [M,65536] vs the dequantized torch GEMM (non-trivial scales)
+      A) BF16 main q vs the dequantized torch GEMM (non-trivial scales)
       B) dequant(iq_fp4, iq_sf) vs the torch reference chain
       C) SF words vs the reference power-of-2 scales
       D) standalone idx_post_kernel vs the same torch reference (same fp32 input)
-      E) head_ssq RED accumulation vs the kernel's own main-q output
+      E) FP32-accumulator head_ssq is close to a BF16-output reference
       F) BITWISE async-handoff closed loop: the mock run exports the kernel's
-         own drained fp32 iq; the standalone kernel over it (same
+         own drained bf16 iq; the standalone kernel over it (same
          idx_postprocess_row code, same input) must reproduce the fused
          iq_fp4/iq_sf bit-exactly -- catches drain/barrier/xform races that a
          cosine threshold would absorb"""
@@ -227,11 +225,12 @@ def test_merged(module, M):
     y, iq_fp4, iq_sf, _ = module.wq_b_proj_gemm_merged(
         x, as_ue8m0(ea), w, as_ue8m0(eb), q_pos, cos_tab, sin_tab,
         head_ssq=ssq, mock_post=False)
+    dtype_ok = y.dtype == torch.bfloat16
 
     # A) main q vs torch ref -- the indexer weight LEADS w, main q follows
     xd = dequant_act(x, ea)
     ref_main = xd @ dequant_weight(w[N_IDX:], eb[N_IDX // 128:]).t()
-    main_cos = F.cosine_similarity(y.flatten(), ref_main.flatten(), dim=0).item()
+    main_cos = F.cosine_similarity(y.float().flatten(), ref_main.flatten(), dim=0).item()
 
     # B/C) iq chain vs torch ref from the fp32 GEMM of the FIRST N_IDX weight rows
     iq_ref_f32 = xd @ dequant_weight(w[:N_IDX], eb[:N_IDX // 128]).t()          # [M, N_IDX]
@@ -246,8 +245,9 @@ def test_merged(module, M):
     sa_deq, _ = dequant_kernel_iq(sa_fp4, sa_sf)
     sa_cos = F.cosine_similarity(sa_deq.flatten(), ref_deq.flatten(), dim=0).item()
 
-    # E) head_ssq vs the kernel's OWN main-q output (isolates the RED accumulation)
-    ssq_ref = y.view(M, N_TOTAL // 512, 512).double().square().sum(-1).float()
+    # Fused SSQ uses pre-round FP32 accumulators; materialized y also includes
+    # BF16 store rounding.
+    ssq_ref = y.float().view(M, N_TOTAL // 512, 512).double().square().sum(-1).float()
     ssq_rel = ((ssq - ssq_ref).abs() / (ssq_ref + 1e-6)).max().item()
 
     # G) standalone head_ssq kernel over the same y
@@ -263,9 +263,10 @@ def test_merged(module, M):
     bw_fp4, bw_sf = module.idx_postprocess_standalone(iq_ws, q_pos, cos_tab, sin_tab)
     bit_ok = torch.equal(bw_fp4, iq_fp4) and torch.equal(bw_sf, iq_sf)
 
-    ok = (main_cos > 0.99 and iq_cos > 0.99 and sf_match > 0.98
-          and sa_cos > 0.999 and ssq_rel < 1e-3 and ssq_sa_rel < 1e-3 and bit_ok)
-    line = (f"main_cos={main_cos:.6f} iq_cos={iq_cos:.6f} sf={sf_match*100:.2f}% "
+    ok = (dtype_ok and main_cos > 0.99 and iq_cos > 0.99 and sf_match > 0.98
+          and sa_cos > 0.999 and ssq_rel < 3e-3 and ssq_sa_rel < 1e-3 and bit_ok)
+    line = (f"y_dtype={y.dtype} main_cos={main_cos:.6f} iq_cos={iq_cos:.6f} "
+            f"sf={sf_match*100:.2f}% "
             f"sa_cos={sa_cos:.6f} ssq_rel={ssq_rel:.1e} ssq_sa_rel={ssq_sa_rel:.1e} "
             f"bitwise={'OK' if bit_ok else 'MISMATCH'}")
     if ok:
@@ -273,7 +274,7 @@ def test_merged(module, M):
     else:
         print(f"  [FAIL] merged M={M}")
         print(f"    {line}")
-        print(f"    main max_diff: {(y - ref_main).abs().max().item():.4e}")
+        print(f"    main max_diff: {(y.float() - ref_main).abs().max().item():.4e}")
         print(f"    iq   max_diff: {(ker_deq - ref_deq).abs().max().item():.4e}")
         if not bit_ok:
             nf = (bw_fp4 != iq_fp4).sum().item()
@@ -333,7 +334,7 @@ def _quant_case(module, M, tag, gate_kw, ref_fn):
     # main q consumes the FRESH fused quant; the indexer weight LEADS w, so the
     # main-q rows start at N_IDX
     ref_main = dequant_act(q1, s1) @ dequant_weight(w[N_IDX:], eb[N_IDX // 128:]).t()
-    main_cos = F.cosine_similarity(y1.flatten(), ref_main.flatten(), dim=0).item()
+    main_cos = F.cosine_similarity(y1.float().flatten(), ref_main.flatten(), dim=0).item()
 
     ok = fp8_match > 0.999 and sf_match > 0.999 and main_cos > 0.99 and det_ok
     print(f"  [{'PASS' if ok else 'FAIL'}] {tag} M={M:<4} fp8={fp8_match*100:.2f}% "
@@ -366,7 +367,7 @@ def benchmark_merged(module):
     comp/win rows use all-compress positions (upper bound; production is 1-in-4).
     cuBLAS is bare fp8 _scaled_mm at the same local shape; fused_BW uses fused."""
     print("\n" + "=" * 60)
-    mode = "TP2 single rank" if N_MERGED == TP2_N_TOTAL + TP2_N_IDX else "full rank"
+    mode = "TPDP (main TP2 + index replicated)" if N_TOTAL == TPDP_N_TOTAL else "full rank"
     print(f"Benchmark: MERGED wq_b ({mode}, main={N_TOTAL}, index={N_IDX}, "
           f"N={N_MERGED}), all fusions")
     print("=" * 60)
@@ -380,13 +381,14 @@ def benchmark_merged(module):
     num_tiles = N_MERGED // 256
     num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     num_clusters = min(num_sms, num_tiles * 2) // 2
-    while num_clusters > 1 and num_tiles % num_clusters:
-        num_clusters -= 1
+    # Mirror the kernel's minimum-wave scheduler.
+    waves = -(-num_tiles // num_clusters)
+    num_clusters = -(-num_tiles // waves)
     requested_clusters = int(os.environ.get('WQ_B_CLUSTERS', 0))
     if requested_clusters > 0:
         num_clusters = min(requested_clusters, min(num_sms, num_tiles * 2) // 2)
-    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); M < 32 pads to the "
-          f"32-row template (GEMM time ~= M=32)")
+    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); M dispatches to the "
+          f"next 32-row template (TMA handles OOB rows; no caller-side padding)")
     print(f"  scheduler {num_tiles} cluster tiles / {num_clusters} resident clusters "
           f"-> max {((num_tiles + num_clusters - 1) // num_clusters)} iterations/cluster")
     print(f"  {'M':<5} {'gemm(us)':<9} {'fused(us)':<10} {'d_post':<7} {'d_ssq':<7} "
@@ -400,7 +402,8 @@ def benchmark_merged(module):
     #   - empty_cache() per cell -> canonical allocator state
     #   - ssqbuf from a FIXED max-size pool -> same address every cell
     ssqbuf_pool = torch.zeros(128, N_TOTAL // 512, device=dev, dtype=torch.float32)
-    for M in list(range(1, 17)) + [31, 32, 61, 64, 96, 97, 127, 128]:
+    # M < 32 shares one specialization, so sample its boundaries and midpoint.
+    for M in [1, 16, 31, 32, 61, 64, 96, 97, 127, 128]:
         torch.cuda.empty_cache()
         x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
         x_sf = make_act_sf_ones(M, dev)
@@ -446,7 +449,7 @@ def benchmark_merged(module):
         try:
             cb_pair = bench_kineto(
                 lambda: torch._scaled_mm(x, wm_t, scale_a=one, scale_b=one,
-                                         out_dtype=torch.float32),
+                                         out_dtype=torch.bfloat16),
                 ('nvjet', 'reduce'), suppress_kineto_output=True)
             cb = 1e6 * sum(cb_pair)
         except Exception as err:
@@ -454,7 +457,7 @@ def benchmark_merged(module):
             if M == 32:
                 print(f"  (cuBLAS baseline unavailable: {err})")
         obytes = (weight_bytes + N_MERGED // WEIGHT_QUANT_BLOCK_N * SF_K +
-                  M * K_DIM + M * SF_K + M * N_TOTAL * 4 +
+                  M * K_DIM + M * SF_K + M * N_TOTAL * 2 +
                   M * (N_IDX // 128) * 68 + M * (N_TOTAL // 512) * 4)
         bw = obytes / (uf * 1e-6) / 1e9
         cb_s = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
@@ -703,9 +706,9 @@ def profile_pipeline(module, M=128, clock_ghz=1.8):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--full-rank', action='store_true',
-        help='run the original main=65536/index=8192 geometry instead of the '
-             'default TP2 single-rank main=32768/index=4096 geometry')
+        '--tpdp', action='store_true',
+        help='main-Q TP2 plus all 64 index-Q heads replicated '
+             '(main=32768/index=8192); default is full rank')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -718,33 +721,32 @@ if __name__ == '__main__':
         print(f"ERROR: tcgen05 block-scale requires sm_100+ (Blackwell), got sm_{sm}")
         sys.exit(1)
 
-    tp2_single_rank = not args.full_rank
-    configure_geometry(tp2_single_rank)
-    print(f"Geometry: {'TP2 single rank' if tp2_single_rank else 'full rank'} "
+    configure_geometry(args.tpdp)
+    geo = 'TPDP main TP2 + replicated indexer' if args.tpdp else 'full rank'
+    print(f"Geometry: {geo} "
           f"main={N_TOTAL}, index={N_IDX}, merged={N_MERGED}, "
           f"cluster_tiles={N_MERGED // 256}")
-    module = load_module(tp2_single_rank=tp2_single_rank)
+    module = load_module(tpdp=args.tpdp)
     assert (module.n_main, module.n_index, module.n_merged) == \
         (N_TOTAL, N_IDX, N_MERGED), "Python/kernel WQB geometry mismatch"
 
     print("\nCorrectness (merged, non-trivial scales, arbitrary batch):")
-    # 32-aligned template points + small/pow2 + primes (host pads to 32)
     results = [test_merged(module, M)
-               for M in [1, 2, 7, 16, 31, 32, 61, 64, 96, 97, 127, 128]]
+               for M in [1, 31, 32, 61, 64, 96, 97, 127, 128]]
 
     print("\nCorrectness (fused indexer compressor, delivery port):")
-    results += [test_comp(module, M) for M in [1, 2, 7, 32, 61, 128]]
-    results += [test_comp(module, M, mock_post=False) for M in [7, 61, 128]]
+    results += [test_comp(module, M) for M in [1, 32, 61, 128]]
+    results += [test_comp(module, M, mock_post=False) for M in [31, 61, 128]]
 
     print("\nCorrectness (fused local kv window, CSA stage 4):")
-    results += [test_win(module, M) for M in [1, 7, 32, 61, 128]]
+    results += [test_win(module, M) for M in [1, 32, 61, 128]]
     results += [test_win(module, M, mock_post=False) for M in [61, 128]]
 
     print("\nCorrectness (fused quant prologue, isolation):")
-    results += [test_quant_iso(module, M) for M in [1, 7, 32, 61, 128]]
+    results += [test_quant_iso(module, M) for M in [1, 32, 61, 128]]
 
     print("\nCorrectness (fused rmsnorm+quant prologue, production form):")
-    results += [test_qnorm(module, M) for M in [1, 2, 7, 32, 61, 128]]
+    results += [test_qnorm(module, M) for M in [1, 32, 61, 128]]
 
     benchmark_merged(module)
 

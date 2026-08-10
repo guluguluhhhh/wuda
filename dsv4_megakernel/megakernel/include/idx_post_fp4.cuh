@@ -28,16 +28,38 @@ struct IdxRowIn {
     float c8[8], s8[8];   // rope cos/sin (loaded for e >= 4 only)
 };
 
+// The standalone path accepts FP32; the fused drain stores the transform's
+// initial BF16 rounding directly in scratch.
+__device__ __forceinline__ void idx_load16(const float* __restrict__ p, float4* out) {
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; ++ i)
+        out[i] = *reinterpret_cast<const float4*>(p + i * 4);
+}
+
+__device__ __forceinline__ void idx_load16(const __nv_bfloat16* __restrict__ p,
+                                           float4* out) {
+    const uint4 a = *reinterpret_cast<const uint4*>(p);
+    const uint4 b = *reinterpret_cast<const uint4*>(p + 8);
+    const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; ++ i) {
+        const float2 lo = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&w[i * 2]));
+        const float2 hi = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(&w[i * 2 + 1]));
+        out[i] = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+}
+
+template <typename src_t>
 __device__ __forceinline__ void idx_row_load(
-    const float* __restrict__ src_row,  // this (m, head)'s 128-col fp32 row
+    const src_t* __restrict__ src_row,   // this (m, head)'s 128-col row
     uint32_t e,                         // 16-col block 0..7
     int m,
     const int* __restrict__ q_pos,
     const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
     IdxRowIn& d) {
-    #pragma unroll
-    for (uint32_t i = 0; i < 4; ++ i)
-        d.raw[i] = *reinterpret_cast<const float4*>(src_row + e * 16 + i * 4);
+    idx_load16(src_row + e * 16, d.raw);
     if (e >= 4) {
         // this lane's 8 rotary pairs are ids (e-4)*8 .. +7: two float4 loads per
         // table instead of 16 scalar __ldg on the dependency chain
@@ -53,6 +75,7 @@ __device__ __forceinline__ void idx_row_load(
     }
 }
 
+template <bool kInputAlreadyBf16>
 __device__ __forceinline__ void idx_row_compute(
     const IdxRowIn& d, uint32_t e, int m, int head,
     uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,
@@ -71,8 +94,10 @@ __device__ __forceinline__ void idx_row_compute(
     for (uint32_t i = 0; i < 4; ++ i) {
         v[i * 4 + 0] = d.raw[i].x; v[i * 4 + 1] = d.raw[i].y;
         v[i * 4 + 2] = d.raw[i].z; v[i * 4 + 3] = d.raw[i].w;
-        bf16r2(v[i * 4 + 0], v[i * 4 + 1]);
-        bf16r2(v[i * 4 + 2], v[i * 4 + 3]);
+        if constexpr (!kInputAlreadyBf16) {
+            bf16r2(v[i * 4 + 0], v[i * 4 + 1]);
+            bf16r2(v[i * 4 + 2], v[i * 4 + 3]);
+        }
     }
     // RoPE on the tail 64 columns (e >= 4): interleaved (even, odd) pairs
     if (e >= 4) {
@@ -111,35 +136,47 @@ __device__ __forceinline__ void idx_row_compute(
     // power-of-2 scale (golden fast_round_scale): 2^ceil(log2(amax/6)) over the
     // 32-col quant block = this lane's 16 + its xor-1 partner's 16
     constexpr float kHadamardScale = 0.08838834764831845f;   // 1/sqrt(128)
-    float amax = 0.0f;
+    uint32_t bv[8];
+    uint32_t amax_bf16 = 0;
     #pragma unroll
-    for (uint32_t i = 0; i < 16; i += 2) {
-        v[i]     *= kHadamardScale;
-        v[i + 1] *= kHadamardScale;
-        bf16r2(v[i], v[i + 1]);
-        amax = fmaxf(amax, fmaxf(fabsf(v[i]), fabsf(v[i + 1])));
+    for (uint32_t i = 0; i < 8; ++i) {
+        const __nv_bfloat162 b = __floats2bfloat162_rn(
+            v[i * 2] * kHadamardScale,
+            v[i * 2 + 1] * kHadamardScale);
+        bv[i] = *reinterpret_cast<const uint32_t*>(&b);
+        const uint32_t lo = bv[i] & 0x7fffu;
+        const uint32_t hi = (bv[i] >> 16) & 0x7fffu;
+        amax_bf16 = max(amax_bf16, max(lo, hi));
     }
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax_bf16 = max(amax_bf16,
+                    __shfl_xor_sync(0xffffffffu, amax_bf16, 1));
+    float amax = __uint_as_float(amax_bf16 << 16);
     amax = fmaxf(amax, 7.052966400779935e-38f);              // 6 * 2^-126
     const uint32_t rbits = __float_as_uint(amax * (1.0f / 6.0f));
     const int32_t sexp = static_cast<int32_t>((rbits >> 23) & 0xff) - 127
                          + (((rbits & 0x7fffffu) != 0) ? 1 : 0);
-    const float inv_scale = __uint_as_float(static_cast<uint32_t>(127 - sexp) << 23);
+    const uint32_t inv_bf16 = static_cast<uint32_t>(127 - sexp) << 7;
+    const uint32_t inv_bf16x2 = inv_bf16 | (inv_bf16 << 16);
     const uint32_t e8m0 = static_cast<uint32_t>(sexp + 127);
 
-    // 16 values -> 8 packed fp4 bytes (low nibble = even element)
+    // Scaling a bf16 by a power of two is exact. Keep the rounded Hadamard
+    // values packed, use one bf16x2 multiply, and convert that pair directly to
+    // FP4 instead of expanding both values back to FP32.
     uint32_t packed[2];
     #pragma unroll
     for (uint32_t i = 0; i < 2; ++ i) {
         uint32_t w = 0;
         #pragma unroll
         for (uint32_t j = 0; j < 4; ++ j) {
-            const float lo = v[i * 8 + j * 2] * inv_scale;
-            const float hi = v[i * 8 + j * 2 + 1] * inv_scale;
+            uint32_t scaled;
+            asm volatile("mul.rn.bf16x2 %0, %1, %2;"
+                         : "=r"(scaled)
+                         : "r"(bv[i * 4 + j]), "r"(inv_bf16x2));
             uint32_t b32;
-            asm volatile("{\n\t.reg .b8 b;\n\tcvt.rn.satfinite.e2m1x2.f32 b, %2, %1;\n\t"
+            asm volatile("{\n\t.reg .b8 b;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.bf16x2 b, %1;\n\t"
                          "cvt.u32.u8 %0, b;\n\t}"
-                         : "=r"(b32) : "f"(lo), "f"(hi));
+                         : "=r"(b32) : "r"(scaled));
             w |= b32 << (j * 8);
         }
         packed[i] = w;
@@ -161,15 +198,17 @@ __device__ __forceinline__ void idx_row_compute(
 }
 
 // load + compute in one step (no pipelining)
+template <typename src_t>
 __device__ __forceinline__ void idx_postprocess_row(
-    const float* __restrict__ src_row, uint32_t e, int m, int head,
+    const src_t* __restrict__ src_row, uint32_t e, int m, int head,
     const int* __restrict__ q_pos,
     const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
     uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,
     int num_heads = idx_post::NUM_HEADS, bool store_ok = true) {
     IdxRowIn d;
     idx_row_load(src_row, e, m, q_pos, rope_cos, rope_sin, d);
-    idx_row_compute(d, e, m, head, iq_fp4, iq_sf, num_heads, store_ok);
+    idx_row_compute<sizeof(src_t) == sizeof(__nv_bfloat16)>(
+        d, e, m, head, iq_fp4, iq_sf, num_heads, store_ok);
 }
 
 // ======================== Standalone post-processing kernel ========================
@@ -177,9 +216,10 @@ __device__ __forceinline__ void idx_postprocess_row(
 // CTA. Out-of-range threads CLAMP to the last row (keeps warps converged for
 // the full-mask shuffles) and suppress their stores. `static`: each including
 // TU / extension module carries its own instantiation.
+template <typename src_t>
 static __global__ void __launch_bounds__(256, 1)
 idx_post_kernel(
-    const float* __restrict__ iq_f32,   // [M, 64, 128]
+    const src_t* __restrict__ iq_f32,   // [M, 64, 128]
     const int* __restrict__ q_pos,
     const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
     uint8_t* __restrict__ iq_fp4, int* __restrict__ iq_sf,

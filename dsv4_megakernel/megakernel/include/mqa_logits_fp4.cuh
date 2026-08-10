@@ -684,6 +684,10 @@ struct MainCompressorArgs {
     const int* slot_map = nullptr;   // [M]
     uint8_t* cmp_cache  = nullptr;   // MODEL1 pages [P, 37440]B
     const int* cmp_dst  = nullptr;   // [M]
+    // Attention may be request-DP while this cache-producing tail remains
+    // replicated. In that case this row count is the global batch, independent
+    // of the attention kernel's local seq_len.
+    uint32_t seq_len = 0;
 };
 
 // MODEL1_FP8Sparse page geometry (FlashMLA quant.py, d=512): body = 64 x
@@ -976,7 +980,7 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         if (comp.kv != nullptr) {
             DG_STATIC_ASSERT(kNumTailThreads == 128, "coop compressor assumes 4 tail warps");
             const uint32_t tail_warp = warp_idx - (kSpecWarpStart + 4);
-            for (uint32_t m = blockIdx.x; m < seq_len; m += gridDim.x) {
+            for (uint32_t m = blockIdx.x; m < comp.seq_len; m += gridDim.x) {
                 const long long p = comp.pos[m];
                 if (((p + 1) & 3) != 0)
                     continue;                              // not a compress row
