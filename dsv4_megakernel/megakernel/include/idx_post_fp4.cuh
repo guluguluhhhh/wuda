@@ -162,6 +162,19 @@ __device__ __forceinline__ void idx_row_compute(
     // Scaling a bf16 by a power of two is exact. Keep the rounded Hadamard
     // values packed, use one bf16x2 multiply, and convert that pair directly to
     // FP4 instead of expanding both values back to FP32.
+    //
+    // cvt.rn.satfinite.e2m1x2.bf16x2 needs PTX ISA 9.1 (CUDA 13.1+); CUDA 13.0 is
+    // ISA 9.0 and ptxas rejects the type combination outright ("Unexpected
+    // instruction types specified for 'cvt'"). The e2m1x2.f32 form is ISA 8.6, so
+    // fall back to it by widening each bf16 half -- bf16 -> f32 just appends zero
+    // mantissa bits, so both forms round the same real value to e2m1 under the
+    // same RNE and the packed bytes are IDENTICAL.
+#if (__CUDACC_VER_MAJOR__ > 13) || \
+    (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1)
+  #define IDX_FP4_PACK_BF16X2 1
+#else
+  #define IDX_FP4_PACK_BF16X2 0
+#endif
     uint32_t packed[2];
     #pragma unroll
     for (uint32_t i = 0; i < 2; ++ i) {
@@ -173,14 +186,26 @@ __device__ __forceinline__ void idx_row_compute(
                          : "=r"(scaled)
                          : "r"(bv[i * 4 + j]), "r"(inv_bf16x2));
             uint32_t b32;
+#if IDX_FP4_PACK_BF16X2
             asm volatile("{\n\t.reg .b8 b;\n\t"
                          "cvt.rn.satfinite.e2m1x2.bf16x2 b, %1;\n\t"
                          "cvt.u32.u8 %0, b;\n\t}"
                          : "=r"(b32) : "r"(scaled));
+#else
+            // low half -> lower nibble, high half -> upper nibble, matching the
+            // packed form: `cvt d, a, b` puts a in the upper half of d.
+            const float s_lo = __uint_as_float(scaled << 16);
+            const float s_hi = __uint_as_float(scaled & 0xffff0000u);
+            asm volatile("{\n\t.reg .b8 b;\n\t"
+                         "cvt.rn.satfinite.e2m1x2.f32 b, %2, %1;\n\t"
+                         "cvt.u32.u8 %0, b;\n\t}"
+                         : "=r"(b32) : "f"(s_lo), "f"(s_hi));
+#endif
             w |= b32 << (j * 8);
         }
         packed[i] = w;
     }
+#undef IDX_FP4_PACK_BF16X2
     if (store_ok) {
         const uint2 pk = make_uint2(packed[0], packed[1]);
         const int64_t off = ((int64_t)m * num_heads + head) * (idx_post::HEAD_DIM / 2);
