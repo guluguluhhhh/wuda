@@ -1075,19 +1075,12 @@ def benchmark(mods, w, ncmp=2048):
         except Exception as err:
             print(f"  (graph capture failed at B={B}: {err})")
 
-        # ---- perfetto timeline: 3x COLD direct chain + 1x graph replay.
-        # Drop the json onto ui.perfetto.dev / chrome://tracing. The flush
-        # memsets show up too -- they are the inter-layer gaps, not part of
-        # any stage.
-        if B in (16, 128):
+        # ---- perfetto timeline: one cold-L2 graph replay only. ------------
+        if B in (16, 128) and not math.isnan(t_graph):
+            flush_l2()
             with _prof(activities=[ProfilerActivity.CPU,
                                    ProfilerActivity.CUDA]) as prof:
-                for _ in range(3):
-                    flush_l2()
-                    chain()
-                if not math.isnan(t_graph):
-                    flush_l2()
-                    g.replay()
+                g.replay()
                 torch.cuda.synchronize()
             tp = f"/tmp/e2e_trace_{os.getpid()}_B{B}.json"
             prof.export_chrome_trace(tp)
