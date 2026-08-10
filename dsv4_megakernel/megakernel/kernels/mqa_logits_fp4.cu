@@ -169,7 +169,7 @@ static int auto_kv_stages(int B, int max_context_len, int num_ctas) {
     return 8;
 }
 
-template <typename logits_dtype_t, int kKVStages>
+template <typename logits_dtype_t, int kKVStages, int kPageKV>
 static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          const int* context_lens, const int* block_table, int bt_stride,
                          void* logits,
@@ -184,7 +184,7 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          cudaStream_t stream) {
     auto kernel = &deep_gemm::sm100_fp4_mqa_logits<
         NUM_HEADS, HEAD_DIM,
-        BLOCK_Q, BLOCK_KV, PAGE_KV, NUM_Q_STAGES, kKVStages,
+        BLOCK_Q, BLOCK_KV, kPageKV, NUM_Q_STAGES, kKVStages,
         NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS, logits_dtype_t>;
 
     // cudaFuncSetAttribute is PER DEVICE state, so this cache is indexed by device
@@ -252,7 +252,9 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
 static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             torch::Tensor kv_cache, torch::Tensor weights,
                             const int* context_lens, const int* block_table, int bt_stride,
-                            int num_blocks, int B, int max_context_len,
+                            int num_blocks, int kv_entries_per_block,
+                            int64_t kv_block_stride_bytes,
+                            int B, int max_context_len,
                             at::ScalarType out_dtype, int stride_logits,
                             int num_ctas, int num_kv_stages,
                             float comp_eps, unsigned long long* prof,
@@ -263,7 +265,6 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             const unsigned int* iq_gen = nullptr,
                             int iq_world = 0, int iq_skip = -1) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
-    constexpr int PAGE_STRIDE = PAGE_KV * (HEAD_DIM / 2 + 4);   // fused page bytes (4352)
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const int q_elem  = (int)q.element_size();    // 1 (int8-packed fp4)
@@ -283,17 +284,20 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                                  H, B, H, BLOCK_Q, (int)weights.stride(0), 0);
     // Fused page cache split into strided views (DeepGEMM attention.hpp from_blob
     // pattern): KV = 3D fp4 view (outermost dim = physical page id, page stride
-    // skips each page's SF tail); SF = 2D int32 view at byte offset PAGE_KV*(D/2).
+    // skips each page's SF tail); SF begins after every entry's FP4 body.
     CUtensorMap dKV = make_tma_3d("kv_paged", kv_cache.data_ptr(), FP4_DT, q_elem,
-                                  D, PAGE_KV, num_blocks,
-                                  D, PAGE_KV, 1,
-                                  /*row stride=*/D / 2, /*page stride=*/PAGE_STRIDE,
+                                  D, kv_entries_per_block, num_blocks,
+                                  D, kv_entries_per_block, 1,
+                                  /*row stride=*/D / 2,
+                                  /*page stride=*/kv_block_stride_bytes,
                                   D / 2, /*is_fp4=*/true, /*unpacked=*/false);
     CUtensorMap dSFKV = make_tma_2d("sf_kv_paged",
-                                    static_cast<uint8_t*>(kv_cache.data_ptr()) + (int64_t)PAGE_KV * (D / 2),
+                                    static_cast<uint8_t*>(kv_cache.data_ptr())
+                                        + (int64_t)kv_entries_per_block * (D / 2),
                                     CU_TENSOR_MAP_DATA_TYPE_INT32, sf_elem,
-                                    PAGE_KV, num_blocks, PAGE_KV, 1,
-                                    PAGE_STRIDE / 4, 0);
+                                    kv_entries_per_block, num_blocks,
+                                    kv_entries_per_block, 1,
+                                    kv_block_stride_bytes / 4, 0);
 
     // Grid: num_ctas CTAs (default = #SMs) split the global KV tile pool; empty
     // chunks exit immediately, so grid.x never over-subscribes.
@@ -303,16 +307,24 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
         num_kv_stages = auto_kv_stages(B, max_context_len, num_ctas);
     const int smem = compute_smem_bytes(num_kv_stages);
     // Capacity clamp for context_lens: whatever the block_table can address.
-    const int seq_len_kv_cap = bt_stride * PAGE_KV;
+    const int seq_len_kv_cap = bt_stride * kv_entries_per_block;
 
     // Instantiated combos: {4,6,8,10} KV stages x {f32, bf16} logits (AOT stand-in
     // for DeepGEMM's JIT per-shape configs).
+    #define MQA_LT_PAGE(dtype_t, stages_, page_) \
+        launch_typed<dtype_t, stages_, page_>(B, seq_len_kv_cap, stride_logits, \
+                                              context_lens, block_table, bt_stride, lp, \
+                                              iq_ready, iq_gen, iq_world, iq_skip, \
+                                              comp_eps, prof, comp, attn_mock, \
+                                              dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
     #define MQA_LT(dtype_t, stages_) \
-        launch_typed<dtype_t, stages_>(B, seq_len_kv_cap, stride_logits, \
-                                       context_lens, block_table, bt_stride, lp, \
-                                       iq_ready, iq_gen, iq_world, iq_skip, \
-                                       comp_eps, prof, comp, attn_mock, \
-                                       dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
+        do { \
+            switch (kv_entries_per_block) { \
+                case 32: MQA_LT_PAGE(dtype_t, stages_, 32); break; \
+                case 64: MQA_LT_PAGE(dtype_t, stages_, 64); break; \
+                default: MQA_LT_PAGE(dtype_t, stages_, 128); break; \
+            } \
+        } while (0)
     TORCH_CHECK(num_kv_stages == 4 || num_kv_stages == 6 || num_kv_stages == 8 || num_kv_stages == 10,
                 "num_kv_stages must be 0 (auto) or one of 4/6/8/10, got ", num_kv_stages);
     if (out_dtype == torch::kFloat) {
@@ -331,14 +343,15 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
         }
     }
     #undef MQA_LT
+    #undef MQA_LT_PAGE
 }
 
 // Shared checks for the PAGED decode entries. Returns (B, num_blocks, max_pages).
 static std::tuple<int, int, int> check_paged(
     const torch::Tensor& q, const torch::Tensor& sf_q, const torch::Tensor& kv_cache,
     const torch::Tensor& weights, const torch::Tensor& context_lens,
-    const torch::Tensor& block_table, at::ScalarType out_dtype) {
-    constexpr int PAGE_BYTES = PAGE_KV * (HEAD_DIM / 2 + 4);   // 4352
+    const torch::Tensor& block_table, at::ScalarType out_dtype,
+    int kv_entries_per_block, int64_t& kv_block_stride_bytes) {
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kInt8 && q.dim() == 3
                 && q.size(1) == NUM_HEADS && q.size(2) == HEAD_DIM / 2 && q.is_contiguous(),
                 "q must be CUDA int8-packed fp4 [B,H,D/2] contiguous");
@@ -352,13 +365,20 @@ static std::tuple<int, int, int> check_paged(
                 && weights.sizes() == torch::IntArrayRef({B, NUM_HEADS})
                 && weights.stride(1) == 1, "weights [B,H] f32");
     TORCH_CHECK(out_dtype == torch::kFloat || out_dtype == torch::kBFloat16, "out_dtype float/bf16");
-    TORCH_CHECK(kv_cache.is_cuda() && kv_cache.is_contiguous()
+    TORCH_CHECK(kv_entries_per_block == 32 || kv_entries_per_block == 64 ||
+                kv_entries_per_block == 128,
+                "kv_entries_per_block must be one of 32/64/128");
+    TORCH_CHECK(kv_cache.is_cuda() && kv_cache.is_contiguous() && kv_cache.dim() == 2
                 && (kv_cache.scalar_type() == torch::kInt8 || kv_cache.scalar_type() == torch::kUInt8),
-                "kv_cache must be CUDA (u)int8 fused pages");
+                "kv_cache must be CUDA (u)int8 physical pages [blocks,stride]");
     const int num_blocks = (int)kv_cache.size(0);
-    TORCH_CHECK(kv_cache.numel() == (int64_t)num_blocks * PAGE_BYTES,
-                "kv_cache must be [num_blocks, ", PAGE_BYTES, "] bytes per page "
-                "(fused: PAGE_KV*(D/2) fp4 then PAGE_KV*4 sf)");
+    if (kv_block_stride_bytes == 0)
+        kv_block_stride_bytes = kv_cache.size(1);
+    const int64_t payload = (int64_t)kv_entries_per_block * (HEAD_DIM / 2 + 4);
+    TORCH_CHECK(kv_block_stride_bytes >= payload && kv_block_stride_bytes % 16 == 0,
+                "kv_block_stride_bytes must cover the FP4 payload and be 16B aligned");
+    TORCH_CHECK(kv_cache.numel() == (int64_t)num_blocks * kv_block_stride_bytes,
+                "kv_cache must expose exactly kv_block_stride_bytes per block");
     TORCH_CHECK(context_lens.is_cuda() && context_lens.scalar_type() == torch::kInt32
                 && context_lens.numel() == B && context_lens.is_contiguous(),
                 "context_lens [B] i32");
@@ -382,11 +402,16 @@ static std::tuple<int, int, int> check_paged(
 static torch::Tensor mqa_logits_fp4_decode(
     torch::Tensor q, torch::Tensor sf_q, torch::Tensor kv_cache,
     torch::Tensor weights, torch::Tensor context_lens, torch::Tensor block_table,
-    int max_context_len, at::ScalarType out_dtype, int num_ctas = 0, int num_kv_stages = 0) {
+    int max_context_len, at::ScalarType out_dtype, int num_ctas = 0,
+    int num_kv_stages = 0, int kv_entries_per_block = PAGE_KV,
+    int64_t kv_block_stride_bytes = 0) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
-                                                  context_lens, block_table, out_dtype);
-    TORCH_CHECK(max_context_len > 0 && max_context_len <= max_pages * PAGE_KV,
-                "max_context_len must be in (0, max_pages*PAGE_KV]");
+                                                  context_lens, block_table, out_dtype,
+                                                  kv_entries_per_block,
+                                                  kv_block_stride_bytes);
+    TORCH_CHECK(max_context_len > 0 &&
+                max_context_len <= max_pages * kv_entries_per_block,
+                "max_context_len exceeds block-table capacity");
 
     const int stride_logits = host_align_up(max_context_len, BLOCK_KV);
     torch::Tensor buf = torch::full({B, stride_logits},
@@ -394,7 +419,8 @@ static torch::Tensor mqa_logits_fp4_decode(
                                     q.options().dtype(out_dtype));
     dispatch_launch(q, sf_q, kv_cache, weights,
                     context_lens.data_ptr<int>(), block_table.data_ptr<int>(), max_pages,
-                    num_blocks, B, max_context_len, out_dtype, stride_logits,
+                    num_blocks, kv_entries_per_block, kv_block_stride_bytes,
+                    B, max_context_len, out_dtype, stride_logits,
                     num_ctas, num_kv_stages,
                     /*comp_eps=*/1e-6f, /*prof=*/nullptr,
                     /*comp=*/deep_gemm::MainCompressorArgs{},
@@ -416,15 +442,17 @@ static void mqa_logits_fp4_decode_out(
     double comp_eps, c10::optional<torch::Tensor> prof,
     c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> comp_norm,
     c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
-    c10::optional<torch::Tensor> comp_kv, c10::optional<torch::Tensor> comp_sc,
+    c10::optional<torch::Tensor> comp_state,
     c10::optional<torch::Tensor> comp_q8, c10::optional<torch::Tensor> comp_s8,
     c10::optional<torch::Tensor> comp_rope, bool mock_attn,
-    // kvcache design: comp_kv/comp_sc become persistent-slot POOLS
-    // [capacity,8,1024] addressed via slot_map [B] i32; cmp_cache/cmp_dst
-    // DIRECT-write the compress rows into Main-compressed MODEL1 pages
-    // (dst[b] = page*64+off, -1 skip).
-    c10::optional<torch::Tensor> slot_map, c10::optional<torch::Tensor> cmp_cache,
+    c10::optional<torch::Tensor> comp_state_row,
+    c10::optional<torch::Tensor> cmp_cache,
     c10::optional<torch::Tensor> cmp_dst,
+    int64_t kv_entries_per_block = PAGE_KV,
+    int64_t kv_block_stride_bytes = 0,
+    int64_t comp_state_ring_entries = 0,
+    int64_t cmp_entries_per_block = 0,
+    int64_t cmp_block_stride_bytes = 0,
     // Cross-rank iq readiness (TP/DP direct-write handoff from wq_b). Only the Q
     // TMA warp waits, so the KV pipeline (99.85% of this kernel's traffic) starts
     // immediately and hides the peer skew -- that is why this belongs here rather
@@ -439,7 +467,9 @@ static void mqa_logits_fp4_decode_out(
     int64_t iq_world = 0, int64_t iq_skip = -1) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
                                                   context_lens, block_table,
-                                                  logits.scalar_type());
+                                                  logits.scalar_type(),
+                                                  (int)kv_entries_per_block,
+                                                  kv_block_stride_bytes);
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) >= B
                 && logits.size(1) % BLOCK_KV == 0 && logits.is_contiguous(),
                 "logits must be [>=B, k*BLOCK_KV] contiguous");
@@ -458,7 +488,7 @@ static void mqa_logits_fp4_decode_out(
 
     // Optional globaltimer stamps [num_ctas, 8] i64 (test_complex.cu phase pattern):
     // 0=attn start, 1=attn end, 2=tail start, 3=tail end, 4=retired (was rms end),
-    // 5=aggregate done, 6=retired (was shift; gone with the B1 ping-pong state),
+    // 5=aggregate done, 6=retired (the RTP ring needs no state-shift phase),
     // 7=compress-row end (ns).
     unsigned long long* prof_ptr = nullptr;
     if (prof.has_value()) {
@@ -471,13 +501,13 @@ static void mqa_logits_fp4_decode_out(
     }
 
     // Optional MAIN-compressor bundle (gemm_fuse_norm_b d=512 part; tail warps).
-    // All-or-none: gated on comp_kv like the original (comp_kv==null => disabled).
+    // All-or-none: gated on the framework state ring.
     deep_gemm::MainCompressorArgs comp{};
-    if (comp_kv.has_value()) {
+    if (comp_state.has_value()) {
         const int64_t comp_B = cmp_pos.has_value() ? cmp_pos->numel() : 0;
         const bool cache_mode = cmp_cache.has_value() && cmp_cache->numel() > 0;
         // Compact q8/s8/rope optional in cache mode (double-write saver).
-        TORCH_CHECK(cmp_pos && comp_norm && cos_tab && sin_tab && comp_sc
+        TORCH_CHECK(cmp_pos && comp_norm && cos_tab && sin_tab && comp_state_row
                     && (cache_mode || (comp_q8 && comp_s8 && comp_rope)),
                     "main-compressor tensors must be given together");
         auto chk = [](const torch::Tensor& t, at::ScalarType ty, const char* n) {
@@ -486,14 +516,16 @@ static void mqa_logits_fp4_decode_out(
         };
         chk(*cmp_pos, torch::kInt64, "cmp_pos");   chk(*comp_norm, torch::kFloat, "comp_norm");
         chk(*cos_tab, torch::kFloat, "cos_tab");   chk(*sin_tab, torch::kFloat, "sin_tab");
-        chk(*comp_kv, torch::kFloat, "comp_kv");   chk(*comp_sc, torch::kFloat, "comp_sc");
+        chk(*comp_state, torch::kFloat, "comp_state");
+        chk(*comp_state_row, torch::kInt32, "comp_state_row");
         TORCH_CHECK(comp_B >= B
                     && comp_B <= (int64_t)deep_gemm::kNumMaxTilePoolTokens
                     && comp_norm->numel() == 512
-                    && (slot_map.has_value() ||
-                        (comp_kv->numel() >= comp_B * 8 * 1024
-                         && comp_sc->numel() >= comp_B * 8 * 1024)),
+                    && comp_state->dim() >= 2 && comp_state->size(-1) == 2048
+                    && comp_state_row->numel() >= comp_B,
                     "main-compressor tensor shapes");
+        TORCH_CHECK(comp_state_ring_entries >= 8,
+                    "comp_state_ring_entries must cover the 8-row window");
         if (comp_q8.has_value() && comp_q8->numel() > 0) {
             chk(*comp_q8, torch::kUInt8, "comp_q8");
             TORCH_CHECK(comp_q8->numel() >= comp_B * 448, "comp_q8 shape");
@@ -514,35 +546,37 @@ static void mqa_logits_fp4_decode_out(
         comp.norm = comp_norm->data_ptr<float>();
         comp.cos_tab = cos_tab->data_ptr<float>();
         comp.sin_tab = sin_tab->data_ptr<float>();
-        comp.kv = comp_kv->data_ptr<float>();
-        comp.sc = comp_sc->data_ptr<float>();
+        comp.state = comp_state->data_ptr<float>();
+        comp.state_row = comp_state_row->data_ptr<int>();
+        comp.state_ring_entries = (int)comp_state_ring_entries;
         comp.seq_len = (uint32_t)comp_B;
-        // kvcache design plumbing (slot indirection + direct MODEL1 writes)
-        if (slot_map.has_value() && slot_map->numel() > 0) {
-            TORCH_CHECK(slot_map->is_cuda() && slot_map->is_contiguous() &&
-                        slot_map->scalar_type() == torch::kInt32 &&
-                        slot_map->numel() >= comp_B,
-                        "slot_map must cover all compressor rows");
-            comp.slot_map = slot_map->data_ptr<int>();
-        }
         if (cmp_cache.has_value() && cmp_cache->numel() > 0) {
             TORCH_CHECK(cmp_dst.has_value(), "cmp_cache requires cmp_dst");
+            TORCH_CHECK(cmp_entries_per_block > 0,
+                        "cmp_cache requires cmp_entries_per_block");
+            const int64_t payload = cmp_entries_per_block *
+                (deep_gemm::M1_TOK_BODY + deep_gemm::M1_SCALE_RECORD_BYTES);
+            TORCH_CHECK(cmp_block_stride_bytes >= payload,
+                        "cmp_block_stride_bytes must cover the MODEL1 payload");
             TORCH_CHECK(cmp_cache->is_cuda() && cmp_cache->is_contiguous() &&
-                        cmp_cache->numel() % deep_gemm::M1_PAGE_BYTES == 0,
-                        "cmp_cache must be MODEL1 pages [P,",
-                        deep_gemm::M1_PAGE_BYTES, "]B");
+                        cmp_cache->scalar_type() == torch::kUInt8 &&
+                        cmp_cache->numel() % cmp_block_stride_bytes == 0,
+                        "cmp_cache must be uint8 physical pages with supplied stride");
             TORCH_CHECK(cmp_dst->is_cuda() && cmp_dst->is_contiguous() &&
                         cmp_dst->scalar_type() == torch::kInt32 &&
                         cmp_dst->numel() >= comp_B,
                         "cmp_dst must cover all compressor rows");
             comp.cmp_cache = reinterpret_cast<uint8_t*>(cmp_cache->data_ptr());
             comp.cmp_dst = cmp_dst->data_ptr<int>();
+            comp.cmp_entries_per_block = (int)cmp_entries_per_block;
+            comp.cmp_block_stride_bytes = (size_t)cmp_block_stride_bytes;
         }
     }
 
     dispatch_launch(q, sf_q, kv_cache, weights,
                     context_lens.data_ptr<int>(), block_table.data_ptr<int>(), max_pages,
-                    num_blocks, B, /*max_context_len=*/(int)logits.size(1),
+                    num_blocks, (int)kv_entries_per_block, kv_block_stride_bytes,
+                    B, /*max_context_len=*/(int)logits.size(1),
                     logits.scalar_type(), /*stride_logits=*/(int)logits.size(1),
                     num_ctas, num_kv_stages,
                     (float)comp_eps, prof_ptr,
@@ -562,7 +596,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mqa_compressor_standalone",
           [](torch::Tensor cmp_pos, torch::Tensor comp_norm,
              torch::Tensor cos_tab, torch::Tensor sin_tab,
-             torch::Tensor comp_kv, torch::Tensor comp_sc,
+             torch::Tensor comp_state, torch::Tensor comp_state_row,
+             int64_t comp_state_ring_entries,
              torch::Tensor comp_q8, torch::Tensor comp_s8,
              torch::Tensor comp_rope, double eps) {
               deep_gemm::MainCompressorArgs comp{};
@@ -570,8 +605,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               comp.norm = comp_norm.data_ptr<float>();
               comp.cos_tab = cos_tab.data_ptr<float>();
               comp.sin_tab = sin_tab.data_ptr<float>();
-              comp.kv = comp_kv.data_ptr<float>();
-              comp.sc = comp_sc.data_ptr<float>();
+              comp.state = comp_state.data_ptr<float>();
+              comp.state_row = comp_state_row.data_ptr<int>();
+              comp.state_ring_entries = (int)comp_state_ring_entries;
               comp.q8 = comp_q8.data_ptr<uint8_t>();
               comp.s8 = comp_s8.data_ptr<float>();
               comp.rope = reinterpret_cast<nv_bfloat16*>(comp_rope.data_ptr());
@@ -582,16 +618,88 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           "standalone MAIN-compressor reference (benchmark sep_us column)",
           py::arg("cmp_pos"), py::arg("comp_norm"), py::arg("cos_tab"), py::arg("sin_tab"),
-          py::arg("comp_kv"), py::arg("comp_sc"), py::arg("comp_q8"), py::arg("comp_s8"),
+          py::arg("comp_state"), py::arg("comp_state_row"),
+          py::arg("comp_state_ring_entries"), py::arg("comp_q8"), py::arg("comp_s8"),
           py::arg("comp_rope"), py::arg("eps") = 1e-6);
+    m.def("mqa_compressor_paged",
+          [](torch::Tensor cmp_pos, torch::Tensor comp_norm,
+             torch::Tensor cos_tab, torch::Tensor sin_tab,
+             torch::Tensor comp_state, torch::Tensor comp_state_row,
+             int64_t comp_state_ring_entries,
+             torch::Tensor cmp_cache, torch::Tensor cmp_dst,
+             int64_t cmp_entries_per_block, int64_t cmp_block_stride_bytes,
+             double eps) {
+              const int64_t B = cmp_pos.numel();
+              TORCH_CHECK(B >= 1 && cmp_pos.is_cuda() && cmp_pos.is_contiguous()
+                          && cmp_pos.scalar_type() == torch::kInt64,
+                          "cmp_pos must be contiguous CUDA int64 [B]");
+              TORCH_CHECK(comp_norm.is_cuda() && comp_norm.is_contiguous()
+                          && comp_norm.scalar_type() == torch::kFloat32
+                          && comp_norm.numel() == 512,
+                          "comp_norm must be contiguous CUDA fp32 [512]");
+              TORCH_CHECK(cos_tab.is_cuda() && cos_tab.is_contiguous()
+                          && cos_tab.scalar_type() == torch::kFloat32
+                          && cos_tab.dim() == 2 && cos_tab.size(1) == 32
+                          && sin_tab.is_cuda() && sin_tab.is_contiguous()
+                          && sin_tab.scalar_type() == torch::kFloat32
+                          && sin_tab.sizes() == cos_tab.sizes(),
+                          "cos_tab/sin_tab must be contiguous CUDA fp32 [S,32]");
+              TORCH_CHECK(comp_state.is_cuda() && comp_state.is_contiguous()
+                          && comp_state.scalar_type() == torch::kFloat32
+                          && comp_state.dim() >= 2 && comp_state.size(-1) == 2048,
+                          "comp_state must be contiguous CUDA fp32 [...,2048]");
+              TORCH_CHECK(comp_state_row.is_cuda() && comp_state_row.is_contiguous()
+                          && comp_state_row.scalar_type() == torch::kInt32
+                          && comp_state_row.numel() >= B
+                          && comp_state_ring_entries >= 8,
+                          "comp_state_row/ring geometry is invalid");
+              const int64_t payload = cmp_entries_per_block
+                  * (deep_gemm::M1_TOK_BODY + deep_gemm::M1_SCALE_RECORD_BYTES);
+              TORCH_CHECK(cmp_entries_per_block > 0
+                          && cmp_block_stride_bytes >= payload
+                          && cmp_cache.is_cuda() && cmp_cache.is_contiguous()
+                          && cmp_cache.scalar_type() == torch::kUInt8
+                          && cmp_cache.numel() % cmp_block_stride_bytes == 0,
+                          "cmp_cache physical page geometry is invalid");
+              TORCH_CHECK(cmp_dst.is_cuda() && cmp_dst.is_contiguous()
+                          && cmp_dst.scalar_type() == torch::kInt32
+                          && cmp_dst.numel() >= B,
+                          "cmp_dst must be contiguous CUDA int32 [>=B]");
+
+              deep_gemm::MainCompressorArgs comp{};
+              comp.pos = reinterpret_cast<const long long*>(cmp_pos.data_ptr<int64_t>());
+              comp.norm = comp_norm.data_ptr<float>();
+              comp.cos_tab = cos_tab.data_ptr<float>();
+              comp.sin_tab = sin_tab.data_ptr<float>();
+              comp.state = comp_state.data_ptr<float>();
+              comp.state_row = comp_state_row.data_ptr<int>();
+              comp.state_ring_entries = (int)comp_state_ring_entries;
+              comp.seq_len = (uint32_t)B;
+              comp.cmp_cache = reinterpret_cast<uint8_t*>(cmp_cache.data_ptr());
+              comp.cmp_dst = cmp_dst.data_ptr<int>();
+              comp.cmp_entries_per_block = (int)cmp_entries_per_block;
+              comp.cmp_block_stride_bytes = (size_t)cmp_block_stride_bytes;
+              standalone_compressor_kernel<<<(uint32_t)B, 128, 0,
+                  at::cuda::getCurrentCUDAStream()>>>(comp, (uint32_t)B,
+                                                      (float)eps);
+          },
+          "Standalone MAIN compressor writing RTP MODEL1 physical pages",
+          py::arg("cmp_pos"), py::arg("comp_norm"), py::arg("cos_tab"),
+          py::arg("sin_tab"), py::arg("comp_state"),
+          py::arg("comp_state_row"), py::arg("comp_state_ring_entries"),
+          py::arg("cmp_cache"), py::arg("cmp_dst"),
+          py::arg("cmp_entries_per_block"),
+          py::arg("cmp_block_stride_bytes"), py::arg("eps") = 1e-6);
     m.def("mqa_logits_fp4_decode", &mqa_logits_fp4_decode,
           "DSV4 FP4 MQA-logits (multi-batch PAGED decode, compressed, ONE launch, "
           "in-kernel tile-pool schedule — no metadata kernel): fused page cache "
-          "[num_blocks, PAGE_KV*(D/2+4)]B + block_table; num_ctas=0 -> one CTA per SM; "
+          "with runtime logical entries/physical stride + block_table; num_ctas=0 -> one CTA per SM; "
           "num_kv_stages=0 -> auto (chunk-length heuristic), or force 4/6/8/10",
           py::arg("q"), py::arg("sf_q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("max_context_len"),
-          py::arg("out_dtype"), py::arg("num_ctas") = 0, py::arg("num_kv_stages") = 0);
+          py::arg("out_dtype"), py::arg("num_ctas") = 0, py::arg("num_kv_stages") = 0,
+          py::arg("kv_entries_per_block") = PAGE_KV,
+          py::arg("kv_block_stride_bytes") = 0);
     m.def("mqa_logits_fp4_decode_out", &mqa_logits_fp4_decode_out,
           "DSV4 FP4 PAGED decode into a preallocated buffer (repo *_out convention; "
           "hoists alloc/-inf-fill out of the timed path); num_ctas=0 -> one CTA per SM; "
@@ -604,11 +712,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("comp_eps") = 1e-6, py::arg("prof") = c10::nullopt,
           py::arg("cmp_pos") = c10::nullopt, py::arg("comp_norm") = c10::nullopt,
           py::arg("cos_tab") = c10::nullopt, py::arg("sin_tab") = c10::nullopt,
-          py::arg("comp_kv") = c10::nullopt, py::arg("comp_sc") = c10::nullopt,
+          py::arg("comp_state") = c10::nullopt,
           py::arg("comp_q8") = c10::nullopt, py::arg("comp_s8") = c10::nullopt,
           py::arg("comp_rope") = c10::nullopt, py::arg("mock_attn") = false,
-          py::arg("slot_map") = c10::nullopt, py::arg("cmp_cache") = c10::nullopt,
+          py::arg("comp_state_row") = c10::nullopt,
+          py::arg("cmp_cache") = c10::nullopt,
           py::arg("cmp_dst") = c10::nullopt,
+          py::arg("kv_entries_per_block") = PAGE_KV,
+          py::arg("kv_block_stride_bytes") = 0,
+          py::arg("comp_state_ring_entries") = 0,
+          py::arg("cmp_entries_per_block") = 0,
+          py::arg("cmp_block_stride_bytes") = 0,
           py::arg("iq_ready") = c10::nullopt, py::arg("iq_gen") = c10::nullopt,
           py::arg("iq_world") = 0, py::arg("iq_skip") = -1);
 }

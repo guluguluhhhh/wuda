@@ -16,6 +16,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 
 namespace idx_post {
@@ -197,6 +198,65 @@ __device__ __forceinline__ void idx_row_compute(
     }
 }
 
+// RTP-LLM FP8 Indexer-Q contract: BF16 boundary -> RoPE -> one E4M3 scale per
+// head row, with that scale folded into the corresponding Indexer weight.
+// Unlike the FP4 path above, this path deliberately has no Hadamard transform.
+template <bool kInputAlreadyBf16>
+__device__ __forceinline__ void idx_row_compute_fp8(
+    const IdxRowIn& d, uint32_t e, int m, int head,
+    const float* __restrict__ weights,
+    uint8_t* __restrict__ iq_fp8, float* __restrict__ folded_weights,
+    int num_heads = idx_post::NUM_HEADS,
+    bool store_ok = true) {
+    const auto bf16r2 = [](float& a, float& b) {
+        const float2 f = __bfloat1622float2(__floats2bfloat162_rn(a, b));
+        a = f.x; b = f.y;
+    };
+    float v[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+        v[i * 4 + 0] = d.raw[i].x; v[i * 4 + 1] = d.raw[i].y;
+        v[i * 4 + 2] = d.raw[i].z; v[i * 4 + 3] = d.raw[i].w;
+        if constexpr (!kInputAlreadyBf16) {
+            bf16r2(v[i * 4 + 0], v[i * 4 + 1]);
+            bf16r2(v[i * 4 + 2], v[i * 4 + 3]);
+        }
+    }
+    if (e >= 4) {
+        #pragma unroll
+        for (uint32_t j = 0; j < 8; ++j) {
+            const float c = d.c8[j], s = d.s8[j];
+            const float ev = v[j * 2], o = v[j * 2 + 1];
+            v[j * 2] = ev * c - o * s;
+            v[j * 2 + 1] = ev * s + o * c;
+            bf16r2(v[j * 2], v[j * 2 + 1]);
+        }
+    }
+
+    float amax = 0.0f;
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; ++i)
+        amax = fmaxf(amax, fabsf(v[i]));
+    #pragma unroll
+    for (uint32_t x = 1; x <= 4; x <<= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, (int)x));
+    const float scale = fmaxf(amax * (1.0f / 448.0f), 1.0e-12f);
+
+    alignas(16) uint8_t q[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; ++i)
+        q[i] = __nv_fp8_e4m3(v[i] / scale).__x;
+    if (store_ok) {
+        const int64_t off = ((int64_t)m * num_heads + head) * idx_post::HEAD_DIM
+                          + e * 16;
+        *reinterpret_cast<uint4*>(iq_fp8 + off) =
+            *reinterpret_cast<const uint4*>(q);
+        if (e == 0)
+            folded_weights[(int64_t)m * num_heads + head] =
+                weights[(int64_t)m * num_heads + head] * scale;
+    }
+}
+
 // load + compute in one step (no pipelining)
 template <typename src_t>
 __device__ __forceinline__ void idx_postprocess_row(
@@ -232,4 +292,24 @@ idx_post_kernel(
                         row / num_heads, row % num_heads,
                         q_pos, rope_cos, rope_sin, iq_fp4, iq_sf,
                         num_heads, raw < total_rows);
+}
+
+template <typename src_t>
+static __global__ void __launch_bounds__(256, 1)
+idx_post_fp8_kernel(
+    const src_t* __restrict__ iq,
+    const float* __restrict__ weights,
+    const int* __restrict__ q_pos,
+    const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
+    uint8_t* __restrict__ iq_fp8, float* __restrict__ folded_weights,
+    int total_rows, int num_heads) {
+    const int raw = blockIdx.x * (256 / 8) + (int)(threadIdx.x >> 3);
+    const int row = raw < total_rows ? raw : total_rows - 1;
+    const int m = row / num_heads, head = row % num_heads;
+    IdxRowIn d;
+    idx_row_load(iq + (int64_t)row * idx_post::HEAD_DIM,
+                 threadIdx.x & 7, m, q_pos, rope_cos, rope_sin, d);
+    idx_row_compute_fp8<sizeof(src_t) == sizeof(__nv_bfloat16)>(
+        d, threadIdx.x & 7, m, head, weights, iq_fp8, folded_weights,
+        num_heads, raw < total_rows);
 }

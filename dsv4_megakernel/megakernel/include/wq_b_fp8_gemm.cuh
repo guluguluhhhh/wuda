@@ -136,6 +136,7 @@ static constexpr int IQ_DONE_WORDS = 32;      // 128B; only word 0 is used
 struct IqDest {
     uint8_t* fp4;       int* sf;           // this rank's mqa-input buffer
     uint8_t* fp4_peer;  int* sf_peer;      // peer DP rank's mirror (nullptr = none)
+    const float* weights;                  // [rows, num_heads], FP8 scale fold input
     int row_lo, row_hi;                    // rows THIS rank owns; others -> peer
     int head_base;                         // global index of this rank's head 0
     int num_heads;                         // heads in the DESTINATION (row stride)

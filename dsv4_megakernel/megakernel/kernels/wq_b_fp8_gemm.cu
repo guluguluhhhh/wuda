@@ -4,7 +4,8 @@
 // x_fp8[M,K_DIM] @ w_fp8[N_MERGED,K_DIM]^T   (indexer rows before main Q)
 //   -> y [M,N_TOTAL] bf16 + ssq [M,NUM_HEADS_OUT] fp32
 //   -> indexer q: by default DRAINED as bf16 iq_ws [M,64,128] (finish it with
-//      idx_postprocess); mock_post=False fuses rope+hadamard+MXFP4 in-kernel.
+//      idx_postprocess); mock_post=False fuses either RTP RoPE+FP8+weight-fold
+//      or the legacy RoPE+Hadamard+MXFP4 transform in-kernel.
 //
 // Usage (default: 256 threads, GEMM + ssq):
 //   y, iq_fp4, iq_sf, ssq, iq_ws = wq_b_proj_gemm_merged(
@@ -16,11 +17,11 @@
 //   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
 //
 // Fused indexer (winkv) COMPRESSOR (optional, delivery op-B-tail port, NO
-// split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc (fresh state
+// split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_state (fresh state
 // row arrives from front's FRONT-EMIT epilogue, +idx_ape)
-// together and warps 8..15 run the state write + compress chain (softmax
-// aggregate -> shift -> RMSNorm -> RoPE -> FWHT -> fp4) fully decoupled from
-// the GEMM; appends idx_q4 [M,64] u8 + idx_s4 [M,4] u8 to the returns.
+// together and warps 8..15 run the state read + compress chain fully decoupled
+// from the GEMM. In RTP FP8 mode it writes 128 E4M3 bytes + one FP32 scale;
+// the explicit legacy mode retains FWHT + FP4.
 // LOCAL KV WINDOW (optional, CSA stage 4 FULL chain): pass win_y2 [M,512] +
 // win_norm [512] (+ cmp_pos/cos_tab/sin_tab) -> RMSNorm + RoPE + per-64 fp8;
 // appends win_q8 [M,448] u8 + win_s8 [M,7] f32 + win_rope [M,64] bf16. Chains
@@ -185,7 +186,7 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
 // The indexer weight precedes main Q, so its transform overlaps the remaining
 // main-Q weight stream. Store warps drain indexer tiles before async workers
 // post-process them.
-template <int M_TPL, bool kProfile, bool kSsq>
+template <int M_TPL, bool kProfile, bool kSsq, bool kIdxFp8>
 __global__ void __launch_bounds__(TPB_IDX, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,    // activation [M,K] e4m3, K-major
@@ -631,7 +632,12 @@ wq_b_proj_kernel(
         // instead of sitting exposed on this kernel's tail. The consumer's iq path
         // is NOT covered by this trigger -- it waits on the ready flags, which are
         // published after SPREAD, so it stays correctly ordered.
-        asm volatile("griddepcontrol.launch_dependents;");
+        // The FP4 consumer has its own Q-readiness protocol. The initial FP8
+        // single-card path does not yet publish per-head readiness, so releasing
+        // a PDL consumer here would let it read Q before SPREAD stores complete.
+        // With no early signal, CUDA releases the dependent at kernel completion.
+        if constexpr (!kIdxFp8)
+            asm volatile("griddepcontrol.launch_dependents;");
     }
 
     // ======== ASYNC TRANSFORM WORKERS (threads 256..511) ========
@@ -685,7 +691,7 @@ wq_b_proj_kernel(
         // resort. Only exit sync: trailing cluster_sync.
         {
             const bool win_on = comp.win_y2 != nullptr;
-            const bool cmp_on = comp.kv != nullptr;
+            const bool cmp_on = comp.state != nullptr;
             if (win_on || cmp_on) {
                 const int wlocal = (int)warp_id - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32;
                 const int rank = ((int)blockIdx.x >= busy)
@@ -701,7 +707,7 @@ wq_b_proj_kernel(
                         idx_comp::process_win_row(comp, m, (int)lane_id);
                 if (cmp_on)
                     for (int m = wid; m < problem_m; m += stride)
-                        idx_comp::process_row(comp, m, (int)lane_id);
+                        idx_comp::process_row<kIdxFp8>(comp, m, (int)lane_id);
             }
         }
 
@@ -759,10 +765,18 @@ wq_b_proj_kernel(
                 idx_row_load(
                     iq_scratch + ((int64_t)mc * IDX_NUM_HEADS + head) * IDX_HEAD_DIM,
                     e8, mc, q_pos, rope_cos, rope_sin, d);
-                idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
-                                      mine ? iqd.fp4 : iqd.fp4_peer,
-                                      mine ? iqd.sf  : iqd.sf_peer,
-                                      iqd.num_heads, m < problem_m);
+                if constexpr (kIdxFp8) {
+                    idx_row_compute_fp8<true>(
+                        d, e8, mc, iqd.head_base + head, iqd.weights,
+                        mine ? iqd.fp4 : iqd.fp4_peer,
+                        reinterpret_cast<float*>(mine ? iqd.sf : iqd.sf_peer),
+                        iqd.num_heads, m < problem_m);
+                } else {
+                    idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
+                                          mine ? iqd.fp4 : iqd.fp4_peer,
+                                          mine ? iqd.sf  : iqd.sf_peer,
+                                          iqd.num_heads, m < problem_m);
+                }
                 ++my_tasks;
             }
             if (iq_prof) {
@@ -898,13 +912,13 @@ static CUtensorMap make_tma_desc_bf16_2d(
 // Swap-AB path only (M <= 128, decode). kSsq is a COMPILE-TIME dispatch
 // dimension (DeepGEMM JIT-config discipline): the ssq-off binary carries no
 // dead branch in the hot loops.
-template <bool kProfile, bool kSsq>
+template <bool kProfile, bool kSsq, bool kIdxFp8>
 static void* get_kernel_ptr(int M) {
     switch (M) {
-        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq>;
-        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq>;
-        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq>;
-        case 128: return (void*)&wq_b_proj_kernel<128, kProfile, kSsq>;
+        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq, kIdxFp8>;
+        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq, kIdxFp8>;
+        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq, kIdxFp8>;
+        case 128: return (void*)&wq_b_proj_kernel<128, kProfile, kSsq, kIdxFp8>;
         default:  return nullptr;
     }
 }
@@ -942,8 +956,9 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> idx_norm = c10::nullopt,
     c10::optional<torch::Tensor> cos_tab = c10::nullopt,
     c10::optional<torch::Tensor> sin_tab = c10::nullopt,
-    c10::optional<torch::Tensor> idx_kv  = c10::nullopt,
-    c10::optional<torch::Tensor> idx_sc  = c10::nullopt,
+    c10::optional<torch::Tensor> idx_state = c10::nullopt,
+    c10::optional<torch::Tensor> idx_state_row = c10::nullopt,
+    int64_t state_ring_entries = 0,
     // local kv window bundle (winkv, CSA stage 4; needs cmp_pos + rope tables too)
     c10::optional<torch::Tensor> win_y2   = c10::nullopt,
     c10::optional<torch::Tensor> win_norm = c10::nullopt,
@@ -954,16 +969,16 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> q_y      = c10::nullopt,
     c10::optional<torch::Tensor> q_norm_w = c10::nullopt,
     double q_eps = 1e-6,
-    // kvcache design (kccache_design.png): persistent-slot state + DIRECT
-    // paged-pool writes. slot_map [M] i32 lets idx_kv/idx_sc be POOLS
-    // [capacity,8,256]; idx_cache/idx_dst scatter the compress rows into the
-    // indexer fused pages; swa_cache/swa_dst scatter every winkv row into the
-    // SWA MODEL1 pages. dst[m] = page*64+off, -1 = skip.
-    c10::optional<torch::Tensor> slot_map  = c10::nullopt,
+    // RTP paged-pool writes. Destination values are flat logical slots; each
+    // pool supplies its own entries-per-block and physical byte stride.
     c10::optional<torch::Tensor> idx_cache = c10::nullopt,
     c10::optional<torch::Tensor> idx_dst   = c10::nullopt,
+    int64_t idx_entries_per_block = 0,
+    int64_t idx_block_stride_bytes = 0,
     c10::optional<torch::Tensor> swa_cache = c10::nullopt,
     c10::optional<torch::Tensor> swa_dst   = c10::nullopt,
+    int64_t swa_entries_per_block = 0,
+    int64_t swa_block_stride_bytes = 0,
     // indexer-q DESTINATION (see IqDest in the header). Default: allocate the
     // plain [M, IDX_NUM_HEADS] layout, degenerating the store math to non-TP.
     // TP/DP callers pass their mqa_logits input buffers: iq_dst/_sf hold the FULL
@@ -976,6 +991,8 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> iq_dst_sf      = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_peer    = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_peer_sf = c10::nullopt,
+    bool indexer_fp8 = false,
+    c10::optional<torch::Tensor> iq_weights = c10::nullopt,
     int64_t iq_head_base = 0,
     int64_t iq_row_lo = 0, int64_t iq_row_hi = -1,
     c10::optional<torch::Tensor> iq_done  = c10::nullopt,
@@ -1037,20 +1054,33 @@ static std::vector<torch::Tensor> run_wq_b(
         TORCH_CHECK(!iq_dst_sf.has_value() && !iq_dst_peer.has_value()
                     && !iq_dst_peer_sf.has_value() && iq_head_base == 0,
                     "iq_dst_sf / iq_dst_peer / iq_head_base require iq_dst");
-        iq_fp4 = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM / 2},
-                              x_fp8.options().dtype(torch::kInt8));
-        iq_sf  = torch::empty({M, IDX_NUM_HEADS}, x_fp8.options().dtype(torch::kInt32));
+        iq_fp4 = torch::empty(
+            {M, IDX_NUM_HEADS, indexer_fp8 ? IDX_HEAD_DIM : IDX_HEAD_DIM / 2},
+            x_fp8.options().dtype(indexer_fp8 ? torch::kFloat8_e4m3fn
+                                              : torch::kInt8));
+        iq_sf = torch::empty({M, IDX_NUM_HEADS},
+                             x_fp8.options().dtype(indexer_fp8 ? torch::kFloat32
+                                                               : torch::kInt32));
     }
     const int iq_rows  = (int)iq_fp4.size(0);
     const int iq_heads = (int)iq_fp4.size(1);
     TORCH_CHECK(iq_fp4.is_cuda() && iq_fp4.dim() == 3 && iq_fp4.is_contiguous()
-                && iq_fp4.scalar_type() == torch::kInt8
-                && iq_fp4.size(2) == IDX_HEAD_DIM / 2,
-                "iq_dst must be CUDA int8 [rows, heads, ", IDX_HEAD_DIM / 2, "] contiguous");
+                && iq_fp4.scalar_type() == (indexer_fp8 ? torch::kFloat8_e4m3fn
+                                                        : torch::kInt8)
+                && iq_fp4.size(2) == (indexer_fp8 ? IDX_HEAD_DIM : IDX_HEAD_DIM / 2),
+                "iq_dst has the wrong dtype/shape for the selected Indexer format");
     TORCH_CHECK(iq_sf.is_cuda() && iq_sf.is_contiguous()
-                && iq_sf.scalar_type() == torch::kInt32
+                && iq_sf.scalar_type() == (indexer_fp8 ? torch::kFloat32
+                                                       : torch::kInt32)
                 && iq_sf.sizes() == torch::IntArrayRef({iq_rows, iq_heads}),
-                "iq_dst_sf must be i32 [rows, heads] matching iq_dst");
+                "iq_dst_sf must match the selected Indexer format and iq_dst");
+    if (indexer_fp8 && !mock_post) {
+        TORCH_CHECK(iq_weights.has_value() && iq_weights->is_cuda()
+                    && iq_weights->scalar_type() == torch::kFloat32
+                    && iq_weights->dim() == 2 && iq_weights->is_contiguous()
+                    && iq_weights->sizes() == torch::IntArrayRef({iq_rows, iq_heads}),
+                    "FP8 Indexer needs contiguous CUDA fp32 iq_weights [rows,heads]");
+    }
     TORCH_CHECK(iq_head_base >= 0 && iq_head_base + IDX_NUM_HEADS <= iq_heads,
                 "iq_head_base + IDX_NUM_HEADS(", IDX_NUM_HEADS, ") exceeds the "
                 "destination head count ", iq_heads);
@@ -1063,10 +1093,10 @@ static std::vector<torch::Tensor> run_wq_b(
     if (iq_dst_peer.has_value()) {
         TORCH_CHECK(iq_dst_peer_sf.has_value(), "iq_dst_peer also needs iq_dst_peer_sf");
         TORCH_CHECK(iq_dst_peer.value().sizes() == iq_fp4.sizes()
-                    && iq_dst_peer.value().scalar_type() == torch::kInt8
+                    && iq_dst_peer.value().scalar_type() == iq_fp4.scalar_type()
                     && iq_dst_peer.value().is_contiguous()
                     && iq_dst_peer_sf.value().sizes() == iq_sf.sizes()
-                    && iq_dst_peer_sf.value().scalar_type() == torch::kInt32
+                    && iq_dst_peer_sf.value().scalar_type() == iq_sf.scalar_type()
                     && iq_dst_peer_sf.value().is_contiguous(),
                     "iq_dst_peer/_sf must mirror iq_dst/_sf exactly");
     } else {
@@ -1107,7 +1137,7 @@ static std::vector<torch::Tensor> run_wq_b(
     const float* cos_ptr = rope_cos.data_ptr<float>();
     const float* sin_ptr = rope_sin.data_ptr<float>();
     uint8_t* iq_fp4_ptr = reinterpret_cast<uint8_t*>(iq_fp4.data_ptr());
-    int* iq_sf_ptr = iq_sf.data_ptr<int>();
+    int* iq_sf_ptr = reinterpret_cast<int*>(iq_sf.data_ptr());
     __nv_bfloat16* iq_ws_ptr =
         reinterpret_cast<__nv_bfloat16*>(iq_ws.data_ptr());
     // No peer -> aim the peer pointers at the local buffer. The host has already
@@ -1119,7 +1149,8 @@ static std::vector<torch::Tensor> run_wq_b(
     iqd.fp4_peer  = iq_dst_peer.has_value()
         ? reinterpret_cast<uint8_t*>(iq_dst_peer.value().data_ptr()) : iq_fp4_ptr;
     iqd.sf_peer   = iq_dst_peer_sf.has_value()
-        ? iq_dst_peer_sf.value().data_ptr<int>() : iq_sf_ptr;
+        ? reinterpret_cast<int*>(iq_dst_peer_sf.value().data_ptr()) : iq_sf_ptr;
+    iqd.weights   = iq_weights.has_value() ? iq_weights->data_ptr<float>() : nullptr;
     iqd.row_lo    = (int)iq_row_lo;
     iqd.row_hi    = (int)iq_row_hi;
     iqd.head_base = (int)iq_head_base;
@@ -1256,13 +1287,19 @@ static std::vector<torch::Tensor> run_wq_b(
     }
 
     // ---- fused indexer compressor + local kv window: validate the bundles ----
-    const bool comp_on = idx_kv.has_value();
+    const bool comp_on = idx_state.has_value();
     const bool win_on  = win_y2.has_value();
     idx_comp::Args comp{};
     torch::Tensor idx_q4_t, idx_s4_t, win_q8_t, win_s8_t, win_rope_t;
     auto ck = [](const torch::Tensor& t, torch::ScalarType ty, const char* n) {
         TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == ty,
                     n, " must be contiguous CUDA ", ty);
+    };
+    auto i32m = [&](const torch::Tensor& t, const char* n) {
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
+                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
+                    n, " must be CUDA i32 [>=M]");
+        return t.data_ptr<int>();
     };
     if (comp_on || win_on) {
         TORCH_CHECK(cmp_pos && cos_tab && sin_tab,
@@ -1282,36 +1319,38 @@ static std::vector<torch::Tensor> run_wq_b(
         // FRONT-EMIT: the fresh idx state row (fp32 + idx_ape on the score
         // half) is published by front_mixed's epilogue BEFORE this kernel;
         // the chain here only aggregates -- no y4/ape inputs anymore.
-        TORCH_CHECK(idx_norm && idx_sc,
-                    "indexer compressor needs idx_norm/idx_kv/idx_sc");
+        TORCH_CHECK(idx_norm,
+                    "indexer compressor needs idx_norm + idx_state");
         ck(*idx_norm, torch::kFloat, "idx_norm");
-        ck(*idx_kv,  torch::kFloat, "idx_kv");
-        ck(*idx_sc,  torch::kFloat, "idx_sc");
+        ck(*idx_state, torch::kFloat, "idx_state");
         TORCH_CHECK(idx_norm->numel() == idx_comp::D_I, "idx_norm must be [128]");
-        const auto state_ok = [&](const torch::Tensor& t) {
-            // Legacy per-step state [M,8,256], or a persistent-slot POOL
-            // [capacity,8,256] when slot_map is given (kvcache design).
-            return t.dim() == 3 && t.size(1) == idx_comp::SROWS
-                && t.size(2) == idx_comp::WK_I
-                && (slot_map.has_value() ? true : t.size(0) == M);
-        };
-        TORCH_CHECK(state_ok(*idx_kv) && state_ok(*idx_sc),
-                    "idx_kv/idx_sc must be [M,8,256]");
+        TORCH_CHECK(idx_state->dim() >= 2 &&
+                    idx_state->size(-1) == 2 * idx_comp::WK_I,
+                    "idx_state last dim must be ", 2 * idx_comp::WK_I,
+                    " ([kv|score] halves)");
         // Compact q4/s4 SKIPPED in cache mode (double-write bandwidth saver);
         // the paged direct write below is the production output. PURE outputs
         // -> empty, not zeros (a zeros fill kernel lands in wall timings;
         // non-compress rows are garbage by contract, consumers gate on pos).
         if (!(idx_cache.has_value() && idx_cache->numel() > 0)) {
-            idx_q4_t = torch::empty({M, idx_comp::D_I / 2},
+            idx_q4_t = torch::empty({M, indexer_fp8 ? idx_comp::D_I
+                                                     : idx_comp::D_I / 2},
                                     x_fp8.options().dtype(torch::kUInt8));
-            idx_s4_t = torch::empty({M, idx_comp::D_I / 32},
-                                    x_fp8.options().dtype(torch::kUInt8));
+            idx_s4_t = torch::empty(
+                {M, indexer_fp8 ? 1 : idx_comp::D_I / 32},
+                x_fp8.options().dtype(indexer_fp8 ? torch::kFloat32
+                                                  : torch::kUInt8));
             comp.q4 = idx_q4_t.data_ptr<uint8_t>();
-            comp.s4 = idx_s4_t.data_ptr<uint8_t>();
+            comp.s4 = reinterpret_cast<uint8_t*>(idx_s4_t.data_ptr());
         }
         comp.norm_w = idx_norm->data_ptr<float>();
-        comp.kv = idx_kv->data_ptr<float>();
-        comp.sc = idx_sc->data_ptr<float>();
+        comp.state = idx_state->data_ptr<float>();
+        TORCH_CHECK(idx_state_row.has_value(),
+                    "idx_state requires idx_state_row");
+        TORCH_CHECK(state_ring_entries >= idx_comp::SROWS,
+                    "state_ring_entries must be >= ", idx_comp::SROWS);
+        comp.state_row = i32m(*idx_state_row, "idx_state_row");
+        comp.state_ring_entries = (int)state_ring_entries;
     }
     if (win_on) {
         TORCH_CHECK(win_norm, "local kv window needs win_y2 AND win_norm");
@@ -1335,32 +1374,41 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.win_y2 = win_y2->data_ptr<float>();
         comp.win_norm = win_norm->data_ptr<float>();
     }
-    // ---- kvcache design plumbing (slot indirection + direct pool writes) ----
-    auto i32m = [&](const torch::Tensor& t, const char* n) {
-        TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
-                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
-                    n, " must be CUDA i32 [M]");
-        return t.data_ptr<int>();
-    };
-    if (slot_map.has_value() && slot_map->numel() > 0)
-        comp.slot_map = i32m(*slot_map, "slot_map");
+    // ---- RTP cache geometry + direct pool writes ----
     if (idx_cache.has_value() && idx_cache->numel() > 0) {
         TORCH_CHECK(idx_dst.has_value(), "idx_cache requires idx_dst");
+        TORCH_CHECK(idx_entries_per_block > 0,
+                    "idx_cache requires idx_entries_per_block");
+        const int64_t payload = idx_entries_per_block
+            * ((indexer_fp8 ? idx_comp::D_I : idx_comp::D_I / 2) + 4);
+        TORCH_CHECK(idx_block_stride_bytes >= payload,
+                    "idx_block_stride_bytes must cover page payload");
+        TORCH_CHECK(!indexer_fp8 || idx_block_stride_bytes % 4 == 0,
+                    "FP8 indexer block stride must preserve FP32 scale alignment");
         TORCH_CHECK(idx_cache->is_cuda() && idx_cache->is_contiguous() &&
-                    idx_cache->numel() % idx_comp::IDX_PAGE_BYTES == 0,
-                    "idx_cache must be fused pages [P,",
-                    idx_comp::IDX_PAGE_BYTES, "]B");
+                    idx_cache->scalar_type() == torch::kUInt8 &&
+                    idx_cache->numel() % idx_block_stride_bytes == 0,
+                    "idx_cache must be uint8 physical pages with the supplied stride");
         comp.idx_cache = reinterpret_cast<uint8_t*>(idx_cache->data_ptr());
         comp.idx_dst = i32m(*idx_dst, "idx_dst");
+        comp.idx_entries_per_block = (int)idx_entries_per_block;
+        comp.idx_block_stride_bytes = (size_t)idx_block_stride_bytes;
     }
     if (swa_cache.has_value() && swa_cache->numel() > 0) {
         TORCH_CHECK(swa_dst.has_value(), "swa_cache requires swa_dst");
+        TORCH_CHECK(swa_entries_per_block > 0,
+                    "swa_cache requires swa_entries_per_block");
+        const int64_t payload = swa_entries_per_block * (idx_comp::M1_TOK_BODY + 8);
+        TORCH_CHECK(swa_block_stride_bytes >= payload,
+                    "swa_block_stride_bytes must cover page payload");
         TORCH_CHECK(swa_cache->is_cuda() && swa_cache->is_contiguous() &&
-                    swa_cache->numel() % idx_comp::M1_PAGE_BYTES == 0,
-                    "swa_cache must be MODEL1 pages [P,",
-                    idx_comp::M1_PAGE_BYTES, "]B");
+                    swa_cache->scalar_type() == torch::kUInt8 &&
+                    swa_cache->numel() % swa_block_stride_bytes == 0,
+                    "swa_cache must be uint8 physical pages with the supplied stride");
         comp.swa_cache = reinterpret_cast<uint8_t*>(swa_cache->data_ptr());
         comp.swa_dst = i32m(*swa_dst, "swa_dst");
+        comp.swa_entries_per_block = (int)swa_entries_per_block;
+        comp.swa_block_stride_bytes = (size_t)swa_block_stride_bytes;
     }
 
     // ---- activation quant producer (PDL; replaces the in-kernel grid ticket) ----
@@ -1386,25 +1434,37 @@ static std::vector<torch::Tensor> run_wq_b(
     }
 
     const bool want_ssq = ssq_ptr != nullptr;
-    void* kernel_ptr = profile
-        ? (want_ssq ? get_kernel_ptr<true, true>(M_pad)  : get_kernel_ptr<true, false>(M_pad))
-        : (want_ssq ? get_kernel_ptr<false, true>(M_pad) : get_kernel_ptr<false, false>(M_pad));
+    void* kernel_ptr = nullptr;
+    if (indexer_fp8) {
+        kernel_ptr = profile
+            ? (want_ssq ? get_kernel_ptr<true, true, true>(M_pad)
+                        : get_kernel_ptr<true, false, true>(M_pad))
+            : (want_ssq ? get_kernel_ptr<false, true, true>(M_pad)
+                        : get_kernel_ptr<false, false, true>(M_pad));
+    } else {
+        kernel_ptr = profile
+            ? (want_ssq ? get_kernel_ptr<true, true, false>(M_pad)
+                        : get_kernel_ptr<true, false, false>(M_pad))
+            : (want_ssq ? get_kernel_ptr<false, true, false>(M_pad)
+                        : get_kernel_ptr<false, false, false>(M_pad));
+    }
     int smem_bytes = get_smem_bytes(M_pad);
     TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
 
     // cudaFuncSetAttribute is PER DEVICE state, so this cache needs the device
     // ordinal: without it the second card in a process never gets the opt-in
     // dynamic smem raised and every launch on it fails.
-    static bool smem_configured[kMaxDevices][2][2][9] = {};
+    static bool smem_configured[kMaxDevices][2][2][2][9] = {};
     const int m_idx = M_pad / 32;
     const int p_idx = profile ? 1 : 0;
     const int s_idx = want_ssq ? 1 : 0;
-    if (!smem_configured[dev_id][p_idx][s_idx][m_idx]) {
+    const int f_idx = indexer_fp8 ? 1 : 0;
+    if (!smem_configured[dev_id][p_idx][s_idx][f_idx][m_idx]) {
         auto attr_err = cudaFuncSetAttribute(kernel_ptr,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr_err), " smem_bytes=", smem_bytes);
-        smem_configured[dev_id][p_idx][s_idx][m_idx] = true;
+        smem_configured[dev_id][p_idx][s_idx][f_idx][m_idx] = true;
     }
 
     {
@@ -1527,16 +1587,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> head_ssq, bool mock_post, bool enable_ssq,
              c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> idx_norm,
              c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
-             c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
+             c10::optional<torch::Tensor> idx_state,
+             c10::optional<torch::Tensor> idx_state_row,
+             int64_t state_ring_entries,
              c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm,
              c10::optional<torch::Tensor> q_y, c10::optional<torch::Tensor> q_norm_w,
              double q_eps,
-             c10::optional<torch::Tensor> slot_map,
              c10::optional<torch::Tensor> idx_cache, c10::optional<torch::Tensor> idx_dst,
+             int64_t idx_entries_per_block, int64_t idx_block_stride_bytes,
              c10::optional<torch::Tensor> swa_cache, c10::optional<torch::Tensor> swa_dst,
+             int64_t swa_entries_per_block, int64_t swa_block_stride_bytes,
              c10::optional<torch::Tensor> iq_dst, c10::optional<torch::Tensor> iq_dst_sf,
              c10::optional<torch::Tensor> iq_dst_peer,
-             c10::optional<torch::Tensor> iq_dst_peer_sf, int64_t iq_head_base,
+             c10::optional<torch::Tensor> iq_dst_peer_sf,
+             bool indexer_fp8, c10::optional<torch::Tensor> iq_weights,
+             int64_t iq_head_base,
              int64_t iq_row_lo, int64_t iq_row_hi,
              c10::optional<torch::Tensor> iq_done, c10::optional<torch::Tensor> iq_ready,
              c10::optional<torch::Tensor> iq_ready_self,
@@ -1545,10 +1610,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
                               cmp_pos, idx_norm,
-                              cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm,
+                              cos_tab, sin_tab, idx_state, idx_state_row,
+                              state_ring_entries, win_y2, win_norm,
                               q_y, q_norm_w, q_eps,
-                              slot_map, idx_cache, idx_dst, swa_cache, swa_dst,
+                              idx_cache, idx_dst, idx_entries_per_block,
+                              idx_block_stride_bytes, swa_cache, swa_dst,
+                              swa_entries_per_block, swa_block_stride_bytes,
                               iq_dst, iq_dst_sf, iq_dst_peer, iq_dst_peer_sf,
+                              indexer_fp8, iq_weights,
                               iq_head_base, iq_row_lo, iq_row_hi,
                               iq_done, iq_ready, iq_ready_self, iq_gen, iq_rank,
                               iq_prof);
@@ -1563,7 +1632,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "garbage; run idx_postprocess_standalone over iq_ws. mock_post=False: "
           "512 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
           "COMPRESSOR (no split-K): pass cmp_pos [M] i64 / idx_norm [128] / "
-          "cos_tab+sin_tab [S,32] / idx_kv+idx_sc [M,8,256] (state rings; the "
+          "cos_tab+sin_tab [S,32] / idx_state [..,512] + idx_state_row + "
+          "state_ring_entries (framework state ring; the "
           "fresh row is published by front's FRONT-EMIT epilogue, +idx_ape) "
           "-- warps 8..15 run it beside the GEMM. "
           "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
@@ -1588,22 +1658,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("idx_norm") = c10::nullopt,
           py::arg("cos_tab") = c10::nullopt,
           py::arg("sin_tab") = c10::nullopt,
-          py::arg("idx_kv") = c10::nullopt,
-          py::arg("idx_sc") = c10::nullopt,
+          py::arg("idx_state") = c10::nullopt,
+          py::arg("idx_state_row") = c10::nullopt,
+          py::arg("state_ring_entries") = 0,
           py::arg("win_y2") = c10::nullopt,
           py::arg("win_norm") = c10::nullopt,
           py::arg("q_y") = c10::nullopt,
           py::arg("q_norm_w") = c10::nullopt,
           py::arg("q_eps") = 1e-6,
-          py::arg("slot_map") = c10::nullopt,
           py::arg("idx_cache") = c10::nullopt,
           py::arg("idx_dst") = c10::nullopt,
+          py::arg("idx_entries_per_block") = 0,
+          py::arg("idx_block_stride_bytes") = 0,
           py::arg("swa_cache") = c10::nullopt,
           py::arg("swa_dst") = c10::nullopt,
+          py::arg("swa_entries_per_block") = 0,
+          py::arg("swa_block_stride_bytes") = 0,
           py::arg("iq_dst") = c10::nullopt,
           py::arg("iq_dst_sf") = c10::nullopt,
           py::arg("iq_dst_peer") = c10::nullopt,
           py::arg("iq_dst_peer_sf") = c10::nullopt,
+          py::arg("indexer_fp8") = false,
+          py::arg("iq_weights") = c10::nullopt,
           py::arg("iq_head_base") = 0,
           py::arg("iq_row_lo") = 0, py::arg("iq_row_hi") = -1,
           py::arg("iq_done") = c10::nullopt,
@@ -1680,6 +1756,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Standalone rope+hadamard+fp4quant over fp32/bf16 iq [M,64,128] -> "
           "(iq_fp4 [M,64,64] i8, iq_sf [M,64] i32) -- the separate-kernel baseline",
           py::arg("iq_f32"), py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"));
+    m.def("idx_postprocess_fp8_standalone",
+          [](torch::Tensor iq, torch::Tensor weights, torch::Tensor q_pos,
+             torch::Tensor rope_cos, torch::Tensor rope_sin) {
+              TORCH_CHECK(iq.is_cuda() && iq.is_contiguous()
+                          && (iq.scalar_type() == torch::kFloat
+                              || iq.scalar_type() == torch::kBFloat16)
+                          && iq.dim() == 3 && iq.size(1) == IDX_NUM_HEADS
+                          && iq.size(2) == IDX_HEAD_DIM,
+                          "iq must be contiguous CUDA fp32/bf16 [M,64,128]");
+              const int M = iq.size(0);
+              TORCH_CHECK(M >= 1 && weights.is_cuda() && weights.is_contiguous()
+                          && weights.scalar_type() == torch::kFloat32
+                          && weights.sizes() == torch::IntArrayRef({M, IDX_NUM_HEADS}),
+                          "weights must be contiguous CUDA fp32 [M,64]");
+              auto q8 = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM},
+                                     iq.options().dtype(torch::kFloat8_e4m3fn));
+              auto wf = torch::empty({M, IDX_NUM_HEADS},
+                                     iq.options().dtype(torch::kFloat32));
+              const int rows = M * IDX_NUM_HEADS;
+              auto stream = at::cuda::getCurrentCUDAStream();
+              if (iq.scalar_type() == torch::kBFloat16)
+                  idx_post_fp8_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      reinterpret_cast<const __nv_bfloat16*>(iq.data_ptr()),
+                      weights.data_ptr<float>(), q_pos.data_ptr<int>(),
+                      rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(q8.data_ptr()), wf.data_ptr<float>(),
+                      rows, IDX_NUM_HEADS);
+              else
+                  idx_post_fp8_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      iq.data_ptr<float>(), weights.data_ptr<float>(),
+                      q_pos.data_ptr<int>(), rope_cos.data_ptr<float>(),
+                      rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(q8.data_ptr()), wf.data_ptr<float>(),
+                      rows, IDX_NUM_HEADS);
+              return std::vector<torch::Tensor>{q8, wf};
+          },
+          "Standalone RTP Indexer-Q BF16/RoPE/E4M3 quant with scale-folded weights",
+          py::arg("iq"), py::arg("weights"), py::arg("q_pos"),
+          py::arg("rope_cos"), py::arg("rope_sin"));
     m.def("head_ssq_standalone",
           [](torch::Tensor y) {
               TORCH_CHECK(y.is_cuda() && y.is_contiguous()

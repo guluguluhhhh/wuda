@@ -2,16 +2,17 @@
 // ============================================================
 // idx_comp_fp4.cuh — fused CUDA-core post-processing for the wq_b merged GEMM
 // (warps 8..11, WARP-LEVEL: 32 threads/row, 4 rows in flight per CTA):
-//   * indexer (winkv) COMPRESSOR (CSA stage 6, delivery op_b_tail port):
-//       y4 state write (+ape) -> [compress row] 8-slot softmax aggregate ->
-//       bf16 RMSNorm(128) -> RoPE(last 64) -> FWHT-128 -> fp4 block-32.
-//       The 8-row overlap state uses a position-derived 4+4 ping-pong mapping,
-//       so compression never copies state[4:8] back to state[0:4].
-//   * LOCAL KV WINDOW post-processing (CSA stage 4, FULL chain -- delivery
-//     stopped at rope): weighted RMSNorm(512) -> RoPE(last 64) -> per-64 fp8
-//     e4m3 quant of [0,448) (delivery main-compressor semantics: scale =
+//   * indexer COMPRESSOR:
+//       [compress row] read the framework's 8-entry state ring -> overlap-cat
+//       softmax aggregate -> bf16 RMSNorm(128) -> RoPE(last 64), then either
+//       RTP FP8 (no Hadamard, one FP32 scale) or legacy FWHT-128 + block-32
+//       FP4. FRONT-EMIT has already published the fresh state row.
+//   * LOCAL KV WINDOW post-processing (full chain, i.e. through the fp8
+//     quant): weighted RMSNorm(512) -> RoPE(last 64) -> per-64 fp8
+//     e4m3 quant of [0,448) (main-compressor semantics: scale =
 //     max(amax,1e-4)/448, fp32) + bf16 rope tail [448,512).
-// NO split-K: y4 [M,512] / win_y2 [M,512] arrive pre-reduced.
+// NO split-K: FRONT-EMIT publishes reduced indexer state and win_y2 [M,512]
+// arrives pre-reduced.
 //
 // Why warp-level: a 128-thread/row version serialized ~12 NamedBarrier phases
 // of raw-latency global traffic per row (~12us/row); here lane l owns a
@@ -32,18 +33,12 @@ constexpr int WK_I  = 256;    // wkv / wgate width each (overlap-cat halves)
 constexpr int D_W   = 512;    // local-window kv dim (winkv row width)
 constexpr int NF8_W = D_W - RD;   // 448 fp8-quantized cols (rope tail stays bf16)
 
-// ---- kvcache-design paged pools (kccache_design.png) ----
-// Indexer fused page (mqa_logits contract): [64tok*64B fp4 | 64tok*4B sf].
-constexpr int IDX_PAGE_TOK   = 64;
-constexpr int IDX_PAGE_BYTES = IDX_PAGE_TOK * (D_I / 2 + 4);          // 4352
-// MODEL1_FP8Sparse page (FlashMLA quant.py, d=512): per token 448B e4m3 nope
-// + 128B bf16 rope packed in the body, 7 e8m0 pow2 scales (+1 pad) in the
-// page tail; page padded to a 576B multiple.
+// Both pools group every entry's data before the per-entry scale records.
+// RTP-LLM supplies logical entries-per-block independently from the physical
+// byte stride, which may include FlashMLA TMA padding.
 constexpr int M1_TOK_BODY    = NF8_W + 2 * RD;                        // 576
-constexpr int M1_PAGE_BYTES  = (IDX_PAGE_TOK * (M1_TOK_BODY + 8) + 575) / 576 * 576;
-constexpr int M1_TAIL_OFF    = IDX_PAGE_TOK * M1_TOK_BODY;            // 36864
 
-// All DEVICE pointers, caller-owned. kv == nullptr disables the compressor;
+// All DEVICE pointers, caller-owned. state == nullptr disables the compressor;
 // win_y2 == nullptr disables the local-window chain. pos/cos_tab/sin_tab are
 // shared by both chains. COMPACT outputs (q4/s4, win_q8/s8/rope) are OPTIONAL
 // once the paged direct writes are on (null = skip: saves ~600B/row of
@@ -56,11 +51,12 @@ struct Args {
     const float* norm_w  = nullptr;   // [D_I] compressor RMSNorm weight
     const float* cos_tab = nullptr;   // [S, RD/2] rope tables (S > max pos)
     const float* sin_tab = nullptr;
-    // [B1] PING-PONG state window: logical row rr at token position p lives at
-    // physical row (4*((p/4)&1) + rr) & 7. The fresh logical row is 4+p%4;
-    // switching the phase advances the previous window without a physical copy.
-    float* kv = nullptr;              // [M, SROWS, WK_I] K/V state ring (INOUT)
-    float* sc = nullptr;              // [M, SROWS, WK_I] score state (INOUT)
+    // Framework scratch state: one ring per request, each entry is
+    // [kv(WK_I) | score(WK_I)]. state_row is already folded to
+    // block_id * state_ring_entries + pos % state_ring_entries.
+    const float* state = nullptr;     // [blocks, ring, 2 * WK_I] fp32
+    const int* state_row = nullptr;   // [M], -1 skips the row
+    int state_ring_entries = 0;
     uint8_t* q4 = nullptr;            // [M, D_I/2]  packed e2m1 (compress rows)
     uint8_t* s4 = nullptr;            // [M, D_I/32] block-32 ue8m0 exponents
     // ---- local kv window (winkv) ----
@@ -69,16 +65,16 @@ struct Args {
     uint8_t* win_q8   = nullptr;      // [M, NF8_W] e4m3
     float*   win_s8   = nullptr;      // [M, NF8_W/64] per-64 fp32 scales (pow2)
     __nv_bfloat16* win_rope = nullptr;// [M, RD] rope tail (bf16)
-    // ---- kvcache design: persistent-slot state + paged-pool DIRECT writes ----
-    // slot_map[m] = this row's persistent request slot: kv/sc become POOLS
-    // [capacity, SROWS, WK_I] addressed by slot (null => legacy row-m).
-    // idx_dst/swa_dst[m] = page*64+off in the respective pool (-1 => skip);
-    // the chains store the SAME bytes as the compact outputs, in cache layout.
-    const int* slot_map = nullptr;    // [M] state slot per row
-    uint8_t* idx_cache  = nullptr;    // indexer fused pages [P, 4352]B
+    // Flat destinations use block_id * entries_per_block + offset. Logical
+    // geometry and physical page stride are deliberately independent.
+    uint8_t* idx_cache  = nullptr;
     const int* idx_dst  = nullptr;    // [M] compressed-token dst (compress rows)
-    uint8_t* swa_cache  = nullptr;    // SWA MODEL1 pages [P, M1_PAGE_BYTES]B
+    int idx_entries_per_block = 0;
+    size_t idx_block_stride_bytes = 0;
+    uint8_t* swa_cache  = nullptr;
     const int* swa_dst  = nullptr;    // [M] token dst (every row)
+    int swa_entries_per_block = 0;
+    size_t swa_block_stride_bytes = 0;
 };
 
 // bf16 round-trip via intrinsics (torch extensions define
@@ -98,35 +94,39 @@ __device__ __forceinline__ float fpow2(int e) {
 }
 
 // One token row, ONE warp (lane = 0..31); lane l owns cols {4l..4l+3}.
+template <bool kFp8>
 __device__ inline void process_row(const Args& a, int m, int lane,
                                    float eps = 1e-6f) {
     const long long p = a.pos[m];
-    const int phase = RATIO * ((int)(p >> 2) & 1);
-    // kvcache design: the state ring lives in a PERSISTENT-slot pool.
-    const int srow = a.slot_map ? a.slot_map[m] : m;
-
-    // (fresh-row publish moved to the FRONT-EMIT epilogue: front scatters
-    // the fp32 accum + idx_ape into kv/sc at the [B1] ping-pong row before
-    // this kernel launches -- stream order makes it visible here.)
+    // FRONT-EMIT published this token's fresh row before this kernel launches.
     if (((p + 1) & (RATIO - 1)) != 0)
         return;                            // not a compress row (row-uniform)
 
-    float* skv = a.kv + (size_t)srow * SROWS * WK_I;
-    float* ssc = a.sc + (size_t)srow * SROWS * WK_I;
+    const int srow = a.state_row[m];
+    if (srow < 0)
+        return;
     const int c0 = 4 * lane;
 
-    // ---- aggregate: per-col 8-slot softmax weighted sum (overlap-cat cols).
-    // All 8 slots load as float4 through the ping-pong mapping (the fresh
-    // slot is pool data now, same as the other 7). ----
+    // Logical row rr of the overlap window ending at p lives at ring row
+    // (p - (SROWS - 1) + rr) % ring. The first four rows read the overlap half
+    // and the final four rows read the current half of each state entry.
     float v[4];
     {
+        const int ring = a.state_ring_entries;
+        const int rcur = srow % ring;
+        const int r0 = (rcur >= SROWS - 1) ? rcur - (SROWS - 1)
+                                           : rcur - (SROWS - 1) + ring;
+        const float* base = a.state + (size_t)(srow - rcur) * (2 * WK_I);
         float4 sc8[SROWS], kv8[SROWS];
         #pragma unroll
         for (int rr = 0; rr < SROWS; ++rr) {
-            const int pr = (phase + rr) & (SROWS - 1);
+            int pr = r0 + rr;
+            if (pr >= ring)
+                pr -= ring;
             const int col = (rr < RATIO) ? c0 : (D_I + c0);
-            sc8[rr] = *reinterpret_cast<const float4*>(ssc + (size_t)pr * WK_I + col);
-            kv8[rr] = *reinterpret_cast<const float4*>(skv + (size_t)pr * WK_I + col);
+            const float* entry = base + (size_t)pr * (2 * WK_I);
+            sc8[rr] = *reinterpret_cast<const float4*>(entry + WK_I + col);
+            kv8[rr] = *reinterpret_cast<const float4*>(entry + col);
         }
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -184,6 +184,39 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         v[3] = bf16r(e1 * cs1.y + o1 * cs1.x);
     }
 
+    if constexpr (kFp8) {
+        // RTP Indexer cache: no Hadamard. One ordinary FP32 scale covers the
+        // whole 128-vector and is stored after all K bytes in the physical page.
+        float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
+                           fmaxf(fabsf(v[2]), fabsf(v[3])));
+        #pragma unroll
+        for (int x = 16; x >= 1; x >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, x));
+        const float scale = fmaxf(amax * (1.0f / 448.0f), 1.0e-12f);
+        alignas(4) uint8_t q[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            q[j] = __nv_fp8_e4m3(v[j] / scale).__x;
+        if (a.q4 != nullptr)
+            *reinterpret_cast<uint32_t*>(a.q4 + (size_t)m * D_I + lane * 4) =
+                *reinterpret_cast<const uint32_t*>(q);
+        if (lane == 0 && a.s4 != nullptr)
+            *reinterpret_cast<float*>(a.s4 + (size_t)m * sizeof(float)) = scale;
+        if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
+            const int dst = a.idx_dst[m];
+            const int epb = a.idx_entries_per_block;
+            uint8_t* page = a.idx_cache
+                + (size_t)(dst / epb) * a.idx_block_stride_bytes;
+            const int off = dst % epb;
+            *reinterpret_cast<uint32_t*>(page + off * D_I + lane * 4) =
+                *reinterpret_cast<const uint32_t*>(q);
+            if (lane == 0)
+                *reinterpret_cast<float*>(page + (size_t)epb * D_I
+                                          + off * sizeof(float)) = scale;
+        }
+        return;
+    }
+
     // ---- FWHT-128, natural order: value index = 4*lane + j.
     // h=1,2 in-thread; h=4..64 via shfl_xor(lane, h/4). ----
     {
@@ -225,16 +258,16 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         const uint16_t packed = (uint16_t)((uint8_t)lo.__x | ((uint16_t)(uint8_t)hi.__x << 8));
         if (a.q4 != nullptr)
             *reinterpret_cast<uint16_t*>(a.q4 + (size_t)m * (D_I / 2) + lane * 2) = packed;
-        // kvcache design: DIRECT store into the indexer fused page (same bytes
-        // as q4/s4, cache layout: [64tok*64B fp4 | 64tok*4B sf]).
+        // Direct store into the RTP physical indexer page.
         if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
             const int dst = a.idx_dst[m];
+            const int epb = a.idx_entries_per_block;
             uint8_t* page = a.idx_cache
-                + (size_t)(dst / IDX_PAGE_TOK) * IDX_PAGE_BYTES;
-            const int off = dst % IDX_PAGE_TOK;
+                + (size_t)(dst / epb) * a.idx_block_stride_bytes;
+            const int off = dst % epb;
             *reinterpret_cast<uint16_t*>(page + off * (D_I / 2) + lane * 2) = packed;
             if ((lane & 7) == 0)
-                page[IDX_PAGE_TOK * (D_I / 2) + off * 4 + (lane >> 3)] =
+                page[(size_t)epb * (D_I / 2) + off * 4 + (lane >> 3)] =
                     (uint8_t)(se + 127);
         }
     }
@@ -305,13 +338,15 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         // bytes + tail e8m0 scale; same quant chain as the compact outputs).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
             const int dst = a.swa_dst[m];
+            const int epb = a.swa_entries_per_block;
             uint8_t* page = a.swa_cache
-                + (size_t)(dst / IDX_PAGE_TOK) * M1_PAGE_BYTES;
-            const int off = dst % IDX_PAGE_TOK;
+                + (size_t)(dst / epb) * a.swa_block_stride_bytes;
+            const int off = dst % epb;
             *reinterpret_cast<uint4*>(page + off * M1_TOK_BODY + lane * 16) =
                 *reinterpret_cast<const uint4*>(q);
             if ((lane & 3) == 0)
-                page[M1_TAIL_OFF + off * 8 + (lane >> 2)] = (uint8_t)(se + 127);
+                page[(size_t)epb * M1_TOK_BODY + off * 8 + (lane >> 2)] =
+                    (uint8_t)(se + 127);
         }
     } else {                                    // lanes 28..31: rope tail (bf16)
         const long long p = a.pos[m];
@@ -335,9 +370,10 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         // kvcache design: rope tail into the SWA MODEL1 body (cols 448..511).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
             const int dst = a.swa_dst[m];
+            const int epb = a.swa_entries_per_block;
             uint8_t* base = a.swa_cache
-                + (size_t)(dst / IDX_PAGE_TOK) * M1_PAGE_BYTES
-                + (dst % IDX_PAGE_TOK) * M1_TOK_BODY + NF8_W;
+                + (size_t)(dst / epb) * a.swa_block_stride_bytes
+                + (size_t)(dst % epb) * M1_TOK_BODY + NF8_W;
             *reinterpret_cast<uint4*>(base + j0 * 4) =
                 *reinterpret_cast<const uint4*>(out);
             *reinterpret_cast<uint4*>(base + j0 * 4 + 16) =
