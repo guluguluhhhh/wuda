@@ -1205,7 +1205,6 @@ def benchmark(mods, w, ncmp=2048):
                 torch.cuda.synchronize()
             tp = os.path.join(trace_dir, f"e2e_{trace_mode}_B{B}.json")
             prof.export_chrome_trace(tp)
-            print(f"  timeline: {tp}")
             del prof
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
