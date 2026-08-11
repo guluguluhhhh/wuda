@@ -26,7 +26,8 @@ torch::Tensor run_op(
     c10::optional<torch::Tensor> idx_state_row_opt,
     c10::optional<torch::Tensor> idx_ape_opt,
     c10::optional<torch::Tensor> win_y2_opt,
-    c10::optional<torch::Tensor> w64_opt) {
+    c10::optional<torch::Tensor> w64_opt,
+    bool pdl) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
               x.scalar_type() == torch::kBFloat16 && x.dim() == 2 &&
               x.size(1) == K, "x must be contiguous bf16 [M,", K, "]");
@@ -242,27 +243,35 @@ torch::Tensor run_op(
   if (batch_n == 16) {
     status = task_times != nullptr
         ? launch<16, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
+                           pdl)
         : launch<16, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
+                            pdl);
   } else if (batch_n == 32) {
     status = task_times != nullptr
         ? launch<32, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
+                           pdl)
         : launch<32, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
+                            pdl);
   } else if (batch_n == 64) {
     status = task_times != nullptr
         ? launch<64, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
+                           pdl)
         : launch<64, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
+                            pdl);
   } else {
     status = task_times != nullptr
         ? launch<128, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
+                            xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
+                            pdl)
         : launch<128, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                             xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
+                             xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
+                             pdl);
   }
   TORCH_CHECK(status == cudaSuccess, "swapAB launch failed: ",
               cudaGetErrorString(status));
@@ -287,5 +296,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       py::arg("main_state_row") = py::none(), py::arg("ape_phase") = py::none(),
       py::arg("idx_state") = py::none(), py::arg("idx_state_row") = py::none(),
       py::arg("idx_ape") = py::none(), py::arg("win_y2") = py::none(),
-      py::arg("w64") = py::none());
+      py::arg("w64") = py::none(), py::arg("pdl") = false);
 }

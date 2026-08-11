@@ -40,7 +40,8 @@ torch::Tensor front_mixed_gemm_op(
     c10::optional<torch::Tensor> idx_state_row_opt,
     c10::optional<torch::Tensor> idx_ape_opt,
     c10::optional<torch::Tensor> win_y2_opt,
-    c10::optional<torch::Tensor> w64_opt) {
+    c10::optional<torch::Tensor> w64_opt,
+    bool pdl) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
               x.scalar_type() == torch::kBFloat16 &&
               x.dim() == 2 && x.size(1) == K, "x must be bf16 [M,", K, "]");
@@ -206,7 +207,7 @@ torch::Tensor front_mixed_gemm_op(
       reinterpret_cast<const uint8_t*>(x_sf.data_ptr()),
       reinterpret_cast<const uint8_t*>(w_sf.data_ptr()),
       hc, emit,
-      m, at::cuda::getCurrentCUDAStream());
+      m, at::cuda::getCurrentCUDAStream(), pdl);
   TORCH_CHECK(status == cudaSuccess, "front_mixed launch failed: ",
               cudaGetErrorString(status));
   return output;
@@ -237,5 +238,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("idx_state_row") = c10::nullopt,
              py::arg("idx_ape") = c10::nullopt,
              py::arg("win_y2") = c10::nullopt,
-             py::arg("w64") = c10::nullopt);
+             py::arg("w64") = c10::nullopt,
+             py::arg("pdl") = false);
 }

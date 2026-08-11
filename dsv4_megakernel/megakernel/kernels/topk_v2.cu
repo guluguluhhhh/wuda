@@ -21,9 +21,8 @@
 // [MEGAKERNEL EDIT]s vs upstream:
 //   1. tvm-ffi TensorMatcher/LaunchKernel -> torch checks + <<<>>> launches
 //      (__cluster_dims__ keeps the compile-time cluster shape).
-//   2. kPDL instantiated FALSE: standalone stream-ordered launches (PDL only
-//      helped when fused behind the scorer via programmatic launch; the
-//      device-side griddepcontrol code stays, gated by the template).
+//   2. kPDL instantiated FALSE: the scorer has only ~0.2us of safe cleanup
+//      after its final logits store, too little to amortize PDL.
 //   3. C++20 std::has_single_bit / countr_zero -> builtin equivalents.
 // ============================================================
 
@@ -400,8 +399,6 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     params.page_bits         = page_bits;
     params.cluster_floor     = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor;
 
-    // [MEGAKERNEL EDIT] standalone launches: kPDL=false (stream order supplies
-    // the plan->transform and scorer->topk dependencies).
     constexpr bool kUsePDL = false;
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     if (use_cluster) {

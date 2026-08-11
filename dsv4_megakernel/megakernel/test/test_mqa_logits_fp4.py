@@ -33,6 +33,14 @@ NUM_HEADS = 64
 HEAD_DIM = 128
 
 
+def _deep_gemm_dir():
+    override = os.environ.get("DEEP_GEMM_DIR")
+    if override:
+        return os.path.abspath(override)
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "DeepGEMM"))
+
+
 # ==================================================================================
 # FP4 quantization + metric helpers, inlined from DeepGEMM (deep_gemm/utils/math.py
 # and deep_gemm/testing/numeric.py) so this test is self-contained — no `deep_gemm`
@@ -167,7 +175,7 @@ def load_cuda_module_fp8():
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
     proj_dir = os.path.dirname(this_dir)
-    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    deep_gemm_dir = _deep_gemm_dir()
     cutlass_dir = os.path.join(proj_dir, "..", "cutlass", "include")
     cutlass_tools_dir = os.path.join(
         proj_dir, "..", "cutlass", "tools", "util", "include")
@@ -372,7 +380,7 @@ def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
 
 def get_deep_gemm():
     """Resolve the checkout explicitly so an older installed wheel cannot win."""
-    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    deep_gemm_dir = _deep_gemm_dir()
     if deep_gemm_dir not in sys.path:
         sys.path.insert(0, deep_gemm_dir)
     import deep_gemm

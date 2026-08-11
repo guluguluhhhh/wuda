@@ -71,6 +71,12 @@ hc_reduce_and_fuse_kernel(
                   "fused attn_norm needs ALL warps in the collapse (lite only)");
     const int pos = static_cast<int>(blockIdx.x);
     if (pos >= num_positions) return;
+    // This epilogue is a PDL producer for front. Release front immediately so
+    // its descriptor/barrier/TMEM prologue can run while we reduce and quantize;
+    // front's griddepcontrol.wait still orders every activation load.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
     // clock64 phase stamps on block 0 only (see PROF_SLOTS layout in the header).
     const bool prof0 = (prof != nullptr && pos == 0);
     if (prof0 && threadIdx.x == 0) prof[2] = ptx::rdclock();
@@ -358,12 +364,6 @@ hc_reduce_and_fuse_kernel(
         }   // !kFusedNorm (streaming collapse)
         if (prof0 && threadIdx.x == COLLAPSE_BASE) prof[7] = ptx::rdclock();  // collapse end
     }
-    // PDL exit (parity with vLLM's pdl_trigger): let the NEXT op in the
-    // chain prelaunch under our tail; its own griddepcontrol.wait provides
-    // the ordering. No-op for non-PDL consumers.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;");
-#endif
 }
 
 // Launch one fuse-kernel variant, optionally as a PDL SECONDARY (PSS attr):

@@ -183,18 +183,15 @@ def _inv_rope_quant_kernel(
     ROPE_DIM_T: tl.constexpr,
     QUANT_GROUP_SIZE_T: tl.constexpr,
     FP8_MAX_T: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    TRIGGER_PDL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     global_head = tl.program_id(1).to(tl.int64)
     group = global_head // heads_per_group
     head_in_group = global_head % heads_per_group
-    if USE_PDL:
-        # This is a middle PDL stage: release the dependent grid so its
-        # initialization can overlap, then wait before reading MLA output.
+    if TRIGGER_PDL:
         tl.extra.cuda.gdc_launch_dependents()
-        tl.extra.cuda.gdc_wait()
 
     if token >= num_tokens:
         tl.store(
@@ -260,15 +257,13 @@ def _quant_o_lora_kernel(
     scale_stride_k,
     QUANT_GROUP_SIZE_T: tl.constexpr,
     FP8_MAX_T: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    TRIGGER_PDL: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     packed_block = tl.program_id(1).to(tl.int64)
-    if USE_PDL:
-        # Match the official vLLM middle-stage PDL protocol.
+    if TRIGGER_PDL:
         tl.extra.cuda.gdc_launch_dependents()
-        tl.extra.cuda.gdc_wait()
     if token >= num_tokens:
         tl.store(scale_ptr + token + packed_block * scale_stride_k, 0)
         return
@@ -382,6 +377,7 @@ def run_o_proj_mhc_post(
     mhc_post_module: Any,
     *,
     use_pdl: bool = True,
+    force_pdl: bool = False,
     run_mhc_post: bool = True,
 ) -> torch.Tensor:
     """Run allocation-free O projection and mHC post on the current stream.
@@ -488,12 +484,18 @@ def run_o_proj_mhc_post(
         ),
     )
 
-    # The pinned DeepGEMM stores PDL enablement in one process-wide runtime.
-    # Serialize the setting and complete enqueue chain, bind launches to the
-    # input device, then restore the caller's setting without waiting on GPU.
+    # These two producer/consumer pairs did not show stable overlap in E2E
+    # traces. Keep them batch-independent and enable them only for the
+    # force-all ablation mode.
+    pdl_inv_to_wo_a = use_pdl and force_pdl
+    pdl_quant_to_wo_b = use_pdl and force_pdl
+
+    # Serialize the process-wide DeepGEMM PDL setting and all affected enqueues.
     assert device.index is not None
     with torch.cuda.device(device):
-        with deepgemm_pdl_enqueue_scope(deep_gemm, use_pdl, device.index):
+        with deepgemm_pdl_enqueue_scope(
+            deep_gemm, pdl_inv_to_wo_a, device.index
+        ):
             _inv_rope_quant_kernel[(aligned_m, heads)](
                 mla_out,
                 positions,
@@ -514,8 +516,8 @@ def run_o_proj_mhc_post(
                 ROPE_DIM_T=ROPE_DIM,
                 QUANT_GROUP_SIZE_T=QUANT_GROUP_SIZE,
                 FP8_MAX_T=FP8_MAX,
-                USE_PDL=use_pdl,
-                launch_pdl=use_pdl,
+                TRIGGER_PDL=pdl_inv_to_wo_a,
+                launch_pdl=False,
                 num_warps=1,
                 num_stages=1,
             )
@@ -527,6 +529,9 @@ def run_o_proj_mhc_post(
                 recipe=(1, 1, 128),
             )
 
+        with deepgemm_pdl_enqueue_scope(
+            deep_gemm, pdl_quant_to_wo_b, device.index
+        ):
             _quant_o_lora_kernel[(aligned_m, intermediate_dim // 512)](
                 workspace.z,
                 workspace.z_fp8,
@@ -537,8 +542,8 @@ def run_o_proj_mhc_post(
                 scale_stride_k=workspace.z_scale.stride(1),
                 QUANT_GROUP_SIZE_T=QUANT_GROUP_SIZE,
                 FP8_MAX_T=FP8_MAX,
-                USE_PDL=use_pdl,
-                launch_pdl=use_pdl,
+                TRIGGER_PDL=pdl_quant_to_wo_b,
+                launch_pdl=False,
                 num_warps=4,
                 num_stages=1,
             )

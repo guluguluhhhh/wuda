@@ -239,11 +239,11 @@ def benchmark(module):
     bf16_bytes = N * K * 2
     print(f"  weight bytes: mixed {mixed_bytes / 1e6:.1f} MB vs all-bf16 "
           f"{bf16_bytes / 1e6:.1f} MB (x{bf16_bytes / mixed_bytes:.2f})")
-    print("  columns: mixed = bare GEMM | +hc = +MHC post/comb tail "
-          "(x arrives pre-normed; q/kv ssq live in the wq_b quant prologue)")
-    print(f"  {'M':<5} {'mixed(us)':<10} {'+hc(us)':<9} "
+    print("  columns: mixed = bare GEMM | +hc = +MHC post/comb tail | "
+          "production = +hc + direct state/win emit (matches E2E)")
+    print(f"  {'M':<5} {'mixed(us)':<10} {'+hc(us)':<9} {'production(us)':<15} "
           f"{'cb_bf16(us)':<12} {'cb_fp8(us)':<11} {'mixed_BW':<9} {'x_bf16':<7}")
-    print("  " + "-" * 70)
+    print("  " + "-" * 86)
 
     one = torch.ones((), device='cuda', dtype=torch.float32)
     for m in (2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128):
@@ -284,11 +284,31 @@ def benchmark(module):
                                             hc_mix=None, hc_base=None, hc_scale=None,
                                             hc_post=None, hc_comb=None, out=out),
             'front_mixed_kernel', suppress_kineto_output=True)
-        # +hc: MHC post/comb tail on (production form)
+        # +hc: MHC post/comb tail on, still using the legacy full-y stores.
         hc = make_hc(mp, seed=m + 7)
         wssq = 1e6 * bench_kineto(
             lambda: module.front_mixed_gemm(xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
                                             out=out, **hc),
+            'front_mixed_kernel', suppress_kineto_output=True)
+        # Match E2E's FRONT-EMIT production bundle. Each row owns one of the
+        # pool's eight state slots; the physical addresses and traffic match
+        # the cache-manager layout without constructing a full KV manager.
+        emit = {
+            'main_kv': torch.empty(mp, 8, 1024, device='cuda'),
+            'main_sc': torch.empty(mp, 8, 1024, device='cuda'),
+            'main_ape': torch.randn(4, 1024, device='cuda'),
+            'state_row': torch.arange(mp, device='cuda', dtype=torch.int32) * 8,
+            'ape_phase': torch.arange(mp, device='cuda', dtype=torch.int32) & 3,
+            'idx_kv': torch.empty(mp, 8, 256, device='cuda'),
+            'idx_sc': torch.empty(mp, 8, 256, device='cuda'),
+            'idx_ape': torch.randn(4, 256, device='cuda'),
+            'win_y2': torch.empty(mp, 512, device='cuda'),
+            'w64': torch.empty(mp, 64, device='cuda'),
+        }
+        production = 1e6 * bench_kineto(
+            lambda: module.front_mixed_gemm(
+                xm, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
+                out=out, **hc, **emit),
             'front_mixed_kernel', suppress_kineto_output=True)
         cb = 1e6 * sum(bench_kineto(
             lambda: torch.mm(x, w_all.t(), out=cb_out),
@@ -308,7 +328,7 @@ def benchmark(module):
 
         io_bytes = mixed_bytes + mp * (K * 2 + K + SF_K) + mp * N * 2
         bw = io_bytes / (mixed * 1e-6) / 1e9
-        print(f"  {m:<5} {mixed:<10.1f} {wssq:<9.1f} {cb:<12.1f} "
+        print(f"  {m:<5} {mixed:<10.1f} {wssq:<9.1f} {production:<15.1f} {cb:<12.1f} "
               f"{cb8_s} {bw:<9.1f} {cb / mixed:<7.2f}")
 
 

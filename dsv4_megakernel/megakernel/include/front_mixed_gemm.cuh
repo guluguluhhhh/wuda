@@ -554,6 +554,9 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
         __cvta_generic_to_shared(&s.tmem_base));
     tmem_alloc_2sm(addr, NUM_TMEM_COLS);
   }
+  // When front is PSS-launched, descriptor/barrier/TMEM initialization above
+  // overlaps the mHC epilogue. Order the first activation-dependent load only.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   // ---- warp3: resident SF preload (fp8 tiles only; one shot, no pipeline).
   // Runs on BOTH CTAs before the prologue cluster_sync. TWO layout rules
   // learned the hard way (first cut: row-major smem, global 128 rows on both
@@ -943,7 +946,7 @@ inline cudaError_t launch_front_mixed(
     const CUtensorMap& desc_d,
     const uint8_t* x_sf, const uint8_t* w_sf,
     const HcTailArgs& hc, const FrontEmitArgs& emit,
-    int m, cudaStream_t stream) {
+    int m, cudaStream_t stream, bool pdl) {
   cudaLaunchConfig_t config{};
   const int m_tiles = (m + BLOCK_M - 1) / BLOCK_M;
   const int clusters = NUM_N_TILES * m_tiles;
@@ -951,13 +954,19 @@ inline cudaError_t launch_front_mixed(
   config.blockDim = dim3(TPB, 1, 1);
   config.dynamicSmemBytes = sizeof(SharedStorage);
   config.stream = stream;
-  cudaLaunchAttribute cluster_attr{};
-  cluster_attr.id = cudaLaunchAttributeClusterDimension;
-  cluster_attr.val.clusterDim.x = CLUSTER_SIZE;
-  cluster_attr.val.clusterDim.y = 1;
-  cluster_attr.val.clusterDim.z = 1;
-  config.attrs = &cluster_attr;
+  cudaLaunchAttribute attrs[2]{};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = CLUSTER_SIZE;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  config.attrs = attrs;
   config.numAttrs = 1;
+  if (pdl) {
+    attrs[config.numAttrs].id =
+        cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[config.numAttrs].val.programmaticStreamSerializationAllowed = 1;
+    ++config.numAttrs;
+  }
   void* args[] = {
       const_cast<CUtensorMap*>(&desc_a),
       const_cast<CUtensorMap*>(&desc_b),

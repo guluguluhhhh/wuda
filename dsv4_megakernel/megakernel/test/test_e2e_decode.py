@@ -138,6 +138,7 @@ O_INTER = O_GROUPS * O_LORA        # 16384
 TPDP_MODE = False
 MLA_DP_MODE = False
 INDEXER_FP8 = True
+PDL_MODE = "on"
 
 
 def configure_geometry(tpdp=False):
@@ -146,6 +147,21 @@ def configure_geometry(tpdp=False):
     MLA_DP_MODE = tpdp
     t_wq.configure_geometry(tpdp)
     WQ_HEADS = t_wq.N_TOTAL // Q_DIM
+
+
+def configure_pdl(mode):
+    global PDL_MODE
+    if mode not in ("on", "all", "none"):
+        raise ValueError(f"unsupported PDL mode: {mode}")
+    PDL_MODE = mode
+
+
+def pdl_enabled():
+    return PDL_MODE != "none"
+
+
+def pdl_forced():
+    return PDL_MODE == "all"
 
 
 def post_attn_enabled():
@@ -194,9 +210,11 @@ def mla_dp_output_to_tp(mla3, B):
 
 
 def load_mhc_post():
-    """mHC post kernel, ported from mega_csa: its kernel math and PDL protocol
-    are byte-for-byte upstream, merged into one .cu with the torch binding
-    (this tree has a single consumer, so upstream's cross-TU split is moot)."""
+    """mHC post port with dependency-independent staging before its PDL wait.
+
+    The kernel and torch binding share one translation unit because this tree
+    has a single consumer and does not need upstream's cross-TU split.
+    """
     from torch.utils.cpp_extension import load
     here = os.path.dirname(os.path.abspath(__file__))
     proj = os.path.dirname(here)
@@ -403,10 +421,14 @@ def ref_o_proj_mhc(
 # ==================== one decode step ====================
 def get_dg():
     """deep_gemm (hard dep for the hybrid mhc): shared resolver in
-    bench_utils (env DEEP_GEMM_DIR > installed wheel > sibling checkout),
-    PDL enabled once."""
+    bench_utils (env DEEP_GEMM_DIR > installed wheel > sibling checkout).
+    The chain-leading mHC GEMM has no PDL producer; O-proj configures its two
+    measured PDL edges independently."""
     from bench_utils import get_deep_gemm
-    dg = get_deep_gemm()
+    enabled = pdl_forced()
+    dg = get_deep_gemm(pdl=enabled)
+    if hasattr(dg, "set_pdl"):
+        dg.set_pdl(enabled)
     assert hasattr(dg, "tf32_hc_prenorm_gemm"), \
         "deep_gemm build lacks tf32_hc_prenorm_gemm"
     return dg
@@ -438,7 +460,8 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
                            EPS, EPS, collapsed, pre, po, cb,
                            with_post_comb=False, attn_norm_w=w["attn_norm"],
                            attn_norm_eps=EPS, mix_out=mix_out,
-                           xq_out=xq_out, xsf_out=xsf_out)
+                           xq_out=xq_out, xsf_out=xsf_out,
+                           pdl=pdl_forced())
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
@@ -476,7 +499,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         main_state=mgr.main_state, main_ape=w["main_ape"],
         main_state_row=st["main_state_row"], ape_phase=(pos % 4).int(),
         idx_state=mgr.idx_state, idx_state_row=st["idx_state_row"],
-        idx_ape=w["idx_ape"], win_y2=win_y2, w64=w64)
+        idx_ape=w["idx_ape"], win_y2=win_y2, w64=w64,
+        pdl=pdl_enabled())
     ref8 = (t_fm.dequant_fp8(x_fp8, x_sf, True)
             @ t_fm.dequant_fp8(w["front_fp8"], w["front_sf"], False).t())
     d8 = max(t_fm.calc_diff(y[:, :1536].float(), ref8[:, :1536]),
@@ -505,7 +529,9 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"],
         swa_entries_per_block=mgr.entries_per_block["swa"],
         swa_block_stride_bytes=mgr.block_stride_bytes["swa"],
-        indexer_fp8=INDEXER_FP8, iq_weights=weights64 if INDEXER_FP8 else None)
+        indexer_fp8=INDEXER_FP8,
+        iq_weights=weights64 if INDEXER_FP8 else None,
+        pdl=pdl_enabled())
     yq, iq_fp4, iq_sf = rets[0], rets[1], rets[2]
     qr, sr = t_wq.ref_qnorm_quant(y[:, :1536], w["q_norm"])
     stats["B_xq_match"] = min(stats.get("B_xq_match", 1.0),
@@ -711,7 +737,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         run_post = not TPDP_MODE
         projected = o_proj_csa.run_o_proj_mhc_post(
             mla3, pos64, w["cos_sin"], hidden, post_t, comb_t,
-            w["o_proj"], oproj_ws(B), mpm, use_pdl=True,
+            w["o_proj"], oproj_ws(B), mpm, use_pdl=pdl_enabled(),
+            force_pdl=pdl_forced(),
             run_mhc_post=run_post)
         ref_final = ref_o_proj_mhc(mla3, pos64, w["cos_sin"], hidden,
                                    post_t, comb_t, w["wo_a"], w["wo_b"],
@@ -785,6 +812,12 @@ def benchmark(mods, w, ncmp=2048):
     missing partial reduction. The ported O-proj entry point performs host-side
     validation, which does not affect graph replay or Kineto device time."""
     hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
+    trace_dir = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "docs", "timeline"))
+    os.makedirs(trace_dir, exist_ok=True)
+    trace_mode = "tpdp" if TPDP_MODE else "full"
+    if PDL_MODE != "on":
+        trace_mode += f"_pdl-{PDL_MODE}"
     print("\n" + "=" * 76)
     print(f"Per-operator latency (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
@@ -814,18 +847,13 @@ def benchmark(mods, w, ncmp=2048):
 
     def flush_l2(drain=True):
         """Evict L2.
-        drain=True (wall path): also DRAIN. The drain is not optional there:
-          the chain's first op (deep_gemm's mhc GEMM) launches with PDL, and
-          without it that GEMM would overlap the memset tail.
+        drain=True (wall path): also drain before returning.
         drain=False (event path): leave the memset IN FLIGHT and enqueue
           behind it. An event recorded next is still stream-ordered AFTER the
           flush, so the flush stays out of the window, but the device stays
           busy ~1ms while the host submits the replay -- otherwise the host's
-          submit latency shows up as device IDLE inside the window (~10us for
-          this 16-node graph). L2 is still cold for the data: a PSS consumer
-          may run its prologue (barrier init / descriptor prefetch) early,
-          but cudaGridDependencySynchronize blocks its loads until the
-          non-signalling memset has actually completed."""
+          submit latency shows up as device idle inside the window (~10us for
+          this graph)."""
         flush_buf.zero_()
         if drain:
             torch.cuda.synchronize()
@@ -902,7 +930,8 @@ def benchmark(mods, w, ncmp=2048):
                 main_state=mgr.main_state, main_ape=w["main_ape"],
                 main_state_row=main_state_row, ape_phase=ape_phase,
                 idx_state=mgr.idx_state, idx_state_row=idx_state_row,
-                idx_ape=w["idx_ape"], win_y2=win_y2_p, w64=w64_p)
+                idx_ape=w["idx_ape"], win_y2=win_y2_p, w64=w64_p,
+                pdl=pdl_enabled())
         run_hc(); run_front()
 
         xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
@@ -927,7 +956,8 @@ def benchmark(mods, w, ncmp=2048):
                 swa_entries_per_block=mgr.entries_per_block["swa"],
                 swa_block_stride_bytes=mgr.block_stride_bytes["swa"],
                 indexer_fp8=INDEXER_FP8,
-                iq_weights=weights64 if INDEXER_FP8 else None)
+                iq_weights=weights64 if INDEXER_FP8 else None,
+                pdl=pdl_enabled())
         run_wqb()
         nc = mgr.n_compressed(slots, pos)
         B_local = local_batch(B)
@@ -1062,11 +1092,12 @@ def benchmark(mods, w, ncmp=2048):
                               else mla_o).contiguous()
                 return o_proj_csa.run_o_proj_mhc_post(
                     mla_tp, pos64, cos_sin_l, hidden, post_b, comb_b,
-                    w["o_proj"], ows, mpm, use_pdl=True, run_mhc_post=False)
+                    w["o_proj"], ows, mpm, use_pdl=pdl_enabled(),
+                    force_pdl=pdl_forced(), run_mhc_post=False)
 
             def run_mhcpost():
                 mpm.mhc_post_out(ows.projected, hidden, post_b, comb_b,
-                                 ows.mhc_output, True)
+                                 ows.mhc_output, pdl_enabled())
             run_oproj()
             stage_fns.append(("o_proj", run_oproj))
             if mhc_post_enabled():
@@ -1166,14 +1197,15 @@ def benchmark(mods, w, ncmp=2048):
             print(f"  (graph capture failed at B={B}: {err})")
 
         # ---- perfetto timeline: one cold-L2 graph replay only. ------------
-        if B in (16, 128) and not math.isnan(t_graph):
+        if B in (16, 64, 96, 112, 128) and not math.isnan(t_graph):
             flush_l2()
             with _prof(activities=[ProfilerActivity.CPU,
                                    ProfilerActivity.CUDA]) as prof:
                 g.replay()
                 torch.cuda.synchronize()
-            tp = f"/tmp/e2e_trace_{os.getpid()}_B{B}.json"
+            tp = os.path.join(trace_dir, f"e2e_{trace_mode}_B{B}.json")
             prof.export_chrome_trace(tp)
+            print(f"  timeline: {tp}")
             del prof
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
@@ -1298,17 +1330,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--indexer-fp4", action="store_true",
         help="use the legacy Wuda FP4 Indexer path (default: RTP-compatible FP8)")
+    parser.add_argument(
+        "--pdl-mode", choices=("on", "all", "none"), default="on",
+        help="on enables the fixed production PDL set; all forces every "
+             "E2E-controlled PDL edge; none disables those controlled edges "
+             "(FlashMLA internal PDL is unchanged)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print("CUDA not available"); sys.exit(0)
     INDEXER_FP8 = not args.indexer_fp4
     configure_geometry(args.tpdp)
+    configure_pdl(args.pdl_mode)
     print(f"Device: {torch.cuda.get_device_name()}")
     geometry = ("TPDP local rank: WQB TP2, MQA/TopK/MLA DP2, O-proj TP2"
                 if args.tpdp else "full-rank e2e")
     print(f"Geometry: {geometry} main={t_wq.N_TOTAL}, index={t_wq.N_IDX}, "
-          f"merged={t_wq.N_MERGED}, indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}")
+          f"merged={t_wq.N_MERGED}, "
+          f"indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}, PDL={PDL_MODE}")
     mqa_test = __import__("test_mqa_logits_fp4")
     mods = (t_hc.load_cuda_module(),
             t_fm_swap.load_module('front_mixed_gemm_csa_swapab',

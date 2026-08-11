@@ -882,7 +882,8 @@ static std::vector<torch::Tensor> run_wq_b(
     bool indexer_fp8 = false,
     c10::optional<torch::Tensor> iq_weights = c10::nullopt,
     int64_t iq_head_base = 0,
-    c10::optional<torch::Tensor> iq_prof = c10::nullopt)
+    c10::optional<torch::Tensor> iq_prof = c10::nullopt,
+    bool pdl = true)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
                 x_fp8.scalar_type() == torch::kFloat8_e4m3fn, "x_fp8 must be CUDA e4m3");
@@ -1324,7 +1325,7 @@ static std::vector<torch::Tensor> run_wq_b(
         attrs[0].val.clusterDim.z = 1;
         config.attrs = attrs;
         config.numAttrs = 1;
-        if (quant_on) {
+        if (quant_on && pdl) {
             // PDL only when a producer is in flight: an unconditional flag
             // would let the GEMM overlap whatever ran before it (e.g. the
             // benchmark's L2-flush kernel), skewing timings.
@@ -1382,7 +1383,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> iq_dst, c10::optional<torch::Tensor> iq_dst_sf,
              bool indexer_fp8, c10::optional<torch::Tensor> iq_weights,
              int64_t iq_head_base,
-             c10::optional<torch::Tensor> iq_prof) {
+             c10::optional<torch::Tensor> iq_prof, bool pdl) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
                               cmp_pos, idx_norm,
@@ -1394,7 +1395,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               swa_entries_per_block, swa_block_stride_bytes,
                               iq_dst, iq_dst_sf, indexer_fp8, iq_weights,
                               iq_head_base,
-                              iq_prof);
+                              iq_prof, pdl);
           },
           "MERGED wq_b + indexer wq_b (w [8192+N,K]: indexer rows FIRST, then "
           "main q), swap path, M in [1,128]. "
@@ -1446,7 +1447,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("indexer_fp8") = false,
           py::arg("iq_weights") = c10::nullopt,
           py::arg("iq_head_base") = 0,
-          py::arg("iq_prof") = c10::nullopt);
+          py::arg("iq_prof") = c10::nullopt,
+          py::arg("pdl") = true);
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

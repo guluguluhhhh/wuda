@@ -216,6 +216,10 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     }
   }
 
+  // A PSS launch may overlap the setup above with the mHC epilogue. Delay
+  // the first activation/scale read until the producer signals completion.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   // Resident FP8 scale factors. Each CTA owns 128 FP8 feature rows, exactly
   // one weight-scale block. Both CTAs replicate the full UMMA_N activation
   // scale tile; rows outside the logical batch are padded to 1.0.
@@ -702,7 +706,7 @@ inline cudaError_t launch(
     const CUtensorMap& desc_x8, const CUtensorMap& desc_w8,
     const uint8_t* x_sf, const uint8_t* w_sf, __nv_bfloat16* out,
     const base::HcTailArgs& hc, const base::FrontEmitArgs& emit,
-    int m, uint64_t* task_times, cudaStream_t stream) {
+    int m, uint64_t* task_times, cudaStream_t stream, bool pdl) {
   const int batch_tiles = (m + BatchN - 1) / BatchN;
   void* args[] = {
       const_cast<CUtensorMap*>(&desc_x16),
@@ -718,13 +722,19 @@ inline cudaError_t launch(
   config.blockDim = dim3(TPB, 1, 1);
   config.dynamicSmemBytes = sizeof(SharedStorage<BatchN>);
   config.stream = stream;
-  cudaLaunchAttribute cluster_attr{};
-  cluster_attr.id = cudaLaunchAttributeClusterDimension;
-  cluster_attr.val.clusterDim.x = CLUSTER_SIZE;
-  cluster_attr.val.clusterDim.y = 1;
-  cluster_attr.val.clusterDim.z = 1;
-  config.attrs = &cluster_attr;
+  cudaLaunchAttribute attrs[2]{};
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = CLUSTER_SIZE;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  config.attrs = attrs;
   config.numAttrs = 1;
+  if (pdl) {
+    attrs[config.numAttrs].id =
+        cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[config.numAttrs].val.programmaticStreamSerializationAllowed = 1;
+    ++config.numAttrs;
+  }
   return cudaLaunchKernelExC(
       &config,
       reinterpret_cast<void*>(swapab_kernel<BatchN, RecordTimestamps>), args);
