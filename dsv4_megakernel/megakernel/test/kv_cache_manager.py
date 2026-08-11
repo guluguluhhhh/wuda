@@ -112,10 +112,12 @@ class KVCacheManager:
         self.reqs = {}   # slot -> dict(pos, swa/cmp/idx page lists)
 
     def _reset_state(self, slots):
-        self.main_state[slots, :, :1024].zero_()
-        self.main_state[slots, :, 1024:].fill_(NEG_INF)
-        self.idx_state[slots, :, :256].zero_()
-        self.idx_state[slots, :, 256:].fill_(NEG_INF)
+        # Assignment writes through for both scalar and tensor indices. In-place
+        # ops on an advanced-index result mutate a temporary tensor instead.
+        self.main_state[slots, :, :1024] = 0.0
+        self.main_state[slots, :, 1024:] = NEG_INF
+        self.idx_state[slots, :, :256] = 0.0
+        self.idx_state[slots, :, 256:] = NEG_INF
 
     # ---- slot lifecycle (design: new/reused slot => KV=0, score=-inf) ----
     def alloc_request(self):

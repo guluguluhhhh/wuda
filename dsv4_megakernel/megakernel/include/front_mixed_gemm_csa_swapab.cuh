@@ -1,6 +1,6 @@
 #pragma once
 
-// HCA front projection, swap-AB variant, CSA output shape:
+// CSA front projection, swap-AB variant:
 //   Y^T[4672,M] = W[4672,7168] @ X^T[7168,M]
 // FP8 uses UMMA_M=256, BF16 uses UMMA_M=128. UMMA_N is the batch tile.
 // Batch splits into AT MOST TWO tiles (M<=16 -> 1, else 2), so the batch
@@ -8,11 +8,11 @@
 // 29 feature tiles (8 fp8 N256 + 21 bf16 N128, tail tile 64 valid rows)
 // x batch_tiles -> 29 or 58 clusters.
 
-#include "front_mixed_gemm_hca.cuh"
+#include "front_mixed_gemm_csa.cuh"
 
-namespace front_mixed_hca_swapab {
+namespace front_mixed_csa_swapab {
 
-namespace base = front_mixed_hca;
+namespace base = front_mixed_csa;
 namespace fp8d = cluster_mma_fp8::detail;
 using Barrier = base::Barrier;
 
@@ -142,6 +142,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     const uint8_t* __restrict__ w_sf,
     __nv_bfloat16* __restrict__ out,
     base::HcTailArgs hc,
+    base::FrontEmitArgs emit,
     int problem_m,
     uint64_t* __restrict__ task_times) {
   using C = Config<BatchN>;
@@ -488,10 +489,13 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
 
   if (is_fp8) {
     constexpr int batch_stores = BatchN / STORE_M;
+    const bool emit_win = emit.main_state != nullptr && feature_base >= 1536;
     #pragma unroll
     for (int st = 0; st < batch_stores; ++st) {
       if (warp >= 4) {
         const int epi_warp = warp - 4;
+        const int out_col = feature_base + rank * FP8_CTA_N +
+                            epi_warp * STORE_N + lane;
         #pragma unroll
         for (int sub = 0; sub < 2; ++sub) {
           uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
@@ -503,10 +507,15 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
           for (int r = 0; r < 8; ++r) {
             const int out_row = batch_base + st * STORE_M + sub * 8 + r;
             if (out_row < problem_m) {
-              const int out_col = feature_base + rank * FP8_CTA_N +
-                                  epi_warp * STORE_N + lane;
-              out[static_cast<size_t>(out_row) * N + out_col] =
-                  __float2bfloat16_rn(__uint_as_float(vals[r]));
+              const float value = __uint_as_float(vals[r]);
+              if (emit_win) {
+                emit.win_y2[static_cast<size_t>(out_row) * 512 +
+                            out_col - 1536] =
+                    __bfloat162float(__float2bfloat16_rn(value));
+              } else {
+                out[static_cast<size_t>(out_row) * N + out_col] =
+                    __float2bfloat16_rn(value);
+              }
             }
           }
         }
@@ -518,7 +527,120 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     // halves. Physical warps 4..7 form the dedicated epilogue warpgroup.
     // The bf16 TAIL tile (feature_base 4608) has 64 valid rows: rank1's
     // columns land at >= N and are clipped.
-    if (warp >= 4) {
+    if (warp >= 4 && emit.main_state != nullptr && feature_base >= 4608) {
+      const int epi_warp = warp - 4;
+      const int out_col = feature_base + rank * BF16_CTA_N +
+                          (epi_warp & 1) * 32 + lane;
+      if (out_col < N) {
+        #pragma unroll
+        for (int c = 0; c < BatchN / CLUSTER_SIZE; c += 8) {
+          uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+          base::tmem_load_8x(c, v0, v1, v2, v3, v4, v5, v6, v7);
+          base::tmem_load_fence();
+          const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+          #pragma unroll
+          for (int r = 0; r < 8; ++r) {
+            const int out_row = batch_base + (epi_warp >> 1) *
+                (BatchN / CLUSTER_SIZE) + c + r;
+            if (out_row < problem_m) {
+              emit.w64[static_cast<size_t>(out_row) * 64 + out_col - 4608] =
+                  __bfloat162float(
+                      __float2bfloat16_rn(__uint_as_float(vals[r])));
+            }
+          }
+        }
+      }
+    } else if (warp >= 4 && emit.main_state != nullptr) {
+      // swapAB's natural TMEM drain assigns one feature column to each lane.
+      // Transpose 32x32 chunks in shared memory so each lane owns one output
+      // row and can publish aligned 32B vectors to the sparse RTP state rings.
+      // The pipeline storage is dead after tmem_full, and each epilogue warp
+      // owns a disjoint 4KB region.
+      float* tile = reinterpret_cast<float*>(s.storage) +
+                    (warp - 4) * 32 * 32;
+      const int row_half_base = ((warp - 4) >> 1) * (BatchN / CLUSTER_SIZE);
+      const int feature_chunk = feature_base + rank * BF16_CTA_N +
+                                ((warp - 4) & 1) * 32;
+      const bool is_main = feature_base < 4096;
+      const int family_base = is_main ? 2048 : 4096;
+      const int state_width = is_main ? 2048 : 512;
+      const int half_width = state_width / 2;
+      const bool add_ape = feature_base >= (is_main ? 3072 : 4352);
+      float* const state = is_main ? emit.main_state : emit.idx_state;
+      const float* const ape = is_main ? emit.main_ape : emit.idx_ape;
+      const int feature_offset = feature_chunk - family_base;
+      #pragma unroll
+      for (int wave = 0; wave < BatchN / CLUSTER_SIZE; wave += 32) {
+        #pragma unroll
+        for (int c = 0; c < 32; c += 8) {
+          if (wave + c < BatchN / CLUSTER_SIZE) {
+            uint32_t v0, v1, v2, v3, v4, v5, v6, v7;
+            base::tmem_load_8x(wave + c, v0, v1, v2, v3,
+                              v4, v5, v6, v7);
+            base::tmem_load_fence();
+            const uint32_t vals[8] = {v0, v1, v2, v3, v4, v5, v6, v7};
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+              const int tile_row = c + r;
+              const int swizzled_col =
+                  (((lane >> 3) ^ (tile_row & 3)) << 3) + (lane & 7);
+              tile[tile_row * 32 + swizzled_col] =
+                  __uint_as_float(vals[r]);
+            }
+          }
+        }
+        __syncwarp();
+
+        const int row_in_half = wave + lane;
+        const int out_row = batch_base + row_half_base + row_in_half;
+        if (row_in_half < BatchN / CLUSTER_SIZE &&
+            out_row < problem_m) {
+          const int state_row = is_main ? emit.main_state_row[out_row]
+                                        : emit.idx_state_row[out_row];
+          if (state_row >= 0) {
+            float* const dst_row = state +
+                static_cast<size_t>(state_row) * state_width + feature_offset;
+            if (add_ape) {
+              const int phase =
+                  emit.ape_phase[out_row] & (base::APE_RATIO - 1);
+              const float* const ape_row = ape +
+                  static_cast<size_t>(phase) * half_width +
+                  feature_offset - half_width;
+              #pragma unroll
+              for (int q = 0; q < 4; ++q) {
+                const int physical_q = q ^ (lane & 3);
+                float4 a = *reinterpret_cast<const float4*>(
+                    tile + lane * 32 + physical_q * 8);
+                float4 b = *reinterpret_cast<const float4*>(
+                    tile + lane * 32 + physical_q * 8 + 4);
+                const float4 p0 = *reinterpret_cast<const float4*>(
+                    ape_row + q * 8);
+                const float4 p1 = *reinterpret_cast<const float4*>(
+                    ape_row + q * 8 + 4);
+                a.x += p0.x; a.y += p0.y;
+                a.z += p0.z; a.w += p0.w;
+                b.x += p1.x; b.y += p1.y;
+                b.z += p1.z; b.w += p1.w;
+                reinterpret_cast<float4*>(dst_row + q * 8)[0] = a;
+                reinterpret_cast<float4*>(dst_row + q * 8)[1] = b;
+              }
+            } else {
+              #pragma unroll
+              for (int q = 0; q < 4; ++q) {
+                const int physical_q = q ^ (lane & 3);
+                const float4 a = *reinterpret_cast<const float4*>(
+                    tile + lane * 32 + physical_q * 8);
+                const float4 b = *reinterpret_cast<const float4*>(
+                    tile + lane * 32 + physical_q * 8 + 4);
+                reinterpret_cast<float4*>(dst_row + q * 8)[0] = a;
+                reinterpret_cast<float4*>(dst_row + q * 8)[1] = b;
+              }
+            }
+          }
+        }
+        __syncwarp();
+      }
+    } else if (warp >= 4) {
       const int epi_warp = warp - 4;
       const int feature_lane =
           rank * BF16_CTA_N + (epi_warp & 1) * 32 + lane;
@@ -579,7 +701,7 @@ inline cudaError_t launch(
     const CUtensorMap& desc_x16, const CUtensorMap& desc_w16,
     const CUtensorMap& desc_x8, const CUtensorMap& desc_w8,
     const uint8_t* x_sf, const uint8_t* w_sf, __nv_bfloat16* out,
-    const base::HcTailArgs& hc,
+    const base::HcTailArgs& hc, const base::FrontEmitArgs& emit,
     int m, uint64_t* task_times, cudaStream_t stream) {
   const int batch_tiles = (m + BatchN - 1) / BatchN;
   void* args[] = {
@@ -588,6 +710,7 @@ inline cudaError_t launch(
       const_cast<CUtensorMap*>(&desc_x8),
       const_cast<CUtensorMap*>(&desc_w8),
       &x_sf, &w_sf, &out, const_cast<base::HcTailArgs*>(&hc),
+      const_cast<base::FrontEmitArgs*>(&emit),
       &m, &task_times};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(
@@ -607,4 +730,4 @@ inline cudaError_t launch(
       reinterpret_cast<void*>(swapab_kernel<BatchN, RecordTimestamps>), args);
 }
 
-}  // namespace front_mixed_hca_swapab
+}  // namespace front_mixed_csa_swapab

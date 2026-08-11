@@ -1,4 +1,4 @@
-"""Correctness and performance tests for the independent HCA swap-AB front GEMM."""
+"""Correctness and performance tests for the independent CSA swap-AB front GEMM."""
 
 import os
 import sys
@@ -8,7 +8,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_utils import bench_kineto
 # Quant helpers / references are shared with the main front test (same K=7168,
-# same 1x128 / 128x128 UE8M0 scheme); only the HCA output shape differs.
+# same 1x128 / 128x128 UE8M0 scheme); only the CSA output shape differs.
 from test_front_mixed_gemm import (
     K, N_FP8, calc_diff, dequant_fp8, hc_ref, make_hc,
     quant_act_fp8, quant_weight_fp8,
@@ -80,15 +80,88 @@ def load_module(name, source):
 
 
 def run_swap(module, x, x8, xsf, weights, out=None, batch_n=0,
-             task_times=None, enable_tail=False, hc=None):
+             task_times=None, enable_tail=False, hc=None, emit=None):
     w16, w8, wsf = weights
     hc = hc or {}
-    return module.front_mixed_gemm_hca_swapab(
+    emit = emit or {}
+    return module.front_mixed_gemm_csa_swapab(
         x, x8, xsf, w16, w8, wsf, out=out,
         batch_n_override=batch_n, task_times=task_times,
         hc_mix=hc.get('hc_mix'), hc_base=hc.get('hc_base'),
         hc_scale=hc.get('hc_scale'), hc_post=hc.get('hc_post'),
-        hc_comb=hc.get('hc_comb'), enable_tail=enable_tail)
+        hc_comb=hc.get('hc_comb'), enable_tail=enable_tail, **emit)
+
+
+def direct_emit_correctness(module, weights, smoke=False):
+    """Production epilogue: q -> y, all other segments -> final buffers."""
+    batches = (1, 17, 64) if smoke else (1, 17, 65, 129, 256)
+    w16, _, _ = weights
+    for b in batches:
+        x, x8, xsf = make_activations(b, seed=4300 + b)
+        plain = run_swap(module, x, x8, xsf, weights)
+
+        phase = (torch.arange(b, device='cuda') % 4).int()
+        main_rows = (torch.arange(b, device='cuda') * 2 + 1).int()
+        idx_rows = (torch.arange(b, device='cuda') * 3 + 2).int()
+        main_state = torch.randn(2 * b + 1, 2048, device='cuda')
+        idx_state = torch.randn(3 * b + 1, 512, device='cuda')
+        main_before, idx_before = main_state.clone(), idx_state.clone()
+        main_ape = torch.randn(4, 1024, device='cuda') * 0.02
+        idx_ape = torch.randn(4, 256, device='cuda') * 0.02
+        win_y2 = torch.full((b, 512), float('nan'), device='cuda')
+        w64 = torch.full((b, 64), float('nan'), device='cuda')
+        emitted = torch.full((b, N), -1234.0, dtype=torch.bfloat16,
+                             device='cuda')
+        hc = make_hc(b, seed=4400 + b)
+        emit = {
+            'main_state': main_state, 'main_ape': main_ape,
+            'main_state_row': main_rows, 'ape_phase': phase,
+            'idx_state': idx_state, 'idx_state_row': idx_rows,
+            'idx_ape': idx_ape, 'win_y2': win_y2, 'w64': w64,
+        }
+        run_swap(module, x, x8, xsf, weights, out=emitted,
+                 enable_tail=True, hc=hc, emit=emit)
+        torch.cuda.synchronize()
+
+        post_ref, comb_ref = hc_ref(
+            hc['hc_mix'], hc['hc_base'], hc['hc_scale'])
+        hc_ok = (torch.allclose(hc['hc_post'], post_ref, rtol=1e-4, atol=1e-6)
+                 and torch.allclose(
+                     hc['hc_comb'], comb_ref, rtol=1e-4, atol=1e-6))
+
+        main_touched = torch.zeros(main_state.size(0), dtype=torch.bool,
+                                   device='cuda')
+        idx_touched = torch.zeros(idx_state.size(0), dtype=torch.bool,
+                                  device='cuda')
+        main_touched[main_rows.long()] = True
+        idx_touched[idx_rows.long()] = True
+        untouched = (
+            torch.equal(main_state[~main_touched], main_before[~main_touched])
+            and torch.equal(idx_state[~idx_touched], idx_before[~idx_touched]))
+
+        bf16_projection = torch.mm(x, w16.t()).float()
+        main_raw = bf16_projection[:, :2048]
+        idx_raw = bf16_projection[:, 2048:2560]
+        main_actual = main_state[main_rows.long()]
+        idx_actual = idx_state[idx_rows.long()]
+        state_ok = (
+            calc_diff(main_actual[:, :1024], main_raw[:, :1024]) < 1e-5
+            and calc_diff(main_actual[:, 1024:] - main_ape[phase.long()],
+                          main_raw[:, 1024:]) < 1e-5
+            and calc_diff(idx_actual[:, :256], idx_raw[:, :256]) < 1e-5
+            and calc_diff(idx_actual[:, 256:] - idx_ape[phase.long()],
+                          idx_raw[:, 256:]) < 1e-5)
+        handoff_ok = (torch.equal(win_y2, plain[:, 1536:2048].float())
+                      and torch.equal(w64, plain[:, 4608:4672].float()))
+        output_ok = (
+            torch.equal(emitted[:, :1536], plain[:, :1536])
+            and torch.equal(emitted[:, 1536:],
+                            torch.full_like(emitted[:, 1536:], -1234.0)))
+        if not (hc_ok and untouched and state_ok and handoff_ok and output_ok):
+            raise AssertionError(
+                f'B={b}: direct emit mismatch hc={hc_ok} untouched={untouched} '
+                f'state={state_ok} handoff={handoff_ok} output={output_ok}')
+    print('PASS HC + direct buffer emit at B=' + ','.join(map(str, batches)))
 
 
 def correctness(module, weights, smoke=False):
@@ -320,13 +393,14 @@ if __name__ == '__main__':
     print(f'Device: {torch.cuda.get_device_name()} capability='
           f'{torch.cuda.get_device_capability()} torch={torch.__version__}')
     swap_module = load_module(
-        'front_mixed_gemm_hca_swapab', 'front_mixed_gemm_hca_swapab.cu')
+        'front_mixed_gemm_csa_swapab', 'front_mixed_gemm_csa_swapab.cu')
     shared_weights = make_weights(seed=4000)
     if '--timeline' in sys.argv:
         timeline(swap_module, shared_weights)
         raise SystemExit(0)
     smoke_mode = '--smoke' in sys.argv
     correctness(swap_module, shared_weights, smoke=smoke_mode)
+    direct_emit_correctness(swap_module, shared_weights, smoke=smoke_mode)
     if '--tail' in sys.argv:
         benchmark_tail(swap_module, shared_weights)
         print('\nALL PASS')

@@ -2,9 +2,9 @@
 test_e2e_decode.py -- END-TO-END DSV4 decode chain over the design-image KV
 cache management (test/kv_cache_manager.py):
 
-  hc_fused(nopc + fused attn_norm) -> front_mixed(+hc tail) ->
+  hc_fused(nopc + fused attn_norm) -> front_mixed_swapAB(+hc tail) ->
   qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + head_ssq + indexer compressor
-  + winkv) -> DeepGEMM FP8 paged MQA + MAIN compressor -> topk_v2(512, page
+  + winkv) -> Wuda fused FP8 paged MQA + MAIN compressor -> topk_v2(512, page
   transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope,
   per-head attn_sink) ->
   o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
@@ -45,6 +45,7 @@ from kv_cache_manager import (KVCacheManager, PAGE, WIN, RATIO,
 
 import test_hc_fused_tc as t_hc
 import test_front_mixed_gemm as t_fm
+import test_front_mixed_gemm_csa_swapab as t_fm_swap
 import test_wq_b_fp8_gemm as t_wq
 import o_proj_csa
 
@@ -352,28 +353,6 @@ def ref_mqa_logits(iq, iq_aux, weights, kv_rows_list):
     return outs
 
 
-def fp8_paged_mqa(dg, q_fp8, folded_weights, mgr, context_lens,
-                  block_table, max_context_len, schedule=None):
-    """Call DeepGEMM with the exact RTP FP8 Indexer cache/Q ABI."""
-    ctx2 = context_lens.view(-1, 1).contiguous()
-    if schedule is None:
-        schedule = dg.get_paged_mqa_logits_metadata(
-            ctx2, mgr.entries_per_block["idx"], dg.get_num_sms())
-    return dg.fp8_paged_mqa_logits(
-        q_fp8.view(q_fp8.size(0), 1, IDX_HEADS, IDX_D),
-        mgr.indexer_cache_view(), folded_weights, ctx2, block_table,
-        schedule, max_context_len)
-
-
-def run_main_compressor_paged(mqm, w, mgr, st, pos, cos=None, sin=None):
-    mqm.mqa_compressor_paged(
-        pos, w["comp_norm"], w["cos"] if cos is None else cos,
-        w["sin"] if sin is None else sin, mgr.main_state,
-        st["main_state_row"], mgr.state_ring_entries, mgr.cmp_pool,
-        st["cmp_dst"], mgr.entries_per_block["cmp"],
-        mgr.block_stride_bytes["cmp"])
-
-
 def ref_flash_attn(qn, swa_rows, cmp_rows, scale, sink=None):
     """softmax over [swa ++ cmp] rows; v == k row (head_dim_v = 512).
 
@@ -463,7 +442,7 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
-    hcm, fmm, wqm, mqm, tkm, mpm = mods
+    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
     B = len(slots)
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
@@ -491,16 +470,13 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                                  dtype=torch.float32)}
     win_y2 = torch.empty(B, 512, device=DEV, dtype=torch.float32)
     w64 = torch.empty(B, 64, device=DEV, dtype=torch.float32)
-    y = fmm.front_mixed_gemm(collapsed, x_fp8, x_sf, w["front_bf16"],
-                             w["front_fp8"], w["front_sf"], **hc,
-                             main_state=mgr.main_state,
-                             main_ape=w["main_ape"],
-                             main_state_row=st["main_state_row"],
-                             ape_phase=(pos % 4).int(),
-                             idx_state=mgr.idx_state,
-                             idx_state_row=st["idx_state_row"],
-                             idx_ape=w["idx_ape"],
-                             win_y2=win_y2, w64=w64)
+    y = fmm.front_mixed_gemm_csa_swapab(
+        collapsed, x_fp8, x_sf, w["front_bf16"], w["front_fp8"],
+        w["front_sf"], **hc, enable_tail=True,
+        main_state=mgr.main_state, main_ape=w["main_ape"],
+        main_state_row=st["main_state_row"], ape_phase=(pos % 4).int(),
+        idx_state=mgr.idx_state, idx_state_row=st["idx_state_row"],
+        idx_ape=w["idx_ape"], win_y2=win_y2, w64=w64)
     ref8 = (t_fm.dequant_fp8(x_fp8, x_sf, True)
             @ t_fm.dequant_fp8(w["front_fp8"], w["front_sf"], False).t())
     d8 = max(t_fm.calc_diff(y[:, :1536].float(), ref8[:, :1536]),
@@ -553,12 +529,22 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     # MODEL1 pages directly; compact would double-write ~600B/row).
     idx_bt = mgr.block_table("idx", slots)[owned]
     if INDEXER_FP8:
-        logits = fp8_paged_mqa(get_dg(), iq_fp4[owned], iq_sf[owned], mgr,
-                               ncmp[owned], idx_bt, logits_buf.size(1))
-        # Temporary unfused boundary: DeepGEMM owns FP8 MQA, while Wuda keeps
-        # MAIN compression as a separate kernel until the optimized fusion is
-        # moved into the unified FP8 attention implementation.
-        run_main_compressor_paged(mqm, w, mgr, st, pos)
+        ctx2 = ncmp[owned].view(-1, 1).contiguous()
+        schedule = get_dg().get_paged_mqa_logits_metadata(
+            ctx2, mgr.entries_per_block["idx"], get_dg().get_num_sms())
+        mq8m.mqa_logits_fp8_decode_out(
+            iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
+            schedule, logits_buf[owned],
+            kv_entries_per_block=mgr.entries_per_block["idx"],
+            kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+            cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
+            sin_tab=w["sin"], comp_state=mgr.main_state,
+            comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+            cmp_dst=st["cmp_dst"],
+            comp_state_ring_entries=mgr.state_ring_entries,
+            cmp_entries_per_block=mgr.entries_per_block["cmp"],
+            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+        logits = logits_buf[owned]
     else:
         mqm.mqa_logits_fp4_decode_out(
             iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned],
@@ -572,7 +558,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             comp_state_ring_entries=mgr.state_ring_entries,
             cmp_entries_per_block=mgr.entries_per_block["cmp"],
             cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
-        logits = logits_buf
+        logits = logits_buf[owned]
     # Assert every live score is finite (no NaN/+inf in logits).
     torch.cuda.synchronize()
     finite = True
@@ -798,7 +784,7 @@ def benchmark(mods, w, ncmp=2048):
     through O-proj; full rank also times mHC post, while TPDP stops before its
     missing partial reduction. The ported O-proj entry point performs host-side
     validation, which does not affect graph replay or Kineto device time."""
-    hcm, fmm, wqm, mqm, tkm, mpm = mods
+    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
     print("\n" + "=" * 76)
     print(f"Per-operator latency (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
@@ -910,16 +896,13 @@ def benchmark(mods, w, ncmp=2048):
             if Bp != B:
                 coll_p[:B].copy_(collapsed)
                 mix_p[:B].copy_(mix)
-            fmm.front_mixed_gemm(coll_p, x8, x8s, w["front_bf16"],
-                                 w["front_fp8"], w["front_sf"], out=y_p,
-                                 **hcd, main_state=mgr.main_state,
-                                 main_ape=w["main_ape"],
-                                 main_state_row=main_state_row,
-                                 ape_phase=ape_phase,
-                                 idx_state=mgr.idx_state,
-                                 idx_state_row=idx_state_row,
-                                 idx_ape=w["idx_ape"],
-                                 win_y2=win_y2_p, w64=w64_p)
+            fmm.front_mixed_gemm_csa_swapab(
+                coll_p, x8, x8s, w["front_bf16"], w["front_fp8"],
+                w["front_sf"], out=y_p, **hcd, enable_tail=True,
+                main_state=mgr.main_state, main_ape=w["main_ape"],
+                main_state_row=main_state_row, ape_phase=ape_phase,
+                idx_state=mgr.idx_state, idx_state_row=idx_state_row,
+                idx_ape=w["idx_ape"], win_y2=win_y2_p, w64=w64_p)
         run_hc(); run_front()
 
         xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
@@ -962,10 +945,20 @@ def benchmark(mods, w, ncmp=2048):
         def run_mqa():
             r = hold["r"]
             if INDEXER_FP8:
-                hold["logits"] = fp8_paged_mqa(
-                    get_dg(), r[1][owned], r[2][owned], mgr, nc[owned], idx_bt,
-                    logits.size(1), schedule=fp8_schedule)
-                run_main_compressor_paged(mqm, w, mgr, st, pos, cosl, sinl)
+                mq8m.mqa_logits_fp8_decode_out(
+                    r[1][owned], mgr.idx_pool, r[2][owned],
+                    nc[owned].view(-1, 1), idx_bt, fp8_schedule,
+                    logits[owned],
+                    kv_entries_per_block=mgr.entries_per_block["idx"],
+                    kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                    cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                    sin_tab=sinl, comp_state=mgr.main_state,
+                    comp_state_row=st["main_state_row"],
+                    cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_ring_entries=mgr.state_ring_entries,
+                    cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+                hold["logits"] = logits[owned]
             else:
                 mqm.mqa_logits_fp4_decode_out(
                     r[1][owned], r[2][owned], mgr.idx_pool, weights64[owned],
@@ -979,7 +972,7 @@ def benchmark(mods, w, ncmp=2048):
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
-                hold["logits"] = logits
+                hold["logits"] = logits[owned]
         run_mqa()
         cmp_bt_full = mgr.block_table("cmp", slots)
         cmp_bt = cmp_bt_full[owned]
@@ -1316,9 +1309,13 @@ if __name__ == "__main__":
                 if args.tpdp else "full-rank e2e")
     print(f"Geometry: {geometry} main={t_wq.N_TOTAL}, index={t_wq.N_IDX}, "
           f"merged={t_wq.N_MERGED}, indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}")
-    mods = (t_hc.load_cuda_module(), t_fm.load_module(),
+    mqa_test = __import__("test_mqa_logits_fp4")
+    mods = (t_hc.load_cuda_module(),
+            t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
+                                  'front_mixed_gemm_csa_swapab.cu'),
             t_wq.load_module(tpdp=args.tpdp),
-            __import__("test_mqa_logits_fp4").load_cuda_module(),
+            mqa_test.load_cuda_module() if not INDEXER_FP8 else None,
+            mqa_test.load_cuda_module_fp8() if INDEXER_FP8 else None,
             __import__("test_topk_v2").load_cuda_module(),
             load_mhc_post() if mhc_post_enabled() else None)
     assert (mods[2].n_main, mods[2].n_index, mods[2].n_merged) == \

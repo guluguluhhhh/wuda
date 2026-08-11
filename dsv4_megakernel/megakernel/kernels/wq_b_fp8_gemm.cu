@@ -142,7 +142,7 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
                    __nv_fp8_e4m3* __restrict__ x_fp8,
                    uint8_t* __restrict__ x_sf, int m_total,
                    float* __restrict__ ssq_zero,
-                   uint32_t* __restrict__ iq_ready_reset) {
+                   uint32_t* __restrict__ iq_drain_ready_reset) {
     // Let WQ_B run its independent prologue while this grid produces inputs;
     // its GDS precedes every global-memory access to those inputs.
     asm volatile("griddepcontrol.launch_dependents;");
@@ -157,9 +157,9 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
              i += gridDim.x * blockDim.x)
             ssq_zero[i] = 0.0f;
     }
-    if (iq_ready_reset != nullptr && blockIdx.x == 0) {
+    if (iq_drain_ready_reset != nullptr && blockIdx.x == 0) {
         for (int head = threadIdx.x; head < IDX_NUM_HEADS; head += blockDim.x)
-            iq_ready_reset[head * IQ_FLAG_STRIDE] = 0u;
+            iq_drain_ready_reset[head * IQ_FLAG_STRIDE] = 0u;
     }
     if (gamma != nullptr) {
         for (int r = blockIdx.x; r < m_total; r += gridDim.x)
@@ -201,8 +201,8 @@ wq_b_proj_kernel(
     // fused indexer projection outputs + rotary metadata
     const __grid_constant__ IqDest iqd,            // indexer-q destination geometry
     __nv_bfloat16* __restrict__ iq_scratch,        // [M, 64, 128] bf16 drain buffer
-    uint32_t* __restrict__ iq_ready,               // [IQ_FLAG_SLOTS] per-head ready flags
-    uint32_t iq_seq,                               // host-monotonic launch tag for them
+    uint32_t* __restrict__ iq_drain_ready,         // [IQ_FLAG_SLOTS] per-head ready flags
+    uint32_t iq_drain_seq,                         // host-monotonic launch tag for them
     const int* __restrict__ q_pos,                 // [M] rotary positions
     const float* __restrict__ rope_cos,           // [max_pos, 32]
     const float* __restrict__ rope_sin,           // [max_pos, 32]
@@ -624,20 +624,6 @@ wq_b_proj_kernel(
             persistent_iter++;
           }
         }
-        // PDL: release the dependent grid HERE, not at kernel end. Everything the
-        // consumer (mqa_logits) streams -- the idx KV pages, the swa pages, the
-        // main-q output -- has been stored by this point; what is still running is
-        // the transform warpgroup's SPREAD plus its cross-rank fence and publish.
-        // Triggering early is what lets those overlap mqa's 557MB KV prefetch
-        // instead of sitting exposed on this kernel's tail. The consumer's iq path
-        // is NOT covered by this trigger -- it waits on the ready flags, which are
-        // published after SPREAD, so it stays correctly ordered.
-        // The FP4 consumer has its own Q-readiness protocol. The initial FP8
-        // single-card path does not yet publish per-head readiness, so releasing
-        // a PDL consumer here would let it read Q before SPREAD stores complete.
-        // With no early signal, CUDA releases the dependent at kernel completion.
-        if constexpr (!kIdxFp8)
-            asm volatile("griddepcontrol.launch_dependents;");
     }
 
     // ======== ASYNC TRANSFORM WORKERS (threads 256..511) ========
@@ -675,7 +661,8 @@ wq_b_proj_kernel(
             // Paired with ld.acquire in SPREAD.
             if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
                 asm volatile("st.release.gpu.global.u32 [%0], %1;"
-                             :: "l"(iq_ready + head * IQ_FLAG_STRIDE), "r"(iq_seq)
+                             :: "l"(iq_drain_ready + head * IQ_FLAG_STRIDE),
+                                "r"(iq_drain_seq)
                              : "memory");
             }
           }
@@ -715,8 +702,7 @@ wq_b_proj_kernel(
         // Flat (head, row-batch) task space over the whole grid. One task uses
         // all transform workers: 8 lanes per row, XFORM_ROWS_PER_TASK rows.
         if (!mock_post) {
-            // [PROFILE] SPREAD entry/exit (cluster0/CTA0): the transform plus its
-            // peer stores, ending before the completion handoff below.
+            // [PROFILE] SPREAD entry/exit (cluster0/CTA0).
             long long iq_t0 = 0;
             const bool iq_prof = iqd.prof != nullptr && blockIdx.x == 0 &&
                 threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS;
@@ -730,7 +716,6 @@ wq_b_proj_kernel(
             const int nbph =
                 (problem_m + XFORM_ROWS_PER_TASK - 1) / XFORM_ROWS_PER_TASK;
             const int nb   = IDX_NUM_HEADS * nbph;
-            int my_tasks = 0;
             for (int task = (int)blockIdx.x; task < nb; task += num_blocks) {
                 const int head = task % IDX_NUM_HEADS;
                 const int m0   = (task / IDX_NUM_HEADS) * XFORM_ROWS_PER_TASK;
@@ -739,28 +724,23 @@ wq_b_proj_kernel(
                 do {   // whole warp polls ONE address -> a single broadcast read;
                        // relaxed while spinning, ONE acquire once it passes
                     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                                 : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                                 : "=r"(v) : "l"(iq_drain_ready + head * IQ_FLAG_STRIDE)
                                  : "memory");
-                    if (v == iq_seq) break;
+                    if (v == iq_drain_seq) break;
                     if (ptx::rdtimer_ns() - spin_t0 >= IQ_SPIN_TIMEOUT_NS) {
                         printf("wq_b SPREAD drain timeout: cta=%d head=%d flag=%u "
-                               "want=%u\n", (int)blockIdx.x, head, v, iq_seq);
+                               "want=%u\n", (int)blockIdx.x, head, v, iq_drain_seq);
                         __trap();
                     }
                     __nanosleep(128);
                 } while (true);
                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
-                             : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                             : "=r"(v) : "l"(iq_drain_ready + head * IQ_FLAG_STRIDE)
                              : "memory");
                 // padding rows CLAMP to the last valid row: warps stay converged for
                 // the full-mask shuffles, stores are suppressed
                 const int m = m0 + (int)r;
                 const int mc = m < problem_m ? m : problem_m - 1;
-                // Destination is DECOUPLED from what we computed (see IqDest):
-                // the row goes to whichever rank owns it, at the SAME row index
-                // mc -- only the BUFFER changes, so a rank simply leaves rows it
-                // does not own untouched. The SOURCE row is always local.
-                const bool mine = mc >= iqd.row_lo && mc < iqd.row_hi;
                 IdxRowIn d;
                 idx_row_load(
                     iq_scratch + ((int64_t)mc * IDX_NUM_HEADS + head) * IDX_HEAD_DIM,
@@ -768,101 +748,17 @@ wq_b_proj_kernel(
                 if constexpr (kIdxFp8) {
                     idx_row_compute_fp8<true>(
                         d, e8, mc, iqd.head_base + head, iqd.weights,
-                        mine ? iqd.fp4 : iqd.fp4_peer,
-                        reinterpret_cast<float*>(mine ? iqd.sf : iqd.sf_peer),
+                        iqd.fp4, reinterpret_cast<float*>(iqd.sf),
                         iqd.num_heads, m < problem_m);
                 } else {
                     idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
-                                          mine ? iqd.fp4 : iqd.fp4_peer,
-                                          mine ? iqd.sf  : iqd.sf_peer,
+                                          iqd.fp4, iqd.sf,
                                           iqd.num_heads, m < problem_m);
                 }
-                ++my_tasks;
             }
             if (iq_prof) {
                 iqd.prof[0] = iq_t0;
                 iqd.prof[1] = ptx::rdclock();
-            }
-            // ---- cross-rank completion handoff (see IqDest for why it lives here
-            // rather than in a separate launch) ----
-            // Arrive with `red`: fire-and-forget, so a CTA never stalls on an atomic
-            // round trip. No __threadfence() either -- the NamedBarrier is a
-            // CTA-scope fence and the release on the reduction extends that to
-            // device scope for whoever acquires the counter.
-            if (iqd.done != nullptr && my_tasks > 0) {
-                // Barrier id 2, scoped to the XFORM warpgroup ONLY: __syncthreads
-                // would hang here -- the TMA/MMA/SF/store warps are in sibling
-                // branches of the role dispatch and never reach this point. It has
-                // One thread arrives on behalf of all transform workers. Barrier
-                // ids 0/1 are used by store and drain handshakes.
-                cutlass::arch::NamedBarrier::sync(NUM_XFORM_THREADS, 2);
-                if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS)
-                    asm volatile("red.release.gpu.global.add.u32 [%0], 1;"
-                                 :: "l"(iqd.done) : "memory");
-            }
-            // CTA 0 is the only waiter, and the kernel ends on the slowest CTA
-            // anyway, so its wait is not additive.
-            //
-            // A fixed poller instead of the textbook "last arriver finalises"
-            // (CUDA's threadFenceReduction: atomicInc, then whoever draws the last
-            // ticket does the tail) because that needs the atomic's RETURN value, so
-            // every CTA stalls one round trip -- ~7us across 144 CTAs here, and
-            // unchanged by splitting the counter over 8 cache lines, which is how we
-            // know it was the round trip and not contention. `red` has no return, so
-            // arrivals never stall.
-            //
-            // This DEPENDS on full residency: CTA 0 waits on CTAs that must already
-            // be running. The host caps num_clusters at min(num_SMs, total_cta) /
-            // CLUSTER_SIZE (WQ_B_CLUSTERS is clamped to the same bound) and the smem
-            // footprint pins occupancy at 1 CTA/SM, so grid <= num_SMs -- but that
-            // only holds if this kernel HAS the SMs. Measured on a GPU with another
-            // tenant at 100% util, the handoff went from +3.6us to +86us: the grid no
-            // longer fits, CTA 0 spins holding an SM that a pending CTA needs, and
-            // the arrival it waits for is several waves away. Not a deadlock (the
-            // timeout would catch that) but the tail latency is gone. The same
-            // requirement is why cooperative_groups::grid.sync() insists on
-            // cudaLaunchCooperativeKernel, which validates residency; here it is
-            // implicit. Treat exclusive occupancy as part of this kernel's contract.
-            if (iqd.done != nullptr && blockIdx.x == 0 &&
-                threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
-                const unsigned int want =
-                    (unsigned int)(nb < num_blocks ? nb : num_blocks);
-                unsigned int v;
-                const unsigned long long spin_t0 = ptx::rdtimer_ns();
-                do {
-                    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                                 : "=r"(v) : "l"(iqd.done) : "memory");
-                    if (v >= want) break;
-                    if (ptx::rdtimer_ns() - spin_t0 >= IQ_SPIN_TIMEOUT_NS) {
-                        printf("wq_b arrival timeout: rank=%d arrived=%u want=%u "
-                               "(grid=%d) -- a CTA never reached the xform barrier, "
-                               "or `done` was not 0 on entry\n",
-                               iqd.rank, v, want, num_blocks);
-                        __trap();
-                    }
-                    __nanosleep(32);
-                } while (true);
-                *iqd.done = 0u;              // safe: no further arrivals this launch
-                // Light-weight system fence, NOT __threadfence_system(): that emits
-                // membar.sys == fence.sc.sys (full sequential consistency), while
-                // the PTX ISA calls fence.acq_rel "a light-weight fence that is
-                // sufficient for memory synchronization in most programs". This is
-                // the SINGLE ordering point of the whole crossing.
-                asm volatile("fence.acq_rel.sys;" ::: "memory");
-                // Plain increment: only this one thread in the grid touches gen.
-                const unsigned int gn = *iqd.gen + 1u;
-                *iqd.gen = gn;
-                // RELAXED stores, not st.release.sys -- a system-scope release store
-                // carries its own implicit .sys fence, so publishing with two of
-                // them right after the fence above paid for that ordering THREE
-                // times (measured 2.7us fence + 6.2us for the pair). The fence is
-                // the ordering point; these just deposit the value.
-                asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
-                             :: "l"(iqd.ready + iqd.rank), "r"(gn) : "memory");
-                if (iqd.ready_self != nullptr)
-                    asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
-                                 :: "l"(iqd.ready_self + iqd.rank), "r"(gn)
-                                 : "memory");
             }
         }
     }
@@ -979,27 +875,13 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> swa_dst   = c10::nullopt,
     int64_t swa_entries_per_block = 0,
     int64_t swa_block_stride_bytes = 0,
-    // indexer-q DESTINATION (see IqDest in the header). Default: allocate the
-    // plain [M, IDX_NUM_HEADS] layout, degenerating the store math to non-TP.
-    // TP/DP callers pass their mqa_logits input buffers: iq_dst/_sf hold the FULL
-    // head set over the whole batch, iq_head_base is this rank's first global head,
-    // and iq_dst_peer/_sf are the peer rank's PEER-MAPPED mirror. Rows outside
-    // [iq_row_lo, iq_row_hi) are stored straight into the mirror at the SAME row
-    // index, which IS the cross-rank exchange. The completion handoff runs at the
-    // end of this kernel -- see IqDest for why it is not a separate launch.
+    // Optional caller-owned local MQA input buffers. By default the outputs use
+    // the plain [M, IDX_NUM_HEADS] layout.
     c10::optional<torch::Tensor> iq_dst         = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_sf      = c10::nullopt,
-    c10::optional<torch::Tensor> iq_dst_peer    = c10::nullopt,
-    c10::optional<torch::Tensor> iq_dst_peer_sf = c10::nullopt,
     bool indexer_fp8 = false,
     c10::optional<torch::Tensor> iq_weights = c10::nullopt,
     int64_t iq_head_base = 0,
-    int64_t iq_row_lo = 0, int64_t iq_row_hi = -1,
-    c10::optional<torch::Tensor> iq_done  = c10::nullopt,
-    c10::optional<torch::Tensor> iq_ready = c10::nullopt,
-    c10::optional<torch::Tensor> iq_ready_self = c10::nullopt,
-    c10::optional<torch::Tensor> iq_gen   = c10::nullopt,
-    int64_t iq_rank = 0,
     c10::optional<torch::Tensor> iq_prof = c10::nullopt)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
@@ -1051,9 +933,8 @@ static std::vector<torch::Tensor> run_wq_b(
         iq_fp4 = iq_dst.value();
         iq_sf  = iq_dst_sf.value();
     } else {
-        TORCH_CHECK(!iq_dst_sf.has_value() && !iq_dst_peer.has_value()
-                    && !iq_dst_peer_sf.has_value() && iq_head_base == 0,
-                    "iq_dst_sf / iq_dst_peer / iq_head_base require iq_dst");
+        TORCH_CHECK(!iq_dst_sf.has_value() && iq_head_base == 0,
+                    "iq_dst_sf / iq_head_base require iq_dst");
         iq_fp4 = torch::empty(
             {M, IDX_NUM_HEADS, indexer_fp8 ? IDX_HEAD_DIM : IDX_HEAD_DIM / 2},
             x_fp8.options().dtype(indexer_fp8 ? torch::kFloat8_e4m3fn
@@ -1084,51 +965,7 @@ static std::vector<torch::Tensor> run_wq_b(
     TORCH_CHECK(iq_head_base >= 0 && iq_head_base + IDX_NUM_HEADS <= iq_heads,
                 "iq_head_base + IDX_NUM_HEADS(", IDX_NUM_HEADS, ") exceeds the "
                 "destination head count ", iq_heads);
-    // Every computed row must land somewhere: rows outside [row_lo, row_hi) go to
-    // the peer. Both ranks size their buffer for the full batch.
-    if (iq_row_hi < 0) iq_row_hi = iq_rows;      // default: we own everything
     TORCH_CHECK(iq_rows >= M, "iq_dst needs >= M rows, got ", iq_rows, " < ", M);
-    TORCH_CHECK(0 <= iq_row_lo && iq_row_lo <= iq_row_hi && iq_row_hi <= iq_rows,
-                "iq_row_lo/hi must satisfy 0 <= lo <= hi <= rows");
-    if (iq_dst_peer.has_value()) {
-        TORCH_CHECK(iq_dst_peer_sf.has_value(), "iq_dst_peer also needs iq_dst_peer_sf");
-        TORCH_CHECK(iq_dst_peer.value().sizes() == iq_fp4.sizes()
-                    && iq_dst_peer.value().scalar_type() == iq_fp4.scalar_type()
-                    && iq_dst_peer.value().is_contiguous()
-                    && iq_dst_peer_sf.value().sizes() == iq_sf.sizes()
-                    && iq_dst_peer_sf.value().scalar_type() == iq_sf.scalar_type()
-                    && iq_dst_peer_sf.value().is_contiguous(),
-                    "iq_dst_peer/_sf must mirror iq_dst/_sf exactly");
-    } else {
-        TORCH_CHECK(iq_row_lo == 0 && iq_row_hi >= M,
-                    "without a peer this rank must own every row it computes");
-    }
-    // Completion handoff is all-or-none, and pointless without a peer.
-    TORCH_CHECK(iq_done.has_value() == iq_ready.has_value()
-                && iq_done.has_value() == iq_gen.has_value(),
-                "iq_done, iq_ready and iq_gen must be given together");
-    if (iq_done.has_value()) {
-        TORCH_CHECK(iq_dst_peer.has_value(),
-                    "iq_done/iq_ready/iq_gen are only meaningful with iq_dst_peer");
-        TORCH_CHECK(iq_done.value().is_cuda() && iq_done.value().is_contiguous()
-                    && iq_done.value().numel() >= IQ_DONE_WORDS
-                    && iq_done.value().scalar_type() == torch::kInt32,
-                    "iq_done must be a CUDA i32 [>= ", IQ_DONE_WORDS,
-                    "] (ZERO-initialized once; the kernel self-resets it)");
-        TORCH_CHECK(iq_gen.value().is_cuda() && iq_gen.value().numel() == 1
-                    && iq_gen.value().scalar_type() == torch::kInt32,
-                    "iq_gen must be a 1-element CUDA i32 (ZERO-initialized once)");
-        TORCH_CHECK(iq_ready.value().is_cuda() && iq_ready.value().is_contiguous()
-                    && iq_ready.value().scalar_type() == torch::kInt32
-                    && iq_rank >= 0 && iq_rank < iq_ready.value().numel(),
-                    "iq_ready must be a CUDA i32 [world] with iq_rank in range");
-        if (iq_ready_self.has_value())
-            TORCH_CHECK(iq_ready_self.value().numel() == iq_ready.value().numel()
-                        && iq_ready_self.value().is_cuda()
-                        && iq_ready_self.value().is_contiguous()
-                        && iq_ready_self.value().scalar_type() == torch::kInt32,
-                        "iq_ready_self must mirror iq_ready");
-    }
     // drain-first workspace: the epilogue dumps the iq accum here (L2-resident)
     // to release the TMEM stage before the transform pass
     auto iq_ws = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM},
@@ -1140,30 +977,12 @@ static std::vector<torch::Tensor> run_wq_b(
     int* iq_sf_ptr = reinterpret_cast<int*>(iq_sf.data_ptr());
     __nv_bfloat16* iq_ws_ptr =
         reinterpret_cast<__nv_bfloat16*>(iq_ws.data_ptr());
-    // No peer -> aim the peer pointers at the local buffer. The host has already
-    // checked [row_lo, row_hi) covers every row in that case, so `mine` is always
-    // true and the peer branch is dead.
     IqDest iqd{};
     iqd.fp4       = iq_fp4_ptr;
     iqd.sf        = iq_sf_ptr;
-    iqd.fp4_peer  = iq_dst_peer.has_value()
-        ? reinterpret_cast<uint8_t*>(iq_dst_peer.value().data_ptr()) : iq_fp4_ptr;
-    iqd.sf_peer   = iq_dst_peer_sf.has_value()
-        ? reinterpret_cast<int*>(iq_dst_peer_sf.value().data_ptr()) : iq_sf_ptr;
     iqd.weights   = iq_weights.has_value() ? iq_weights->data_ptr<float>() : nullptr;
-    iqd.row_lo    = (int)iq_row_lo;
-    iqd.row_hi    = (int)iq_row_hi;
     iqd.head_base = (int)iq_head_base;
     iqd.num_heads = iq_heads;
-    iqd.done      = iq_done.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_done.value().data_ptr()) : nullptr;
-    iqd.ready     = iq_ready.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_ready.value().data_ptr()) : nullptr;
-    iqd.ready_self = iq_ready_self.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_ready_self.value().data_ptr()) : nullptr;
-    iqd.gen       = iq_gen.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_gen.value().data_ptr()) : nullptr;
-    iqd.rank      = (int)iq_rank;
     if (iq_prof.has_value()) {
         TORCH_CHECK(iq_prof.value().is_cuda() && iq_prof.value().is_contiguous()
                     && iq_prof.value().numel() >= 2
@@ -1185,8 +1004,8 @@ static std::vector<torch::Tensor> run_wq_b(
     // resets the valid flag words before GDS releases WQ_B; capture without that
     // producer retains a memset fallback. Graph and eager launches sharing a
     // device must not run concurrently on different streams.
-    static uint32_t* iq_ready_dev[kMaxDevices] = {};
-    static uint32_t  iq_ready_tag[kMaxDevices] = {};
+    static uint32_t* iq_drain_ready_dev[kMaxDevices] = {};
+    static uint32_t  iq_drain_ready_tag[kMaxDevices] = {};
     const int dev_id = x_fp8.device().index();
     TORCH_CHECK(dev_id >= 0 && dev_id < kMaxDevices,
                 "wq_b: device index ", dev_id, " outside the flag table");
@@ -1194,26 +1013,26 @@ static std::vector<torch::Tensor> run_wq_b(
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     TORCH_CHECK(cudaStreamIsCapturing(stream, &cap) == cudaSuccess,
                 "wq_b: cudaStreamIsCapturing failed");
-    if (iq_ready_dev[dev_id] == nullptr) {
+    if (iq_drain_ready_dev[dev_id] == nullptr) {
         TORCH_CHECK(cap == cudaStreamCaptureStatusNone,
                     "wq_b: run one eager launch before capturing (the iq "
                     "ready-flag page cannot be allocated during capture)");
-        TORCH_CHECK(cudaMalloc(&iq_ready_dev[dev_id], kFlagBytes) == cudaSuccess,
+        TORCH_CHECK(cudaMalloc(&iq_drain_ready_dev[dev_id], kFlagBytes) == cudaSuccess,
                     "wq_b: iq ready-flag alloc failed");
-        TORCH_CHECK(cudaMemsetAsync(iq_ready_dev[dev_id], 0, kFlagBytes, stream)
+        TORCH_CHECK(cudaMemsetAsync(iq_drain_ready_dev[dev_id], 0, kFlagBytes, stream)
                         == cudaSuccess, "wq_b: iq ready-flag zero failed");
     }
-    uint32_t* iq_ready_ptr = iq_ready_dev[dev_id];
-    uint32_t* iq_ready_reset_ptr = nullptr;
-    uint32_t  iq_seq;
+    uint32_t* iq_drain_ready_ptr = iq_drain_ready_dev[dev_id];
+    uint32_t* iq_drain_ready_reset_ptr = nullptr;
+    uint32_t  iq_drain_seq;
     if (cap == cudaStreamCaptureStatusNone) {
-        iq_seq = ++iq_ready_tag[dev_id];
+        iq_drain_seq = ++iq_drain_ready_tag[dev_id];
     } else {
-        iq_seq = 1u;
+        iq_drain_seq = 1u;
         if (quant_on) {
-            iq_ready_reset_ptr = iq_ready_ptr;
+            iq_drain_ready_reset_ptr = iq_drain_ready_ptr;
         } else {
-            TORCH_CHECK(cudaMemsetAsync(iq_ready_ptr, 0, kFlagBytes, stream)
+            TORCH_CHECK(cudaMemsetAsync(iq_drain_ready_ptr, 0, kFlagBytes, stream)
                             == cudaSuccess,
                         "wq_b: iq ready-flag reset node failed");
         }
@@ -1489,7 +1308,7 @@ static std::vector<torch::Tensor> run_wq_b(
                 qy_ptr, qy_lda, qgamma_ptr, static_cast<float>(q_eps),
                 const_cast<__nv_fp8_e4m3*>(x_ptr),
                 const_cast<uint8_t*>(xsf_ptr), M, ssq_ptr,
-                iq_ready_reset_ptr);
+                iq_drain_ready_reset_ptr);
         }
 
         cudaLaunchConfig_t config = {};
@@ -1517,7 +1336,7 @@ static std::vector<torch::Tensor> run_wq_b(
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &num_clusters, &ssq_ptr,
-            &iqd, &iq_ws_ptr, &iq_ready_ptr, &iq_seq,
+            &iqd, &iq_ws_ptr, &iq_drain_ready_ptr, &iq_drain_seq,
             &q_pos_ptr, &cos_ptr, &sin_ptr,
             &mock_i, &comp, &prof_dev
         };
@@ -1536,45 +1355,8 @@ static std::vector<torch::Tensor> run_wq_b(
     return ret;
 }
 
-// ======================== Cross-rank readiness wait ========================
-// Waits until every OTHER rank has published a generation >= our own for this
-// launch, then releases the chain with one system-scope acquire.
-//
-// `>= *gen` (not `== tag`) is what makes this graph-safe: both ranks replay the
-// same graph the same number of times, so their generations advance in lockstep
-// and the flag re-arms itself every launch -- no host tag to freeze, no memset.
-// Our own slot is skipped: stream order already guarantees our producer ran.
-//
-// Deadlock-free: every flag it waits on is written by a DIFFERENT device, so no
-// resource this kernel holds is needed by its own producer. (An in-kernel spin
-// waiting on work that needs the SAME device's SMs would deadlock -- that is why
-// this is a separate 1-block launch and not folded into a consumer sharing the
-// grid with its producer.)
-__global__ void iq_wait_kernel(const unsigned int* __restrict__ ready,
-                               const unsigned int* __restrict__ gen,
-                               int world, int skip) {
-    if ((int)threadIdx.x >= world || (int)threadIdx.x == skip) return;
-    unsigned int want;
-    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(want) : "l"(gen) : "memory");
-    unsigned int v;
-    const unsigned long long t0 = ptx::rdtimer_ns();
-    do {   // relaxed while spinning; a single acquire once it passes
-        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                     : "=r"(v) : "l"(ready + threadIdx.x) : "memory");
-        if (v >= want) break;
-        if (ptx::rdtimer_ns() - t0 >= IQ_SPIN_TIMEOUT_NS) {
-            printf("iq_wait timeout: rank_slot=%u flag=%u want=%u (world=%d "
-                   "skip=%d)\n", threadIdx.x, v, want, world, skip);
-            __trap();
-        }
-        __nanosleep(256);
-    } while (true);
-    asm volatile("fence.acquire.sys;" ::: "memory");
-}
-
 // ======================== PyTorch Binding ========================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.attr("iq_done_words") = IQ_DONE_WORDS;
     m.attr("n_main") = N_TOTAL;
     m.attr("n_index") = N_IDX;
     m.attr("n_merged") = N_MERGED;
@@ -1598,14 +1380,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> swa_cache, c10::optional<torch::Tensor> swa_dst,
              int64_t swa_entries_per_block, int64_t swa_block_stride_bytes,
              c10::optional<torch::Tensor> iq_dst, c10::optional<torch::Tensor> iq_dst_sf,
-             c10::optional<torch::Tensor> iq_dst_peer,
-             c10::optional<torch::Tensor> iq_dst_peer_sf,
              bool indexer_fp8, c10::optional<torch::Tensor> iq_weights,
              int64_t iq_head_base,
-             int64_t iq_row_lo, int64_t iq_row_hi,
-             c10::optional<torch::Tensor> iq_done, c10::optional<torch::Tensor> iq_ready,
-             c10::optional<torch::Tensor> iq_ready_self,
-             c10::optional<torch::Tensor> iq_gen, int64_t iq_rank,
              c10::optional<torch::Tensor> iq_prof) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
@@ -1616,10 +1392,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                               idx_cache, idx_dst, idx_entries_per_block,
                               idx_block_stride_bytes, swa_cache, swa_dst,
                               swa_entries_per_block, swa_block_stride_bytes,
-                              iq_dst, iq_dst_sf, iq_dst_peer, iq_dst_peer_sf,
-                              indexer_fp8, iq_weights,
-                              iq_head_base, iq_row_lo, iq_row_hi,
-                              iq_done, iq_ready, iq_ready_self, iq_gen, iq_rank,
+                              iq_dst, iq_dst_sf, indexer_fp8, iq_weights,
+                              iq_head_base,
                               iq_prof);
           },
           "MERGED wq_b + indexer wq_b (w [8192+N,K]: indexer rows FIRST, then "
@@ -1639,16 +1413,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
           "[512] (+ cmp_pos/cos_tab/sin_tab) -> appends win_q8 [M,448] u8, win_s8 "
           "[M,7] f32, win_rope [M,64] bf16. "
-          "IQ DESTINATION (TP/DP direct write): iq_dst [rows,heads,64] i8 + "
-          "iq_dst_sf [rows,heads] i32 are the mqa_logits input buffers holding the "
-          "FULL head set over this rank's DP row share; iq_head_base is this rank's "
-          "first global head; rows >= `rows` are stored into iq_dst_peer/_sf (the "
-          "peer rank's PEER-MAPPED mirror -- that store IS the cross-rank exchange, "
-          "iq_ready [world] i32 + iq_gen [1] i32 (both zero-init ONCE) + iq_rank "
-          "arm the completion handoff: the CTA seeing the last task increment "
-          "bumps iq_gen and .sys-releases it into iq_ready[iq_rank] -- where "
-          "iq_ready is the PEER's flag page. Omit them all for the plain "
-          "[M,IDX_NUM_HEADS] single-GPU layout.",
+          "IQ DESTINATION: optional iq_dst [rows,heads,64] + iq_dst_sf "
+          "[rows,heads] write directly into caller-owned local MQA input buffers; "
+          "omit both for the plain [M,IDX_NUM_HEADS] layout.",
           py::arg("x_fp8"), py::arg("x_sf"), py::arg("w_fp8"), py::arg("w_sf"),
           py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"),
           py::arg("head_ssq") = c10::nullopt,
@@ -1676,38 +1443,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("swa_block_stride_bytes") = 0,
           py::arg("iq_dst") = c10::nullopt,
           py::arg("iq_dst_sf") = c10::nullopt,
-          py::arg("iq_dst_peer") = c10::nullopt,
-          py::arg("iq_dst_peer_sf") = c10::nullopt,
           py::arg("indexer_fp8") = false,
           py::arg("iq_weights") = c10::nullopt,
           py::arg("iq_head_base") = 0,
-          py::arg("iq_row_lo") = 0, py::arg("iq_row_hi") = -1,
-          py::arg("iq_done") = c10::nullopt,
-          py::arg("iq_ready") = c10::nullopt,
-          py::arg("iq_ready_self") = c10::nullopt,
-          py::arg("iq_gen") = c10::nullopt,
-          py::arg("iq_rank") = 0,
           py::arg("iq_prof") = c10::nullopt);
-    m.def("iq_wait",
-          [](torch::Tensor ready, torch::Tensor gen, int64_t world, int64_t skip) {
-              TORCH_CHECK(ready.is_cuda() && ready.is_contiguous()
-                          && ready.scalar_type() == torch::kInt32
-                          && world > 0 && world <= ready.numel(),
-                          "iq_wait: ready must be a CUDA i32 [>= world]");
-              TORCH_CHECK(gen.is_cuda() && gen.numel() == 1
-                          && gen.scalar_type() == torch::kInt32,
-                          "iq_wait: gen must be a 1-element CUDA i32");
-              iq_wait_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-                  reinterpret_cast<const unsigned int*>(ready.data_ptr()),
-                  reinterpret_cast<const unsigned int*>(gen.data_ptr()),
-                  (int)world, (int)skip);
-          },
-          "Wait until every rank except `skip` has published a generation >= our "
-          "own (*gen), then acquire (.sys). Consumer half of the wq_b iq "
-          "direct-write handoff: launch between wq_b and mqa_logits. "
-          "Graph-capturable (the device generation re-arms itself on replay) and "
-          "deadlock-free (every flag comes from another device).",
-          py::arg("ready"), py::arg("gen"), py::arg("world"), py::arg("skip"));
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

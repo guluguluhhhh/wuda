@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared low-level support for the HCA swap-AB front projection.
+// Shared low-level support for the CSA swap-AB front projection.
 // The retired no-swap kernel intentionally does not live in this header.
 
 #include <cstddef>
@@ -13,7 +13,7 @@
 
 #include "cluster_mma_fp8.cuh"
 
-namespace front_mixed_hca {
+namespace front_mixed_csa {
 
 constexpr int K = 7168;
 constexpr int N = 3072;
@@ -204,6 +204,23 @@ struct HcTailArgs {
   float* comb_out = nullptr;     // [m,4,4]
 };
 
+// Direct front-projection handoff used by the decode chain. When main_state
+// is non-null, only q [0,1536) is written to the bf16 output; the remaining
+// projection segments are published directly from the fp32 accumulators.
+constexpr int APE_RATIO = 4;
+
+struct FrontEmitArgs {
+  float* main_state = nullptr;         // [blocks, ring, 2048]
+  const float* main_ape = nullptr;     // [4,1024]
+  const int* main_state_row = nullptr; // [M], -1 skips a row
+  const int* ape_phase = nullptr;      // [M]
+  float* idx_state = nullptr;          // [blocks, ring, 512]
+  const int* idx_state_row = nullptr;  // [M], -1 skips a row
+  const float* idx_ape = nullptr;      // [4,256]
+  float* win_y2 = nullptr;             // [M,512]
+  float* w64 = nullptr;                // [M,64]
+};
+
 __device__ __forceinline__ float hc_tail_sigmoid(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -297,4 +314,4 @@ inline CUresult make_fp8_map(
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-}  // namespace front_mixed_hca
+}  // namespace front_mixed_csa

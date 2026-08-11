@@ -17,6 +17,7 @@ package needed (FP4 quant/dequant + calc_diff are inlined below).
 
     python test/test_mqa_logits_fp4.py            # correctness, then the fuse-comp table
     python test/test_mqa_logits_fp4.py --base     # attention-only table instead
+    python test/test_mqa_logits_fp4.py --fp8      # FP8 vs DeepGEMM + fused MAIN
 """
 
 import argparse
@@ -151,6 +152,41 @@ def load_cuda_module():
         sources=[os.path.join(proj_dir, "kernels", "mqa_logits_fp4.cu")],
         extra_include_paths=[
             os.path.join(proj_dir, "include"),
+            cutlass_dir,
+            cutlass_tools_dir,
+        ],
+        extra_cuda_cflags=cuda_flags,
+        extra_ldflags=["-lcuda"],
+        verbose=True,
+    )
+
+
+def load_cuda_module_fp8():
+    """Build the standalone FP8+MAIN implementation from its own translation unit."""
+    from torch.utils.cpp_extension import load
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    proj_dir = os.path.dirname(this_dir)
+    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    cutlass_dir = os.path.join(proj_dir, "..", "cutlass", "include")
+    cutlass_tools_dir = os.path.join(
+        proj_dir, "..", "cutlass", "tools", "util", "include")
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    cuda_flags = [
+        "-O3", "--use_fast_math", "-std=c++17", "--expt-relaxed-constexpr",
+        "-lineinfo", "--ptxas-options=-v",
+        "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
+        "-include", os.path.join(proj_dir, "include", "sm103_cutlass_shim.h"),
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1", "-diag-suppress=3288",
+        f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
+    ]
+    return load(
+        name="mqa_logits_fp8_fused",
+        sources=[os.path.join(proj_dir, "kernels", "mqa_logits_fp8.cu")],
+        extra_include_paths=[
+            os.path.join(proj_dir, "include"),
+            os.path.join(deep_gemm_dir, "deep_gemm", "include"),
             cutlass_dir,
             cutlass_tools_dir,
         ],
@@ -330,6 +366,279 @@ def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
     values than historical (min-based) tables."""
     return 1e6 * bench_kineto(fn, name_substr, num_tests=num_tests,
                               suppress_kineto_output=True)
+
+
+# ------------------------------------------------------------------ FP8 MQA + MAIN
+
+def get_deep_gemm():
+    """Resolve the checkout explicitly so an older installed wheel cannot win."""
+    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    if deep_gemm_dir not in sys.path:
+        sys.path.insert(0, deep_gemm_dir)
+    import deep_gemm
+    return deep_gemm
+
+
+def build_fp8_paged_cache(kv, entries_per_block=64, shuffle=True,
+                          block_stride_padding=0):
+    """Quantize [B,T,128] BF16 into DeepGEMM's planar FP8 paged ABI.
+
+    The object passed to DeepGEMM has logical shape [pages, page, 1, 132], but
+    each physical page is planar: all E4M3 K bytes, then all FP32 token scales.
+    """
+    B, T, D = kv.shape
+    assert D == HEAD_DIM and T % entries_per_block == 0
+    epb = entries_per_block
+    num_blocks = B * T // epb
+    amax = kv.abs().float().amax(dim=-1).clamp_min(1e-4)
+    scale = amax / 448.0
+    kv_fp8 = (kv * scale.reciprocal().unsqueeze(-1)).to(torch.float8_e4m3fn)
+    kv_sim = (kv_fp8.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+    payload = epb * (D + 4)
+    stride = payload + block_stride_padding
+    assert stride >= payload and stride % 16 == 0
+    permutation = (torch.randperm(num_blocks, device="cuda") if shuffle else
+                   torch.arange(num_blocks, device="cuda"))
+    pages = torch.full((num_blocks, stride), 0xA5, dtype=torch.uint8,
+                       device="cuda")
+    pages[permutation, :epb * D] = kv_fp8.contiguous().view(
+        num_blocks, epb * D).view(torch.uint8)
+    pages[permutation, epb * D:payload] = scale.contiguous().view(
+        num_blocks, epb).view(torch.uint8).view(num_blocks, epb * 4)
+    block_table = permutation.to(torch.int32).view(B, T // epb).contiguous()
+    dg_view = pages.as_strided(
+        (num_blocks, epb, 1, D + 4),
+        (pages.stride(0), D + 4, D + 4, 1))
+    return pages, dg_view, block_table, kv_sim
+
+
+def make_fp8_attention_case(B, T, entries_per_block=64,
+                            block_stride_padding=0, mixed_context=False):
+    dg = get_deep_gemm()
+    torch.manual_seed(B * 1009 + T * 7 + entries_per_block)
+    q_bf16 = torch.randn(B, NUM_HEADS, HEAD_DIM, device="cuda",
+                         dtype=torch.bfloat16)
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(B, T, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    pages, dg_pages, block_table, kv_sim = build_fp8_paged_cache(
+        kv, entries_per_block, shuffle=True,
+        block_stride_padding=block_stride_padding)
+
+    # The RTP producer folds its per-head Q scale into this tensor. Random
+    # positive scales exercise exactly that ABI while keeping Q itself plain E4M3.
+    original_weights = torch.randn(B, NUM_HEADS, device="cuda")
+    q_scale = torch.rand(B, NUM_HEADS, device="cuda") * 1.5 + 0.25
+    folded_weights = (original_weights * q_scale).contiguous()
+    if mixed_context:
+        lo = max(1, entries_per_block // 2)
+        context = torch.linspace(lo, T, B, device="cuda").to(torch.int32)
+    else:
+        context = torch.full((B,), T, device="cuda", dtype=torch.int32)
+    context_2d = context.view(B, 1).contiguous()
+    schedule = dg.get_paged_mqa_logits_metadata(
+        context_2d, entries_per_block, dg.get_num_sms())
+    return dict(
+        q=q_fp8, q_sim=q_fp8.to(torch.bfloat16), kv=kv, kv_sim=kv_sim,
+        pages=pages, dg_pages=dg_pages, weights=folded_weights,
+        context=context, context_2d=context_2d, block_table=block_table,
+        schedule=schedule, entries_per_block=entries_per_block,
+        block_stride_bytes=pages.size(1), T=T)
+
+
+def call_wuda_fp8(module, case, logits, num_kv_stages=0, **compressor):
+    module.mqa_logits_fp8_decode_out(
+        case["q"], case["pages"], case["weights"], case["context_2d"],
+        case["block_table"], case["schedule"], logits,
+        case["entries_per_block"], case["block_stride_bytes"],
+        num_kv_stages, 1e-6, **compressor)
+
+
+def call_deep_gemm_fp8(case):
+    dg = get_deep_gemm()
+    return dg.fp8_paged_mqa_logits(
+        case["q"].view(case["q"].size(0), 1, NUM_HEADS, HEAD_DIM),
+        case["dg_pages"], case["weights"], case["context_2d"],
+        case["block_table"], case["schedule"], case["T"])
+
+
+def test_fp8_attention(module):
+    print("\n[fp8-attention] Wuda vs deep_gemm.fp8_paged_mqa_logits")
+    print(f"{'page':>6} {'padding':>8} {'valid':>8} {'bitwise':>9} "
+          f"{'max_abs':>10} {'values':>9} {'result':>8}")
+    print("-" * 68)
+    ok_all = True
+    for epb, padding, mixed in ((32, 128, True), (64, 0, False),
+                                (128, 256, True)):
+        case = make_fp8_attention_case(
+            8, 512, epb, block_stride_padding=padding,
+            mixed_context=mixed)
+        sentinel = -12345.0
+        logits = torch.full((8, 512), sentinel, device="cuda")
+        call_wuda_fp8(module, case, logits)
+        reference = call_deep_gemm_fp8(case)
+        torch.cuda.synchronize()
+        positions = torch.arange(512, device="cuda")[None, :]
+        valid = positions < case["context"][:, None]
+        bitwise = torch.equal(logits[valid], reference[valid])
+        max_abs = (logits[valid] - reference[valid]).abs().max().item()
+        # DeepGEMM's clean_logits=False contract writes whole 256-token splits;
+        # values at positions >= context_len are unspecified and not consumed.
+        ok = bitwise
+        ok_all &= ok
+        valid_desc = "mixed" if mixed else "full"
+        print(f"{epb:6d} {padding:8d} {valid_desc:>8} {str(bitwise):>9} "
+              f"{max_abs:10.3e} {int(valid.sum()):9d} "
+              f"{('PASS' if ok else 'FAIL'):>8}")
+        del case, logits, reference
+    return ok_all
+
+
+def make_main_compressor_inputs(B):
+    positions = torch.arange(B, dtype=torch.int64, device="cuda")
+    norm = torch.rand(512, device="cuda") + 0.5
+    angle = torch.outer(
+        torch.arange(max(B, 8), device="cuda", dtype=torch.float32),
+        1.0 / (10000.0 ** (torch.arange(32, device="cuda") / 32.0)))
+    cos_tab = torch.cos(angle).contiguous()
+    sin_tab = torch.sin(angle).contiguous()
+    state = torch.randn(B, 8, 2048, device="cuda")
+    state_row = (torch.arange(B, device="cuda") * 8 + positions % 8).int()
+    return positions, norm, cos_tab, sin_tab, state, state_row
+
+
+def test_fp8_main_compressor(module):
+    """Fused and standalone paths share the device function and must be exact."""
+    print("\n[fp8-main] fused attention + MAIN compressor")
+    B, T = 8, 512
+    case = make_fp8_attention_case(B, T, 64)
+    pos, norm, cos_tab, sin_tab, state, state_row = \
+        make_main_compressor_inputs(B)
+    state_before = state.clone()
+    base_logits = torch.full((B, T), -12345.0, device="cuda")
+    fused_logits = torch.full_like(base_logits, -12345.0)
+    call_wuda_fp8(module, case, base_logits)
+
+    fused_q8 = torch.full((B, 448), 0xAB, dtype=torch.uint8, device="cuda")
+    fused_s8 = torch.full((B, 7), -1.0, device="cuda")
+    fused_rope = torch.full((B, 64), -1.0, dtype=torch.bfloat16, device="cuda")
+    ref_q8 = fused_q8.clone()
+    ref_s8 = fused_s8.clone()
+    ref_rope = fused_rope.clone()
+
+    cmp_epb = 4
+    cmp_payload = cmp_epb * (576 + 8)
+    cmp_stride = cmp_payload + 128
+    cmp_cache = torch.full((2, cmp_stride), 0xA5, dtype=torch.uint8,
+                           device="cuda")
+    cmp_dst = torch.arange(B, dtype=torch.int32, device="cuda")
+    compressor = dict(
+        cmp_pos=pos, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
+        comp_state=state, comp_state_row=state_row,
+        comp_state_ring_entries=8, comp_q8=fused_q8, comp_s8=fused_s8,
+        comp_rope=fused_rope, cmp_cache=cmp_cache, cmp_dst=cmp_dst,
+        cmp_entries_per_block=cmp_epb,
+        cmp_block_stride_bytes=cmp_stride)
+    call_wuda_fp8(module, case, fused_logits, **compressor)
+    module.mqa_compressor_fp8_standalone(
+        pos, norm, cos_tab, sin_tab, state, state_row, 8,
+        ref_q8, ref_s8, ref_rope, 1e-6)
+    torch.cuda.synchronize()
+
+    logits_ok = torch.equal(base_logits, fused_logits)
+    compact_ok = (torch.equal(fused_q8, ref_q8) and
+                  torch.equal(fused_s8, ref_s8) and
+                  torch.equal(fused_rope, ref_rope))
+    state_ok = torch.equal(state, state_before)
+    trigger = ((pos + 1) % 4 == 0).cpu().tolist()
+    cache_ok = True
+    cache_cpu = cmp_cache.cpu()
+    q8_cpu, s8_cpu = fused_q8.cpu(), fused_s8.cpu()
+    rope_bytes = fused_rope.contiguous().view(torch.uint8).cpu()
+    for row, writes in enumerate(trigger):
+        page, offset = row // cmp_epb, row % cmp_epb
+        body = cache_cpu[page, offset * 576:(offset + 1) * 576]
+        scale_offset = cmp_epb * 576 + offset * 8
+        scale_record = cache_cpu[page, scale_offset:scale_offset + 8]
+        if writes:
+            expected_scale = (s8_cpu[row].log2() + 127).to(torch.uint8)
+            cache_ok &= torch.equal(body[:448], q8_cpu[row])
+            cache_ok &= torch.equal(body[448:], rope_bytes[row])
+            cache_ok &= torch.equal(scale_record[:7], expected_scale)
+            cache_ok &= bool(scale_record[7] == 0xA5)
+        else:
+            cache_ok &= bool((body == 0xA5).all())
+            cache_ok &= bool((scale_record == 0xA5).all())
+    cache_ok &= bool((cache_cpu[:, cmp_payload:] == 0xA5).all())
+
+    checks = (("attention bitwise unchanged", logits_ok),
+              ("standalone compressor bitwise match", compact_ok),
+              ("compressor state read-only", state_ok),
+              ("MODEL1 paged write + canaries", cache_ok))
+    for label, passed in checks:
+        print(f"  {label:<38} {'PASS' if passed else 'FAIL'}")
+    return all(passed for _, passed in checks)
+
+
+def benchmark_fp8(module, num_tests=30):
+    """Cold-HBM comparison; Wuda auto-selects 3/4/5 KV stages."""
+    print("\n[fp8-perf] DeepGEMM vs Wuda FP8 attention and fused MAIN")
+    print("  All values are mean CUDA kernel time with 8GB L2 flush per call.")
+    print(f"{'B':>4} {'T':>7} {'stg':>4} {'DG_us':>9} {'Wuda_us':>9} {'W/DG':>7} "
+          f"{'cmp_us':>8} {'fused_us':>10} {'fuse-base':>10} {'result':>8}")
+    print("-" * 96)
+    ok_all = True
+    for B, T in ((16, 1024), (16, 8192), (64, 8192), (128, 16384)):
+        case = make_fp8_attention_case(B, T, 64)
+        logits = torch.empty((B, T), device="cuda")
+        splits_per_cta = (B * ((T + 255) // 256) +
+                          get_deep_gemm().get_num_sms() - 1) // \
+            get_deep_gemm().get_num_sms()
+        stage = 3 if splits_per_cta <= 1 else (4 if splits_per_cta <= 8 else 5)
+        base_call = lambda: call_wuda_fp8(module, case, logits, 0)
+        dg_call = lambda: call_deep_gemm_fp8(case)
+
+        pos, norm, cos_tab, sin_tab, state, state_row = \
+            make_main_compressor_inputs(B)
+        q8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
+        s8 = torch.empty(B, 7, device="cuda")
+        rope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
+        compressor = dict(
+            cmp_pos=pos, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
+            comp_state=state, comp_state_row=state_row,
+            comp_state_ring_entries=8, comp_q8=q8, comp_s8=s8,
+            comp_rope=rope)
+        fused_call = lambda: call_wuda_fp8(
+            module, case, logits, 0, **compressor)
+        standalone_call = lambda: module.mqa_compressor_fp8_standalone(
+            pos, norm, cos_tab, sin_tab, state, state_row, 8,
+            q8, s8, rope, 1e-6)
+
+        # Warm both JIT paths before profiling; DeepGEMM compiles lazily.
+        dg_call(); base_call(); fused_call(); standalone_call()
+        torch.cuda.synchronize()
+        dg_us = kernel_us(dg_call, "sm100_paged_mqa_logits", num_tests)
+        base_us = kernel_us(
+            base_call, "sm100_fp8_paged_mqa_logits_fused", num_tests)
+        cmp_us = kernel_us(
+            standalone_call, "standalone_compressor_kernel", num_tests)
+        fused_us = kernel_us(
+            fused_call, "sm100_fp8_paged_mqa_logits_fused", num_tests)
+        align_ratio = base_us / dg_us
+        fuse_delta = fused_us - base_us
+        # Mean-profiler noise on short kernels is about 0.2us. Treat <=3% or
+        # <=0.5us as aligned; fusion must stay within the same envelope.
+        aligned = base_us <= dg_us * 1.03 + 0.5
+        no_regression = fused_us <= base_us * 1.03 + 0.5
+        passed = aligned and no_regression
+        ok_all &= passed
+        print(f"{B:4d} {T:7d} {stage:4d} {dg_us:9.3f} {base_us:9.3f} "
+              f"{align_ratio:7.3f} {cmp_us:8.3f} {fused_us:10.3f} "
+              f"{fuse_delta:10.3f} {('PASS' if passed else 'FAIL'):>8}")
+        del case, logits, pos, norm, cos_tab, sin_tab, state, state_row
+        del q8, s8, rope
+        torch.cuda.empty_cache()
+    return ok_all
 
 
 BLOCK_Q = 1   # decode: 1 query token per q-block (UMMA_N=64); mirrors the kernel config
@@ -754,6 +1063,8 @@ def timeline(module, B, T, stg=0):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--fp8", action="store_true",
+                        help="test the separate FP8 MQA + MAIN implementation")
     parser.add_argument("--base", action="store_true",
                         help="attention-only benchmark table (default is the fuse-comp table)")
     parser.add_argument("--sweep-stages", action="store_true",
@@ -772,6 +1083,21 @@ def main():
     major, minor = torch.cuda.get_device_capability()
     print(f"device={torch.cuda.get_device_name()} sm_{major}{minor} "
           f"torch={torch.__version__} cuda={torch.version.cuda}")
+    if args.fp8:
+        print("JIT compiling the separate mqa_logits_fp8.cu ...")
+        module = load_cuda_module_fp8()
+        ok = True
+        if not args.skip_correctness:
+            ok &= test_fp8_attention(module)
+            ok &= test_fp8_main_compressor(module)
+            print("\nALL FP8 CORRECTNESS PASSED" if ok else
+                  "\nFP8 CORRECTNESS FAILED")
+        if not args.skip_bench:
+            ok &= benchmark_fp8(module)
+            print("\nALL FP8 PERF GATES PASSED" if ok else
+                  "\nFP8 PERF GATE FAILED")
+        return 0 if ok else 1
+
     print("JIT compiling mqa_logits_fp4.cu ...")
     module = load_cuda_module()
 
