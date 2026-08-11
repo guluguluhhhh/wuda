@@ -170,6 +170,67 @@ def test_correctness(module, m):
     return ok
 
 
+def test_rtp_state_pool(module):
+    """FRONT-EMIT must address the two RTP state rings independently."""
+    m = 8
+    x, x_fp8, x_sf, w_bf16, w_fp8, w_sf = make_inputs(m, seed=20260809)
+    plain = module.front_mixed_gemm(
+        x, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
+        None, None, None, None, None)
+
+    pos = torch.tensor([3, 4, 5, 6, 7, 8, 9, 11], device='cuda')
+    phase = (pos % 4).int()
+    main_blocks = torch.arange(1, m + 1, device='cuda')
+    idx_blocks = torch.arange(m + 1, 2 * m + 1, device='cuda')
+    main_rows = (main_blocks * 8 + pos % 8).int()
+    idx_rows = (idx_blocks * 8 + pos % 8).int()
+    main_state = torch.randn((m + 1) * 8, 2048, device='cuda')
+    idx_state = torch.randn((2 * m + 1) * 8, 512, device='cuda')
+    main_before, idx_before = main_state.clone(), idx_state.clone()
+    main_ape = torch.randn(4, 1024, device='cuda') * 0.02
+    idx_ape = torch.randn(4, 256, device='cuda') * 0.02
+    win_y2 = torch.full((m, 512), float('nan'), device='cuda')
+    w64 = torch.full((m, 64), float('nan'), device='cuda')
+    emitted = torch.full((m, N), -1234.0, dtype=torch.bfloat16, device='cuda')
+
+    module.front_mixed_gemm(
+        x, x_fp8, x_sf, w_bf16, w_fp8, w_sf,
+        None, None, None, None, None, out=emitted,
+        main_state=main_state, main_ape=main_ape,
+        main_state_row=main_rows, ape_phase=phase,
+        idx_state=idx_state, idx_state_row=idx_rows, idx_ape=idx_ape,
+        win_y2=win_y2, w64=w64)
+    torch.cuda.synchronize()
+
+    main_touched = torch.zeros(main_state.size(0), dtype=torch.bool, device='cuda')
+    idx_touched = torch.zeros(idx_state.size(0), dtype=torch.bool, device='cuda')
+    main_touched[main_rows.long()] = True
+    idx_touched[idx_rows.long()] = True
+    untouched = (torch.equal(main_state[~main_touched], main_before[~main_touched])
+                 and torch.equal(idx_state[~idx_touched], idx_before[~idx_touched]))
+
+    bf16_projection = x.float() @ w_bf16.float().t()
+    main_raw = bf16_projection[:, :2048]
+    idx_raw = bf16_projection[:, 2048:2560]
+    main_actual = main_state[main_rows.long()]
+    idx_actual = idx_state[idx_rows.long()]
+    values_ok = (
+        calc_diff(main_actual[:, :1024], main_raw[:, :1024]) < 1e-5
+        and calc_diff(main_actual[:, 1024:] - main_ape[phase.long()],
+                      main_raw[:, 1024:]) < 1e-5
+        and calc_diff(idx_actual[:, :256], idx_raw[:, :256]) < 1e-5
+        and calc_diff(idx_actual[:, 256:] - idx_ape[phase.long()],
+                      idx_raw[:, 256:]) < 1e-5)
+    handoff_ok = (torch.equal(win_y2, plain[:, 1536:2048].float())
+                  and torch.equal(w64, plain[:, -64:].float()))
+    output_ok = (torch.equal(emitted[:, :1536], plain[:, :1536])
+                 and torch.equal(emitted[:, 1536:],
+                                 torch.full_like(emitted[:, 1536:], -1234.0)))
+    ok = untouched and values_ok and handoff_ok and output_ok
+    print(f"  RTP state-pool writer: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def benchmark(module):
     print("\n" + "=" * 64)
     print("Benchmark: front_mixed_gemm vs cuBLAS (bench_kineto, 8GB L2 flush)")
@@ -263,6 +324,7 @@ if __name__ == '__main__':
     results = []
     for m in (1, 2, 4, 8, 16, 32, 64, 96, 100, 128):   # incl. non-16-aligned M
         results.append(test_correctness(module, m))
+    results.append(test_rtp_state_pool(module))
 
     benchmark(module)
 

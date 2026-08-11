@@ -17,6 +17,7 @@ package needed (FP4 quant/dequant + calc_diff are inlined below).
 
     python test/test_mqa_logits_fp4.py            # correctness, then the fuse-comp table
     python test/test_mqa_logits_fp4.py --base     # attention-only table instead
+    python test/test_mqa_logits_fp4.py --fp8      # FP8 vs DeepGEMM + fused MAIN
 """
 
 import argparse
@@ -160,6 +161,41 @@ def load_cuda_module():
     )
 
 
+def load_cuda_module_fp8():
+    """Build the standalone FP8+MAIN implementation from its own translation unit."""
+    from torch.utils.cpp_extension import load
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    proj_dir = os.path.dirname(this_dir)
+    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    cutlass_dir = os.path.join(proj_dir, "..", "cutlass", "include")
+    cutlass_tools_dir = os.path.join(
+        proj_dir, "..", "cutlass", "tools", "util", "include")
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    cuda_flags = [
+        "-O3", "--use_fast_math", "-std=c++17", "--expt-relaxed-constexpr",
+        "-lineinfo", "--ptxas-options=-v",
+        "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
+        "-include", os.path.join(proj_dir, "include", "sm103_cutlass_shim.h"),
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1", "-diag-suppress=3288",
+        f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
+    ]
+    return load(
+        name="mqa_logits_fp8_fused",
+        sources=[os.path.join(proj_dir, "kernels", "mqa_logits_fp8.cu")],
+        extra_include_paths=[
+            os.path.join(proj_dir, "include"),
+            os.path.join(deep_gemm_dir, "deep_gemm", "include"),
+            cutlass_dir,
+            cutlass_tools_dir,
+        ],
+        extra_cuda_cflags=cuda_flags,
+        extra_ldflags=["-lcuda"],
+        verbose=True,
+    )
+
+
 def ref_fp8_mqa_logits(q, kv, weights, ks, ke):
     """Verbatim from DeepGEMM tests/test_attention.py::ref_fp8_mqa_logits."""
     seq_len_kv = kv.shape[0]
@@ -187,23 +223,29 @@ PAGE_KV = 64      # fused-page tokens (RTP-LLM tokens_per_block); mirrors the ke
 PAGE_BYTES = PAGE_KV * (HEAD_DIM // 2 + 4)   # 4352: fp4 bytes then per-token i32 sf
 
 
-def build_paged_cache(kv_p, kv_sf, B, T, shuffle=False):
+def build_paged_cache(kv_p, kv_sf, B, T, shuffle=False,
+                      entries_per_block=PAGE_KV, block_stride_bytes=None):
     """kv_p [B*T, D/2] i8 + kv_sf [B*T] i32 (logical order) -> fused page cache
     uint8 [num_blocks, PAGE_BYTES] + block_table [B, T//PAGE_KV] i32.
     Fused page layout (DeepGEMM kv_cache_cast_to_mxfp4-compatible):
     [PAGE_KV*(D/2) fp4 bytes | PAGE_KV*4 sf bytes]. shuffle=True scatters logical
     pages across the physical pool (REAL paged semantics: exercises block_table
     indirection); False keeps identity mapping (contiguous HBM ranges, benchmark)."""
-    assert T % PAGE_KV == 0
-    num_blocks = B * T // PAGE_KV
+    epb = entries_per_block
+    assert T % epb == 0
+    payload_bytes = epb * (HEAD_DIM // 2 + 4)
+    stride_bytes = block_stride_bytes or payload_bytes
+    assert stride_bytes >= payload_bytes and stride_bytes % 16 == 0
+    num_blocks = B * T // epb
     perm = (torch.randperm(num_blocks, device="cuda")
             if shuffle else torch.arange(num_blocks, device="cuda"))
-    fused = torch.empty(num_blocks, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    fused[perm, :PAGE_KV * (HEAD_DIM // 2)] = \
-        kv_p.contiguous().view(torch.uint8).view(num_blocks, PAGE_KV * (HEAD_DIM // 2))
-    fused[perm, PAGE_KV * (HEAD_DIM // 2):] = \
-        kv_sf.contiguous().view(num_blocks, PAGE_KV).view(torch.uint8).view(num_blocks, PAGE_KV * 4)
-    block_table = perm.to(torch.int32).view(B, T // PAGE_KV).contiguous()
+    fused = torch.full((num_blocks, stride_bytes), 0xA5, device="cuda",
+                       dtype=torch.uint8)
+    fused[perm, :epb * (HEAD_DIM // 2)] = \
+        kv_p.contiguous().view(torch.uint8).view(num_blocks, epb * (HEAD_DIM // 2))
+    fused[perm, epb * (HEAD_DIM // 2):payload_bytes] = \
+        kv_sf.contiguous().view(num_blocks, epb).view(torch.uint8).view(num_blocks, epb * 4)
+    block_table = perm.to(torch.int32).view(B, T // epb).contiguous()
     return fused, block_table
 
 
@@ -219,7 +261,8 @@ def make_valid(B, T, valid):
     return [valid] * B, torch.full((B,), valid, dtype=torch.int32, device="cuda")
 
 
-def run_decode(module, B, T, out_dtype, valid=None):
+def run_decode(module, B, T, out_dtype, valid=None, entries_per_block=PAGE_KV,
+               block_stride_padding=0):
     torch.manual_seed(B * 7 + T)
     q = torch.randn(B, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)     # iq per token
     kv = torch.randn(B, T, HEAD_DIM, device="cuda", dtype=torch.bfloat16)            # idx_kv_cache
@@ -238,11 +281,17 @@ def run_decode(module, B, T, out_dtype, valid=None):
     ctx = (valid_t if valid_t is not None
            else torch.full((B,), T, dtype=torch.int32, device="cuda"))
     # SHUFFLED page table: the kernel must reassemble logical order via block_table
-    fused, block_table = build_paged_cache(kv_p.view(-1, HEAD_DIM // 2),
-                                           kv_sf.view(-1), B, T, shuffle=True)
+    payload = entries_per_block * (HEAD_DIM // 2 + 4)
+    stride_bytes = payload + block_stride_padding
+    fused, block_table = build_paged_cache(
+        kv_p.view(-1, HEAD_DIM // 2), kv_sf.view(-1), B, T, shuffle=True,
+        entries_per_block=entries_per_block,
+        block_stride_bytes=stride_bytes)
 
     got = module.mqa_logits_fp4_decode(q_p, q_sf, fused, weights, ctx, block_table,
-                                       T, out_dtype)
+                                       T, out_dtype,
+                                       kv_entries_per_block=entries_per_block,
+                                       kv_block_stride_bytes=stride_bytes)
     torch.cuda.synchronize()
     assert got.shape == (B, T), got.shape
 
@@ -293,6 +342,21 @@ def test_decode(module):
     return ok_all
 
 
+def test_runtime_page_geometry(module):
+    """RTP logical entries and physical block stride are independent."""
+    print("\n[decode] runtime page geometry with physical padding")
+    ok_all = True
+    for epb in (32, 64, 128):
+        diff, sim = run_decode(module, 2, 256, torch.float32,
+                               entries_per_block=epb,
+                               block_stride_padding=128)
+        ok = diff < 0.02 and sim < 2e-3
+        ok_all &= ok
+        print(f"  epb={epb:<3} padded_stride: diff_ref={diff:.3e} "
+              f"diff_sim={sim:.3e} {'PASS' if ok else 'FAIL'}")
+    return ok_all
+
+
 def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
     """Thin adapter over bench_utils.bench_kineto (DeepGEMM's bench, vendored
     verbatim): 8GB L2 flush before EVERY call (cold-HBM KV reads + GPU chill
@@ -304,6 +368,279 @@ def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
                               suppress_kineto_output=True)
 
 
+# ------------------------------------------------------------------ FP8 MQA + MAIN
+
+def get_deep_gemm():
+    """Resolve the checkout explicitly so an older installed wheel cannot win."""
+    deep_gemm_dir = os.environ.get("DEEP_GEMM_DIR", "/root/work/DeepGEMM")
+    if deep_gemm_dir not in sys.path:
+        sys.path.insert(0, deep_gemm_dir)
+    import deep_gemm
+    return deep_gemm
+
+
+def build_fp8_paged_cache(kv, entries_per_block=64, shuffle=True,
+                          block_stride_padding=0):
+    """Quantize [B,T,128] BF16 into DeepGEMM's planar FP8 paged ABI.
+
+    The object passed to DeepGEMM has logical shape [pages, page, 1, 132], but
+    each physical page is planar: all E4M3 K bytes, then all FP32 token scales.
+    """
+    B, T, D = kv.shape
+    assert D == HEAD_DIM and T % entries_per_block == 0
+    epb = entries_per_block
+    num_blocks = B * T // epb
+    amax = kv.abs().float().amax(dim=-1).clamp_min(1e-4)
+    scale = amax / 448.0
+    kv_fp8 = (kv * scale.reciprocal().unsqueeze(-1)).to(torch.float8_e4m3fn)
+    kv_sim = (kv_fp8.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+    payload = epb * (D + 4)
+    stride = payload + block_stride_padding
+    assert stride >= payload and stride % 16 == 0
+    permutation = (torch.randperm(num_blocks, device="cuda") if shuffle else
+                   torch.arange(num_blocks, device="cuda"))
+    pages = torch.full((num_blocks, stride), 0xA5, dtype=torch.uint8,
+                       device="cuda")
+    pages[permutation, :epb * D] = kv_fp8.contiguous().view(
+        num_blocks, epb * D).view(torch.uint8)
+    pages[permutation, epb * D:payload] = scale.contiguous().view(
+        num_blocks, epb).view(torch.uint8).view(num_blocks, epb * 4)
+    block_table = permutation.to(torch.int32).view(B, T // epb).contiguous()
+    dg_view = pages.as_strided(
+        (num_blocks, epb, 1, D + 4),
+        (pages.stride(0), D + 4, D + 4, 1))
+    return pages, dg_view, block_table, kv_sim
+
+
+def make_fp8_attention_case(B, T, entries_per_block=64,
+                            block_stride_padding=0, mixed_context=False):
+    dg = get_deep_gemm()
+    torch.manual_seed(B * 1009 + T * 7 + entries_per_block)
+    q_bf16 = torch.randn(B, NUM_HEADS, HEAD_DIM, device="cuda",
+                         dtype=torch.bfloat16)
+    q_fp8 = q_bf16.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(B, T, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    pages, dg_pages, block_table, kv_sim = build_fp8_paged_cache(
+        kv, entries_per_block, shuffle=True,
+        block_stride_padding=block_stride_padding)
+
+    # The RTP producer folds its per-head Q scale into this tensor. Random
+    # positive scales exercise exactly that ABI while keeping Q itself plain E4M3.
+    original_weights = torch.randn(B, NUM_HEADS, device="cuda")
+    q_scale = torch.rand(B, NUM_HEADS, device="cuda") * 1.5 + 0.25
+    folded_weights = (original_weights * q_scale).contiguous()
+    if mixed_context:
+        lo = max(1, entries_per_block // 2)
+        context = torch.linspace(lo, T, B, device="cuda").to(torch.int32)
+    else:
+        context = torch.full((B,), T, device="cuda", dtype=torch.int32)
+    context_2d = context.view(B, 1).contiguous()
+    schedule = dg.get_paged_mqa_logits_metadata(
+        context_2d, entries_per_block, dg.get_num_sms())
+    return dict(
+        q=q_fp8, q_sim=q_fp8.to(torch.bfloat16), kv=kv, kv_sim=kv_sim,
+        pages=pages, dg_pages=dg_pages, weights=folded_weights,
+        context=context, context_2d=context_2d, block_table=block_table,
+        schedule=schedule, entries_per_block=entries_per_block,
+        block_stride_bytes=pages.size(1), T=T)
+
+
+def call_wuda_fp8(module, case, logits, num_kv_stages=0, **compressor):
+    module.mqa_logits_fp8_decode_out(
+        case["q"], case["pages"], case["weights"], case["context_2d"],
+        case["block_table"], case["schedule"], logits,
+        case["entries_per_block"], case["block_stride_bytes"],
+        num_kv_stages, 1e-6, **compressor)
+
+
+def call_deep_gemm_fp8(case):
+    dg = get_deep_gemm()
+    return dg.fp8_paged_mqa_logits(
+        case["q"].view(case["q"].size(0), 1, NUM_HEADS, HEAD_DIM),
+        case["dg_pages"], case["weights"], case["context_2d"],
+        case["block_table"], case["schedule"], case["T"])
+
+
+def test_fp8_attention(module):
+    print("\n[fp8-attention] Wuda vs deep_gemm.fp8_paged_mqa_logits")
+    print(f"{'page':>6} {'padding':>8} {'valid':>8} {'bitwise':>9} "
+          f"{'max_abs':>10} {'values':>9} {'result':>8}")
+    print("-" * 68)
+    ok_all = True
+    for epb, padding, mixed in ((32, 128, True), (64, 0, False),
+                                (128, 256, True)):
+        case = make_fp8_attention_case(
+            8, 512, epb, block_stride_padding=padding,
+            mixed_context=mixed)
+        sentinel = -12345.0
+        logits = torch.full((8, 512), sentinel, device="cuda")
+        call_wuda_fp8(module, case, logits)
+        reference = call_deep_gemm_fp8(case)
+        torch.cuda.synchronize()
+        positions = torch.arange(512, device="cuda")[None, :]
+        valid = positions < case["context"][:, None]
+        bitwise = torch.equal(logits[valid], reference[valid])
+        max_abs = (logits[valid] - reference[valid]).abs().max().item()
+        # DeepGEMM's clean_logits=False contract writes whole 256-token splits;
+        # values at positions >= context_len are unspecified and not consumed.
+        ok = bitwise
+        ok_all &= ok
+        valid_desc = "mixed" if mixed else "full"
+        print(f"{epb:6d} {padding:8d} {valid_desc:>8} {str(bitwise):>9} "
+              f"{max_abs:10.3e} {int(valid.sum()):9d} "
+              f"{('PASS' if ok else 'FAIL'):>8}")
+        del case, logits, reference
+    return ok_all
+
+
+def make_main_compressor_inputs(B):
+    positions = torch.arange(B, dtype=torch.int64, device="cuda")
+    norm = torch.rand(512, device="cuda") + 0.5
+    angle = torch.outer(
+        torch.arange(max(B, 8), device="cuda", dtype=torch.float32),
+        1.0 / (10000.0 ** (torch.arange(32, device="cuda") / 32.0)))
+    cos_tab = torch.cos(angle).contiguous()
+    sin_tab = torch.sin(angle).contiguous()
+    state = torch.randn(B, 8, 2048, device="cuda")
+    state_row = (torch.arange(B, device="cuda") * 8 + positions % 8).int()
+    return positions, norm, cos_tab, sin_tab, state, state_row
+
+
+def test_fp8_main_compressor(module):
+    """Fused and standalone paths share the device function and must be exact."""
+    print("\n[fp8-main] fused attention + MAIN compressor")
+    B, T = 8, 512
+    case = make_fp8_attention_case(B, T, 64)
+    pos, norm, cos_tab, sin_tab, state, state_row = \
+        make_main_compressor_inputs(B)
+    state_before = state.clone()
+    base_logits = torch.full((B, T), -12345.0, device="cuda")
+    fused_logits = torch.full_like(base_logits, -12345.0)
+    call_wuda_fp8(module, case, base_logits)
+
+    fused_q8 = torch.full((B, 448), 0xAB, dtype=torch.uint8, device="cuda")
+    fused_s8 = torch.full((B, 7), -1.0, device="cuda")
+    fused_rope = torch.full((B, 64), -1.0, dtype=torch.bfloat16, device="cuda")
+    ref_q8 = fused_q8.clone()
+    ref_s8 = fused_s8.clone()
+    ref_rope = fused_rope.clone()
+
+    cmp_epb = 4
+    cmp_payload = cmp_epb * (576 + 8)
+    cmp_stride = cmp_payload + 128
+    cmp_cache = torch.full((2, cmp_stride), 0xA5, dtype=torch.uint8,
+                           device="cuda")
+    cmp_dst = torch.arange(B, dtype=torch.int32, device="cuda")
+    compressor = dict(
+        cmp_pos=pos, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
+        comp_state=state, comp_state_row=state_row,
+        comp_state_ring_entries=8, comp_q8=fused_q8, comp_s8=fused_s8,
+        comp_rope=fused_rope, cmp_cache=cmp_cache, cmp_dst=cmp_dst,
+        cmp_entries_per_block=cmp_epb,
+        cmp_block_stride_bytes=cmp_stride)
+    call_wuda_fp8(module, case, fused_logits, **compressor)
+    module.mqa_compressor_fp8_standalone(
+        pos, norm, cos_tab, sin_tab, state, state_row, 8,
+        ref_q8, ref_s8, ref_rope, 1e-6)
+    torch.cuda.synchronize()
+
+    logits_ok = torch.equal(base_logits, fused_logits)
+    compact_ok = (torch.equal(fused_q8, ref_q8) and
+                  torch.equal(fused_s8, ref_s8) and
+                  torch.equal(fused_rope, ref_rope))
+    state_ok = torch.equal(state, state_before)
+    trigger = ((pos + 1) % 4 == 0).cpu().tolist()
+    cache_ok = True
+    cache_cpu = cmp_cache.cpu()
+    q8_cpu, s8_cpu = fused_q8.cpu(), fused_s8.cpu()
+    rope_bytes = fused_rope.contiguous().view(torch.uint8).cpu()
+    for row, writes in enumerate(trigger):
+        page, offset = row // cmp_epb, row % cmp_epb
+        body = cache_cpu[page, offset * 576:(offset + 1) * 576]
+        scale_offset = cmp_epb * 576 + offset * 8
+        scale_record = cache_cpu[page, scale_offset:scale_offset + 8]
+        if writes:
+            expected_scale = (s8_cpu[row].log2() + 127).to(torch.uint8)
+            cache_ok &= torch.equal(body[:448], q8_cpu[row])
+            cache_ok &= torch.equal(body[448:], rope_bytes[row])
+            cache_ok &= torch.equal(scale_record[:7], expected_scale)
+            cache_ok &= bool(scale_record[7] == 0xA5)
+        else:
+            cache_ok &= bool((body == 0xA5).all())
+            cache_ok &= bool((scale_record == 0xA5).all())
+    cache_ok &= bool((cache_cpu[:, cmp_payload:] == 0xA5).all())
+
+    checks = (("attention bitwise unchanged", logits_ok),
+              ("standalone compressor bitwise match", compact_ok),
+              ("compressor state read-only", state_ok),
+              ("MODEL1 paged write + canaries", cache_ok))
+    for label, passed in checks:
+        print(f"  {label:<38} {'PASS' if passed else 'FAIL'}")
+    return all(passed for _, passed in checks)
+
+
+def benchmark_fp8(module, num_tests=30):
+    """Cold-HBM comparison; Wuda auto-selects 3/4/5 KV stages."""
+    print("\n[fp8-perf] DeepGEMM vs Wuda FP8 attention and fused MAIN")
+    print("  All values are mean CUDA kernel time with 8GB L2 flush per call.")
+    print(f"{'B':>4} {'T':>7} {'stg':>4} {'DG_us':>9} {'Wuda_us':>9} {'W/DG':>7} "
+          f"{'cmp_us':>8} {'fused_us':>10} {'fuse-base':>10} {'result':>8}")
+    print("-" * 96)
+    ok_all = True
+    for B, T in ((16, 1024), (16, 8192), (64, 8192), (128, 16384)):
+        case = make_fp8_attention_case(B, T, 64)
+        logits = torch.empty((B, T), device="cuda")
+        splits_per_cta = (B * ((T + 255) // 256) +
+                          get_deep_gemm().get_num_sms() - 1) // \
+            get_deep_gemm().get_num_sms()
+        stage = 3 if splits_per_cta <= 1 else (4 if splits_per_cta <= 8 else 5)
+        base_call = lambda: call_wuda_fp8(module, case, logits, 0)
+        dg_call = lambda: call_deep_gemm_fp8(case)
+
+        pos, norm, cos_tab, sin_tab, state, state_row = \
+            make_main_compressor_inputs(B)
+        q8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
+        s8 = torch.empty(B, 7, device="cuda")
+        rope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
+        compressor = dict(
+            cmp_pos=pos, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
+            comp_state=state, comp_state_row=state_row,
+            comp_state_ring_entries=8, comp_q8=q8, comp_s8=s8,
+            comp_rope=rope)
+        fused_call = lambda: call_wuda_fp8(
+            module, case, logits, 0, **compressor)
+        standalone_call = lambda: module.mqa_compressor_fp8_standalone(
+            pos, norm, cos_tab, sin_tab, state, state_row, 8,
+            q8, s8, rope, 1e-6)
+
+        # Warm both JIT paths before profiling; DeepGEMM compiles lazily.
+        dg_call(); base_call(); fused_call(); standalone_call()
+        torch.cuda.synchronize()
+        dg_us = kernel_us(dg_call, "sm100_paged_mqa_logits", num_tests)
+        base_us = kernel_us(
+            base_call, "sm100_fp8_paged_mqa_logits_fused", num_tests)
+        cmp_us = kernel_us(
+            standalone_call, "standalone_compressor_kernel", num_tests)
+        fused_us = kernel_us(
+            fused_call, "sm100_fp8_paged_mqa_logits_fused", num_tests)
+        align_ratio = base_us / dg_us
+        fuse_delta = fused_us - base_us
+        # Mean-profiler noise on short kernels is about 0.2us. Treat <=3% or
+        # <=0.5us as aligned; fusion must stay within the same envelope.
+        aligned = base_us <= dg_us * 1.03 + 0.5
+        no_regression = fused_us <= base_us * 1.03 + 0.5
+        passed = aligned and no_regression
+        ok_all &= passed
+        print(f"{B:4d} {T:7d} {stage:4d} {dg_us:9.3f} {base_us:9.3f} "
+              f"{align_ratio:7.3f} {cmp_us:8.3f} {fused_us:10.3f} "
+              f"{fuse_delta:10.3f} {('PASS' if passed else 'FAIL'):>8}")
+        del case, logits, pos, norm, cos_tab, sin_tab, state, state_row
+        del q8, s8, rope
+        torch.cuda.empty_cache()
+    return ok_all
+
+
 BLOCK_Q = 1   # decode: 1 query token per q-block (UMMA_N=64); mirrors the kernel config
 BLOCK_KV = 256
 
@@ -313,9 +650,8 @@ def test_main_compressor(module):
     compressor_process_row, d=512 part): per COMPRESS row ((pos+1)%4==0)
       overlap-cat softmax aggregate -> weighted bf16 RMSNorm ->
       RoPE(last 64) -> fp8 e4m3 block-64 quant.
-    [B1] state rows are a pos-derived PING-PONG window (physical row =
-    (4*(pos//4 % 2) + rr) & 7 for logical row rr); the kernel never writes the
-    state, so ALL rows must come back untouched (the old shift is gone).
+    State is the RTP [kv|score] ring; the kernel never writes it, so every
+    entry must come back untouched.
     Checks vs a torch reference with the same per-step bf16 rounding (softmax /
     RMSNorm reduce ORDER differs -> tolerance-based), logits bitwise unchanged."""
     print("\n[main-compressor] tail port vs torch ref")
@@ -344,9 +680,9 @@ def test_main_compressor(module):
     ang = torch.outer(torch.arange(S, device="cuda", dtype=torch.float32),
                       1.0 / (10000.0 ** (torch.arange(32, device="cuda") / 32.0)))
     cos_tab, sin_tab = torch.cos(ang).contiguous(), torch.sin(ang).contiguous()
-    comp_kv = torch.randn(B, 8, 1024, device="cuda", dtype=torch.float32)
-    comp_sc = torch.randn(B, 8, 1024, device="cuda", dtype=torch.float32)
-    kv0, sc0 = comp_kv.clone(), comp_sc.clone()
+    comp_state = torch.randn(B, 8, 2048, device="cuda", dtype=torch.float32)
+    state_rows = (torch.arange(B, device="cuda") * 8 + pos % 8).int()
+    state0 = comp_state.clone()
     comp_q8 = torch.full((B, 448), 0xAB, device="cuda", dtype=torch.uint8)   # sentinel
     comp_s8 = torch.full((B, 7), -1.0, device="cuda", dtype=torch.float32)
     comp_rope = torch.zeros(B, 64, device="cuda", dtype=torch.bfloat16)
@@ -355,7 +691,8 @@ def test_main_compressor(module):
     module.mqa_logits_fp4_decode_out(
         q_p, q_sf, fused_c, weights, ctx, block_table, logits, 0, 0,
         cmp_pos=pos, comp_norm=comp_norm, cos_tab=cos_tab, sin_tab=sin_tab,
-        comp_kv=comp_kv, comp_sc=comp_sc, comp_q8=comp_q8, comp_s8=comp_s8,
+        comp_state=comp_state, comp_state_row=state_rows,
+        comp_state_ring_entries=8, comp_q8=comp_q8, comp_s8=comp_s8,
         comp_rope=comp_rope)
     torch.cuda.synchronize()
 
@@ -366,18 +703,18 @@ def test_main_compressor(module):
     for m in range(B):
         p = int(pos[m])
         if (p + 1) % 4 != 0:   # untouched row
-            row_ok = (torch.equal(comp_kv[m], kv0[m]) and torch.equal(comp_sc[m], sc0[m])
+            row_ok = (torch.equal(comp_state[m], state0[m])
                       and bool((comp_q8[m] == 0xAB).all()) and bool((comp_s8[m] == -1.0).all()))
             ok &= row_ok
             print(f"  row {m} (pos {p}, skip): untouched {'PASS' if row_ok else 'FAIL'}")
             continue
-        # torch reference; logical row rr lives at physical row (base+rr)&7
-        # (B1 ping-pong: pos 3 -> base 0 = identity, pos 7 -> base 4 = flipped)
-        base = 4 * ((p >> 2) & 1)
-        perm = [(base + r) & 7 for r in range(8)]
+        # Torch reference over the eight ring rows ending at the current row.
+        current = int(state_rows[m]) % 8
+        perm = [(current - 7 + r) % 8 for r in range(8)]
+        kv0, sc0 = state0[m, :, :1024], state0[m, :, 1024:]
         col = torch.stack([idx if r < 4 else idx + 512 for r in range(8)])       # [8,512]
-        sc8 = torch.gather(sc0[m][perm], 1, col)
-        kv8 = torch.gather(kv0[m][perm], 1, col)
+        sc8 = torch.gather(sc0[perm], 1, col)
+        kv8 = torch.gather(kv0[perm], 1, col)
         e = torch.exp(sc8 - sc8.max(0).values)
         agg = (e * kv8).sum(0) / e.sum(0)
         vb = agg.bfloat16().float()
@@ -391,8 +728,8 @@ def test_main_compressor(module):
         # MODEL1 scale: pow2-ceil(clamp(amax/448, 1e-4)) -- e8m0-exact
         scale_ref = torch.pow(2.0, (blk.abs().max(1).values / 448.0)
                               .clamp_min(1e-4).log2().ceil())
-        # checks (reduce-order ulps -> tolerances; B1: state must be UNTOUCHED)
-        state_ok = torch.equal(comp_kv[m], kv0[m]) and torch.equal(comp_sc[m], sc0[m])
+        # checks (reduce-order ulps -> tolerances; state must be read-only)
+        state_ok = torch.equal(comp_state[m], state0[m])
         s8_diff = ((comp_s8[m] - scale_ref).abs() / scale_ref).max().item()
         deq = comp_q8[m].view(torch.float8_e4m3fn).float().view(7, 64) * comp_s8[m][:, None]
         q8_diff = ((deq - blk).abs() / (blk.abs() + comp_s8[m][:, None] * 448 * 0.01)).max().item()
@@ -403,6 +740,104 @@ def test_main_compressor(module):
               f"s8 {s8_diff:.2e} q8 {q8_diff:.3f} rope {rope_diff:.3f} "
               f"{'PASS' if row_ok else 'FAIL'}")
     return bool(ok)
+
+
+def test_main_compressor_pool_write(module):
+    """MAIN MODEL1 writes obey RTP block ids, record layout, and padding."""
+    torch.manual_seed(20260809)
+    dev, B = 'cuda', 3
+    positions = torch.tensor([3, 4, 7], device=dev, dtype=torch.int64)
+    state_blocks = torch.tensor([2, 3, 5], device=dev)
+    state_rows = (state_blocks * 8 + positions % 8).int()
+    state = torch.randn(6 * 8, 2048, device=dev) * 0.1
+    norm = torch.rand(512, device=dev) + 0.5
+    ang = torch.outer(torch.arange(64, device=dev, dtype=torch.float32),
+                      1.0 / (10000.0 ** (torch.arange(32, device=dev) / 32.0)))
+    cos_tab, sin_tab = torch.cos(ang).contiguous(), torch.sin(ang).contiguous()
+
+    cmp_epb, body_bytes, scale_bytes = 32, 576, 8
+    cmp_payload = cmp_epb * (body_bytes + scale_bytes)
+    cmp_stride = (cmp_payload + body_bytes - 1) // body_bytes * body_bytes
+    cmp_cache = torch.full((6, cmp_stride), 0xA5, device=dev, dtype=torch.uint8)
+    cmp_dst = torch.tensor([cmp_epb + 31, 2 * cmp_epb + 7,
+                            4 * cmp_epb + 3], device=dev, dtype=torch.int32)
+
+    idx_epb = 32
+    idx_stride = idx_epb * (HEAD_DIM // 2 + 4) + 128
+    idx_cache = torch.full((4, idx_stride), 0xA5, device=dev, dtype=torch.uint8)
+    block_table = torch.tensor([[2], [0], [3]], device=dev, dtype=torch.int32)
+    q = torch.zeros(B, NUM_HEADS, HEAD_DIM // 2, device=dev, dtype=torch.int8)
+    q_sf = torch.full((B, NUM_HEADS), 0x7F7F7F7F, device=dev,
+                      dtype=torch.int32)
+    weights = torch.zeros(B, NUM_HEADS, device=dev)
+    context_lens = torch.ones(B, device=dev, dtype=torch.int32)
+    logits = torch.full((B, BLOCK_KV), float('-inf'), device=dev)
+
+    module.mqa_logits_fp4_decode_out(
+        q, q_sf, idx_cache, weights, context_lens, block_table, logits, 4, 0,
+        cmp_pos=positions, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
+        comp_state=state, comp_state_row=state_rows,
+        comp_state_ring_entries=8, cmp_cache=cmp_cache, cmp_dst=cmp_dst,
+        kv_entries_per_block=idx_epb, kv_block_stride_bytes=idx_stride,
+        cmp_entries_per_block=cmp_epb, cmp_block_stride_bytes=cmp_stride,
+        mock_attn=True)
+    torch.cuda.synchronize()
+
+    compress_rows = (0, 2)
+    allowed = torch.zeros_like(cmp_cache, dtype=torch.bool)
+    got_q8, got_s8, got_rope = [], [], []
+    for row in compress_rows:
+        page, off = divmod(int(cmp_dst[row]), cmp_epb)
+        body_base = off * body_bytes
+        body = cmp_cache[page, body_base:body_base + body_bytes]
+        got_q8.append(body[:448])
+        got_rope.append(body[448:].contiguous().view(torch.bfloat16))
+        scale_base = cmp_epb * body_bytes + off * scale_bytes
+        got_s8.append(cmp_cache[page, scale_base:scale_base + 7])
+        allowed[page, body_base:body_base + body_bytes] = True
+        # MODEL1 reserves eight scale bytes but writes seven exponent bytes.
+        allowed[page, scale_base:scale_base + 7] = True
+    untouched = torch.equal(cmp_cache[~allowed],
+                            torch.full_like(cmp_cache[~allowed], 0xA5))
+
+    current = state_rows.long() % 8
+    block_base = state_rows.long() - current
+    logical = ((current[:, None] - 7
+                + torch.arange(8, device=dev)[None, :]) % 8)
+    entries = state[(block_base[:, None] + logical).long()]
+    kv, score = entries[..., :1024], entries[..., 1024:]
+    kv_overlap = torch.cat((kv[:, :4, :512], kv[:, 4:, 512:]), dim=1)
+    score_overlap = torch.cat((score[:, :4, :512], score[:, 4:, 512:]), dim=1)
+    value = (torch.softmax(score_overlap, dim=1) * kv_overlap).sum(dim=1)
+    value = value.bfloat16().float()
+    value = (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+             * norm).bfloat16().float()
+    rope_pos = positions + 1 - 4
+    even, odd = value[:, 448::2].clone(), value[:, 449::2].clone()
+    value[:, 448::2] = (even * cos_tab[rope_pos]
+                        - odd * sin_tab[rope_pos]).bfloat16().float()
+    value[:, 449::2] = (even * sin_tab[rope_pos]
+                        + odd * cos_tab[rope_pos]).bfloat16().float()
+    blocks = value[:, :448].view(B, 7, 64)
+    ref_scale = torch.pow(2.0, (blocks.abs().amax(-1) / 448.0)
+                              .clamp_min(1e-4).log2().ceil())
+    ref_q8 = (blocks / ref_scale.unsqueeze(-1)).to(torch.float8_e4m3fn) \
+        .view(B, 448).view(torch.uint8)
+    ref_s8 = (ref_scale.log2() + 127).to(torch.uint8)
+    ref_rope = value[:, 448:].bfloat16()
+
+    rows = torch.tensor(compress_rows, device=dev)
+    got_q8, got_s8, got_rope = (torch.stack(got_q8), torch.stack(got_s8),
+                                 torch.stack(got_rope))
+    values_ok = (
+        (got_q8 == ref_q8[rows]).float().mean().item() > 0.98
+        and (got_s8 == ref_s8[rows]).float().mean().item() > 0.98
+        and (got_rope.view(torch.uint8)
+             == ref_rope[rows].contiguous().view(torch.uint8)).float().mean().item()
+        > 0.98)
+    ok = untouched and values_ok
+    print(f"  RTP MAIN paged-pool writer: {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def cast_to_fp4_chunked(x2d, chunk_rows=1 << 21):
@@ -485,20 +920,23 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     cnorm = torch.rand(512, device="cuda") + 0.5
                     ctab = torch.rand(4, 32, device="cuda")
                     stab = torch.rand(4, 32, device="cuda")
-                    ckv = torch.randn(B, 8, 1024, device="cuda")
-                    csc = torch.randn(B, 8, 1024, device="cuda")
+                    cstate = torch.randn(B, 8, 2048, device="cuda")
+                    crows = (torch.arange(B, device="cuda") * 8 + cpos % 8).int()
                     cq8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
                     cs8 = torch.empty(B, 7, device="cuda")
                     crope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
                     acall = lambda s=stg: module.mqa_logits_fp4_decode_out(
                         q_p, q_sf, fused, weights, ctx, block_table, logits, 0, s,
                         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
-                        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
+                        comp_state=cstate, comp_state_row=crows,
+                        comp_state_ring_entries=8,
+                        comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
                     aus = kernel_us(acall)
                     # "each op as its OWN kernel" reference: standalone compressor
                     # (one warp per row, full grid), SAME L2-flushed estimator.
                     cmp1 = kernel_us(lambda: module.mqa_compressor_standalone(
-                        cpos, cnorm, ctab, stab, ckv, csc, cq8, cs8, crope, 1e-6),
+                        cpos, cnorm, ctab, stab, cstate, crows, 8,
+                        cq8, cs8, crope, 1e-6),
                                      name_substr="standalone_compressor")
                     sep = kus + cmp1
                     # tail IN SITU solo: attention mocked out (384 threads exit at
@@ -507,7 +945,9 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     tcall = lambda s=stg: module.mqa_logits_fp4_decode_out(
                         q_p, q_sf, fused, weights, ctx, block_table, logits, 0, s,
                         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
-                        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope,
+                        comp_state=cstate, comp_state_row=crows,
+                        comp_state_ring_entries=8,
+                        comp_q8=cq8, comp_s8=cs8, comp_rope=crope,
                         mock_attn=True)
                     tus = kernel_us(tcall)
                     attn_bytes = (B * NUM_HEADS * (HEAD_DIM // 2 + 4 + 4)
@@ -516,7 +956,7 @@ def benchmark(module, sweep_stages=False, fuse_comp=False):
                     print(f"{B:4d} {T:7d} {4*T:8d} {eff_stg:5d} "
                           f"{kus:9.3f} {aus:8.3f} {aus-kus:7.3f} {tus:8.3f} "
                           f"{cmp1:8.3f} {sep:8.3f} {sep/aus:5.2f} {bw:9.0f}")
-                    del cpos, cnorm, ctab, stab, ckv, csc, cq8, cs8, crope
+                    del cpos, cnorm, ctab, stab, cstate, crows, cq8, cs8, crope
                 else:
                     # DeepGEMM test_attention.py accounting (paged decode path):
                     #   reads:  q fp4-packed + sf_q i32 + weights f32, KV fp4-packed 64B + sf 4B per slot
@@ -558,8 +998,8 @@ def timeline(module, B, T, stg=0):
     cnorm = torch.rand(512, device="cuda") + 0.5
     ctab = torch.rand(4, 32, device="cuda")
     stab = torch.rand(4, 32, device="cuda")
-    ckv = torch.randn(B, 8, 1024, device="cuda")
-    csc = torch.randn(B, 8, 1024, device="cuda")
+    cstate = torch.randn(B, 8, 2048, device="cuda")
+    crows = (torch.arange(B, device="cuda") * 8 + cpos % 8).int()
     cq8 = torch.empty(B, 448, dtype=torch.uint8, device="cuda")
     cs8 = torch.empty(B, 7, device="cuda")
     crope = torch.empty(B, 64, dtype=torch.bfloat16, device="cuda")
@@ -569,7 +1009,8 @@ def timeline(module, B, T, stg=0):
         q_p, q_sf, fused, weights, ctx, block_table, logits, 0, stg,
         prof=p,
         cmp_pos=cpos, comp_norm=cnorm, cos_tab=ctab, sin_tab=stab,
-        comp_kv=ckv, comp_sc=csc, comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
+        comp_state=cstate, comp_state_row=crows, comp_state_ring_entries=8,
+        comp_q8=cq8, comp_s8=cs8, comp_rope=crope)
     fcall()  # warmup
     torch.cuda.synchronize()
     torch.empty(int(8e9 // 4), dtype=torch.int, device="cuda").zero_()  # cold L2/HBM
@@ -611,7 +1052,7 @@ def timeline(module, B, T, stg=0):
 
     # ---- compressor phase breakdown, critical (latest-finishing) compress-row CTA
     # (test_complex.cu pattern); phases relative to tail start. Slots 4/6 retired
-    # (rms section gone; shift gone with the B1 ping-pong state).
+    # (rms section gone; the RTP ring needs no state-shift phase).
     if int(p[:, 7].max()) > 0:
         i = int(p[:, 7].argmax())
         t2, t5, t7 = (p[i, k].item() for k in (2, 5, 7))
@@ -622,6 +1063,8 @@ def timeline(module, B, T, stg=0):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--fp8", action="store_true",
+                        help="test the separate FP8 MQA + MAIN implementation")
     parser.add_argument("--base", action="store_true",
                         help="attention-only benchmark table (default is the fuse-comp table)")
     parser.add_argument("--sweep-stages", action="store_true",
@@ -640,13 +1083,30 @@ def main():
     major, minor = torch.cuda.get_device_capability()
     print(f"device={torch.cuda.get_device_name()} sm_{major}{minor} "
           f"torch={torch.__version__} cuda={torch.version.cuda}")
+    if args.fp8:
+        print("JIT compiling the separate mqa_logits_fp8.cu ...")
+        module = load_cuda_module_fp8()
+        ok = True
+        if not args.skip_correctness:
+            ok &= test_fp8_attention(module)
+            ok &= test_fp8_main_compressor(module)
+            print("\nALL FP8 CORRECTNESS PASSED" if ok else
+                  "\nFP8 CORRECTNESS FAILED")
+        if not args.skip_bench:
+            ok &= benchmark_fp8(module)
+            print("\nALL FP8 PERF GATES PASSED" if ok else
+                  "\nFP8 PERF GATE FAILED")
+        return 0 if ok else 1
+
     print("JIT compiling mqa_logits_fp4.cu ...")
     module = load_cuda_module()
 
     ok = True
     if not args.skip_correctness:
+        ok &= test_runtime_page_geometry(module)
         ok &= test_decode(module)
         ok &= test_main_compressor(module)
+        ok &= test_main_compressor_pool_write(module)
         print("\nALL PASSED" if ok else "\nCORRECTNESS FAILED")
     if not args.skip_bench:
         # default: fuse-comp table; --base / --sweep-stages fall back to attention-only

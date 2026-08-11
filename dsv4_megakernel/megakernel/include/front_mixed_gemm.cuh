@@ -46,6 +46,7 @@ namespace fp8d = cluster_mma_fp8::detail;
 constexpr int K = 7168;
 constexpr int N = 4672;
 constexpr int N_FP8 = 2048;              // wq_a 1536 | wkv 512 (reordered layout)
+constexpr int APE_RATIO = 4;
 constexpr int BLOCK_M = 128;
 constexpr int CTA_M = 64;
 constexpr int BLOCK_K = 128;
@@ -397,29 +398,28 @@ struct HcTailArgs {
 };
 
 // [FRONT-EMIT] Direct side-channel epilogue outputs (all-or-none, gated on
-// main_kv != nullptr). The accumulators leave TMEM as fp32, so the
+// main_state != nullptr). The accumulators leave TMEM as fp32, so the
 // compressor-bound segments are emitted at FULL fp32 (model.py Compressor:
 // "compression need fp32") -- this REMOVES the old y-bf16 round trip AND its
 // fp32(bf16(acc)) rounding deviation. y writes are skipped for every emitted
 // tile: only the q columns [0,1536) still land in y.
 //   [1536,2048) win  -> win_y2 [M,512] as fp32(bf16(acc))  (wkv output is
 //                       bf16 in the reference -> keep that rounding)
-//   [2048,4096) main -> MAIN state pool rows, fp32; score half += ape[pos%4]
+//   [2048,4096) main -> MAIN state entry, fp32; score half += ape[pos%ratio]
 //                       (model.py L332 score_state contract)
-//   [4096,4608) idx  -> IDX state pool rows, fp32; score half += idx_ape
-//                       (SAME [B1] ping-pong row as main: state_row[m] =
-//                       slot*8 + (4*((p>>2)&1)+4+p%4)&7; wq_b's compressor
-//                       became a pure POOL READER)
+//   [4096,4608) idx  -> IDX state entry, fp32; score half += idx_ape. It lands
+//                       at idx_state_row[m], independently from the MAIN row.
 //   [4608,4672) w64  -> w64 [M,64] as fp32(bf16(acc)) (weights_proj is bf16)
+// Each framework state entry is `[kv(W) | score+ape(W)]` fp32. State rows are
+// host-folded `block * ring_entries + pos % ring_entries`; -1 skips the row.
 struct FrontEmitArgs {
-  float* main_kv = nullptr;        // pool [capacity,8,1024], kv half
-  float* main_sc = nullptr;        // pool [capacity,8,1024], score half
-  const float* ape = nullptr;      // [4,1024] main-compressor ape
-  const int* state_row = nullptr;  // [M] slot*8 + pingpong row (host-folded)
-  const int* ape_phase = nullptr;  // [M] pos % 4
-  float* idx_kv = nullptr;         // pool [capacity,8,256], kv half
-  float* idx_sc = nullptr;         // pool [capacity,8,256], score half
-  const float* idx_ape = nullptr;  // [4,256] indexer-compressor ape
+  float* main_state = nullptr;     // [blocks, ring, 2048]
+  const float* ape = nullptr;      // [ratio,1024] main-compressor ape
+  const int* main_state_row = nullptr; // [M]
+  const int* ape_phase = nullptr;  // [M] absolute pos or pos % APE_RATIO
+  float* idx_state = nullptr;      // [blocks, ring, 512]
+  const int* idx_state_row = nullptr; // [M]
+  const float* idx_ape = nullptr;  // [ratio,256] indexer-compressor ape
   float* win_y2 = nullptr;         // [M,512]
   float* w64 = nullptr;            // [M,64]
 };
@@ -521,7 +521,7 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
   // [FRONT-EMIT] store family (uniform for the whole cluster; FAM_Y when
   // the side-emit bundle is absent -> byte-identical legacy behavior).
   int fam = FAM_Y;
-  if (emit.main_kv != nullptr) {
+  if (emit.main_state != nullptr) {
     if (n_col_base >= 4608)      fam = FAM_W64;
     else if (n_col_base >= 4096) fam = FAM_IDX;
     else if (n_col_base >= 2048) fam = FAM_MAIN;
@@ -770,10 +770,16 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
       // to avoid duplicate smem writes; TMEM reads DO duplicate safely) --
       // wg0 takes st=0, wg1 takes st=1, halving each warp's store chain.
       const int erow = m_tile * BLOCK_M + rank * CTA_M + row_half * 32 + lane;
-      int e_srow = 0, e_aph = 0;
-      if ((fam == FAM_MAIN || fam == FAM_IDX) && erow < problem_m) {
-        e_srow = emit.state_row[erow];
-        e_aph = emit.ape_phase[erow];
+      int e_row = -1, e_aph = 0;
+      bool emit_row_ok = true;
+      if (fam == FAM_MAIN || fam == FAM_IDX) {
+        emit_row_ok = false;
+        if (erow < problem_m) {
+          e_row = fam == FAM_MAIN ? emit.main_state_row[erow]
+                                  : emit.idx_state_row[erow];
+          e_aph = emit.ape_phase[erow] & (APE_RATIO - 1);
+          emit_row_ok = e_row >= 0;
+        }
       }
       #pragma unroll
       for (int st = 0; st < EPI_STEPS; ++st) {
@@ -789,7 +795,7 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
           const int col = col_group * EPI_COLS_PER_WARP + st * 16 + sub * 8;
           const int out_row = m_tile * BLOCK_M + rank * CTA_M + row;
           const int out_col = n_col_base + col;
-          if (out_row < problem_m && out_col + 7 < N) {
+          if (out_row < problem_m && out_col + 7 < N && emit_row_ok) {
             if (fam == FAM_Y) {
               uint4 packed = pack_bf16x8(v0, v1, v2, v3, v4, v5, v6, v7);
               const int atom_col = col % EPI_ATOM_N;
@@ -813,10 +819,8 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
                   __uint_as_float(v6), __uint_as_float(v7)};
               float* dst;
               if (fam == FAM_MAIN) {
-                const int seg = out_col - 2048;   // tile-uniform half select
-                if (seg < 1024) {
-                  dst = emit.main_kv + (size_t)e_srow * 1024 + seg;
-                } else {
+                const int seg = out_col - 2048;
+                if (seg >= 1024) {
                   // score half: +ape[pos%4] at publish (model.py L332)
                   const float* ap =
                       emit.ape + (size_t)e_aph * 1024 + (seg - 1024);
@@ -824,23 +828,19 @@ static __global__ void __launch_bounds__(TPB, 1) front_mixed_kernel(
                   const float4 a1 = *reinterpret_cast<const float4*>(ap + 4);
                   f[0] += a0.x; f[1] += a0.y; f[2] += a0.z; f[3] += a0.w;
                   f[4] += a1.x; f[5] += a1.y; f[6] += a1.z; f[7] += a1.w;
-                  dst = emit.main_sc + (size_t)e_srow * 1024 + (seg - 1024);
                 }
+                dst = emit.main_state + (size_t)e_row * 2048 + seg;
               } else if (fam == FAM_IDX) {
-                // IDX state pool rows (same [B1] row as main); score half
-                // carries +idx_ape[pos%4] at publish.
-                const int seg = out_col - 4096;   // tile-uniform half select
-                if (seg < 256) {
-                  dst = emit.idx_kv + (size_t)e_srow * 256 + seg;
-                } else {
+                const int seg = out_col - 4096;
+                if (seg >= 256) {
                   const float* ap =
                       emit.idx_ape + (size_t)e_aph * 256 + (seg - 256);
                   const float4 a0 = *reinterpret_cast<const float4*>(ap);
                   const float4 a1 = *reinterpret_cast<const float4*>(ap + 4);
                   f[0] += a0.x; f[1] += a0.y; f[2] += a0.z; f[3] += a0.w;
                   f[4] += a1.x; f[5] += a1.y; f[6] += a1.z; f[7] += a1.w;
-                  dst = emit.idx_sc + (size_t)e_srow * 256 + (seg - 256);
                 }
+                dst = emit.idx_state + (size_t)e_row * 512 + seg;
               } else {
                 // WIN / W64: bf16-round first (wkv / weights_proj outputs
                 // are bf16 in the reference), then widen -- numerically

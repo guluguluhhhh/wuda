@@ -2,9 +2,9 @@
 test_e2e_decode.py -- END-TO-END DSV4 decode chain over the design-image KV
 cache management (test/kv_cache_manager.py):
 
-  hc_fused(nopc + fused attn_norm) -> front_mixed(+hc tail) ->
+  hc_fused(nopc + fused attn_norm) -> front_mixed_swapAB(+hc tail) ->
   qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + head_ssq + indexer compressor
-  + winkv) -> mqa_logits(paged, + MAIN compressor tail) -> topk_v2(512, page
+  + winkv) -> Wuda fused FP8 paged MQA + MAIN compressor -> topk_v2(512, page
   transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope,
   per-head attn_sink) ->
   o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
@@ -29,7 +29,8 @@ states and final outputs bitwise identical (run-to-run determinism).
 
 flash_mla is optional (import-guarded): without it stages A-D still run, and
 the o_proj/mhc_post tail (which consumes the MLA output) is skipped with it.
-The default geometry is the full-rank e2e chain. --tpdp benchmarks the mixed
+The default is the RTP-compatible FP8 Indexer; --indexer-fp4 is the explicit
+legacy A/B path. The default geometry is the full-rank e2e chain. --tpdp benchmarks the mixed
 local rank: main-Q TP2 with replicated index-Q, request-DP2 MQA/TopK/FlashMLA,
 and the original global-B TP2 O-proj shard (64 heads, 8 groups). Layout handoffs
 remain outside this single-process test.
@@ -44,6 +45,7 @@ from kv_cache_manager import (KVCacheManager, PAGE, WIN, RATIO,
 
 import test_hc_fused_tc as t_hc
 import test_front_mixed_gemm as t_fm
+import test_front_mixed_gemm_csa_swapab as t_fm_swap
 import test_wq_b_fp8_gemm as t_wq
 import o_proj_csa
 
@@ -135,6 +137,7 @@ O_GROUPS, O_LORA = 16, 1024        # o_proj: 16 groups x rank 1024
 O_INTER = O_GROUPS * O_LORA        # 16384
 TPDP_MODE = False
 MLA_DP_MODE = False
+INDEXER_FP8 = True
 
 
 def configure_geometry(tpdp=False):
@@ -296,37 +299,50 @@ def deq_idx_pool(mgr, slots, pos):
     out = []
     for i, s in enumerate(slots):
         ncmp = (int(pos[i]) + 1) // RATIO
+        epb = mgr.entries_per_block["idx"]
         rows = []
         for ct in range(ncmp):
-            page = mgr.reqs[s]["idx"][ct // PAGE]
-            off = ct % PAGE
-            fp4 = mgr.idx_pool[page, : PAGE * 64].view(PAGE, 64)[off]
-            sf = mgr.idx_pool[page, PAGE * 64 + off * 4:
-                              PAGE * 64 + off * 4 + 4]      # 4 x block-32 e8m0
-            scale = torch.pow(2.0, sf[:4].float() - 127.0)
-            v = deq_fp4(fp4).view(4, 32) * scale.view(4, 1)
+            page = mgr.reqs[s]["idx"][ct // epb]
+            off = ct % epb
+            if mgr.indexer_fp8:
+                q8 = mgr.idx_pool[page, :epb * IDX_D].view(epb, IDX_D)[off]
+                scale = mgr.idx_pool[page, epb * IDX_D + off * 4:
+                                     epb * IDX_D + off * 4 + 4] \
+                    .view(torch.float32)[0]
+                v = q8.view(torch.float8_e4m3fn).float() * scale
+            else:
+                fp4 = mgr.idx_pool[page, : epb * 64].view(epb, 64)[off]
+                sf = mgr.idx_pool[page, epb * 64 + off * 4:
+                                  epb * 64 + off * 4 + 4]
+                scale = torch.pow(2.0, sf[:4].float() - 127.0)
+                v = deq_fp4(fp4).view(4, 32) * scale.view(4, 1)
             rows.append(v.view(128))
         out.append(torch.stack(rows) if rows else
                    torch.zeros(0, 128, device=DEV))
     return out
 
 
-def deq_model1_row(pool, page, off):
-    body = pool[page, : PAGE * (D_NOPE + 2 * D_ROPE)] \
-        .view(PAGE, D_NOPE + 2 * D_ROPE)[off]
-    sf = pool[page, PAGE * (D_NOPE + 2 * D_ROPE):
-              PAGE * (D_NOPE + 2 * D_ROPE) + PAGE * 8].view(PAGE, 8)[off]
+def deq_model1_row(pool, page, off, entries_per_block):
+    epb = entries_per_block
+    body = pool[page, : epb * (D_NOPE + 2 * D_ROPE)] \
+        .view(epb, D_NOPE + 2 * D_ROPE)[off]
+    sf = pool[page, epb * (D_NOPE + 2 * D_ROPE):
+              epb * (D_NOPE + 2 * D_ROPE) + epb * 8].view(epb, 8)[off]
     nope = body[:D_NOPE].view(torch.float8_e4m3fn).float().view(NTILES, TILE)
     scale = sf[:NTILES].view(torch.float8_e8m0fnu).float()
     rope = body[D_NOPE:].view(torch.bfloat16).float()
     return torch.cat([(nope * scale.view(NTILES, 1)).view(D_NOPE), rope])
 
 
-def ref_mqa_logits(iq_fp4, iq_sf, weights, kv_rows_list):
+def ref_mqa_logits(iq, iq_aux, weights, kv_rows_list):
     """relu(<q_h, k_t>)·w_h summed over the 64 indexer heads; q dequant via
     test_wq_b's dequant_kernel_iq (iq_sf = 4 packed block-32 ue8m0 / head)."""
-    B = iq_fp4.size(0)
-    q = t_wq.dequant_kernel_iq(iq_fp4, iq_sf)[0].view(B, IDX_HEADS, IDX_D)
+    B = iq.size(0)
+    if iq.dtype == torch.float8_e4m3fn:
+        q = iq.float()
+        weights = iq_aux
+    else:
+        q = t_wq.dequant_kernel_iq(iq, iq_aux)[0].view(B, IDX_HEADS, IDX_D)
     outs = []
     for b in range(B):
         kv = kv_rows_list[b]                                   # [n,128]
@@ -426,7 +442,7 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
-    hcm, fmm, wqm, mqm, tkm, mpm = mods
+    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
     B = len(slots)
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
@@ -454,38 +470,42 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                                  dtype=torch.float32)}
     win_y2 = torch.empty(B, 512, device=DEV, dtype=torch.float32)
     w64 = torch.empty(B, 64, device=DEV, dtype=torch.float32)
-    y = fmm.front_mixed_gemm(collapsed, x_fp8, x_sf, w["front_bf16"],
-                             w["front_fp8"], w["front_sf"], **hc,
-                             main_kv=mgr.main_kv, main_sc=mgr.main_sc,
-                             main_ape=w["main_ape"],
-                             state_row=mgr.main_state_rows(slots, pos),
-                             ape_phase=(pos % 4).int(),
-                             idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
-                             idx_ape=w["idx_ape"],
-                             win_y2=win_y2, w64=w64)
+    y = fmm.front_mixed_gemm_csa_swapab(
+        collapsed, x_fp8, x_sf, w["front_bf16"], w["front_fp8"],
+        w["front_sf"], **hc, enable_tail=True,
+        main_state=mgr.main_state, main_ape=w["main_ape"],
+        main_state_row=st["main_state_row"], ape_phase=(pos % 4).int(),
+        idx_state=mgr.idx_state, idx_state_row=st["idx_state_row"],
+        idx_ape=w["idx_ape"], win_y2=win_y2, w64=w64)
     ref8 = (t_fm.dequant_fp8(x_fp8, x_sf, True)
             @ t_fm.dequant_fp8(w["front_fp8"], w["front_sf"], False).t())
     d8 = max(t_fm.calc_diff(y[:, :1536].float(), ref8[:, :1536]),
              t_fm.calc_diff(win_y2, ref8[:, 1536:]))
     stats["A_front_d8"] = max(stats.get("A_front_d8", 0.0), d8)
 
-    # -- 3. wq_b ALL fusions; the KERNEL writes idx state pool (slot_map),
+    # -- 3. wq_b ALL fusions; the KERNEL reads the folded idx state ring,
     #       the indexer fused pages AND the SWA MODEL1 pages directly --------
     xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
     xq_sf = torch.empty(B, 12, device=DEV, dtype=torch.uint8)
     ssq = torch.zeros(B, WQ_HEADS, device=DEV, dtype=torch.float32)
+    weights64 = w64
     rets = wqm.wq_b_proj_gemm_merged(
         xq, t_wq.as_ue8m0(xq_sf), w["wq_fp8"], w["wq_sf"], q_pos,
         w["cos"], w["sin"], head_ssq=ssq, mock_post=False,
         cmp_pos=pos,
         idx_norm=w["idx_norm"],
         cos_tab=w["cos"], sin_tab=w["sin"],
-        idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
+        idx_state=mgr.idx_state, idx_state_row=st["idx_state_row"],
+        state_ring_entries=mgr.state_ring_entries,
         win_y2=win_y2, win_norm=w["win_norm"],
         q_y=y[:, :1536], q_norm_w=w["q_norm"],
-        slot_map=st["slot_map"],
         idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
-        swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"])
+        idx_entries_per_block=mgr.entries_per_block["idx"],
+        idx_block_stride_bytes=mgr.block_stride_bytes["idx"],
+        swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"],
+        swa_entries_per_block=mgr.entries_per_block["swa"],
+        swa_block_stride_bytes=mgr.block_stride_bytes["swa"],
+        indexer_fp8=INDEXER_FP8, iq_weights=weights64 if INDEXER_FP8 else None)
     yq, iq_fp4, iq_sf = rets[0], rets[1], rets[2]
     qr, sr = t_wq.ref_qnorm_quant(y[:, :1536], w["q_norm"])
     stats["B_xq_match"] = min(stats.get("B_xq_match", 1.0),
@@ -496,10 +516,9 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     #       accum + ape[pos%4] on the score half; model.py L332 contract) --
 
     # -- 5. mqa_logits (paged idx pool) + MAIN compressor tail: the KERNEL
-    #       reads the state POOL via slot_map and writes the Main-compressed
+    #       reads the folded state ring and writes the Main-compressed
     #       MODEL1 pages directly ------------------------------------------
     ncmp = mgr.n_compressed(slots, pos)
-    weights64 = w64
     logits_buf.fill_(float("-inf"))
     # One process models one DP rank: attention and TopK own only these rows.
     # The fused main-compressor still receives the unsliced global-B tensors so
@@ -508,26 +527,54 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     owned = slice(0, B_local)
     # PRODUCTION form: compact comp_q8/s8/rope OMITTED (cache mode writes the
     # MODEL1 pages directly; compact would double-write ~600B/row).
-    mqm.mqa_logits_fp4_decode_out(
-        iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned], ncmp[owned],
-        mgr.block_table("idx", slots)[owned], logits_buf[owned],
-        cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
-        sin_tab=w["sin"], comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
-        slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
-        cmp_dst=st["cmp_dst"])
-    # zero-row robustness: the fp4 chain's se has NO clamp (amax=0 -> sf byte
-    # 0, codes 0); assert the consumer stays finite (no NaN/+inf in logits).
+    idx_bt = mgr.block_table("idx", slots)[owned]
+    if INDEXER_FP8:
+        ctx2 = ncmp[owned].view(-1, 1).contiguous()
+        schedule = get_dg().get_paged_mqa_logits_metadata(
+            ctx2, mgr.entries_per_block["idx"], get_dg().get_num_sms())
+        mq8m.mqa_logits_fp8_decode_out(
+            iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
+            schedule, logits_buf[owned],
+            kv_entries_per_block=mgr.entries_per_block["idx"],
+            kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+            cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
+            sin_tab=w["sin"], comp_state=mgr.main_state,
+            comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+            cmp_dst=st["cmp_dst"],
+            comp_state_ring_entries=mgr.state_ring_entries,
+            cmp_entries_per_block=mgr.entries_per_block["cmp"],
+            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+        logits = logits_buf[owned]
+    else:
+        mqm.mqa_logits_fp4_decode_out(
+            iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned],
+            ncmp[owned], idx_bt, logits_buf[owned],
+            cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
+            sin_tab=w["sin"], comp_state=mgr.main_state,
+            comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+            cmp_dst=st["cmp_dst"],
+            kv_entries_per_block=mgr.entries_per_block["idx"],
+            kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+            comp_state_ring_entries=mgr.state_ring_entries,
+            cmp_entries_per_block=mgr.entries_per_block["cmp"],
+            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+        logits = logits_buf[owned]
+    # Assert every live score is finite (no NaN/+inf in logits).
     torch.cuda.synchronize()
-    lg = logits_buf[owned, : max(int(ncmp[owned].max()), 1)]
-    stats["G_finite"] = stats.get("G_finite", True) and \
-        bool((torch.isnan(lg) | (lg == float("inf"))).sum().item() == 0)
+    finite = True
+    for b in range(B_local):
+        n = int(ncmp[b])
+        if n:
+            lg = logits[b, :n]
+            finite &= bool((torch.isnan(lg) | torch.isinf(lg)).sum().item() == 0)
+    stats["G_finite"] = stats.get("G_finite", True) and finite
 
     kv_rows = deq_idx_pool(mgr, slots, pos)
     refs = ref_mqa_logits(iq_fp4, iq_sf, weights64, kv_rows)
     for b in range(B_local):
         n = int(ncmp[b])
         if n:
-            d = (logits_buf[b, :n].float() - refs[b]).abs().max().item()
+            d = (logits[b, :n].float() - refs[b]).abs().max().item()
             rel = d / (refs[b].abs().max().item() + 1e-6)
             stats["C_mqa_rel"] = max(stats.get("C_mqa_rel", 0.0), rel)
 
@@ -537,7 +584,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     # tiny ncmp). -inf tail beyond seq_len is never read.
     cmp_bt = mgr.block_table("cmp", slots)[owned]
     L = max(int(ncmp[owned].max()), 1)
-    page_idx = tkm.topk_v2(logits_buf[owned, :L], ncmp[owned], cmp_bt,
+    page_idx = tkm.topk_v2(logits[owned, :L], ncmp[owned], cmp_bt,
                            TOPK, PAGE, None)
     for b in range(B_local):
         n = int(ncmp[b])
@@ -620,12 +667,14 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             table = mgr.reqs[slots_mla[b]]["swa"]
             n_sw = int(swa_len[b])
             sw = torch.stack([deq_model1_row(mgr.swa_pool,
-                                             table[(t % WIN) // PAGE],
-                                             (t % WIN) % PAGE)
+                                             table[(t % WIN) // mgr.entries_per_block["swa"]],
+                                             (t % WIN) % mgr.entries_per_block["swa"],
+                                             mgr.entries_per_block["swa"])
                               for t in range(p + 1 - n_sw, p + 1)]) \
                 if n_sw else torch.zeros(0, Q_DIM, device=DEV)
             cm = torch.stack([deq_model1_row(mgr.cmp_pool, int(pi) // PAGE,
-                                             int(pi) % PAGE)
+                                             int(pi) % PAGE,
+                                             mgr.entries_per_block["cmp"])
                               for pi in page_idx_full[b][:int(cmp_len[b])]]) \
                 if int(cmp_len[b]) else torch.zeros(0, Q_DIM, device=DEV)
             ref = ref_flash_attn(qn.bfloat16().float(), sw, cm, Q_DIM ** -0.5,
@@ -642,9 +691,16 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 out[b, 0].float().flatten(), ref.flatten(), dim=0).item()
             stats["E_mla_cos"] = min(stats.get("E_mla_cos", 1.0), cos)
         if dbg is not None:   # F-bisect: last-step producer snapshots
+            # DeepGEMM intentionally leaves columns >= context_len unspecified.
+            # Normalize only the debug snapshot; TopK already gates reads with
+            # ncmp and the production path pays no cleanup kernel.
+            dbg_logits = logits.clone()
+            dbg_logits.masked_fill_(
+                torch.arange(dbg_logits.size(1), device=DEV).view(1, -1)
+                >= ncmp[owned].view(-1, 1), float("-inf"))
             dbg.update(y_q=y[:, :1536].clone(), win_y2=win_y2.clone(),
                        yq=yq.clone(), ssq=ssq.clone(),
-                       logits=logits_buf.clone(), page_idx=page_idx_full.clone(),
+                       logits=dbg_logits, page_idx=page_idx_full.clone(),
                        iq=rets[1].clone())
 
         # -- 8. TP2 O projection stops at this rank's FP32 partial. ----------
@@ -728,7 +784,7 @@ def benchmark(mods, w, ncmp=2048):
     through O-proj; full rank also times mHC post, while TPDP stops before its
     missing partial reduction. The ported O-proj entry point performs host-side
     validation, which does not affect graph replay or Kineto device time."""
-    hcm, fmm, wqm, mqm, tkm, mpm = mods
+    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
     print("\n" + "=" * 76)
     print(f"Per-operator latency (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
@@ -776,7 +832,8 @@ def benchmark(mods, w, ncmp=2048):
 
     for B in (2, 16, 32, 48, 64, 80, 96, 112, 128):
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
-                             + 4 * B, max_pages_per_req=ncmp // PAGE)
+                             + 4 * B, max_pages_per_req=ncmp // PAGE,
+                             indexer_fp8=INDEXER_FP8)
         slots = [mgr.alloc_request() for _ in range(B)]
         for s in slots:                       # fabricate history: next step is
             mgr.reqs[s]["pos"] = 4 * ncmp - 2   # pos 4*ncmp-1 (compress row)
@@ -830,25 +887,22 @@ def benchmark(mods, w, ncmp=2048):
         w64_p = torch.empty(Bp, 64, device=DEV, dtype=torch.float32)
         win_y2, weights64 = win_y2_p[:B], w64_p[:B]
         p0 = 4 * ncmp - 1                       # same pos for every request
-        phys_row = ((4 * ((p0 >> 2) & 1)) + 4 + (p0 & 3)) & 7
-        state_row = torch.full((Bp,), B * 8, dtype=torch.int32, device=DEV)
-        state_row[:B] = torch.tensor([s * 8 + phys_row for s in slots],
-                                     dtype=torch.int32, device=DEV)
+        main_state_row = torch.full((Bp,), -1, dtype=torch.int32, device=DEV)
+        main_state_row[:B] = mgr.state_rows(slots, pos)
+        idx_state_row = main_state_row.clone()
         ape_phase = torch.full((Bp,), p0 % 4, dtype=torch.int32, device=DEV)
 
         def run_front():
             if Bp != B:
                 coll_p[:B].copy_(collapsed)
                 mix_p[:B].copy_(mix)
-            fmm.front_mixed_gemm(coll_p, x8, x8s, w["front_bf16"],
-                                 w["front_fp8"], w["front_sf"], out=y_p,
-                                 **hcd, main_kv=mgr.main_kv,
-                                 main_sc=mgr.main_sc,
-                                 main_ape=w["main_ape"],
-                                 state_row=state_row, ape_phase=ape_phase,
-                                 idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
-                                 idx_ape=w["idx_ape"],
-                                 win_y2=win_y2_p, w64=w64_p)
+            fmm.front_mixed_gemm_csa_swapab(
+                coll_p, x8, x8s, w["front_bf16"], w["front_fp8"],
+                w["front_sf"], out=y_p, **hcd, enable_tail=True,
+                main_state=mgr.main_state, main_ape=w["main_ape"],
+                main_state_row=main_state_row, ape_phase=ape_phase,
+                idx_state=mgr.idx_state, idx_state_row=idx_state_row,
+                idx_ape=w["idx_ape"], win_y2=win_y2_p, w64=w64_p)
         run_hc(); run_front()
 
         xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
@@ -861,12 +915,19 @@ def benchmark(mods, w, ncmp=2048):
                 xq, xq_sf, w["wq_fp8"], w["wq_sf"], q_pos, cosl, sinl,
                 head_ssq=ssq, mock_post=False, cmp_pos=pos,
                 idx_norm=w["idx_norm"], cos_tab=cosl,
-                sin_tab=sinl, idx_kv=mgr.idx_kv, idx_sc=mgr.idx_sc,
+                sin_tab=sinl, idx_state=mgr.idx_state,
+                idx_state_row=st["idx_state_row"],
+                state_ring_entries=mgr.state_ring_entries,
                 win_y2=win_y2, win_norm=w["win_norm"],
                 q_y=y[:, :1536], q_norm_w=w["q_norm"],
-                slot_map=st["slot_map"],
                 idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
-                swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"])
+                idx_entries_per_block=mgr.entries_per_block["idx"],
+                idx_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                swa_cache=mgr.swa_pool, swa_dst=st["swa_dst"],
+                swa_entries_per_block=mgr.entries_per_block["swa"],
+                swa_block_stride_bytes=mgr.block_stride_bytes["swa"],
+                indexer_fp8=INDEXER_FP8,
+                iq_weights=weights64 if INDEXER_FP8 else None)
         run_wqb()
         nc = mgr.n_compressed(slots, pos)
         B_local = local_batch(B)
@@ -874,17 +935,44 @@ def benchmark(mods, w, ncmp=2048):
         idx_bt = mgr.block_table("idx", slots)[owned]
         logits = torch.full((B, (ncmp + 255) // 256 * 256), float("-inf"),
                             device=DEV)
+        fp8_schedule = None
+        if INDEXER_FP8:
+            fp8_schedule = get_dg().get_paged_mqa_logits_metadata(
+                nc[owned].view(-1, 1).contiguous(),
+                mgr.entries_per_block["idx"], get_dg().get_num_sms())
 
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
         def run_mqa():
             r = hold["r"]
-            mqm.mqa_logits_fp4_decode_out(
-                r[1][owned], r[2][owned], mgr.idx_pool, weights64[owned],
-                nc[owned], idx_bt, logits[owned],
-                cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
-                sin_tab=sinl, comp_kv=mgr.main_kv, comp_sc=mgr.main_sc,
-                slot_map=st["slot_map"], cmp_cache=mgr.cmp_pool,
-                cmp_dst=st["cmp_dst"])
+            if INDEXER_FP8:
+                mq8m.mqa_logits_fp8_decode_out(
+                    r[1][owned], mgr.idx_pool, r[2][owned],
+                    nc[owned].view(-1, 1), idx_bt, fp8_schedule,
+                    logits[owned],
+                    kv_entries_per_block=mgr.entries_per_block["idx"],
+                    kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                    cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                    sin_tab=sinl, comp_state=mgr.main_state,
+                    comp_state_row=st["main_state_row"],
+                    cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_ring_entries=mgr.state_ring_entries,
+                    cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+                hold["logits"] = logits[owned]
+            else:
+                mqm.mqa_logits_fp4_decode_out(
+                    r[1][owned], r[2][owned], mgr.idx_pool, weights64[owned],
+                    nc[owned], idx_bt, logits[owned],
+                    cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                    sin_tab=sinl, comp_state=mgr.main_state,
+                    comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+                    cmp_dst=st["cmp_dst"],
+                    kv_entries_per_block=mgr.entries_per_block["idx"],
+                    kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                    comp_state_ring_entries=mgr.state_ring_entries,
+                    cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+                hold["logits"] = logits[owned]
         run_mqa()
         cmp_bt_full = mgr.block_table("cmp", slots)
         cmp_bt = cmp_bt_full[owned]
@@ -893,8 +981,10 @@ def benchmark(mods, w, ncmp=2048):
                          + (logical % PAGE).int()).contiguous()
         page_idx = page_idx_full[owned]
         meta = torch.zeros(B_local + 1, 2, dtype=torch.int32, device=DEV)
-        run_topk = lambda: tkm.topk_v2_transform(
-            logits[owned, :ncmp], nc[owned], cmp_bt, page_idx, PAGE, meta, None)
+        def run_topk():
+            tkm.topk_v2_transform(
+                hold["logits"][:, :ncmp], nc[owned], cmp_bt, page_idx,
+                PAGE, meta, None)
         run_topk()
 
         stage_fns = [("mhc", run_hc), ("front", run_front),
@@ -1104,6 +1194,7 @@ def benchmark(mods, w, ncmp=2048):
         W_FRONT = (2048 * DIM + 2624 * DIM * 2) / MB          # fp8 + bf16
         W_WQB = t_wq.N_MERGED * 1536 / MB
         eff_state_w = B * (1024 + 1024 + 256 + 256) * 4 / MB  # front fresh rows
+        idx_bytes = 132 if INDEXER_FP8 else 68
         t = {}   # stage -> (total_MB, internal_MB)
         hid = B * HC * DIM * 2 / MB
         mhc_int = B * (DIM * 2 + DIM + 24 * 4 + 4 * 8 + 16 * 4) / MB
@@ -1113,13 +1204,13 @@ def benchmark(mods, w, ncmp=2048):
         t["front"] = (W_FRONT + fr_int + eff_state_w, fr_int)
         wq_int = (B * 1536 * 3                   # xq write + qnorm y read
                   + B * t_wq.N_TOTAL * 2         # y bf16 write (q for mla)
-                  + B * 64 * 68 + B * 512 * 4) / MB
-        wq_eff = W_WQB + (B * 8 * 512 * 4 + B * (584 + 68)) / MB
+                  + B * 64 * idx_bytes + B * 512 * 4) / MB
+        wq_eff = W_WQB + (B * 8 * 512 * 4 + B * (584 + idx_bytes)) / MB
         t["wq_b"] = (wq_eff + wq_int, wq_int)
         # Attention/logits are request-DP; the fused main-compressor remains
         # replicated over global B so every rank publishes a complete cache.
-        mqa_eff = (B_local * ncmp * 68 + B * 8 * 2048 * 4 + B * 584) / MB
-        mqa_int = (B_local * ncmp * 4 + B_local * 64 * 68
+        mqa_eff = (B_local * ncmp * idx_bytes + B * 8 * 2048 * 4 + B * 584) / MB
+        mqa_int = (B_local * ncmp * 4 + B_local * 64 * idx_bytes
                    + B_local * 64 * 4) / MB
         t["mqa"] = (mqa_eff + mqa_int, mqa_int)
         tk_int = (B_local * ncmp * 4 + B_local * TOPK * 4) / MB
@@ -1177,7 +1268,7 @@ def benchmark(mods, w, ncmp=2048):
 def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
     torch.manual_seed(seed)
     mgr = KVCacheManager(capacity=B + 4, pages_per_pool=256,
-                         max_pages_per_req=8)
+                         max_pages_per_req=8, indexer_fp8=INDEXER_FP8)
     slots = [mgr.alloc_request() for _ in range(B)]
     logits_buf = torch.full((B, 256), float("-inf"), device=DEV)
     stats, finals = {}, None
@@ -1193,8 +1284,7 @@ def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
         finals = decode_step(mods, w, mgr, slots, hidden, logits_buf, stats,
                              dbg=dbg)
     snap = (finals.clone(), mgr.swa_pool.clone(), mgr.cmp_pool.clone(),
-            mgr.idx_pool.clone(), mgr.main_kv.clone(), mgr.idx_kv.clone(),
-            mgr.main_sc.clone()) + tuple(
+            mgr.idx_pool.clone(), mgr.main_state.clone(), mgr.idx_state.clone()) + tuple(
         dbg[k] for k in ("y_q", "win_y2", "yq", "ssq", "logits",
                          "page_idx", "iq") if k in dbg)
     return stats, snap
@@ -1205,19 +1295,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tpdp", action="store_true",
         help="WQB TP2, MQA/TopK/MLA DP2, and O-proj TP2; default is full rank")
+    parser.add_argument(
+        "--indexer-fp4", action="store_true",
+        help="use the legacy Wuda FP4 Indexer path (default: RTP-compatible FP8)")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         print("CUDA not available"); sys.exit(0)
+    INDEXER_FP8 = not args.indexer_fp4
     configure_geometry(args.tpdp)
     print(f"Device: {torch.cuda.get_device_name()}")
     geometry = ("TPDP local rank: WQB TP2, MQA/TopK/MLA DP2, O-proj TP2"
                 if args.tpdp else "full-rank e2e")
     print(f"Geometry: {geometry} main={t_wq.N_TOTAL}, index={t_wq.N_IDX}, "
-          f"merged={t_wq.N_MERGED}")
-    mods = (t_hc.load_cuda_module(), t_fm.load_module(),
+          f"merged={t_wq.N_MERGED}, indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}")
+    mqa_test = __import__("test_mqa_logits_fp4")
+    mods = (t_hc.load_cuda_module(),
+            t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
+                                  'front_mixed_gemm_csa_swapab.cu'),
             t_wq.load_module(tpdp=args.tpdp),
-            __import__("test_mqa_logits_fp4").load_cuda_module(),
+            mqa_test.load_cuda_module() if not INDEXER_FP8 else None,
+            mqa_test.load_cuda_module_fp8() if INDEXER_FP8 else None,
             __import__("test_topk_v2").load_cuda_module(),
             load_mhc_post() if mhc_post_enabled() else None)
     assert (mods[2].n_main, mods[2].n_index, mods[2].n_merged) == \
@@ -1255,7 +1353,7 @@ if __name__ == "__main__":
             f"{nreq}/{B} req differ (<=25%), max/global {rel:.2e} (<2e-2)"
 
     for name, a, b in zip(("finals", "swa_pool", "cmp_pool", "idx_pool",
-                           "main_kv", "idx_kv", "main_sc", "y_q", "win_y2",
+                           "main_state", "idx_state", "y_q", "win_y2",
                            "yq", "ssq", "logits", "page_idx", "iq"),
                           snap1, snap2):
         if name in ("finals", "ssq"):

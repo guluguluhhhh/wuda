@@ -1,11 +1,11 @@
-// PyTorch binding for the independent HCA swap-AB front projection.
+// PyTorch binding for the independent CSA swap-AB front projection.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include "front_mixed_gemm_hca_swapab.cuh"
+#include "front_mixed_gemm_csa_swapab.cuh"
 
-namespace front_mixed_hca_swapab {
+namespace front_mixed_csa_swapab {
 
 torch::Tensor run_op(
     torch::Tensor x, torch::Tensor x_fp8, torch::Tensor x_sf,
@@ -17,7 +17,16 @@ torch::Tensor run_op(
     c10::optional<torch::Tensor> hc_scale_opt,
     c10::optional<torch::Tensor> hc_post_opt,
     c10::optional<torch::Tensor> hc_comb_opt,
-    bool enable_tail, double hc_eps) {
+    bool enable_tail, double hc_eps,
+    c10::optional<torch::Tensor> main_state_opt,
+    c10::optional<torch::Tensor> main_ape_opt,
+    c10::optional<torch::Tensor> main_state_row_opt,
+    c10::optional<torch::Tensor> ape_phase_opt,
+    c10::optional<torch::Tensor> idx_state_opt,
+    c10::optional<torch::Tensor> idx_state_row_opt,
+    c10::optional<torch::Tensor> idx_ape_opt,
+    c10::optional<torch::Tensor> win_y2_opt,
+    c10::optional<torch::Tensor> w64_opt) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
               x.scalar_type() == torch::kBFloat16 && x.dim() == 2 &&
               x.size(1) == K, "x must be contiguous bf16 [M,", K, "]");
@@ -120,6 +129,49 @@ torch::Tensor run_op(
     hc.m = static_cast<int>(tail_m);
   }
 
+  base::FrontEmitArgs emit{};
+  if (main_state_opt.has_value() && main_state_opt->numel() > 0) {
+    TORCH_CHECK(main_ape_opt && main_state_row_opt && ape_phase_opt &&
+                idx_state_opt && idx_state_row_opt && idx_ape_opt &&
+                win_y2_opt && w64_opt,
+                "front-emit tensors must be given together");
+    auto f32 = [](const torch::Tensor& tensor, int64_t min_numel,
+                  const char* name) {
+      TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
+                  tensor.scalar_type() == torch::kFloat32 &&
+                  tensor.numel() >= min_numel,
+                  name, " must be contiguous CUDA fp32 with >= ", min_numel,
+                  " elements");
+    };
+    auto i32 = [m](const torch::Tensor& tensor, const char* name) {
+      TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
+                  tensor.scalar_type() == torch::kInt32 && tensor.numel() >= m,
+                  name, " must be contiguous CUDA int32 with >= M elements");
+    };
+    f32(*main_state_opt, 2048, "main_state");
+    TORCH_CHECK(main_state_opt->size(-1) == 2048,
+                "main_state last dimension must be 2048");
+    f32(*main_ape_opt, base::APE_RATIO * 1024, "main_ape");
+    i32(*main_state_row_opt, "main_state_row");
+    i32(*ape_phase_opt, "ape_phase");
+    f32(*idx_state_opt, 512, "idx_state");
+    TORCH_CHECK(idx_state_opt->size(-1) == 512,
+                "idx_state last dimension must be 512");
+    i32(*idx_state_row_opt, "idx_state_row");
+    f32(*idx_ape_opt, base::APE_RATIO * 256, "idx_ape");
+    f32(*win_y2_opt, static_cast<int64_t>(m) * 512, "win_y2");
+    f32(*w64_opt, static_cast<int64_t>(m) * 64, "w64");
+    emit.main_state = main_state_opt->data_ptr<float>();
+    emit.main_ape = main_ape_opt->data_ptr<float>();
+    emit.main_state_row = main_state_row_opt->data_ptr<int>();
+    emit.ape_phase = ape_phase_opt->data_ptr<int>();
+    emit.idx_state = idx_state_opt->data_ptr<float>();
+    emit.idx_state_row = idx_state_row_opt->data_ptr<int>();
+    emit.idx_ape = idx_ape_opt->data_ptr<float>();
+    emit.win_y2 = win_y2_opt->data_ptr<float>();
+    emit.w64 = w64_opt->data_ptr<float>();
+  }
+
   static thread_local CUtensorMap desc_x16{}, desc_w16{}, desc_x8{}, desc_w8{};
   static thread_local const void* cached_x16 = nullptr;
   static thread_local const void* cached_w16 = nullptr;
@@ -190,39 +242,39 @@ torch::Tensor run_op(
   if (batch_n == 16) {
     status = task_times != nullptr
         ? launch<16, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
         : launch<16, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
   } else if (batch_n == 32) {
     status = task_times != nullptr
         ? launch<32, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
         : launch<32, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
   } else if (batch_n == 64) {
     status = task_times != nullptr
         ? launch<64, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, m, task_times, stream)
+                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
         : launch<64, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, m, nullptr, stream);
+                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
   } else {
     status = task_times != nullptr
         ? launch<128, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, m, task_times, stream)
+                            xsf, wsf, out_ptr, hc, emit, m, task_times, stream)
         : launch<128, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                             xsf, wsf, out_ptr, hc, m, nullptr, stream);
+                             xsf, wsf, out_ptr, hc, emit, m, nullptr, stream);
   }
   TORCH_CHECK(status == cudaSuccess, "swapAB launch failed: ",
               cudaGetErrorString(status));
   return out;
 }
 
-}  // namespace front_mixed_hca_swapab
+}  // namespace front_mixed_csa_swapab
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
-      "front_mixed_gemm_hca_swapab", &front_mixed_hca_swapab::run_op,
-      "HCA mixed front projection, swap-AB, BF16 output",
+      "front_mixed_gemm_csa_swapab", &front_mixed_csa_swapab::run_op,
+      "CSA mixed front projection, swap-AB, BF16 output",
       py::arg("x"), py::arg("x_fp8"), py::arg("x_sf"),
       py::arg("w_bf16"), py::arg("w_fp8"), py::arg("w_sf"),
       py::arg("out") = py::none(), py::arg("batch_n_override") = 0,
@@ -230,5 +282,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       py::arg("hc_mix") = py::none(), py::arg("hc_base") = py::none(),
       py::arg("hc_scale") = py::none(), py::arg("hc_post") = py::none(),
       py::arg("hc_comb") = py::none(), py::arg("enable_tail") = false,
-      py::arg("hc_eps") = 1e-6);
+      py::arg("hc_eps") = 1e-6,
+      py::arg("main_state") = py::none(), py::arg("main_ape") = py::none(),
+      py::arg("main_state_row") = py::none(), py::arg("ape_phase") = py::none(),
+      py::arg("idx_state") = py::none(), py::arg("idx_state_row") = py::none(),
+      py::arg("idx_ape") = py::none(), py::arg("win_y2") = py::none(),
+      py::arg("w64") = py::none());
 }

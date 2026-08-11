@@ -31,14 +31,13 @@ torch::Tensor front_mixed_gemm_op(
     c10::optional<torch::Tensor> hc_comb_opt,
     c10::optional<torch::Tensor> out_opt,
     double hc_eps,
-    // [FRONT-EMIT] all-or-none direct side outputs (gated on main_kv)
-    c10::optional<torch::Tensor> main_kv_opt,
-    c10::optional<torch::Tensor> main_sc_opt,
+    // [FRONT-EMIT] all-or-none direct side outputs (gated on main_state)
+    c10::optional<torch::Tensor> main_state_opt,
     c10::optional<torch::Tensor> main_ape_opt,
-    c10::optional<torch::Tensor> state_row_opt,
+    c10::optional<torch::Tensor> main_state_row_opt,
     c10::optional<torch::Tensor> ape_phase_opt,
-    c10::optional<torch::Tensor> idx_kv_opt,
-    c10::optional<torch::Tensor> idx_sc_opt,
+    c10::optional<torch::Tensor> idx_state_opt,
+    c10::optional<torch::Tensor> idx_state_row_opt,
     c10::optional<torch::Tensor> idx_ape_opt,
     c10::optional<torch::Tensor> win_y2_opt,
     c10::optional<torch::Tensor> w64_opt) {
@@ -160,9 +159,9 @@ torch::Tensor front_mixed_gemm_op(
 
   // [FRONT-EMIT] validate + gather the side-output bundle (all-or-none).
   FrontEmitArgs emit{};
-  if (main_kv_opt.has_value() && main_kv_opt->numel() > 0) {
-    TORCH_CHECK(main_sc_opt && main_ape_opt && state_row_opt &&
-                ape_phase_opt && idx_kv_opt && idx_sc_opt && idx_ape_opt &&
+  if (main_state_opt.has_value() && main_state_opt->numel() > 0) {
+    TORCH_CHECK(main_ape_opt && main_state_row_opt && ape_phase_opt &&
+                idx_state_opt && idx_state_row_opt && idx_ape_opt &&
                 win_y2_opt && w64_opt,
                 "front-emit tensors must be given together");
     auto f32c = [](const torch::Tensor& t, int64_t n, const char* what) {
@@ -175,23 +174,27 @@ torch::Tensor front_mixed_gemm_op(
                   t.scalar_type() == torch::kInt32 && t.numel() >= m,
                   what, " must be contiguous i32 [>=M]");
     };
-    f32c(*main_kv_opt, 8 * 1024, "main_kv");   // pool [cap,8,1024]
-    f32c(*main_sc_opt, 8 * 1024, "main_sc");
+    const auto state_pool = [&](const torch::Tensor& t, int64_t entry_elems,
+                                const char* what) {
+      f32c(t, entry_elems, what);
+      TORCH_CHECK(t.size(-1) == entry_elems, what, " last dim must be ",
+                  entry_elems, " ([kv|score] halves), got ", t.size(-1));
+    };
+    state_pool(*main_state_opt, 2 * 1024, "main_state");
+    state_pool(*idx_state_opt, 2 * 256, "idx_state");
     f32c(*main_ape_opt, 4 * 1024, "main_ape");
-    i32c(*state_row_opt, "state_row");
+    i32c(*main_state_row_opt, "main_state_row");
+    i32c(*idx_state_row_opt, "idx_state_row");
     i32c(*ape_phase_opt, "ape_phase");
-    f32c(*idx_kv_opt, 8 * 256, "idx_kv");      // pool [cap,8,256]
-    f32c(*idx_sc_opt, 8 * 256, "idx_sc");
     f32c(*idx_ape_opt, 4 * 256, "idx_ape");
     f32c(*win_y2_opt, (int64_t)m * 512, "win_y2");
     f32c(*w64_opt, (int64_t)m * 64, "w64");
-    emit.main_kv = main_kv_opt->data_ptr<float>();
-    emit.main_sc = main_sc_opt->data_ptr<float>();
+    emit.main_state = main_state_opt->data_ptr<float>();
     emit.ape = main_ape_opt->data_ptr<float>();
-    emit.state_row = state_row_opt->data_ptr<int>();
+    emit.main_state_row = main_state_row_opt->data_ptr<int>();
     emit.ape_phase = ape_phase_opt->data_ptr<int>();
-    emit.idx_kv = idx_kv_opt->data_ptr<float>();
-    emit.idx_sc = idx_sc_opt->data_ptr<float>();
+    emit.idx_state = idx_state_opt->data_ptr<float>();
+    emit.idx_state_row = idx_state_row_opt->data_ptr<int>();
     emit.idx_ape = idx_ape_opt->data_ptr<float>();
     emit.win_y2 = win_y2_opt->data_ptr<float>();
     emit.w64 = w64_opt->data_ptr<float>();
@@ -217,22 +220,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "cols [2048,4672), reordered layout) -> bf16 [M,4672]. x arrives "
              "pre-normed (MHC fuses attn_norm); q/kv ssq live in the wq_b "
              "quant prologue. hc_* args are REQUIRED (None to disable). "
-             "[FRONT-EMIT] main_kv..w64 given together enable direct side "
-             "outputs: main/idx state -> pools fp32 (+ape on score halves, "
-             "[B1] pingpong rows), win_y2/w64 fp32(bf16); those tiles skip y.",
+             "[FRONT-EMIT] main_state..w64 given together enable direct side "
+             "outputs: main/idx state -> independent RTP state-ring rows fp32 "
+             "(+ape on score halves), win_y2/w64 fp32(bf16).",
              py::arg("x"), py::arg("x_fp8"), py::arg("x_sf"),
              py::arg("w_bf16"), py::arg("w_fp8"), py::arg("w_sf"),
              py::arg("hc_mix"), py::arg("hc_base"), py::arg("hc_scale"),
              py::arg("hc_post"), py::arg("hc_comb"),
              py::arg("out") = c10::nullopt,
              py::arg("hc_eps") = 1e-6,
-             py::arg("main_kv") = c10::nullopt,
-             py::arg("main_sc") = c10::nullopt,
+             py::arg("main_state") = c10::nullopt,
              py::arg("main_ape") = c10::nullopt,
-             py::arg("state_row") = c10::nullopt,
+             py::arg("main_state_row") = c10::nullopt,
              py::arg("ape_phase") = c10::nullopt,
-             py::arg("idx_kv") = c10::nullopt,
-             py::arg("idx_sc") = c10::nullopt,
+             py::arg("idx_state") = c10::nullopt,
+             py::arg("idx_state_row") = c10::nullopt,
              py::arg("idx_ape") = c10::nullopt,
              py::arg("win_y2") = c10::nullopt,
              py::arg("w64") = c10::nullopt);

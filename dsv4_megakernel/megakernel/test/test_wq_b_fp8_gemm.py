@@ -181,6 +181,20 @@ def ref_idx_chain(iq_f32, pos, cos_tab, sin_tab):
     return deq.view(M, num_heads, 128), sf
 
 
+def ref_idx_fp8_chain(iq_bf16, weights, pos, cos_tab, sin_tab):
+    """RTP Indexer-Q: BF16 boundary -> RoPE -> per-head E4M3 + weight fold."""
+    M, num_heads, _ = iq_bf16.shape
+    x = iq_bf16.float()
+    c = cos_tab[pos].unsqueeze(1)
+    s = sin_tab[pos].unsqueeze(1)
+    e, o = x[..., 64::2].clone(), x[..., 65::2].clone()
+    x[..., 64::2] = (e * c - o * s).bfloat16().float()
+    x[..., 65::2] = (e * s + o * c).bfloat16().float()
+    scale = (x.abs().amax(-1) / 448.0).clamp_min(1e-12)
+    q = (x / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    return q, weights * scale
+
+
 def dequant_kernel_iq(iq_fp4, iq_sf):
     """Kernel outputs -> float: iq_fp4 [M,64,64] i8 packed (low nibble = even elem),
     iq_sf [M,64] i32 packed-ue8m0 (byte b = 32-col block b)."""
@@ -280,6 +294,41 @@ def test_merged(module, M):
             nf = (bw_fp4 != iq_fp4).sum().item()
             ns = (bw_sf != iq_sf).sum().item()
             print(f"    bitwise mismatch: fp4 bytes {nf}, sf words {ns}")
+    return ok
+
+
+def test_indexer_q_fp8(module, M):
+    """Fused WQ_B FP8 Q transform must match the standalone and Torch ABI."""
+    dev = 'cuda'
+    torch.manual_seed(M + 2026)
+    x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(
+        torch.float8_e4m3fn)
+    cos_tab, sin_tab = make_rope_tables()
+    q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev,
+                          dtype=torch.int32)
+    weights = torch.randn(M, N_IDX // 128, device=dev)
+    args = (x, make_act_sf_ones(M, dev), w, make_weight_sf_ones(dev),
+            q_pos, cos_tab, sin_tab)
+
+    fused = module.wq_b_proj_gemm_merged(
+        *args, mock_post=False, enable_ssq=False,
+        indexer_fp8=True, iq_weights=weights)
+    iq_ws = module.wq_b_proj_gemm_merged(
+        *args, mock_post=True, enable_ssq=False)[-1]
+    sa_q, sa_w = module.idx_postprocess_fp8_standalone(
+        iq_ws, weights, q_pos, cos_tab, sin_tab)
+    ref_q, ref_w = ref_idx_fp8_chain(iq_ws, weights, q_pos.long(),
+                                     cos_tab, sin_tab)
+
+    fused_ok = (torch.equal(fused[1].view(torch.uint8), sa_q.view(torch.uint8))
+                and torch.equal(fused[2], sa_w))
+    q_match = (sa_q.view(torch.uint8) == ref_q.view(torch.uint8)).float().mean().item()
+    w_rel = ((sa_w - ref_w).abs() / ref_w.abs().clamp_min(1e-8)).max().item()
+    ok = fused_ok and q_match > 0.999 and w_rel < 1e-5
+    print(f"  [{'PASS' if ok else 'FAIL'}] idx-q fp8 M={M:<4} "
+          f"fused={'OK' if fused_ok else 'MISMATCH'} "
+          f"q={q_match*100:.3f}% w_rel={w_rel:.2e}")
     return ok
 
 
@@ -476,44 +525,45 @@ def make_comp_inputs(M, dev, all_compress=False):
     torch.manual_seed(M * 7 + 3)
     pos = (torch.full((M,), 3, dtype=torch.int64, device=dev) if all_compress
            else torch.randint(3, 4000, (M,), dtype=torch.int64, device=dev))
+    state = torch.randn(M, 8, 512, device=dev)
+    state_rows = (torch.arange(M, device=dev) * 8 + pos % 8).int()
     return dict(
         cmp_pos=pos,
         _y4=torch.randn(M, 512, device=dev),
         _ape=torch.randn(4, 256, device=dev),
         idx_norm=torch.rand(128, device=dev) + 0.5,
-        idx_kv=torch.randn(M, 8, 256, device=dev),
-        idx_sc=torch.randn(M, 8, 256, device=dev))
+        idx_state=state,
+        idx_state_row=state_rows,
+        state_ring_entries=8)
 
 
-def publish_fresh(kv, sc, y4, pos, ape):
-    """FRONT-EMIT simulation: fresh state row at the [B1] ping-pong physical
-    row, +ape on the score half (exactly what front's epilogue does)."""
+def publish_fresh(state, state_rows, y4, pos, ape):
+    """FRONT-EMIT simulation over RTP [kv|score] state entries."""
     M = pos.shape[0]
     dev = y4.device
     pmod = (pos % 4).long()
-    phase = 4 * ((pos >> 2) & 1).long()
-    ridx = torch.arange(M, device=dev)
-    fresh = (phase + 4 + pmod) & 7
-    kv[ridx, fresh] = y4[:, :256]
-    sc[ridx, fresh] = y4[:, 256:] + ape[pmod]
+    fresh = state.view(-1, 512)[state_rows.long()]
+    fresh[:, :256] = y4[:, :256]
+    fresh[:, 256:] = y4[:, 256:] + ape[pmod]
 
 
-def ref_comp_step(kv, sc, pos, norm_w, cos_tab, sin_tab, eps=1e-6):
+def ref_comp_step(state, state_rows, pos, norm_w, cos_tab, sin_tab, eps=1e-6,
+                  fp8=False):
     """Torch reference of one fused-compressor step (POOL-READER form: the
     fresh row is ALREADY in kv/sc via publish_fresh): overlap-cat 8-slot
     softmax -> bf16 RMSNorm -> rope(last 64, bf16) -> @H128*128^-0.5 (bf16)
     -> fp4 sim. kv/sc are READ-ONLY here (the kernel writes nothing either).
-    [B1] PING-PONG: logical row rr of position p lives at physical
-    (4*((p>>2)&1) + rr) & 7."""
+    The caller supplies the current folded RTP row; older rows are recovered
+    by walking backward inside the same physical block."""
     M = pos.shape[0]
-    dev = kv.device
-    phase = 4 * ((pos >> 2) & 1).long()                    # [M] 0 or 4
-    ridx = torch.arange(M, device=dev)
+    dev = state.device
     compress = ((pos + 1) % 4) == 0
-    # aggregate reads logical rows THROUGH the ping-pong mapping
-    lrow = (phase.view(M, 1) + torch.arange(8, device=dev).view(1, 8)) & 7
-    kv_l = kv[ridx.view(M, 1), lrow]                       # [M,8,256] logical
-    sc_l = sc[ridx.view(M, 1), lrow]
+    current = state_rows.long() % 8
+    lrow = (current.view(M, 1) - 7 +
+            torch.arange(8, device=dev).view(1, 8)) % 8
+    ridx = torch.arange(M, device=dev).view(M, 1)
+    entries = state[ridx, lrow]
+    kv_l, sc_l = entries[..., :256], entries[..., 256:]
     kv_cat = torch.cat([kv_l[:, :4, :128], kv_l[:, 4:, 128:]], dim=1)
     sc_cat = torch.cat([sc_l[:, :4, :128], sc_l[:, 4:, 128:]], dim=1)
     cmp = (torch.softmax(sc_cat, dim=1) * kv_cat).sum(1)            # [M,128]
@@ -525,6 +575,9 @@ def ref_comp_step(kv, sc, pos, norm_w, cos_tab, sin_tab, eps=1e-6):
     e, o = x[:, 64::2].clone(), x[:, 65::2].clone()
     x[:, 64::2] = (e * c - o * s).bfloat16().float()
     x[:, 65::2] = (e * s + o * c).bfloat16().float()
+    if fp8:
+        scale = (x.abs().amax(-1) / 448.0).clamp_min(1e-12)
+        return (x / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale, compress
     x = (x @ hadamard_128(dev) * (128.0 ** -0.5)).bfloat16().float()
     blk = x.view(M, 4, 32)
     sf = _ceil_to_ue8m0(blk.abs().amax(-1).clamp_min(6.0 * 2.0 ** -126) / 6.0)
@@ -548,9 +601,9 @@ def test_comp(module, M, mock_post=True):
     comp = make_comp_inputs(M, dev)
     # FRONT-EMIT simulation: publish the fresh row into the KERNEL's pools
     # (in production front's epilogue does this before wq_b launches).
-    publish_fresh(comp['idx_kv'], comp['idx_sc'], comp['_y4'],
+    publish_fresh(comp['idx_state'], comp['idx_state_row'], comp['_y4'],
                   comp['cmp_pos'], comp['_ape'])
-    kv_ref, sc_ref = comp['idx_kv'].clone(), comp['idx_sc'].clone()
+    state_ref = comp['idx_state'].clone()
     kw = {k: v for k, v in comp.items() if not k.startswith('_')}
 
     out = module.wq_b_proj_gemm_merged(
@@ -560,11 +613,10 @@ def test_comp(module, M, mock_post=True):
     q4, s4 = out[-2], out[-1]                    # [M,64] u8, [M,4] u8
 
     ref_deq, ref_s4, cmask = ref_comp_step(
-        kv_ref, sc_ref, comp['cmp_pos'],
+        state_ref, comp['idx_state_row'], comp['cmp_pos'],
         comp['idx_norm'], cos_tab, sin_tab)
 
-    state_ok = (torch.equal(kv_ref, comp['idx_kv'])
-                and torch.equal(sc_ref, comp['idx_sc']))
+    state_ok = torch.equal(state_ref, comp['idx_state'])
     if cmask.any():
         un = torch.zeros(M, 128, dtype=torch.int8, device=dev)
         un[:, 0::2] = (q4 & 0x0F).to(torch.int8)
@@ -638,6 +690,136 @@ def test_win(module, M, mock_post=True):
     tag = 'PASS' if ok else 'FAIL'
     print(f"  [{tag}] winkv        M={M:<4} q8={q_match*100:.2f}% "
           f"s8={s_match*100:.2f}% rope={r_match*100:.2f}%")
+    return ok
+
+
+def test_rtp_paged_pool_writes(module, indexer_fp8=False):
+    """Direct Indexer/SWA writes must not touch neighboring RTP records."""
+    dev, M = 'cuda', 8
+    torch.manual_seed(20260809)
+    pos = torch.tensor([3, 4, 5, 6, 7, 8, 9, 11], device=dev,
+                       dtype=torch.int64)
+    cos_tab, sin_tab = make_rope_tables()
+    idx_norm = torch.rand(128, device=dev) + 0.5
+    win = make_win_inputs(M, dev)
+
+    block_ids = torch.arange(M + 1, 2 * M + 1, device=dev)
+    state_rows = (block_ids * 8 + pos % 8).int()
+    idx_state = torch.randn((2 * M + 1) * 8, 512, device=dev)
+    y4 = torch.randn(M, 512, device=dev)
+    ape = torch.randn(4, 256, device=dev)
+    publish_fresh(idx_state, state_rows, y4, pos, ape)
+    state_before = idx_state.clone()
+
+    # Keep a valid destination on row 7 but suppress it with state_row=-1.
+    # This catches negative ring addressing at a compression boundary.
+    kernel_rows = state_rows.clone()
+    kernel_rows[7] = -1
+    idx_epb, idx_body, idx_scale = 64, (128 if indexer_fp8 else 64), 4
+    idx_stride = idx_epb * (idx_body + idx_scale) + 128
+    idx_cache = torch.full((5, idx_stride), 0xA5, device=dev,
+                           dtype=torch.uint8)
+    idx_dst = torch.full((M,), -1, device=dev, dtype=torch.int32)
+    idx_dst[0] = idx_epb + 63
+    idx_dst[4] = 2 * idx_epb + 7
+    idx_dst[7] = 3 * idx_epb + 19
+
+    swa_epb, swa_body, swa_scale = 256, 576, 8
+    swa_payload = swa_epb * (swa_body + swa_scale)
+    swa_stride = (swa_payload + swa_body - 1) // swa_body * swa_body
+    swa_cache = torch.full((9, swa_stride), 0xA5, device=dev,
+                           dtype=torch.uint8)
+    swa_dst = torch.tensor([
+        swa_epb + 3, 2 * swa_epb + 255, 3 * swa_epb + 64, -1,
+        4 * swa_epb + 128, 5 * swa_epb + 7, 6 * swa_epb + 200,
+        7 * swa_epb + 1], device=dev, dtype=torch.int32)
+
+    x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(
+        torch.float8_e4m3fn)
+    module.wq_b_proj_gemm_merged(
+        x, make_act_sf_ones(M, dev), w, make_weight_sf_ones(dev),
+        pos.int(), cos_tab, sin_tab, mock_post=True, enable_ssq=False,
+        cmp_pos=pos, idx_norm=idx_norm, cos_tab=cos_tab, sin_tab=sin_tab,
+        idx_state=idx_state, idx_state_row=kernel_rows,
+        state_ring_entries=8, win_y2=win['win_y2'], win_norm=win['win_norm'],
+        idx_cache=idx_cache, idx_dst=idx_dst,
+        idx_entries_per_block=idx_epb, idx_block_stride_bytes=idx_stride,
+        indexer_fp8=indexer_fp8,
+        swa_cache=swa_cache, swa_dst=swa_dst,
+        swa_entries_per_block=swa_epb, swa_block_stride_bytes=swa_stride)
+    torch.cuda.synchronize()
+
+    idx_rows = (0, 4)
+    swa_rows = tuple(i for i in range(M) if int(swa_dst[i]) >= 0)
+    idx_allowed = torch.zeros_like(idx_cache, dtype=torch.bool)
+    swa_allowed = torch.zeros_like(swa_cache, dtype=torch.bool)
+    got_q4, got_s4 = [], []
+    for row in idx_rows:
+        page, off = divmod(int(idx_dst[row]), idx_epb)
+        got_q4.append(idx_cache[page, off * idx_body:(off + 1) * idx_body])
+        scale_base = idx_epb * idx_body + off * idx_scale
+        got_s4.append(idx_cache[page, scale_base:scale_base + idx_scale])
+        idx_allowed[page, off * idx_body:(off + 1) * idx_body] = True
+        idx_allowed[page, scale_base:scale_base + idx_scale] = True
+
+    got_q8, got_s8, got_rope = [], [], []
+    for row in swa_rows:
+        page, off = divmod(int(swa_dst[row]), swa_epb)
+        body_base = off * swa_body
+        body = swa_cache[page, body_base:body_base + swa_body]
+        got_q8.append(body[:448])
+        got_rope.append(body[448:].contiguous().view(torch.bfloat16))
+        scale_base = swa_epb * swa_body + off * swa_scale
+        got_s8.append(swa_cache[page, scale_base:scale_base + 7])
+        swa_allowed[page, body_base:body_base + swa_body] = True
+        # The eighth scale-record byte is padding and must remain canary.
+        swa_allowed[page, scale_base:scale_base + 7] = True
+
+    untouched = (
+        torch.equal(idx_cache[~idx_allowed],
+                    torch.full_like(idx_cache[~idx_allowed], 0xA5))
+        and torch.equal(swa_cache[~swa_allowed],
+                        torch.full_like(swa_cache[~swa_allowed], 0xA5))
+        and torch.equal(idx_state, state_before))
+
+    selected_state = state_before.view(-1, 8, 512)[block_ids.long()]
+    ref_deq, ref_s4, _ = ref_comp_step(
+        selected_state, (pos % 8).int(), pos, idx_norm, cos_tab, sin_tab,
+        fp8=indexer_fp8)
+    got_q4, got_s4 = torch.stack(got_q4), torch.stack(got_s4)
+    rows = torch.tensor(idx_rows, device=dev)
+    if indexer_fp8:
+        got_scale = got_s4.contiguous().view(torch.float32).view(-1)
+        idx_ok = (
+            (got_q4 == ref_deq[rows].view(torch.uint8)).float().mean().item()
+            > 0.999
+            and torch.allclose(got_scale, ref_s4[rows], rtol=1e-6, atol=0))
+    else:
+        unpacked = torch.empty(len(idx_rows), 128, dtype=torch.int8, device=dev)
+        unpacked[:, 0::2] = (got_q4 & 0x0F).to(torch.int8)
+        unpacked[:, 1::2] = ((got_q4 >> 4) & 0x0F).to(torch.int8)
+        got_scale = torch.pow(2.0, got_s4.float() - 127.0)
+        got_deq = (_dequantize_from_fp4_e2m1(unpacked)
+                   * got_scale.repeat_interleave(32, -1))
+        idx_ok = ((got_deq == ref_deq[rows]).float().mean().item() > 0.98
+                  and (got_s4 == ref_s4[rows]).float().mean().item() > 0.98)
+
+    ref_q8, ref_scale8, ref_rope = ref_win_step(
+        win['win_y2'], pos, win['win_norm'], cos_tab, sin_tab)
+    got_q8, got_s8, got_rope = (torch.stack(got_q8), torch.stack(got_s8),
+                                 torch.stack(got_rope))
+    rows = torch.tensor(swa_rows, device=dev)
+    ref_exp8 = (ref_scale8.log2() + 127).to(torch.uint8)
+    swa_ok = (
+        (got_q8 == ref_q8[rows].view(torch.uint8)).float().mean().item() > 0.98
+        and (got_s8 == ref_exp8[rows]).float().mean().item() > 0.98
+        and (got_rope.view(torch.uint8)
+             == ref_rope[rows].contiguous().view(torch.uint8)).float().mean().item()
+        > 0.98)
+    ok = untouched and idx_ok and swa_ok
+    fmt = 'FP8' if indexer_fp8 else 'FP4'
+    print(f"  RTP paged-pool writers ({fmt} Indexer): {'PASS' if ok else 'FAIL'}")
     return ok
 
 
@@ -734,6 +916,9 @@ if __name__ == '__main__':
     results = [test_merged(module, M)
                for M in [1, 31, 32, 61, 64, 96, 97, 127, 128]]
 
+    print("\nCorrectness (RTP FP8 Indexer-Q transform):")
+    results += [test_indexer_q_fp8(module, M) for M in [1, 61, 128]]
+
     print("\nCorrectness (fused indexer compressor, delivery port):")
     results += [test_comp(module, M) for M in [1, 32, 61, 128]]
     results += [test_comp(module, M, mock_post=False) for M in [31, 61, 128]]
@@ -741,6 +926,8 @@ if __name__ == '__main__':
     print("\nCorrectness (fused local kv window, CSA stage 4):")
     results += [test_win(module, M) for M in [1, 32, 61, 128]]
     results += [test_win(module, M, mock_post=False) for M in [61, 128]]
+    results.append(test_rtp_paged_pool_writes(module))
+    results.append(test_rtp_paged_pool_writes(module, indexer_fp8=True))
 
     print("\nCorrectness (fused quant prologue, isolation):")
     results += [test_quant_iso(module, M) for M in [1, 32, 61, 128]]

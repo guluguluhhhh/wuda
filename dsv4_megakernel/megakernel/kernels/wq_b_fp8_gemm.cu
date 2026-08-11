@@ -4,7 +4,8 @@
 // x_fp8[M,K_DIM] @ w_fp8[N_MERGED,K_DIM]^T   (indexer rows before main Q)
 //   -> y [M,N_TOTAL] bf16 + ssq [M,NUM_HEADS_OUT] fp32
 //   -> indexer q: by default DRAINED as bf16 iq_ws [M,64,128] (finish it with
-//      idx_postprocess); mock_post=False fuses rope+hadamard+MXFP4 in-kernel.
+//      idx_postprocess); mock_post=False fuses either RTP RoPE+FP8+weight-fold
+//      or the legacy RoPE+Hadamard+MXFP4 transform in-kernel.
 //
 // Usage (default: 256 threads, GEMM + ssq):
 //   y, iq_fp4, iq_sf, ssq, iq_ws = wq_b_proj_gemm_merged(
@@ -16,11 +17,11 @@
 //   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
 //
 // Fused indexer (winkv) COMPRESSOR (optional, delivery op-B-tail port, NO
-// split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_kv/idx_sc (fresh state
+// split-K): pass cmp_pos/idx_norm/cos_tab/sin_tab/idx_state (fresh state
 // row arrives from front's FRONT-EMIT epilogue, +idx_ape)
-// together and warps 8..15 run the state write + compress chain (softmax
-// aggregate -> shift -> RMSNorm -> RoPE -> FWHT -> fp4) fully decoupled from
-// the GEMM; appends idx_q4 [M,64] u8 + idx_s4 [M,4] u8 to the returns.
+// together and warps 8..15 run the state read + compress chain fully decoupled
+// from the GEMM. In RTP FP8 mode it writes 128 E4M3 bytes + one FP32 scale;
+// the explicit legacy mode retains FWHT + FP4.
 // LOCAL KV WINDOW (optional, CSA stage 4 FULL chain): pass win_y2 [M,512] +
 // win_norm [512] (+ cmp_pos/cos_tab/sin_tab) -> RMSNorm + RoPE + per-64 fp8;
 // appends win_q8 [M,448] u8 + win_s8 [M,7] f32 + win_rope [M,64] bf16. Chains
@@ -141,7 +142,7 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
                    __nv_fp8_e4m3* __restrict__ x_fp8,
                    uint8_t* __restrict__ x_sf, int m_total,
                    float* __restrict__ ssq_zero,
-                   uint32_t* __restrict__ iq_ready_reset) {
+                   uint32_t* __restrict__ iq_drain_ready_reset) {
     // Let WQ_B run its independent prologue while this grid produces inputs;
     // its GDS precedes every global-memory access to those inputs.
     asm volatile("griddepcontrol.launch_dependents;");
@@ -156,9 +157,9 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
              i += gridDim.x * blockDim.x)
             ssq_zero[i] = 0.0f;
     }
-    if (iq_ready_reset != nullptr && blockIdx.x == 0) {
+    if (iq_drain_ready_reset != nullptr && blockIdx.x == 0) {
         for (int head = threadIdx.x; head < IDX_NUM_HEADS; head += blockDim.x)
-            iq_ready_reset[head * IQ_FLAG_STRIDE] = 0u;
+            iq_drain_ready_reset[head * IQ_FLAG_STRIDE] = 0u;
     }
     if (gamma != nullptr) {
         for (int r = blockIdx.x; r < m_total; r += gridDim.x)
@@ -185,7 +186,7 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
 // The indexer weight precedes main Q, so its transform overlaps the remaining
 // main-Q weight stream. Store warps drain indexer tiles before async workers
 // post-process them.
-template <int M_TPL, bool kProfile, bool kSsq>
+template <int M_TPL, bool kProfile, bool kSsq, bool kIdxFp8>
 __global__ void __launch_bounds__(TPB_IDX, 1)
 wq_b_proj_kernel(
     const __grid_constant__ CUtensorMap desc_A,    // activation [M,K] e4m3, K-major
@@ -200,8 +201,8 @@ wq_b_proj_kernel(
     // fused indexer projection outputs + rotary metadata
     const __grid_constant__ IqDest iqd,            // indexer-q destination geometry
     __nv_bfloat16* __restrict__ iq_scratch,        // [M, 64, 128] bf16 drain buffer
-    uint32_t* __restrict__ iq_ready,               // [IQ_FLAG_SLOTS] per-head ready flags
-    uint32_t iq_seq,                               // host-monotonic launch tag for them
+    uint32_t* __restrict__ iq_drain_ready,         // [IQ_FLAG_SLOTS] per-head ready flags
+    uint32_t iq_drain_seq,                         // host-monotonic launch tag for them
     const int* __restrict__ q_pos,                 // [M] rotary positions
     const float* __restrict__ rope_cos,           // [max_pos, 32]
     const float* __restrict__ rope_sin,           // [max_pos, 32]
@@ -623,15 +624,6 @@ wq_b_proj_kernel(
             persistent_iter++;
           }
         }
-        // PDL: release the dependent grid HERE, not at kernel end. Everything the
-        // consumer (mqa_logits) streams -- the idx KV pages, the swa pages, the
-        // main-q output -- has been stored by this point; what is still running is
-        // the transform warpgroup's SPREAD plus its cross-rank fence and publish.
-        // Triggering early is what lets those overlap mqa's 557MB KV prefetch
-        // instead of sitting exposed on this kernel's tail. The consumer's iq path
-        // is NOT covered by this trigger -- it waits on the ready flags, which are
-        // published after SPREAD, so it stays correctly ordered.
-        asm volatile("griddepcontrol.launch_dependents;");
     }
 
     // ======== ASYNC TRANSFORM WORKERS (threads 256..511) ========
@@ -669,7 +661,8 @@ wq_b_proj_kernel(
             // Paired with ld.acquire in SPREAD.
             if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
                 asm volatile("st.release.gpu.global.u32 [%0], %1;"
-                             :: "l"(iq_ready + head * IQ_FLAG_STRIDE), "r"(iq_seq)
+                             :: "l"(iq_drain_ready + head * IQ_FLAG_STRIDE),
+                                "r"(iq_drain_seq)
                              : "memory");
             }
           }
@@ -685,7 +678,7 @@ wq_b_proj_kernel(
         // resort. Only exit sync: trailing cluster_sync.
         {
             const bool win_on = comp.win_y2 != nullptr;
-            const bool cmp_on = comp.kv != nullptr;
+            const bool cmp_on = comp.state != nullptr;
             if (win_on || cmp_on) {
                 const int wlocal = (int)warp_id - (NUM_NON_EPI_THREADS + NUM_STORE_THREADS) / 32;
                 const int rank = ((int)blockIdx.x >= busy)
@@ -701,7 +694,7 @@ wq_b_proj_kernel(
                         idx_comp::process_win_row(comp, m, (int)lane_id);
                 if (cmp_on)
                     for (int m = wid; m < problem_m; m += stride)
-                        idx_comp::process_row(comp, m, (int)lane_id);
+                        idx_comp::process_row<kIdxFp8>(comp, m, (int)lane_id);
             }
         }
 
@@ -709,8 +702,7 @@ wq_b_proj_kernel(
         // Flat (head, row-batch) task space over the whole grid. One task uses
         // all transform workers: 8 lanes per row, XFORM_ROWS_PER_TASK rows.
         if (!mock_post) {
-            // [PROFILE] SPREAD entry/exit (cluster0/CTA0): the transform plus its
-            // peer stores, ending before the completion handoff below.
+            // [PROFILE] SPREAD entry/exit (cluster0/CTA0).
             long long iq_t0 = 0;
             const bool iq_prof = iqd.prof != nullptr && blockIdx.x == 0 &&
                 threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS;
@@ -724,7 +716,6 @@ wq_b_proj_kernel(
             const int nbph =
                 (problem_m + XFORM_ROWS_PER_TASK - 1) / XFORM_ROWS_PER_TASK;
             const int nb   = IDX_NUM_HEADS * nbph;
-            int my_tasks = 0;
             for (int task = (int)blockIdx.x; task < nb; task += num_blocks) {
                 const int head = task % IDX_NUM_HEADS;
                 const int m0   = (task / IDX_NUM_HEADS) * XFORM_ROWS_PER_TASK;
@@ -733,122 +724,41 @@ wq_b_proj_kernel(
                 do {   // whole warp polls ONE address -> a single broadcast read;
                        // relaxed while spinning, ONE acquire once it passes
                     asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                                 : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                                 : "=r"(v) : "l"(iq_drain_ready + head * IQ_FLAG_STRIDE)
                                  : "memory");
-                    if (v == iq_seq) break;
+                    if (v == iq_drain_seq) break;
                     if (ptx::rdtimer_ns() - spin_t0 >= IQ_SPIN_TIMEOUT_NS) {
                         printf("wq_b SPREAD drain timeout: cta=%d head=%d flag=%u "
-                               "want=%u\n", (int)blockIdx.x, head, v, iq_seq);
+                               "want=%u\n", (int)blockIdx.x, head, v, iq_drain_seq);
                         __trap();
                     }
                     __nanosleep(128);
                 } while (true);
                 asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
-                             : "=r"(v) : "l"(iq_ready + head * IQ_FLAG_STRIDE)
+                             : "=r"(v) : "l"(iq_drain_ready + head * IQ_FLAG_STRIDE)
                              : "memory");
                 // padding rows CLAMP to the last valid row: warps stay converged for
                 // the full-mask shuffles, stores are suppressed
                 const int m = m0 + (int)r;
                 const int mc = m < problem_m ? m : problem_m - 1;
-                // Destination is DECOUPLED from what we computed (see IqDest):
-                // the row goes to whichever rank owns it, at the SAME row index
-                // mc -- only the BUFFER changes, so a rank simply leaves rows it
-                // does not own untouched. The SOURCE row is always local.
-                const bool mine = mc >= iqd.row_lo && mc < iqd.row_hi;
                 IdxRowIn d;
                 idx_row_load(
                     iq_scratch + ((int64_t)mc * IDX_NUM_HEADS + head) * IDX_HEAD_DIM,
                     e8, mc, q_pos, rope_cos, rope_sin, d);
-                idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
-                                      mine ? iqd.fp4 : iqd.fp4_peer,
-                                      mine ? iqd.sf  : iqd.sf_peer,
-                                      iqd.num_heads, m < problem_m);
-                ++my_tasks;
+                if constexpr (kIdxFp8) {
+                    idx_row_compute_fp8<true>(
+                        d, e8, mc, iqd.head_base + head, iqd.weights,
+                        iqd.fp4, reinterpret_cast<float*>(iqd.sf),
+                        iqd.num_heads, m < problem_m);
+                } else {
+                    idx_row_compute<true>(d, e8, mc, iqd.head_base + head,
+                                          iqd.fp4, iqd.sf,
+                                          iqd.num_heads, m < problem_m);
+                }
             }
             if (iq_prof) {
                 iqd.prof[0] = iq_t0;
                 iqd.prof[1] = ptx::rdclock();
-            }
-            // ---- cross-rank completion handoff (see IqDest for why it lives here
-            // rather than in a separate launch) ----
-            // Arrive with `red`: fire-and-forget, so a CTA never stalls on an atomic
-            // round trip. No __threadfence() either -- the NamedBarrier is a
-            // CTA-scope fence and the release on the reduction extends that to
-            // device scope for whoever acquires the counter.
-            if (iqd.done != nullptr && my_tasks > 0) {
-                // Barrier id 2, scoped to the XFORM warpgroup ONLY: __syncthreads
-                // would hang here -- the TMA/MMA/SF/store warps are in sibling
-                // branches of the role dispatch and never reach this point. It has
-                // One thread arrives on behalf of all transform workers. Barrier
-                // ids 0/1 are used by store and drain handshakes.
-                cutlass::arch::NamedBarrier::sync(NUM_XFORM_THREADS, 2);
-                if (threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS)
-                    asm volatile("red.release.gpu.global.add.u32 [%0], 1;"
-                                 :: "l"(iqd.done) : "memory");
-            }
-            // CTA 0 is the only waiter, and the kernel ends on the slowest CTA
-            // anyway, so its wait is not additive.
-            //
-            // A fixed poller instead of the textbook "last arriver finalises"
-            // (CUDA's threadFenceReduction: atomicInc, then whoever draws the last
-            // ticket does the tail) because that needs the atomic's RETURN value, so
-            // every CTA stalls one round trip -- ~7us across 144 CTAs here, and
-            // unchanged by splitting the counter over 8 cache lines, which is how we
-            // know it was the round trip and not contention. `red` has no return, so
-            // arrivals never stall.
-            //
-            // This DEPENDS on full residency: CTA 0 waits on CTAs that must already
-            // be running. The host caps num_clusters at min(num_SMs, total_cta) /
-            // CLUSTER_SIZE (WQ_B_CLUSTERS is clamped to the same bound) and the smem
-            // footprint pins occupancy at 1 CTA/SM, so grid <= num_SMs -- but that
-            // only holds if this kernel HAS the SMs. Measured on a GPU with another
-            // tenant at 100% util, the handoff went from +3.6us to +86us: the grid no
-            // longer fits, CTA 0 spins holding an SM that a pending CTA needs, and
-            // the arrival it waits for is several waves away. Not a deadlock (the
-            // timeout would catch that) but the tail latency is gone. The same
-            // requirement is why cooperative_groups::grid.sync() insists on
-            // cudaLaunchCooperativeKernel, which validates residency; here it is
-            // implicit. Treat exclusive occupancy as part of this kernel's contract.
-            if (iqd.done != nullptr && blockIdx.x == 0 &&
-                threadIdx.x == NUM_NON_EPI_THREADS + NUM_STORE_THREADS) {
-                const unsigned int want =
-                    (unsigned int)(nb < num_blocks ? nb : num_blocks);
-                unsigned int v;
-                const unsigned long long spin_t0 = ptx::rdtimer_ns();
-                do {
-                    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                                 : "=r"(v) : "l"(iqd.done) : "memory");
-                    if (v >= want) break;
-                    if (ptx::rdtimer_ns() - spin_t0 >= IQ_SPIN_TIMEOUT_NS) {
-                        printf("wq_b arrival timeout: rank=%d arrived=%u want=%u "
-                               "(grid=%d) -- a CTA never reached the xform barrier, "
-                               "or `done` was not 0 on entry\n",
-                               iqd.rank, v, want, num_blocks);
-                        __trap();
-                    }
-                    __nanosleep(32);
-                } while (true);
-                *iqd.done = 0u;              // safe: no further arrivals this launch
-                // Light-weight system fence, NOT __threadfence_system(): that emits
-                // membar.sys == fence.sc.sys (full sequential consistency), while
-                // the PTX ISA calls fence.acq_rel "a light-weight fence that is
-                // sufficient for memory synchronization in most programs". This is
-                // the SINGLE ordering point of the whole crossing.
-                asm volatile("fence.acq_rel.sys;" ::: "memory");
-                // Plain increment: only this one thread in the grid touches gen.
-                const unsigned int gn = *iqd.gen + 1u;
-                *iqd.gen = gn;
-                // RELAXED stores, not st.release.sys -- a system-scope release store
-                // carries its own implicit .sys fence, so publishing with two of
-                // them right after the fence above paid for that ordering THREE
-                // times (measured 2.7us fence + 6.2us for the pair). The fence is
-                // the ordering point; these just deposit the value.
-                asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
-                             :: "l"(iqd.ready + iqd.rank), "r"(gn) : "memory");
-                if (iqd.ready_self != nullptr)
-                    asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
-                                 :: "l"(iqd.ready_self + iqd.rank), "r"(gn)
-                                 : "memory");
             }
         }
     }
@@ -898,13 +808,13 @@ static CUtensorMap make_tma_desc_bf16_2d(
 // Swap-AB path only (M <= 128, decode). kSsq is a COMPILE-TIME dispatch
 // dimension (DeepGEMM JIT-config discipline): the ssq-off binary carries no
 // dead branch in the hot loops.
-template <bool kProfile, bool kSsq>
+template <bool kProfile, bool kSsq, bool kIdxFp8>
 static void* get_kernel_ptr(int M) {
     switch (M) {
-        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq>;
-        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq>;
-        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq>;
-        case 128: return (void*)&wq_b_proj_kernel<128, kProfile, kSsq>;
+        case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq, kIdxFp8>;
+        case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq, kIdxFp8>;
+        case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq, kIdxFp8>;
+        case 128: return (void*)&wq_b_proj_kernel<128, kProfile, kSsq, kIdxFp8>;
         default:  return nullptr;
     }
 }
@@ -942,8 +852,9 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> idx_norm = c10::nullopt,
     c10::optional<torch::Tensor> cos_tab = c10::nullopt,
     c10::optional<torch::Tensor> sin_tab = c10::nullopt,
-    c10::optional<torch::Tensor> idx_kv  = c10::nullopt,
-    c10::optional<torch::Tensor> idx_sc  = c10::nullopt,
+    c10::optional<torch::Tensor> idx_state = c10::nullopt,
+    c10::optional<torch::Tensor> idx_state_row = c10::nullopt,
+    int64_t state_ring_entries = 0,
     // local kv window bundle (winkv, CSA stage 4; needs cmp_pos + rope tables too)
     c10::optional<torch::Tensor> win_y2   = c10::nullopt,
     c10::optional<torch::Tensor> win_norm = c10::nullopt,
@@ -954,35 +865,23 @@ static std::vector<torch::Tensor> run_wq_b(
     c10::optional<torch::Tensor> q_y      = c10::nullopt,
     c10::optional<torch::Tensor> q_norm_w = c10::nullopt,
     double q_eps = 1e-6,
-    // kvcache design (kccache_design.png): persistent-slot state + DIRECT
-    // paged-pool writes. slot_map [M] i32 lets idx_kv/idx_sc be POOLS
-    // [capacity,8,256]; idx_cache/idx_dst scatter the compress rows into the
-    // indexer fused pages; swa_cache/swa_dst scatter every winkv row into the
-    // SWA MODEL1 pages. dst[m] = page*64+off, -1 = skip.
-    c10::optional<torch::Tensor> slot_map  = c10::nullopt,
+    // RTP paged-pool writes. Destination values are flat logical slots; each
+    // pool supplies its own entries-per-block and physical byte stride.
     c10::optional<torch::Tensor> idx_cache = c10::nullopt,
     c10::optional<torch::Tensor> idx_dst   = c10::nullopt,
+    int64_t idx_entries_per_block = 0,
+    int64_t idx_block_stride_bytes = 0,
     c10::optional<torch::Tensor> swa_cache = c10::nullopt,
     c10::optional<torch::Tensor> swa_dst   = c10::nullopt,
-    // indexer-q DESTINATION (see IqDest in the header). Default: allocate the
-    // plain [M, IDX_NUM_HEADS] layout, degenerating the store math to non-TP.
-    // TP/DP callers pass their mqa_logits input buffers: iq_dst/_sf hold the FULL
-    // head set over the whole batch, iq_head_base is this rank's first global head,
-    // and iq_dst_peer/_sf are the peer rank's PEER-MAPPED mirror. Rows outside
-    // [iq_row_lo, iq_row_hi) are stored straight into the mirror at the SAME row
-    // index, which IS the cross-rank exchange. The completion handoff runs at the
-    // end of this kernel -- see IqDest for why it is not a separate launch.
+    int64_t swa_entries_per_block = 0,
+    int64_t swa_block_stride_bytes = 0,
+    // Optional caller-owned local MQA input buffers. By default the outputs use
+    // the plain [M, IDX_NUM_HEADS] layout.
     c10::optional<torch::Tensor> iq_dst         = c10::nullopt,
     c10::optional<torch::Tensor> iq_dst_sf      = c10::nullopt,
-    c10::optional<torch::Tensor> iq_dst_peer    = c10::nullopt,
-    c10::optional<torch::Tensor> iq_dst_peer_sf = c10::nullopt,
+    bool indexer_fp8 = false,
+    c10::optional<torch::Tensor> iq_weights = c10::nullopt,
     int64_t iq_head_base = 0,
-    int64_t iq_row_lo = 0, int64_t iq_row_hi = -1,
-    c10::optional<torch::Tensor> iq_done  = c10::nullopt,
-    c10::optional<torch::Tensor> iq_ready = c10::nullopt,
-    c10::optional<torch::Tensor> iq_ready_self = c10::nullopt,
-    c10::optional<torch::Tensor> iq_gen   = c10::nullopt,
-    int64_t iq_rank = 0,
     c10::optional<torch::Tensor> iq_prof = c10::nullopt)
 {
     TORCH_CHECK(x_fp8.is_cuda() && x_fp8.is_contiguous() &&
@@ -1034,71 +933,39 @@ static std::vector<torch::Tensor> run_wq_b(
         iq_fp4 = iq_dst.value();
         iq_sf  = iq_dst_sf.value();
     } else {
-        TORCH_CHECK(!iq_dst_sf.has_value() && !iq_dst_peer.has_value()
-                    && !iq_dst_peer_sf.has_value() && iq_head_base == 0,
-                    "iq_dst_sf / iq_dst_peer / iq_head_base require iq_dst");
-        iq_fp4 = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM / 2},
-                              x_fp8.options().dtype(torch::kInt8));
-        iq_sf  = torch::empty({M, IDX_NUM_HEADS}, x_fp8.options().dtype(torch::kInt32));
+        TORCH_CHECK(!iq_dst_sf.has_value() && iq_head_base == 0,
+                    "iq_dst_sf / iq_head_base require iq_dst");
+        iq_fp4 = torch::empty(
+            {M, IDX_NUM_HEADS, indexer_fp8 ? IDX_HEAD_DIM : IDX_HEAD_DIM / 2},
+            x_fp8.options().dtype(indexer_fp8 ? torch::kFloat8_e4m3fn
+                                              : torch::kInt8));
+        iq_sf = torch::empty({M, IDX_NUM_HEADS},
+                             x_fp8.options().dtype(indexer_fp8 ? torch::kFloat32
+                                                               : torch::kInt32));
     }
     const int iq_rows  = (int)iq_fp4.size(0);
     const int iq_heads = (int)iq_fp4.size(1);
     TORCH_CHECK(iq_fp4.is_cuda() && iq_fp4.dim() == 3 && iq_fp4.is_contiguous()
-                && iq_fp4.scalar_type() == torch::kInt8
-                && iq_fp4.size(2) == IDX_HEAD_DIM / 2,
-                "iq_dst must be CUDA int8 [rows, heads, ", IDX_HEAD_DIM / 2, "] contiguous");
+                && iq_fp4.scalar_type() == (indexer_fp8 ? torch::kFloat8_e4m3fn
+                                                        : torch::kInt8)
+                && iq_fp4.size(2) == (indexer_fp8 ? IDX_HEAD_DIM : IDX_HEAD_DIM / 2),
+                "iq_dst has the wrong dtype/shape for the selected Indexer format");
     TORCH_CHECK(iq_sf.is_cuda() && iq_sf.is_contiguous()
-                && iq_sf.scalar_type() == torch::kInt32
+                && iq_sf.scalar_type() == (indexer_fp8 ? torch::kFloat32
+                                                       : torch::kInt32)
                 && iq_sf.sizes() == torch::IntArrayRef({iq_rows, iq_heads}),
-                "iq_dst_sf must be i32 [rows, heads] matching iq_dst");
+                "iq_dst_sf must match the selected Indexer format and iq_dst");
+    if (indexer_fp8 && !mock_post) {
+        TORCH_CHECK(iq_weights.has_value() && iq_weights->is_cuda()
+                    && iq_weights->scalar_type() == torch::kFloat32
+                    && iq_weights->dim() == 2 && iq_weights->is_contiguous()
+                    && iq_weights->sizes() == torch::IntArrayRef({iq_rows, iq_heads}),
+                    "FP8 Indexer needs contiguous CUDA fp32 iq_weights [rows,heads]");
+    }
     TORCH_CHECK(iq_head_base >= 0 && iq_head_base + IDX_NUM_HEADS <= iq_heads,
                 "iq_head_base + IDX_NUM_HEADS(", IDX_NUM_HEADS, ") exceeds the "
                 "destination head count ", iq_heads);
-    // Every computed row must land somewhere: rows outside [row_lo, row_hi) go to
-    // the peer. Both ranks size their buffer for the full batch.
-    if (iq_row_hi < 0) iq_row_hi = iq_rows;      // default: we own everything
     TORCH_CHECK(iq_rows >= M, "iq_dst needs >= M rows, got ", iq_rows, " < ", M);
-    TORCH_CHECK(0 <= iq_row_lo && iq_row_lo <= iq_row_hi && iq_row_hi <= iq_rows,
-                "iq_row_lo/hi must satisfy 0 <= lo <= hi <= rows");
-    if (iq_dst_peer.has_value()) {
-        TORCH_CHECK(iq_dst_peer_sf.has_value(), "iq_dst_peer also needs iq_dst_peer_sf");
-        TORCH_CHECK(iq_dst_peer.value().sizes() == iq_fp4.sizes()
-                    && iq_dst_peer.value().scalar_type() == torch::kInt8
-                    && iq_dst_peer.value().is_contiguous()
-                    && iq_dst_peer_sf.value().sizes() == iq_sf.sizes()
-                    && iq_dst_peer_sf.value().scalar_type() == torch::kInt32
-                    && iq_dst_peer_sf.value().is_contiguous(),
-                    "iq_dst_peer/_sf must mirror iq_dst/_sf exactly");
-    } else {
-        TORCH_CHECK(iq_row_lo == 0 && iq_row_hi >= M,
-                    "without a peer this rank must own every row it computes");
-    }
-    // Completion handoff is all-or-none, and pointless without a peer.
-    TORCH_CHECK(iq_done.has_value() == iq_ready.has_value()
-                && iq_done.has_value() == iq_gen.has_value(),
-                "iq_done, iq_ready and iq_gen must be given together");
-    if (iq_done.has_value()) {
-        TORCH_CHECK(iq_dst_peer.has_value(),
-                    "iq_done/iq_ready/iq_gen are only meaningful with iq_dst_peer");
-        TORCH_CHECK(iq_done.value().is_cuda() && iq_done.value().is_contiguous()
-                    && iq_done.value().numel() >= IQ_DONE_WORDS
-                    && iq_done.value().scalar_type() == torch::kInt32,
-                    "iq_done must be a CUDA i32 [>= ", IQ_DONE_WORDS,
-                    "] (ZERO-initialized once; the kernel self-resets it)");
-        TORCH_CHECK(iq_gen.value().is_cuda() && iq_gen.value().numel() == 1
-                    && iq_gen.value().scalar_type() == torch::kInt32,
-                    "iq_gen must be a 1-element CUDA i32 (ZERO-initialized once)");
-        TORCH_CHECK(iq_ready.value().is_cuda() && iq_ready.value().is_contiguous()
-                    && iq_ready.value().scalar_type() == torch::kInt32
-                    && iq_rank >= 0 && iq_rank < iq_ready.value().numel(),
-                    "iq_ready must be a CUDA i32 [world] with iq_rank in range");
-        if (iq_ready_self.has_value())
-            TORCH_CHECK(iq_ready_self.value().numel() == iq_ready.value().numel()
-                        && iq_ready_self.value().is_cuda()
-                        && iq_ready_self.value().is_contiguous()
-                        && iq_ready_self.value().scalar_type() == torch::kInt32,
-                        "iq_ready_self must mirror iq_ready");
-    }
     // drain-first workspace: the epilogue dumps the iq accum here (L2-resident)
     // to release the TMEM stage before the transform pass
     auto iq_ws = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM},
@@ -1107,32 +974,15 @@ static std::vector<torch::Tensor> run_wq_b(
     const float* cos_ptr = rope_cos.data_ptr<float>();
     const float* sin_ptr = rope_sin.data_ptr<float>();
     uint8_t* iq_fp4_ptr = reinterpret_cast<uint8_t*>(iq_fp4.data_ptr());
-    int* iq_sf_ptr = iq_sf.data_ptr<int>();
+    int* iq_sf_ptr = reinterpret_cast<int*>(iq_sf.data_ptr());
     __nv_bfloat16* iq_ws_ptr =
         reinterpret_cast<__nv_bfloat16*>(iq_ws.data_ptr());
-    // No peer -> aim the peer pointers at the local buffer. The host has already
-    // checked [row_lo, row_hi) covers every row in that case, so `mine` is always
-    // true and the peer branch is dead.
     IqDest iqd{};
     iqd.fp4       = iq_fp4_ptr;
     iqd.sf        = iq_sf_ptr;
-    iqd.fp4_peer  = iq_dst_peer.has_value()
-        ? reinterpret_cast<uint8_t*>(iq_dst_peer.value().data_ptr()) : iq_fp4_ptr;
-    iqd.sf_peer   = iq_dst_peer_sf.has_value()
-        ? iq_dst_peer_sf.value().data_ptr<int>() : iq_sf_ptr;
-    iqd.row_lo    = (int)iq_row_lo;
-    iqd.row_hi    = (int)iq_row_hi;
+    iqd.weights   = iq_weights.has_value() ? iq_weights->data_ptr<float>() : nullptr;
     iqd.head_base = (int)iq_head_base;
     iqd.num_heads = iq_heads;
-    iqd.done      = iq_done.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_done.value().data_ptr()) : nullptr;
-    iqd.ready     = iq_ready.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_ready.value().data_ptr()) : nullptr;
-    iqd.ready_self = iq_ready_self.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_ready_self.value().data_ptr()) : nullptr;
-    iqd.gen       = iq_gen.has_value()
-        ? reinterpret_cast<unsigned int*>(iq_gen.value().data_ptr()) : nullptr;
-    iqd.rank      = (int)iq_rank;
     if (iq_prof.has_value()) {
         TORCH_CHECK(iq_prof.value().is_cuda() && iq_prof.value().is_contiguous()
                     && iq_prof.value().numel() >= 2
@@ -1154,8 +1004,8 @@ static std::vector<torch::Tensor> run_wq_b(
     // resets the valid flag words before GDS releases WQ_B; capture without that
     // producer retains a memset fallback. Graph and eager launches sharing a
     // device must not run concurrently on different streams.
-    static uint32_t* iq_ready_dev[kMaxDevices] = {};
-    static uint32_t  iq_ready_tag[kMaxDevices] = {};
+    static uint32_t* iq_drain_ready_dev[kMaxDevices] = {};
+    static uint32_t  iq_drain_ready_tag[kMaxDevices] = {};
     const int dev_id = x_fp8.device().index();
     TORCH_CHECK(dev_id >= 0 && dev_id < kMaxDevices,
                 "wq_b: device index ", dev_id, " outside the flag table");
@@ -1163,26 +1013,26 @@ static std::vector<torch::Tensor> run_wq_b(
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
     TORCH_CHECK(cudaStreamIsCapturing(stream, &cap) == cudaSuccess,
                 "wq_b: cudaStreamIsCapturing failed");
-    if (iq_ready_dev[dev_id] == nullptr) {
+    if (iq_drain_ready_dev[dev_id] == nullptr) {
         TORCH_CHECK(cap == cudaStreamCaptureStatusNone,
                     "wq_b: run one eager launch before capturing (the iq "
                     "ready-flag page cannot be allocated during capture)");
-        TORCH_CHECK(cudaMalloc(&iq_ready_dev[dev_id], kFlagBytes) == cudaSuccess,
+        TORCH_CHECK(cudaMalloc(&iq_drain_ready_dev[dev_id], kFlagBytes) == cudaSuccess,
                     "wq_b: iq ready-flag alloc failed");
-        TORCH_CHECK(cudaMemsetAsync(iq_ready_dev[dev_id], 0, kFlagBytes, stream)
+        TORCH_CHECK(cudaMemsetAsync(iq_drain_ready_dev[dev_id], 0, kFlagBytes, stream)
                         == cudaSuccess, "wq_b: iq ready-flag zero failed");
     }
-    uint32_t* iq_ready_ptr = iq_ready_dev[dev_id];
-    uint32_t* iq_ready_reset_ptr = nullptr;
-    uint32_t  iq_seq;
+    uint32_t* iq_drain_ready_ptr = iq_drain_ready_dev[dev_id];
+    uint32_t* iq_drain_ready_reset_ptr = nullptr;
+    uint32_t  iq_drain_seq;
     if (cap == cudaStreamCaptureStatusNone) {
-        iq_seq = ++iq_ready_tag[dev_id];
+        iq_drain_seq = ++iq_drain_ready_tag[dev_id];
     } else {
-        iq_seq = 1u;
+        iq_drain_seq = 1u;
         if (quant_on) {
-            iq_ready_reset_ptr = iq_ready_ptr;
+            iq_drain_ready_reset_ptr = iq_drain_ready_ptr;
         } else {
-            TORCH_CHECK(cudaMemsetAsync(iq_ready_ptr, 0, kFlagBytes, stream)
+            TORCH_CHECK(cudaMemsetAsync(iq_drain_ready_ptr, 0, kFlagBytes, stream)
                             == cudaSuccess,
                         "wq_b: iq ready-flag reset node failed");
         }
@@ -1256,13 +1106,19 @@ static std::vector<torch::Tensor> run_wq_b(
     }
 
     // ---- fused indexer compressor + local kv window: validate the bundles ----
-    const bool comp_on = idx_kv.has_value();
+    const bool comp_on = idx_state.has_value();
     const bool win_on  = win_y2.has_value();
     idx_comp::Args comp{};
     torch::Tensor idx_q4_t, idx_s4_t, win_q8_t, win_s8_t, win_rope_t;
     auto ck = [](const torch::Tensor& t, torch::ScalarType ty, const char* n) {
         TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == ty,
                     n, " must be contiguous CUDA ", ty);
+    };
+    auto i32m = [&](const torch::Tensor& t, const char* n) {
+        TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
+                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
+                    n, " must be CUDA i32 [>=M]");
+        return t.data_ptr<int>();
     };
     if (comp_on || win_on) {
         TORCH_CHECK(cmp_pos && cos_tab && sin_tab,
@@ -1282,36 +1138,38 @@ static std::vector<torch::Tensor> run_wq_b(
         // FRONT-EMIT: the fresh idx state row (fp32 + idx_ape on the score
         // half) is published by front_mixed's epilogue BEFORE this kernel;
         // the chain here only aggregates -- no y4/ape inputs anymore.
-        TORCH_CHECK(idx_norm && idx_sc,
-                    "indexer compressor needs idx_norm/idx_kv/idx_sc");
+        TORCH_CHECK(idx_norm,
+                    "indexer compressor needs idx_norm + idx_state");
         ck(*idx_norm, torch::kFloat, "idx_norm");
-        ck(*idx_kv,  torch::kFloat, "idx_kv");
-        ck(*idx_sc,  torch::kFloat, "idx_sc");
+        ck(*idx_state, torch::kFloat, "idx_state");
         TORCH_CHECK(idx_norm->numel() == idx_comp::D_I, "idx_norm must be [128]");
-        const auto state_ok = [&](const torch::Tensor& t) {
-            // Legacy per-step state [M,8,256], or a persistent-slot POOL
-            // [capacity,8,256] when slot_map is given (kvcache design).
-            return t.dim() == 3 && t.size(1) == idx_comp::SROWS
-                && t.size(2) == idx_comp::WK_I
-                && (slot_map.has_value() ? true : t.size(0) == M);
-        };
-        TORCH_CHECK(state_ok(*idx_kv) && state_ok(*idx_sc),
-                    "idx_kv/idx_sc must be [M,8,256]");
+        TORCH_CHECK(idx_state->dim() >= 2 &&
+                    idx_state->size(-1) == 2 * idx_comp::WK_I,
+                    "idx_state last dim must be ", 2 * idx_comp::WK_I,
+                    " ([kv|score] halves)");
         // Compact q4/s4 SKIPPED in cache mode (double-write bandwidth saver);
         // the paged direct write below is the production output. PURE outputs
         // -> empty, not zeros (a zeros fill kernel lands in wall timings;
         // non-compress rows are garbage by contract, consumers gate on pos).
         if (!(idx_cache.has_value() && idx_cache->numel() > 0)) {
-            idx_q4_t = torch::empty({M, idx_comp::D_I / 2},
+            idx_q4_t = torch::empty({M, indexer_fp8 ? idx_comp::D_I
+                                                     : idx_comp::D_I / 2},
                                     x_fp8.options().dtype(torch::kUInt8));
-            idx_s4_t = torch::empty({M, idx_comp::D_I / 32},
-                                    x_fp8.options().dtype(torch::kUInt8));
+            idx_s4_t = torch::empty(
+                {M, indexer_fp8 ? 1 : idx_comp::D_I / 32},
+                x_fp8.options().dtype(indexer_fp8 ? torch::kFloat32
+                                                  : torch::kUInt8));
             comp.q4 = idx_q4_t.data_ptr<uint8_t>();
-            comp.s4 = idx_s4_t.data_ptr<uint8_t>();
+            comp.s4 = reinterpret_cast<uint8_t*>(idx_s4_t.data_ptr());
         }
         comp.norm_w = idx_norm->data_ptr<float>();
-        comp.kv = idx_kv->data_ptr<float>();
-        comp.sc = idx_sc->data_ptr<float>();
+        comp.state = idx_state->data_ptr<float>();
+        TORCH_CHECK(idx_state_row.has_value(),
+                    "idx_state requires idx_state_row");
+        TORCH_CHECK(state_ring_entries >= idx_comp::SROWS,
+                    "state_ring_entries must be >= ", idx_comp::SROWS);
+        comp.state_row = i32m(*idx_state_row, "idx_state_row");
+        comp.state_ring_entries = (int)state_ring_entries;
     }
     if (win_on) {
         TORCH_CHECK(win_norm, "local kv window needs win_y2 AND win_norm");
@@ -1335,32 +1193,41 @@ static std::vector<torch::Tensor> run_wq_b(
         comp.win_y2 = win_y2->data_ptr<float>();
         comp.win_norm = win_norm->data_ptr<float>();
     }
-    // ---- kvcache design plumbing (slot indirection + direct pool writes) ----
-    auto i32m = [&](const torch::Tensor& t, const char* n) {
-        TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
-                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
-                    n, " must be CUDA i32 [M]");
-        return t.data_ptr<int>();
-    };
-    if (slot_map.has_value() && slot_map->numel() > 0)
-        comp.slot_map = i32m(*slot_map, "slot_map");
+    // ---- RTP cache geometry + direct pool writes ----
     if (idx_cache.has_value() && idx_cache->numel() > 0) {
         TORCH_CHECK(idx_dst.has_value(), "idx_cache requires idx_dst");
+        TORCH_CHECK(idx_entries_per_block > 0,
+                    "idx_cache requires idx_entries_per_block");
+        const int64_t payload = idx_entries_per_block
+            * ((indexer_fp8 ? idx_comp::D_I : idx_comp::D_I / 2) + 4);
+        TORCH_CHECK(idx_block_stride_bytes >= payload,
+                    "idx_block_stride_bytes must cover page payload");
+        TORCH_CHECK(!indexer_fp8 || idx_block_stride_bytes % 4 == 0,
+                    "FP8 indexer block stride must preserve FP32 scale alignment");
         TORCH_CHECK(idx_cache->is_cuda() && idx_cache->is_contiguous() &&
-                    idx_cache->numel() % idx_comp::IDX_PAGE_BYTES == 0,
-                    "idx_cache must be fused pages [P,",
-                    idx_comp::IDX_PAGE_BYTES, "]B");
+                    idx_cache->scalar_type() == torch::kUInt8 &&
+                    idx_cache->numel() % idx_block_stride_bytes == 0,
+                    "idx_cache must be uint8 physical pages with the supplied stride");
         comp.idx_cache = reinterpret_cast<uint8_t*>(idx_cache->data_ptr());
         comp.idx_dst = i32m(*idx_dst, "idx_dst");
+        comp.idx_entries_per_block = (int)idx_entries_per_block;
+        comp.idx_block_stride_bytes = (size_t)idx_block_stride_bytes;
     }
     if (swa_cache.has_value() && swa_cache->numel() > 0) {
         TORCH_CHECK(swa_dst.has_value(), "swa_cache requires swa_dst");
+        TORCH_CHECK(swa_entries_per_block > 0,
+                    "swa_cache requires swa_entries_per_block");
+        const int64_t payload = swa_entries_per_block * (idx_comp::M1_TOK_BODY + 8);
+        TORCH_CHECK(swa_block_stride_bytes >= payload,
+                    "swa_block_stride_bytes must cover page payload");
         TORCH_CHECK(swa_cache->is_cuda() && swa_cache->is_contiguous() &&
-                    swa_cache->numel() % idx_comp::M1_PAGE_BYTES == 0,
-                    "swa_cache must be MODEL1 pages [P,",
-                    idx_comp::M1_PAGE_BYTES, "]B");
+                    swa_cache->scalar_type() == torch::kUInt8 &&
+                    swa_cache->numel() % swa_block_stride_bytes == 0,
+                    "swa_cache must be uint8 physical pages with the supplied stride");
         comp.swa_cache = reinterpret_cast<uint8_t*>(swa_cache->data_ptr());
         comp.swa_dst = i32m(*swa_dst, "swa_dst");
+        comp.swa_entries_per_block = (int)swa_entries_per_block;
+        comp.swa_block_stride_bytes = (size_t)swa_block_stride_bytes;
     }
 
     // ---- activation quant producer (PDL; replaces the in-kernel grid ticket) ----
@@ -1386,25 +1253,37 @@ static std::vector<torch::Tensor> run_wq_b(
     }
 
     const bool want_ssq = ssq_ptr != nullptr;
-    void* kernel_ptr = profile
-        ? (want_ssq ? get_kernel_ptr<true, true>(M_pad)  : get_kernel_ptr<true, false>(M_pad))
-        : (want_ssq ? get_kernel_ptr<false, true>(M_pad) : get_kernel_ptr<false, false>(M_pad));
+    void* kernel_ptr = nullptr;
+    if (indexer_fp8) {
+        kernel_ptr = profile
+            ? (want_ssq ? get_kernel_ptr<true, true, true>(M_pad)
+                        : get_kernel_ptr<true, false, true>(M_pad))
+            : (want_ssq ? get_kernel_ptr<false, true, true>(M_pad)
+                        : get_kernel_ptr<false, false, true>(M_pad));
+    } else {
+        kernel_ptr = profile
+            ? (want_ssq ? get_kernel_ptr<true, true, false>(M_pad)
+                        : get_kernel_ptr<true, false, false>(M_pad))
+            : (want_ssq ? get_kernel_ptr<false, true, false>(M_pad)
+                        : get_kernel_ptr<false, false, false>(M_pad));
+    }
     int smem_bytes = get_smem_bytes(M_pad);
     TORCH_CHECK(kernel_ptr != nullptr && smem_bytes > 0, "Unsupported M=", M);
 
     // cudaFuncSetAttribute is PER DEVICE state, so this cache needs the device
     // ordinal: without it the second card in a process never gets the opt-in
     // dynamic smem raised and every launch on it fails.
-    static bool smem_configured[kMaxDevices][2][2][9] = {};
+    static bool smem_configured[kMaxDevices][2][2][2][9] = {};
     const int m_idx = M_pad / 32;
     const int p_idx = profile ? 1 : 0;
     const int s_idx = want_ssq ? 1 : 0;
-    if (!smem_configured[dev_id][p_idx][s_idx][m_idx]) {
+    const int f_idx = indexer_fp8 ? 1 : 0;
+    if (!smem_configured[dev_id][p_idx][s_idx][f_idx][m_idx]) {
         auto attr_err = cudaFuncSetAttribute(kernel_ptr,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr_err), " smem_bytes=", smem_bytes);
-        smem_configured[dev_id][p_idx][s_idx][m_idx] = true;
+        smem_configured[dev_id][p_idx][s_idx][f_idx][m_idx] = true;
     }
 
     {
@@ -1429,7 +1308,7 @@ static std::vector<torch::Tensor> run_wq_b(
                 qy_ptr, qy_lda, qgamma_ptr, static_cast<float>(q_eps),
                 const_cast<__nv_fp8_e4m3*>(x_ptr),
                 const_cast<uint8_t*>(xsf_ptr), M, ssq_ptr,
-                iq_ready_reset_ptr);
+                iq_drain_ready_reset_ptr);
         }
 
         cudaLaunchConfig_t config = {};
@@ -1457,7 +1336,7 @@ static std::vector<torch::Tensor> run_wq_b(
         void* ptr_args[] = {
             &desc_A, &desc_B, &xsf_ptr, &wsf_ptr, &desc_D,
             &M, &grid_size, &num_clusters, &ssq_ptr,
-            &iqd, &iq_ws_ptr, &iq_ready_ptr, &iq_seq,
+            &iqd, &iq_ws_ptr, &iq_drain_ready_ptr, &iq_drain_seq,
             &q_pos_ptr, &cos_ptr, &sin_ptr,
             &mock_i, &comp, &prof_dev
         };
@@ -1476,45 +1355,8 @@ static std::vector<torch::Tensor> run_wq_b(
     return ret;
 }
 
-// ======================== Cross-rank readiness wait ========================
-// Waits until every OTHER rank has published a generation >= our own for this
-// launch, then releases the chain with one system-scope acquire.
-//
-// `>= *gen` (not `== tag`) is what makes this graph-safe: both ranks replay the
-// same graph the same number of times, so their generations advance in lockstep
-// and the flag re-arms itself every launch -- no host tag to freeze, no memset.
-// Our own slot is skipped: stream order already guarantees our producer ran.
-//
-// Deadlock-free: every flag it waits on is written by a DIFFERENT device, so no
-// resource this kernel holds is needed by its own producer. (An in-kernel spin
-// waiting on work that needs the SAME device's SMs would deadlock -- that is why
-// this is a separate 1-block launch and not folded into a consumer sharing the
-// grid with its producer.)
-__global__ void iq_wait_kernel(const unsigned int* __restrict__ ready,
-                               const unsigned int* __restrict__ gen,
-                               int world, int skip) {
-    if ((int)threadIdx.x >= world || (int)threadIdx.x == skip) return;
-    unsigned int want;
-    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(want) : "l"(gen) : "memory");
-    unsigned int v;
-    const unsigned long long t0 = ptx::rdtimer_ns();
-    do {   // relaxed while spinning; a single acquire once it passes
-        asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                     : "=r"(v) : "l"(ready + threadIdx.x) : "memory");
-        if (v >= want) break;
-        if (ptx::rdtimer_ns() - t0 >= IQ_SPIN_TIMEOUT_NS) {
-            printf("iq_wait timeout: rank_slot=%u flag=%u want=%u (world=%d "
-                   "skip=%d)\n", threadIdx.x, v, want, world, skip);
-            __trap();
-        }
-        __nanosleep(256);
-    } while (true);
-    asm volatile("fence.acquire.sys;" ::: "memory");
-}
-
 // ======================== PyTorch Binding ========================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.attr("iq_done_words") = IQ_DONE_WORDS;
     m.attr("n_main") = N_TOTAL;
     m.attr("n_index") = N_IDX;
     m.attr("n_merged") = N_MERGED;
@@ -1527,30 +1369,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              c10::optional<torch::Tensor> head_ssq, bool mock_post, bool enable_ssq,
              c10::optional<torch::Tensor> cmp_pos, c10::optional<torch::Tensor> idx_norm,
              c10::optional<torch::Tensor> cos_tab, c10::optional<torch::Tensor> sin_tab,
-             c10::optional<torch::Tensor> idx_kv, c10::optional<torch::Tensor> idx_sc,
+             c10::optional<torch::Tensor> idx_state,
+             c10::optional<torch::Tensor> idx_state_row,
+             int64_t state_ring_entries,
              c10::optional<torch::Tensor> win_y2, c10::optional<torch::Tensor> win_norm,
              c10::optional<torch::Tensor> q_y, c10::optional<torch::Tensor> q_norm_w,
              double q_eps,
-             c10::optional<torch::Tensor> slot_map,
              c10::optional<torch::Tensor> idx_cache, c10::optional<torch::Tensor> idx_dst,
+             int64_t idx_entries_per_block, int64_t idx_block_stride_bytes,
              c10::optional<torch::Tensor> swa_cache, c10::optional<torch::Tensor> swa_dst,
+             int64_t swa_entries_per_block, int64_t swa_block_stride_bytes,
              c10::optional<torch::Tensor> iq_dst, c10::optional<torch::Tensor> iq_dst_sf,
-             c10::optional<torch::Tensor> iq_dst_peer,
-             c10::optional<torch::Tensor> iq_dst_peer_sf, int64_t iq_head_base,
-             int64_t iq_row_lo, int64_t iq_row_hi,
-             c10::optional<torch::Tensor> iq_done, c10::optional<torch::Tensor> iq_ready,
-             c10::optional<torch::Tensor> iq_ready_self,
-             c10::optional<torch::Tensor> iq_gen, int64_t iq_rank,
+             bool indexer_fp8, c10::optional<torch::Tensor> iq_weights,
+             int64_t iq_head_base,
              c10::optional<torch::Tensor> iq_prof) {
               return run_wq_b(x_fp8, x_sf, w_fp8, w_sf, /*profile=*/false, head_ssq,
                               q_pos, rope_cos, rope_sin, mock_post, enable_ssq,
                               cmp_pos, idx_norm,
-                              cos_tab, sin_tab, idx_kv, idx_sc, win_y2, win_norm,
+                              cos_tab, sin_tab, idx_state, idx_state_row,
+                              state_ring_entries, win_y2, win_norm,
                               q_y, q_norm_w, q_eps,
-                              slot_map, idx_cache, idx_dst, swa_cache, swa_dst,
-                              iq_dst, iq_dst_sf, iq_dst_peer, iq_dst_peer_sf,
-                              iq_head_base, iq_row_lo, iq_row_hi,
-                              iq_done, iq_ready, iq_ready_self, iq_gen, iq_rank,
+                              idx_cache, idx_dst, idx_entries_per_block,
+                              idx_block_stride_bytes, swa_cache, swa_dst,
+                              swa_entries_per_block, swa_block_stride_bytes,
+                              iq_dst, iq_dst_sf, indexer_fp8, iq_weights,
+                              iq_head_base,
                               iq_prof);
           },
           "MERGED wq_b + indexer wq_b (w [8192+N,K]: indexer rows FIRST, then "
@@ -1563,22 +1406,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "garbage; run idx_postprocess_standalone over iq_ws. mock_post=False: "
           "512 threads, fuses rope+hadamard+fp4quant in-kernel. Fused indexer "
           "COMPRESSOR (no split-K): pass cmp_pos [M] i64 / idx_norm [128] / "
-          "cos_tab+sin_tab [S,32] / idx_kv+idx_sc [M,8,256] (state rings; the "
+          "cos_tab+sin_tab [S,32] / idx_state [..,512] + idx_state_row + "
+          "state_ring_entries (framework state ring; the "
           "fresh row is published by front's FRONT-EMIT epilogue, +idx_ape) "
           "-- warps 8..15 run it beside the GEMM. "
           "LOCAL KV WINDOW (CSA stage 4 full chain): pass win_y2 [M,512] + win_norm "
           "[512] (+ cmp_pos/cos_tab/sin_tab) -> appends win_q8 [M,448] u8, win_s8 "
           "[M,7] f32, win_rope [M,64] bf16. "
-          "IQ DESTINATION (TP/DP direct write): iq_dst [rows,heads,64] i8 + "
-          "iq_dst_sf [rows,heads] i32 are the mqa_logits input buffers holding the "
-          "FULL head set over this rank's DP row share; iq_head_base is this rank's "
-          "first global head; rows >= `rows` are stored into iq_dst_peer/_sf (the "
-          "peer rank's PEER-MAPPED mirror -- that store IS the cross-rank exchange, "
-          "iq_ready [world] i32 + iq_gen [1] i32 (both zero-init ONCE) + iq_rank "
-          "arm the completion handoff: the CTA seeing the last task increment "
-          "bumps iq_gen and .sys-releases it into iq_ready[iq_rank] -- where "
-          "iq_ready is the PEER's flag page. Omit them all for the plain "
-          "[M,IDX_NUM_HEADS] single-GPU layout.",
+          "IQ DESTINATION: optional iq_dst [rows,heads,64] + iq_dst_sf "
+          "[rows,heads] write directly into caller-owned local MQA input buffers; "
+          "omit both for the plain [M,IDX_NUM_HEADS] layout.",
           py::arg("x_fp8"), py::arg("x_sf"), py::arg("w_fp8"), py::arg("w_sf"),
           py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"),
           py::arg("head_ssq") = c10::nullopt,
@@ -1588,50 +1425,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("idx_norm") = c10::nullopt,
           py::arg("cos_tab") = c10::nullopt,
           py::arg("sin_tab") = c10::nullopt,
-          py::arg("idx_kv") = c10::nullopt,
-          py::arg("idx_sc") = c10::nullopt,
+          py::arg("idx_state") = c10::nullopt,
+          py::arg("idx_state_row") = c10::nullopt,
+          py::arg("state_ring_entries") = 0,
           py::arg("win_y2") = c10::nullopt,
           py::arg("win_norm") = c10::nullopt,
           py::arg("q_y") = c10::nullopt,
           py::arg("q_norm_w") = c10::nullopt,
           py::arg("q_eps") = 1e-6,
-          py::arg("slot_map") = c10::nullopt,
           py::arg("idx_cache") = c10::nullopt,
           py::arg("idx_dst") = c10::nullopt,
+          py::arg("idx_entries_per_block") = 0,
+          py::arg("idx_block_stride_bytes") = 0,
           py::arg("swa_cache") = c10::nullopt,
           py::arg("swa_dst") = c10::nullopt,
+          py::arg("swa_entries_per_block") = 0,
+          py::arg("swa_block_stride_bytes") = 0,
           py::arg("iq_dst") = c10::nullopt,
           py::arg("iq_dst_sf") = c10::nullopt,
-          py::arg("iq_dst_peer") = c10::nullopt,
-          py::arg("iq_dst_peer_sf") = c10::nullopt,
+          py::arg("indexer_fp8") = false,
+          py::arg("iq_weights") = c10::nullopt,
           py::arg("iq_head_base") = 0,
-          py::arg("iq_row_lo") = 0, py::arg("iq_row_hi") = -1,
-          py::arg("iq_done") = c10::nullopt,
-          py::arg("iq_ready") = c10::nullopt,
-          py::arg("iq_ready_self") = c10::nullopt,
-          py::arg("iq_gen") = c10::nullopt,
-          py::arg("iq_rank") = 0,
           py::arg("iq_prof") = c10::nullopt);
-    m.def("iq_wait",
-          [](torch::Tensor ready, torch::Tensor gen, int64_t world, int64_t skip) {
-              TORCH_CHECK(ready.is_cuda() && ready.is_contiguous()
-                          && ready.scalar_type() == torch::kInt32
-                          && world > 0 && world <= ready.numel(),
-                          "iq_wait: ready must be a CUDA i32 [>= world]");
-              TORCH_CHECK(gen.is_cuda() && gen.numel() == 1
-                          && gen.scalar_type() == torch::kInt32,
-                          "iq_wait: gen must be a 1-element CUDA i32");
-              iq_wait_kernel<<<1, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-                  reinterpret_cast<const unsigned int*>(ready.data_ptr()),
-                  reinterpret_cast<const unsigned int*>(gen.data_ptr()),
-                  (int)world, (int)skip);
-          },
-          "Wait until every rank except `skip` has published a generation >= our "
-          "own (*gen), then acquire (.sys). Consumer half of the wq_b iq "
-          "direct-write handoff: launch between wq_b and mqa_logits. "
-          "Graph-capturable (the device generation re-arms itself on replay) and "
-          "deadlock-free (every flag comes from another device).",
-          py::arg("ready"), py::arg("gen"), py::arg("world"), py::arg("skip"));
     m.def("wq_b_proj_gemm_merged_profiled",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,
@@ -1680,6 +1495,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Standalone rope+hadamard+fp4quant over fp32/bf16 iq [M,64,128] -> "
           "(iq_fp4 [M,64,64] i8, iq_sf [M,64] i32) -- the separate-kernel baseline",
           py::arg("iq_f32"), py::arg("q_pos"), py::arg("rope_cos"), py::arg("rope_sin"));
+    m.def("idx_postprocess_fp8_standalone",
+          [](torch::Tensor iq, torch::Tensor weights, torch::Tensor q_pos,
+             torch::Tensor rope_cos, torch::Tensor rope_sin) {
+              TORCH_CHECK(iq.is_cuda() && iq.is_contiguous()
+                          && (iq.scalar_type() == torch::kFloat
+                              || iq.scalar_type() == torch::kBFloat16)
+                          && iq.dim() == 3 && iq.size(1) == IDX_NUM_HEADS
+                          && iq.size(2) == IDX_HEAD_DIM,
+                          "iq must be contiguous CUDA fp32/bf16 [M,64,128]");
+              const int M = iq.size(0);
+              TORCH_CHECK(M >= 1 && weights.is_cuda() && weights.is_contiguous()
+                          && weights.scalar_type() == torch::kFloat32
+                          && weights.sizes() == torch::IntArrayRef({M, IDX_NUM_HEADS}),
+                          "weights must be contiguous CUDA fp32 [M,64]");
+              auto q8 = torch::empty({M, IDX_NUM_HEADS, IDX_HEAD_DIM},
+                                     iq.options().dtype(torch::kFloat8_e4m3fn));
+              auto wf = torch::empty({M, IDX_NUM_HEADS},
+                                     iq.options().dtype(torch::kFloat32));
+              const int rows = M * IDX_NUM_HEADS;
+              auto stream = at::cuda::getCurrentCUDAStream();
+              if (iq.scalar_type() == torch::kBFloat16)
+                  idx_post_fp8_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      reinterpret_cast<const __nv_bfloat16*>(iq.data_ptr()),
+                      weights.data_ptr<float>(), q_pos.data_ptr<int>(),
+                      rope_cos.data_ptr<float>(), rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(q8.data_ptr()), wf.data_ptr<float>(),
+                      rows, IDX_NUM_HEADS);
+              else
+                  idx_post_fp8_kernel<<<(rows + 31) / 32, 256, 0, stream>>>(
+                      iq.data_ptr<float>(), weights.data_ptr<float>(),
+                      q_pos.data_ptr<int>(), rope_cos.data_ptr<float>(),
+                      rope_sin.data_ptr<float>(),
+                      reinterpret_cast<uint8_t*>(q8.data_ptr()), wf.data_ptr<float>(),
+                      rows, IDX_NUM_HEADS);
+              return std::vector<torch::Tensor>{q8, wf};
+          },
+          "Standalone RTP Indexer-Q BF16/RoPE/E4M3 quant with scale-folded weights",
+          py::arg("iq"), py::arg("weights"), py::arg("q_pos"),
+          py::arg("rope_cos"), py::arg("rope_sin"));
     m.def("head_ssq_standalone",
           [](torch::Tensor y) {
               TORCH_CHECK(y.is_cuda() && y.is_contiguous()
