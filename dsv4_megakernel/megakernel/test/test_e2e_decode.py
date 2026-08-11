@@ -11,8 +11,9 @@ cache management (test/kv_cache_manager.py):
 
 The tail follows the official mega_csa post-attention boundary. o_proj_csa.py
 adds TP2 support around the two Triton quant kernels and DeepGEMM wo_a/wo_b;
-mhc_post.cu closes the full-rank residual mix. residual is this layer's input,
-while post/comb come from the front hc tail.
+mhc_post.cu closes the residual mix. residual is this layer's input, while
+post/comb come from the front hc tail. Until communication is integrated, TP2
+fabricates the C3 all-reduce result from its local O-proj partial.
 
 Multi-step decode simulation (the cache/state semantics ONLY show up across
 steps): B requests advance pos together; mid-run one request is freed and its
@@ -23,7 +24,7 @@ Stage gates per step:
   A front y (fp8/bf16 segment calc_diff)          D topk vs torch.topk+transform
   B wq_b x_fp8 quant chain (byte match)           E flashMLA vs torch attention
   C mqa logits vs torch ref over DEQUANT pools        over the DEQUANT pools
-  H full rank checks o_proj+mhc_post; TPDP checks the FP32 O-proj partial
+  H checks o_proj+mhc_post (TPDP fabricates the C3 all-reduce between them)
 Global gate: the whole simulation runs TWICE from the same seed -> all caches,
 states and final outputs bitwise identical (run-to-run determinism).
 
@@ -169,8 +170,7 @@ def post_attn_enabled():
 
 
 def mhc_post_enabled():
-    """TP O-proj needs the missing reduction before mHC post."""
-    return HAS_FLASH_MLA and not TPDP_MODE
+    return HAS_FLASH_MLA
 
 
 def attention_heads():
@@ -207,6 +207,17 @@ def mla_dp_output_to_tp(mla3, B):
     if not peer_rows:
         return local_heads.contiguous()
     return torch.cat((local_heads, local_heads[:peer_rows]), dim=0).contiguous()
+
+
+def fabricate_tp_o_reduce(local_partial):
+    """Fabricate C3's FP32 TP2 sum and model-dtype output for mHC post.
+
+    A real rank receives the peer O-proj partial, sums both in FP32, then casts
+    back to BF16. Reusing the local partial as the peer keeps this single-rank
+    test deterministic while preserving the communication boundary's dtype.
+    """
+    assert TPDP_MODE
+    return (local_partial + local_partial).to(torch.bfloat16)
 
 
 def load_mhc_post():
@@ -414,8 +425,13 @@ def ref_o_proj_mhc(
     proj = z.flatten(1) @ wo_b.float().t()
     if not run_mhc_post:
         return proj
+    return ref_mhc_post(proj, residual, post, comb)
+
+
+def ref_mhc_post(attention_out, residual, post, comb):
     return (torch.einsum("mij,mih->mjh", comb, residual.float())
-            + post.unsqueeze(-1) * proj.unsqueeze(1)).to(torch.bfloat16)
+            + post.unsqueeze(-1) * attention_out.float().unsqueeze(1)) \
+        .to(torch.bfloat16)
 
 
 # ==================== one decode step ====================
@@ -729,7 +745,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                        logits=dbg_logits, page_idx=page_idx_full.clone(),
                        iq=rets[1].clone())
 
-        # -- 8. TP2 O projection stops at this rank's FP32 partial. ----------
+        # -- 8. O projection -> (fabricated TP C3) -> mHC post. --------------
         mla3_dp = (out[:, 0] if out.dim() == 4 else out).contiguous()
         mla3 = mla_dp_output_to_tp(mla3_dp, B)
         pos64 = pos.to(torch.int64).contiguous()
@@ -743,6 +759,13 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         ref_final = ref_o_proj_mhc(mla3, pos64, w["cos_sin"], hidden,
                                    post_t, comb_t, w["wo_a"], w["wo_b"],
                                    run_mhc_post=run_post)
+        if TPDP_MODE:
+            projected = fabricate_tp_o_reduce(projected)
+            ref_final = fabricate_tp_o_reduce(ref_final)
+            mpm.mhc_post_out(projected, hidden, post_t, comb_t,
+                             oproj_ws(B).mhc_output, pdl_enabled())
+            projected = oproj_ws(B).mhc_output
+            ref_final = ref_mhc_post(ref_final, hidden, post_t, comb_t)
         stats["H_oproj_diff"] = max(
             stats.get("H_oproj_diff", 0.0),
             t_fm.calc_diff(projected.float(), ref_final.float()))
@@ -808,9 +831,9 @@ def benchmark(mods, w, ncmp=2048):
     and the graph timing window is opened stream-ordered behind the flush.
     Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
     and lens real, cache bytes arbitrary -- latency-neutral. The chain runs
-    through O-proj; full rank also times mHC post, while TPDP stops before its
-    missing partial reduction. The ported O-proj entry point performs host-side
-    validation, which does not affect graph replay or Kineto device time."""
+    through O-proj and mHC post. TPDP fabricates the missing C3 result outside
+    timing. The ported O-proj entry point performs host-side validation, which
+    does not affect graph replay or Kineto device time."""
     hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
     trace_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "docs", "timeline"))
@@ -836,8 +859,8 @@ def benchmark(mods, w, ncmp=2048):
     if TPDP_MODE:
         print("  --tpdp: MQA/TopK/MLA run ceil(B/2) rows; MLA H=128; O-proj "
               "remains global B x H=64 with the 8-group TP2 shard")
-        print("  Both TP/DP layout handoffs are fabricated outside timing; "
-              "communication is not measured")
+        print("  TP/DP layout handoffs and the O-proj TP reduction are "
+              "fabricated outside timing; communication is not measured")
     print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
     print("  " + "-" * (5 + 9 * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
@@ -1096,9 +1119,14 @@ def benchmark(mods, w, ncmp=2048):
                     force_pdl=pdl_forced(), run_mhc_post=False)
 
             def run_mhcpost():
-                mpm.mhc_post_out(ows.projected, hidden, post_b, comb_b,
+                mpm.mhc_post_out(mhcpost_input, hidden, post_b, comb_b,
                                  ows.mhc_output, pdl_enabled())
             run_oproj()
+            # Stand in for C3 without charging an unimplemented collective to
+            # either operator. The fixed buffer is also suitable for graph
+            # capture, matching the other fabricated TP/DP handoffs above.
+            mhcpost_input = (fabricate_tp_o_reduce(ows.projected)
+                             if TPDP_MODE else ows.projected)
             stage_fns.append(("o_proj", run_oproj))
             if mhc_post_enabled():
                 run_mhcpost()
@@ -1440,10 +1468,7 @@ if __name__ == "__main__":
                          stats.get("E_mla_cos", 0) > 0.98))
         # o_proj is fp8-quantized twice (activation + both weight stages), so
         # the official mega_csa unit-test threshold applies here too.
-        h_name = ("H o_proj partial calc_diff"
-                  if TPDP_MODE
-                  else "H o_proj+mhc_post calc_diff")
-        gates.insert(5, (h_name,
+        gates.insert(5, ("H o_proj+mhc_post calc_diff",
                          stats.get("H_oproj_diff", 1), "< 2e-2",
                          stats.get("H_oproj_diff", 1) < 2e-2))
     ok = True
