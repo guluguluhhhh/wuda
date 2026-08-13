@@ -384,9 +384,8 @@ def run_o_proj_mhc_post(
 
     run_mhc_post=False stops after wo_b and returns workspace.projected: the
     caller then owns the mHC-post launch (the e2e bench does this to time the
-    two halves as separate operators). mhc_post's PDL is its own launch
-    attribute, so splitting the call does not change the pipeline protocol.
-    TP2 always uses run_mhc_post=False and returns an FP32 partial for C3.
+    two halves as separate operators). TP2 always uses run_mhc_post=False and
+    returns an FP32 partial for C3.
     """
 
     import deep_gemm
@@ -560,7 +559,6 @@ def run_o_proj_mhc_post(
                     post,
                     comb,
                     workspace.mhc_output,
-                    use_pdl,
                 )
     return workspace.mhc_output if run_mhc_post else workspace.projected
 

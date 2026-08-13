@@ -20,7 +20,6 @@ struct MhcPostArgs {
   const float* comb = nullptr;                    // [M,4,4], [input,output]
   __nv_bfloat16* output = nullptr;                // [M,4,7168]
   int m = 0;
-  bool use_pdl = true;
 };
 
 // Official DeepSeek-V4 mHC post:

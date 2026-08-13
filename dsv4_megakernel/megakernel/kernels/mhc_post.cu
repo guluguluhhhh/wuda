@@ -4,7 +4,7 @@
 // into one translation unit -- this tree has a single consumer, so the upstream
 // cross-TU forward declaration (detail/validated_launches.h) is unnecessary and
 // bindings live next to the kernel like every other kernel here.
-// The math is unchanged; residual/gate staging is moved before the PDL wait.
+// The math is unchanged.
 
 #include <mhc_post.cuh>
 
@@ -38,7 +38,6 @@ bool ranges_overlap(const BufferRange& lhs, const BufferRange& rhs) {
   return lhs_begin - rhs_begin < rhs.bytes;
 }
 
-template <bool kUsePdl>
 __global__ void mhc_post_kernel(const __nv_bfloat16* attention_out,
                                 const __nv_bfloat16* residual,
                                 const float* post, const float* comb,
@@ -47,9 +46,6 @@ __global__ void mhc_post_kernel(const __nv_bfloat16* attention_out,
   const int row = static_cast<int>(blockIdx.y);
   if (row >= m) return;
 
-  // residual/post/comb were published before wo_b launched and are independent
-  // of its output, so stage them during the wo_b tail. Only attention_out needs
-  // the immediate-predecessor PDL ordering below.
   if (threadIdx.x < 4) mix[threadIdx.x] = post[row * 4 + threadIdx.x];
   if (threadIdx.x < 16) mix[4 + threadIdx.x] = comb[row * 16 + threadIdx.x];
   __syncthreads();
@@ -65,10 +61,6 @@ __global__ void mhc_post_kernel(const __nv_bfloat16* attention_out,
           residual + (row * 4 + i) * kMhcHiddenDim + dim);
     }
   }
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  if constexpr (kUsePdl) cudaGridDependencySynchronize();
-#endif
 
   if (valid) {
     alignas(16) __nv_bfloat16 x[8];
@@ -92,12 +84,6 @@ __global__ void mhc_post_kernel(const __nv_bfloat16* attention_out,
     }
   }
 
-  if constexpr (kUsePdl) {
-    // A following layer may consume the whole output through PDL. Do not
-    // publish this CTA until every vector store issued by the block is done.
-    __syncthreads();
-    if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
-  }
 }
 
 // Launch-only entry (upstream detail::mhc_post_run_validated): the caller must
@@ -105,26 +91,10 @@ __global__ void mhc_post_kernel(const __nv_bfloat16* attention_out,
 cudaError_t launch_validated(const MhcPostArgs& args, cudaStream_t stream) {
   const dim3 block(kThreads);
   const dim3 grid((kVectorsPerRow + kThreads - 1) / kThreads, args.m);
-  if (!args.use_pdl) {
-    mhc_post_kernel<false><<<grid, block, 0, stream>>>(
-        args.attention_out, args.residual, args.post, args.comb, args.output,
-        args.m);
-    return cudaGetLastError();
-  }
-
-  cudaLaunchConfig_t config{};
-  config.gridDim = grid;
-  config.blockDim = block;
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
-  cudaLaunchAttribute attribute{};
-  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute.val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = &attribute;
-  config.numAttrs = 1;
-  return cudaLaunchKernelEx(
-      &config, mhc_post_kernel<true>, args.attention_out, args.residual,
-      args.post, args.comb, args.output, args.m);
+  mhc_post_kernel<<<grid, block, 0, stream>>>(
+      args.attention_out, args.residual, args.post, args.comb, args.output,
+      args.m);
+  return cudaGetLastError();
 }
 
 }  // namespace
@@ -170,8 +140,8 @@ cudaError_t mhc_post_run(const MhcPostArgs& args, cudaStream_t stream) {
 namespace {
 
 void mhc_post_out(torch::Tensor attention_out, torch::Tensor residual,
-                  torch::Tensor post, torch::Tensor comb, torch::Tensor output,
-                  bool use_pdl) {
+                  torch::Tensor post, torch::Tensor comb,
+                  torch::Tensor output) {
   const int64_t m = attention_out.size(0);
   TORCH_CHECK(attention_out.is_cuda() && attention_out.scalar_type() == torch::kBFloat16 &&
                   attention_out.is_contiguous() &&
@@ -201,7 +171,6 @@ void mhc_post_out(torch::Tensor attention_out, torch::Tensor residual,
   args.comb = comb.data_ptr<float>();
   args.output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
   args.m = static_cast<int>(m);
-  args.use_pdl = use_pdl;
   const cudaError_t status = mega::csa::mhc_post_run(
       args, at::cuda::getCurrentCUDAStream().stream());
   TORCH_CHECK(status == cudaSuccess, "mhc_post_run: ", cudaGetErrorString(status));

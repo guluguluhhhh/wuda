@@ -775,7 +775,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             projected = fabricate_tp_o_reduce(projected)
             ref_final = fabricate_tp_o_reduce(ref_final)
             mpm.mhc_post_out(projected, hidden, post_t, comb_t,
-                             oproj_ws(B).mhc_output, pdl_enabled())
+                             oproj_ws(B).mhc_output)
             projected = oproj_ws(B).mhc_output
             ref_final = ref_mhc_post(ref_final, hidden, post_t, comb_t)
         stats["H_oproj_diff"] = max(
@@ -1188,7 +1188,7 @@ def benchmark(mods, w, ncmp=2048, batches=None):
 
             def run_mhcpost():
                 mpm.mhc_post_out(mhcpost_input, hidden, post_b, comb_b,
-                                 ows.mhc_output, pdl_enabled())
+                                 ows.mhc_output)
             run_oproj()
             # Stand in for C3 without charging an unimplemented collective to
             # either operator. The fixed buffer is also suitable for graph
