@@ -18,9 +18,11 @@
 #include <deep_gemm/scheduler/sm100_mqa_logits.cuh>
 #include <deep_gemm/scheduler/sm100_paged_mqa_logits.cuh>
 
+#include "query_rms_rope.cuh"
+
 // FP8 MQA uses DeepGEMM's paged scheduler and device math. This local copy keeps
 // that attention path isolated from the existing FP4 implementation and adds a
-// fourth warpgroup which runs the DSV4 MAIN compressor concurrently.
+// fourth warpgroup which runs query RMSNorm+RoPE and the DSV4 MAIN compressor.
 
 namespace wuda_fp8_mqa {
 
@@ -41,6 +43,77 @@ struct MainCompressorArgs {
     size_t cmp_block_stride_bytes = 0;
     uint32_t seq_len = 0;
 };
+
+struct QueryRmsRopeArgs {
+    const nv_bfloat16* x = nullptr;
+    const long long* positions = nullptr;
+    const float* cos_tab = nullptr;
+    const float* sin_tab = nullptr;
+    nv_bfloat16* out = nullptr;
+    const int* work_flag = nullptr;
+    int input_heads = 0;
+    uint32_t output_rows = 0;
+    float eps = 1e-6f;
+};
+
+// Any warp that has finished its primary role claims one query row from a
+// per-CTA shared queue. A full warp owns one complete 512-wide RMS reduction.
+template <bool kAblation>
+__device__ __forceinline__ void run_query_rms_rope(
+        const QueryRmsRopeArgs& query, uint32_t* next, uint32_t lane) {
+    using namespace wuda_query_rms_rope;
+    if constexpr (kAblation) {
+        if (*query.work_flag == 0)
+            return;
+    }
+
+    while (true) {
+        uint32_t item = 0;
+        if (lane == 0)
+            item = atomicAdd(next, 1u);
+        item = __shfl_sync(0xffffffffu, item, 0);
+        const uint32_t output_row = blockIdx.x + item * gridDim.x;
+        if (output_row >= query.output_rows)
+            break;
+        // MODEL1 FlashMLA always consumes 128 query heads. Both production
+        // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
+        // repeating runtime integer division/modulo in every lane of every row.
+        const uint32_t batch = output_row >> 7;
+        const uint32_t output_head = output_row & 127u;
+        const uint32_t input_head = output_head & (query.input_heads - 1);
+        const uint32_t input_row = batch * query.input_heads + input_head;
+
+        const uint4* input = reinterpret_cast<const uint4*>(
+            query.x + static_cast<uint64_t>(input_row) * kHidden) + lane;
+        uint4* output = reinterpret_cast<uint4*>(
+            query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        uint4 values[kVecsPerThread];
+        #pragma unroll
+        for (int i = 0; i < kVecsPerThread; ++i)
+            values[i] = input[i * kWarp];
+
+        float sumsq = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kVecsPerThread; ++i)
+            sumsq += vec_sumsq(values[i]);
+        const float scale = rsqrtf(
+            warp_sum(sumsq)
+                / static_cast<float>(kHidden) + query.eps);
+
+        const long long position = query.positions[batch];
+        const float* cos = query.cos_tab
+            + static_cast<uint64_t>(position) * (kRope / 2);
+        const float* sin = query.sin_tab
+            + static_cast<uint64_t>(position) * (kRope / 2);
+        output[0] = scale_vec(values[0], scale);
+        if (lane >= 24) {
+            const int pair_base = (lane - 24) * (kElemsPerVec / 2);
+            output[kWarp] = scale_rope_vec(
+                values[1], scale, cos, sin, pair_base);
+        } else
+            output[kWarp] = scale_vec(values[1], scale);
+    }
+}
 
 constexpr int kM1TokenBodyBytes = 576;
 constexpr int kM1ScaleRecordBytes = 8;
@@ -252,7 +325,8 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
+          bool kWaitPrimary = true>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
@@ -344,7 +418,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     // below, matching the register-diet strategy used by the FP4 fused kernel.
     constexpr uint32_t kNumMathRegisters = 128;
 
-    cudaGridDependencySynchronize();
+    if constexpr (kWaitPrimary)
+        cudaGridDependencySynchronize();
 
     if (warp_idx == kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
@@ -761,7 +836,9 @@ template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           uint32_t kNumTailThreads,
           typename logits_dtype_t,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
+          bool kHasQuery = false, bool kWaitPrimary = false,
+          bool kQueryAblation = false>
 CUTLASS_GLOBAL __launch_bounds__(
     kNumSpecializedThreads + kNumMathThreads + kNumTailThreads, 1)
 void sm100_fp8_paged_mqa_logits_fused(
@@ -772,6 +849,7 @@ void sm100_fp8_paged_mqa_logits_fused(
     const uint32_t* schedule_meta,
     const wuda_fp8_mqa::MainCompressorArgs compressor,
     const float compressor_eps,
+    const wuda_fp8_mqa::QueryRmsRopeArgs query,
     const __grid_constant__ cute::TmaDescriptor tensor_map_q,
     const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
     const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -786,11 +864,18 @@ void sm100_fp8_paged_mqa_logits_fused(
     DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit,
                      "Invalid split/page size");
 
+    __shared__ uint32_t query_next;
+    if constexpr (kHasQuery) {
+        if (threadIdx.x == 0)
+            query_next = 0;
+        __syncthreads();
+    }
+
     const uint32_t warp = cutlass::canonical_warp_idx_sync();
     const uint32_t lane = ptx::get_lane_idx();
     if (warp >= kFirstTailWarp) {
+        const uint32_t group = warp - kFirstTailWarp;
         if (compressor.state != nullptr) {
-            const uint32_t group = warp - kFirstTailWarp;
             // DeepGEMM assigns short schedules from low to high SM indices.
             // Reverse the independent compressor mapping so short decode steps
             // use otherwise-idle CTAs instead of contending with attention.
@@ -803,6 +888,12 @@ void sm100_fp8_paged_mqa_logits_fused(
                         compressor, row, position, group, lane,
                         compressor_eps, /*barrier_id=*/2);
             }
+        }
+        if constexpr (kHasQuery) {
+            if constexpr (kWaitPrimary)
+                cudaGridDependencySynchronize();
+            wuda_fp8_mqa::run_query_rms_rope<kQueryAblation>(
+                query, &query_next, lane);
         }
         return;
     }
@@ -822,10 +913,14 @@ void sm100_fp8_paged_mqa_logits_fused(
         kNumQStages, kNumKVStages, 0,
         kNumSpecializedThreads, kNumMathThreads,
         cutlass::float_e4m3_t, logits_dtype_t, float,
-        decltype(make_scheduler), kNumMathWarpGroups>(
+        decltype(make_scheduler), kNumMathWarpGroups, kWaitPrimary>(
             logits_stride, logits,
             tensor_map_q, tensor_map_sf_q, tensor_map_kv,
             tensor_map_sf_kv, tensor_map_weights, make_scheduler);
+
+    if constexpr (kHasQuery)
+        wuda_fp8_mqa::run_query_rms_rope<kQueryAblation>(
+            query, &query_next, lane);
 }
 
 } // namespace deep_gemm

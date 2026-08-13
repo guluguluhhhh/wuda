@@ -207,6 +207,7 @@ wq_b_proj_kernel(
     const float* __restrict__ rope_cos,           // [max_pos, 32]
     const float* __restrict__ rope_sin,           // [max_pos, 32]
     int mock_post,                                 // 1 = drain only, skip the transform (baseline)
+    int post_q_pdl,                               // release the post-Q dependent branch
     const __grid_constant__ idx_comp::Args comp,   // fused indexer compressor (kv==nullptr => off)
     int64_t* prof)                                 // clock64 timing buffer (nullptr if disabled)
 {
@@ -262,6 +263,12 @@ wq_b_proj_kernel(
 
     ptx::cluster_sync();
     cudaGridDependencySynchronize();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Release the post-Q query branch.  Its own PDL wait still protects every
+    // read of D, while its setup can overlap this GEMM's main work.
+    if (post_q_pdl)
+        asm volatile("griddepcontrol.launch_dependents;" :::);
+#endif
 
     // SMEM bases (swap-AB: MMA A-operand = weight (smem_b), B-operand = activation (smem_a)).
     auto* smem_a_base = reinterpret_cast<__nv_fp8_e4m3*>(s.smem_a);   // activation
@@ -1297,6 +1304,7 @@ static std::vector<torch::Tensor> run_wq_b(
         // indexer compressor / winkv chains also run on warps 8..15.
         dim3 block((mock_post && !comp_on && !win_on) ? TPB : TPB_IDX, 1, 1);
         int mock_i = mock_post ? 1 : 0;
+        int post_q_pdl = pdl ? 1 : 0;
 
         // Activation quant producer: launched FIRST on the same stream; the
         // GEMM below is PDL-linked (programmatic stream serialization), so its
@@ -1339,7 +1347,7 @@ static std::vector<torch::Tensor> run_wq_b(
             &M, &grid_size, &num_clusters, &ssq_ptr,
             &iqd, &iq_ws_ptr, &iq_drain_ready_ptr, &iq_drain_seq,
             &q_pos_ptr, &cos_ptr, &sin_ptr,
-            &mock_i, &comp, &prof_dev
+            &mock_i, &post_q_pdl, &comp, &prof_dev
         };
         auto err = cudaLaunchKernelExC(&config, kernel_ptr, ptr_args);
         TORCH_CHECK(err == cudaSuccess, "kernel launch failed: ", cudaGetErrorString(err));

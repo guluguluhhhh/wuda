@@ -123,31 +123,74 @@ static void launch_typed(
     const int* context_lens, float* logits, const int* block_table,
     const int* schedule_meta,
     const wuda_fp8_mqa::MainCompressorArgs& compressor,
+    const wuda_fp8_mqa::QueryRmsRopeArgs& query,
     float compressor_eps,
     const CUtensorMap& q_map, const CUtensorMap& sf_q_map,
     const CUtensorMap& kv_map, const CUtensorMap& sf_kv_map,
-    const CUtensorMap& weights_map, cudaStream_t stream) {
-    auto kernel = &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
-        1, kNumHeads, kHeadDim, kPageKV,
-        true, false, kNumQStages, kKVStages,
-        kSplitKV, kSplitsPerChunk,
-        kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
-        float>;
+    const CUtensorMap& weights_map, cudaStream_t stream, bool pdl) {
+    using KernelPtr = void (*)(
+        uint32_t, uint32_t, uint32_t, const uint32_t*, float*,
+        const uint32_t*, const uint32_t*, const uint32_t*,
+        wuda_fp8_mqa::MainCompressorArgs, float,
+        wuda_fp8_mqa::QueryRmsRopeArgs,
+        cute::TmaDescriptor, cute::TmaDescriptor, cute::TmaDescriptor,
+        cute::TmaDescriptor, cute::TmaDescriptor);
+    KernelPtr kernel;
+    const bool query_ablation = query.work_flag != nullptr;
+    if (query.x == nullptr) {
+        kernel = &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
+            1, kNumHeads, kHeadDim, kPageKV,
+            true, false, kNumQStages, kKVStages,
+            kSplitKV, kSplitsPerChunk,
+            kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
+            float, kNumMathThreads / 128, false, false, false>;
+    } else if (pdl) {
+        kernel = query_ablation
+            ? &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
+                1, kNumHeads, kHeadDim, kPageKV,
+                true, false, kNumQStages, kKVStages,
+                kSplitKV, kSplitsPerChunk,
+                kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
+                float, kNumMathThreads / 128, true, true, true>
+            : &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
+                1, kNumHeads, kHeadDim, kPageKV,
+                true, false, kNumQStages, kKVStages,
+                kSplitKV, kSplitsPerChunk,
+                kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
+                float, kNumMathThreads / 128, true, true, false>;
+    } else {
+        kernel = query_ablation
+            ? &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
+                1, kNumHeads, kHeadDim, kPageKV,
+                true, false, kNumQStages, kKVStages,
+                kSplitKV, kSplitsPerChunk,
+                kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
+                float, kNumMathThreads / 128, true, false, true>
+            : &deep_gemm::sm100_fp8_paged_mqa_logits_fused<
+                1, kNumHeads, kHeadDim, kPageKV,
+                true, false, kNumQStages, kKVStages,
+                kSplitKV, kSplitsPerChunk,
+                kNumSpecializedThreads, kNumMathThreads, kNumTailThreads,
+                float, kNumMathThreads / 128, true, false, false>;
+    }
 
     constexpr int kMaxDevices = 16;
-    static bool configured[kMaxDevices] = {};
+    static bool configured[kMaxDevices][2][2][2] = {};
     int device = 0;
     TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice failed");
     TORCH_CHECK(device >= 0 && device < kMaxDevices,
                 "device ordinal exceeds local configuration cache");
     const int smem = shared_memory_bytes<kKVStages>();
-    if (!configured[device]) {
+    const int query_idx = query.x != nullptr ? 1 : 0;
+    const int ablation_idx = query_ablation ? 1 : 0;
+    const int wait_idx = query.x != nullptr && pdl ? 1 : 0;
+    if (!configured[device][query_idx][ablation_idx][wait_idx]) {
         const cudaError_t attr = cudaFuncSetAttribute(
             reinterpret_cast<void*>(kernel),
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         TORCH_CHECK(attr == cudaSuccess, "cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(attr), " smem=", smem);
-        configured[device] = true;
+        configured[device][query_idx][ablation_idx][wait_idx] = true;
     }
 
     cudaLaunchConfig_t config{};
@@ -155,6 +198,13 @@ static void launch_typed(
     config.blockDim = dim3(kThreads, 1, 1);
     config.dynamicSmemBytes = smem;
     config.stream = stream;
+    cudaLaunchAttribute attribute{};
+    if (pdl) {
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+    }
     const cudaError_t launch = cudaLaunchKernelEx(
         &config, kernel,
         static_cast<uint32_t>(batch),
@@ -164,7 +214,7 @@ static void launch_typed(
         reinterpret_cast<const uint32_t*>(block_table),
         static_cast<const uint32_t*>(nullptr),
         reinterpret_cast<const uint32_t*>(schedule_meta),
-        compressor, compressor_eps,
+        compressor, compressor_eps, query,
         q_map, sf_q_map, kv_map, sf_kv_map, weights_map);
     TORCH_CHECK(launch == cudaSuccess, "mqa_logits_fp8 launch failed: ",
                 cudaGetErrorString(launch));
@@ -260,6 +310,81 @@ static wuda_fp8_mqa::MainCompressorArgs make_compressor_args(
     return args;
 }
 
+static wuda_fp8_mqa::QueryRmsRopeArgs make_query_args(
+    const c10::optional<torch::Tensor>& query_x,
+    const c10::optional<torch::Tensor>& query_positions,
+    const c10::optional<torch::Tensor>& query_cos,
+    const c10::optional<torch::Tensor>& query_sin,
+    const c10::optional<torch::Tensor>& query_out,
+    int64_t query_input_heads, double query_eps,
+    const c10::optional<torch::Tensor>& query_work_flag) {
+    wuda_fp8_mqa::QueryRmsRopeArgs args{};
+    if (!query_x.has_value())
+        return args;
+
+    TORCH_CHECK(query_positions && query_cos && query_sin && query_out,
+                "query RMSNorm+RoPE tensors must be provided together");
+    auto check = [](const torch::Tensor& tensor, at::ScalarType dtype,
+                    const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous()
+                    && tensor.scalar_type() == dtype,
+                    name, " must be contiguous CUDA with the expected dtype");
+    };
+    check(*query_x, torch::kBFloat16, "query_x");
+    check(*query_positions, torch::kInt64, "query_positions");
+    check(*query_cos, torch::kFloat32, "query_cos");
+    check(*query_sin, torch::kFloat32, "query_sin");
+    check(*query_out, torch::kBFloat16, "query_out");
+    TORCH_CHECK(query_input_heads > 0
+                && query_x->numel() % (query_input_heads * 512) == 0,
+                "query_x must contain complete [B,input_heads,512] rows");
+    const int64_t output_batch = query_positions->numel();
+    TORCH_CHECK(output_batch > 0
+                && query_out->numel() % (output_batch * 512) == 0,
+                "query_out must contain complete [B,output_heads,512] rows");
+    const int64_t input_batch =
+        query_x->numel() / (query_input_heads * 512);
+    const int64_t output_heads = query_out->numel() / (output_batch * 512);
+    TORCH_CHECK(output_batch <= input_batch && output_heads > 0
+                && output_heads % query_input_heads == 0,
+                "invalid fused query batch/head geometry");
+    TORCH_CHECK(output_heads == 128
+                && (query_input_heads == 64 || query_input_heads == 128),
+                "fused MODEL1 query requires output_heads=128 and "
+                "query_input_heads=64 or 128");
+    TORCH_CHECK(output_batch <= UINT32_MAX / output_heads,
+                "fused query row count exceeds uint32 range");
+    TORCH_CHECK(query_cos->dim() == 2 && query_cos->size(1) == 32
+                && query_sin->sizes() == query_cos->sizes(),
+                "query cos/sin tables must be float32 [max_pos,32]");
+    TORCH_CHECK(query_x->get_device() == query_out->get_device()
+                && query_positions->get_device() == query_x->get_device()
+                && query_cos->get_device() == query_x->get_device()
+                && query_sin->get_device() == query_x->get_device(),
+                "fused query tensors must be on one device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(query_x->data_ptr()) % 16 == 0
+                && reinterpret_cast<uintptr_t>(query_out->data_ptr()) % 16 == 0,
+                "query_x and query_out must be 16-byte aligned");
+
+    args.x = reinterpret_cast<const nv_bfloat16*>(query_x->data_ptr());
+    args.positions = reinterpret_cast<const long long*>(
+        query_positions->data_ptr<int64_t>());
+    args.cos_tab = query_cos->data_ptr<float>();
+    args.sin_tab = query_sin->data_ptr<float>();
+    args.out = reinterpret_cast<nv_bfloat16*>(query_out->data_ptr());
+    args.input_heads = static_cast<int>(query_input_heads);
+    args.output_rows = static_cast<uint32_t>(output_batch * output_heads);
+    args.eps = static_cast<float>(query_eps);
+    if (query_work_flag.has_value()) {
+        check(*query_work_flag, torch::kInt32, "query_work_flag");
+        TORCH_CHECK(query_work_flag->numel() == 1
+                    && query_work_flag->get_device() == query_x->get_device(),
+                    "query_work_flag must be a CUDA int32 scalar on query_x device");
+        args.work_flag = query_work_flag->data_ptr<int>();
+    }
+    return args;
+}
+
 static void mqa_logits_fp8_decode_out(
     torch::Tensor q, torch::Tensor kv_cache, torch::Tensor weights,
     torch::Tensor context_lens, torch::Tensor block_table,
@@ -279,7 +404,16 @@ static void mqa_logits_fp8_decode_out(
     c10::optional<torch::Tensor> cmp_cache,
     c10::optional<torch::Tensor> cmp_dst,
     int64_t cmp_entries_per_block,
-    int64_t cmp_block_stride_bytes) {
+    int64_t cmp_block_stride_bytes,
+    c10::optional<torch::Tensor> query_x,
+    c10::optional<torch::Tensor> query_positions,
+    c10::optional<torch::Tensor> query_cos,
+    c10::optional<torch::Tensor> query_sin,
+    c10::optional<torch::Tensor> query_out,
+    int64_t query_input_heads,
+    double query_eps,
+    c10::optional<torch::Tensor> query_work_flag,
+    bool pdl) {
     TORCH_CHECK(q.is_cuda() && q.is_contiguous()
                 && q.scalar_type() == torch::kFloat8_e4m3fn
                 && q.dim() == 3 && q.size(1) == kNumHeads
@@ -345,6 +479,9 @@ static void mqa_logits_fp8_decode_out(
         comp_state_row, comp_state_ring_entries, comp_q8, comp_s8,
         comp_rope, cmp_cache, cmp_dst, cmp_entries_per_block,
         cmp_block_stride_bytes);
+    const auto query = make_query_args(
+        query_x, query_positions, query_cos, query_sin, query_out,
+        query_input_heads, query_eps, query_work_flag);
 
     CUtensorMap q_map = make_tma_2d(
         "q", q.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
@@ -373,8 +510,8 @@ static void mqa_logits_fp8_decode_out(
     launch_typed<STAGES, PAGE>(batch, logits_stride, block_table_stride, \
         context_lens.data_ptr<int>(), logits.data_ptr<float>(), \
         block_table.data_ptr<int>(), schedule_meta.data_ptr<int>(), \
-        compressor, static_cast<float>(comp_eps), q_map, sf_q_map, \
-        kv_map, sf_kv_map, weights_map, stream)
+        compressor, query, static_cast<float>(comp_eps), q_map, sf_q_map, \
+        kv_map, sf_kv_map, weights_map, stream, pdl)
 #define DISPATCH_PAGE(STAGES) \
     do { \
         if (kv_entries_per_block == 32) LAUNCH_PAGE(STAGES, 32); \
@@ -426,7 +563,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("cmp_cache") = c10::nullopt,
         py::arg("cmp_dst") = c10::nullopt,
         py::arg("cmp_entries_per_block") = 0,
-        py::arg("cmp_block_stride_bytes") = 0);
+        py::arg("cmp_block_stride_bytes") = 0,
+        py::arg("query_x") = c10::nullopt,
+        py::arg("query_positions") = c10::nullopt,
+        py::arg("query_cos") = c10::nullopt,
+        py::arg("query_sin") = c10::nullopt,
+        py::arg("query_out") = c10::nullopt,
+        py::arg("query_input_heads") = 0,
+        py::arg("query_eps") = 1e-6,
+        py::arg("query_work_flag") = c10::nullopt,
+        py::arg("pdl") = false);
 
     module.def(
         "mqa_compressor_fp8_standalone",

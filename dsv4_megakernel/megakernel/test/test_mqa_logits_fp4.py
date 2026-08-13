@@ -38,7 +38,7 @@ def _deep_gemm_dir():
     if override:
         return os.path.abspath(override)
     return os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "DeepGEMM"))
+        os.path.dirname(__file__), "..", "..", "..", "..", "DeepGEMM"))
 
 
 # ==================================================================================

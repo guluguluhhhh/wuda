@@ -162,7 +162,7 @@ def get_deep_gemm(pdl: bool = True):
             except ModuleNotFoundError:
                 here = os.path.dirname(os.path.abspath(__file__))
                 cand = os.path.abspath(
-                    os.path.join(here, "..", "..", "..", "DeepGEMM"))
+                    os.path.join(here, "..", "..", "..", "..", "DeepGEMM"))
                 if not os.path.isdir(os.path.join(cand, "deep_gemm")):
                     raise ModuleNotFoundError(
                         "deep_gemm not found. Either `pip install .` inside "

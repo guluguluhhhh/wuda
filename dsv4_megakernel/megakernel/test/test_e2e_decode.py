@@ -3,10 +3,10 @@ test_e2e_decode.py -- END-TO-END DSV4 decode chain over the design-image KV
 cache management (test/kv_cache_manager.py):
 
   hc_fused(nopc + fused attn_norm) -> front_mixed_swapAB(+hc tail) ->
-  qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + head_ssq + indexer compressor
-  + winkv) -> Wuda fused FP8 paged MQA + MAIN compressor -> topk_v2(512, page
-  transform) -> flash_mla(SWA pool + compressed pool, fused query_rms_rope,
-  per-head attn_sink) ->
+  qnorm_quant(PDL) + wq_b(ALL fusions: idxpost + indexer compressor + winkv)
+  -> query RMSNorm+RoPE (PDL side branch) + Wuda fused FP8 paged MQA + MAIN
+  compressor -> topk_v2(512, page transform) -> official flash_mla(SWA pool +
+  compressed pool, native 512-d query, per-head attn_sink) ->
   o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
 
 The tail follows the official mega_csa post-attention boundary. o_proj_csa.py
@@ -37,7 +37,7 @@ and the original global-B TP2 O-proj shard (64 heads, 8 groups). Layout handoffs
 remain outside this single-process test.
 """
 import argparse
-import os, sys, math, warnings, torch
+import json, os, sys, math, tempfile, warnings, torch
 warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,48 +51,22 @@ import test_wq_b_fp8_gemm as t_wq
 import o_proj_csa
 
 def _import_flash_mla():
-    """Import flash_mla from the SIBLING source package (identical layout on
-    the dev box and B300): dsv4_megakernel/rmsnorm_epilogue_rope_flashmla_v4_
-    b300_20260726/FlashMLA. The installed wheel may predate this interface
-    (no fused-q kwargs), so the SOURCE tree wins; its compiled backend
-    flash_mla.cuda resolves in order:
-      1. a .so built inside the source package (pip install -e / build_ext)
-      2. artifacts/cuda.cpython-*.so packaged next to it (ABI must match)
-      3. fall back to the installed wheel (old interface; stage E then uses
-         whatever it offers)."""
-    import glob, importlib, importlib.util
+    """Import the official FlashMLA checkout, never the private fused-query
+    fork or an older installed wheel."""
+    import importlib
     here = os.path.dirname(os.path.abspath(__file__))
-    pkg = os.path.abspath(os.path.join(
-        here, "..", "..", "rmsnorm_epilogue_rope_flashmla_v4_b300_20260726"))
-    src = os.path.join(pkg, "FlashMLA")
-    if os.path.isdir(src):
-        if not glob.glob(os.path.join(src, "flash_mla", "cuda*.so")):
-            # ABI probe: try any packaged backend; a cpython-version mismatch
-            # (e.g. artifacts built for 3.10 under a 3.11 env) just skips.
-            for cand in glob.glob(os.path.join(pkg, "artifacts", "cuda*.so")):
-                try:
-                    spec = importlib.util.spec_from_file_location(
-                        "flash_mla.cuda", cand)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    sys.modules["flash_mla.cuda"] = mod
-                    print(f"[flash_mla] packaged backend: {cand}")
-                    break
-                except Exception as e:
-                    print(f"[flash_mla] artifact {os.path.basename(cand)} "
-                          f"unusable ({e})")
-        sys.path.insert(0, src)
-        try:
-            m = importlib.import_module("flash_mla")
-            print(f"[flash_mla] source tree: {src}")
-            return m
-        except Exception as e:   # ABI mismatch etc. -> installed wheel
-            print(f"[flash_mla] source import failed ({e}); trying the wheel")
-            sys.path.remove(src)
-            for k in [k for k in sys.modules if k.startswith("flash_mla")]:
-                del sys.modules[k]
+    default_src = os.path.abspath(os.path.join(
+        here, "..", "..", "..", "..", "FlashMLA"))
+    src = os.path.abspath(os.environ.get("FLASH_MLA_DIR", default_src))
+    if not os.path.isdir(os.path.join(src, "flash_mla")):
+        raise ModuleNotFoundError(f"official FlashMLA checkout not found at {src}")
+    for key in [k for k in sys.modules if k.startswith("flash_mla")]:
+        del sys.modules[key]
+    sys.path.insert(0, src)
     m = importlib.import_module("flash_mla")
-    print(f"[flash_mla] installed wheel: {m.__file__}")
+    if not os.path.realpath(m.__file__).startswith(os.path.realpath(src) + os.sep):
+        raise ImportError(f"expected FlashMLA from {src}, got {m.__file__}")
+    print(f"[flash_mla] official source tree: {src}")
     return m
 
 
@@ -100,24 +74,10 @@ try:
     flash_mla = _import_flash_mla()
     HAS_FLASH_MLA = True
     import inspect
-    # Old wheels lack the FUSED query-prologue kwargs; fall back to the
-    # standalone query_rms_rope KERNEL (same CUDA op, separate launch).
-    FMLA_FUSED_Q = "q_rms_sum_sq" in inspect.signature(
-        flash_mla.flash_mla_with_kvcache).parameters
-    # OFFICIAL per-head attn_sink (model.py L456 is an nn.Parameter, so it is a
-    # CHECKPOINT weight, not an option). Old wheels lack the kwarg; the torch
-    # ref then drops it too so stage E stays self-consistent -- but such a run
-    # no longer matches official inference.
     FMLA_ATTN_SINK = "attn_sink" in inspect.signature(
         flash_mla.flash_mla_with_kvcache).parameters
     if not FMLA_ATTN_SINK:
-        print("[warn] flash_mla has no attn_sink kwarg -- stage E runs the "
-              "SINKLESS chain (kernel and ref both), which is NOT official "
-              "model.py semantics")
-    if not FMLA_FUSED_Q and not hasattr(flash_mla, "query_rms_rope"):
-        print("[warn] flash_mla has neither fused-q nor query_rms_rope -- "
-              "stage E skipped (build the source package on this box)")
-        HAS_FLASH_MLA = False
+        raise ImportError("official FlashMLA build lacks attn_sink support")
 except Exception as e:
     print(f"[warn] flash_mla unavailable ({e}) -- stage E skipped")
     HAS_FLASH_MLA = False
@@ -140,6 +100,9 @@ TPDP_MODE = False
 MLA_DP_MODE = False
 INDEXER_FP8 = True
 PDL_MODE = "on"
+Q_RMS_MAX_BLOCKS = 1024
+Q_RMS_ABLATION = False
+FUSE_QUERY_RMS = True
 
 
 def configure_geometry(tpdp=False):
@@ -163,6 +126,16 @@ def pdl_enabled():
 
 def pdl_forced():
     return PDL_MODE == "all"
+
+
+def fused_query_rms():
+    return INDEXER_FP8 and FUSE_QUERY_RMS
+
+
+def inplace_query_rms():
+    # Full rank has a one-to-one [B,128,512] input/output mapping. TPDP expands
+    # 64 local WQ heads to 128 DP attention heads and therefore stays out-of-place.
+    return fused_query_rms() and not TPDP_MODE
 
 
 def post_attn_enabled():
@@ -234,6 +207,23 @@ def load_mhc_post():
     return load(
         name="e2e_mhc_post",
         sources=[os.path.join(proj, "kernels", "mhc_post.cu")],
+        extra_include_paths=[os.path.join(proj, "include")],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math",
+                           f"-gencode=arch=compute_{sm}a,code=sm_{sm}a"],
+        verbose=False,
+    )
+
+
+def load_query_rms_rope():
+    """Build the allocation-free post-Q_B RMSNorm+RoPE side branch."""
+    from torch.utils.cpp_extension import load
+    here = os.path.dirname(os.path.abspath(__file__))
+    proj = os.path.dirname(here)
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    return load(
+        name="e2e_query_rms_rope",
+        sources=[os.path.join(proj, "kernels", "rmsnorm_prod.cu")],
         extra_include_paths=[os.path.join(proj, "include")],
         extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math",
                            f"-gencode=arch=compute_{sm}a,code=sm_{sm}a"],
@@ -481,7 +471,7 @@ def run_mhc_hybrid(dg, hcm, hidden, w, collapsed, pre, po, cb,
 
 
 def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
-    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
+    hcm, fmm, wqm, qrm, mqm, mq8m, tkm, mpm = mods
     B = len(slots)
     st = mgr.step_begin(slots)
     pos, q_pos = st["pos"], st["q_pos"]
@@ -527,11 +517,30 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     #       the indexer fused pages AND the SWA MODEL1 pages directly --------
     xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
     xq_sf = torch.empty(B, 12, device=DEV, dtype=torch.uint8)
-    ssq = torch.zeros(B, WQ_HEADS, device=DEV, dtype=torch.float32)
     weights64 = w64
+    B_mla = mla_batch(B)
+    pos_mla = pos[:B_mla]
+    q_ready = (None if inplace_query_rms() else
+               torch.empty(B_mla, 1, attention_heads(), Q_DIM,
+                           device=DEV, dtype=torch.bfloat16))
+
+    # Prepare the MQA metadata before entering the PDL submission sequence.
+    ncmp = mgr.n_compressed(slots, pos)
+    logits_buf.fill_(float("-inf"))
+    B_local = local_batch(B)
+    owned = slice(0, B_local)
+    idx_bt = mgr.block_table("idx", slots)[owned]
+    if INDEXER_FP8:
+        ctx2 = ncmp[owned].view(-1, 1).contiguous()
+        schedule = get_dg().get_paged_mqa_logits_metadata(
+            ctx2, mgr.entries_per_block["idx"], get_dg().get_num_sms())
+
+    # Submit the PDL pair without intervening CUDA work. The FP8 MQA grid waits
+    # for Q_B, then its independent tail warpgroup produces q_ready alongside
+    # attention and the MAIN compressor.
     rets = wqm.wq_b_proj_gemm_merged(
         xq, t_wq.as_ue8m0(xq_sf), w["wq_fp8"], w["wq_sf"], q_pos,
-        w["cos"], w["sin"], head_ssq=ssq, mock_post=False,
+        w["cos"], w["sin"], head_ssq=None, enable_ssq=False, mock_post=False,
         cmp_pos=pos,
         idx_norm=w["idx_norm"],
         cos_tab=w["cos"], sin_tab=w["sin"],
@@ -549,31 +558,9 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         iq_weights=weights64 if INDEXER_FP8 else None,
         pdl=pdl_enabled())
     yq, iq_fp4, iq_sf = rets[0], rets[1], rets[2]
-    qr, sr = t_wq.ref_qnorm_quant(y[:, :1536], w["q_norm"])
-    stats["B_xq_match"] = min(stats.get("B_xq_match", 1.0),
-                              (xq.view(torch.uint8) == qr.view(torch.uint8))
-                              .float().mean().item())
-
-    # -- 4. MAIN state: published by the FRONT-EMIT epilogue above (fp32
-    #       accum + ape[pos%4] on the score half; model.py L332 contract) --
-
-    # -- 5. mqa_logits (paged idx pool) + MAIN compressor tail: the KERNEL
-    #       reads the folded state ring and writes the Main-compressed
-    #       MODEL1 pages directly ------------------------------------------
-    ncmp = mgr.n_compressed(slots, pos)
-    logits_buf.fill_(float("-inf"))
-    # One process models one DP rank: attention and TopK own only these rows.
-    # The fused main-compressor still receives the unsliced global-B tensors so
-    # each rank updates its complete replicated MODEL1 cache.
-    B_local = local_batch(B)
-    owned = slice(0, B_local)
-    # PRODUCTION form: compact comp_q8/s8/rope OMITTED (cache mode writes the
-    # MODEL1 pages directly; compact would double-write ~600B/row).
-    idx_bt = mgr.block_table("idx", slots)[owned]
-    if INDEXER_FP8:
-        ctx2 = ncmp[owned].view(-1, 1).contiguous()
-        schedule = get_dg().get_paged_mqa_logits_metadata(
-            ctx2, mgr.entries_per_block["idx"], get_dg().get_num_sms())
+    if inplace_query_rms():
+        q_ready = yq.view(B_mla, 1, attention_heads(), Q_DIM)
+    if fused_query_rms():
         mq8m.mqa_logits_fp8_decode_out(
             iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
             schedule, logits_buf[owned],
@@ -585,22 +572,51 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             cmp_dst=st["cmp_dst"],
             comp_state_ring_entries=mgr.state_ring_entries,
             cmp_entries_per_block=mgr.entries_per_block["cmp"],
-            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
+            query_x=yq, query_positions=pos_mla, query_cos=w["cos"],
+            query_sin=w["sin"], query_out=q_ready,
+            query_input_heads=WQ_HEADS, query_eps=EPS,
+            pdl=pdl_enabled())
         logits = logits_buf[owned]
     else:
-        mqm.mqa_logits_fp4_decode_out(
-            iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned],
-            ncmp[owned], idx_bt, logits_buf[owned],
-            cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
-            sin_tab=w["sin"], comp_state=mgr.main_state,
-            comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-            cmp_dst=st["cmp_dst"],
-            kv_entries_per_block=mgr.entries_per_block["idx"],
-            kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
-            comp_state_ring_entries=mgr.state_ring_entries,
-            cmp_entries_per_block=mgr.entries_per_block["cmp"],
-            cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
-        logits = logits_buf[owned]
+        qrm.rmsnorm_rope_out(yq, pos_mla, w["cos"], w["sin"], q_ready,
+                             WQ_HEADS, EPS, pdl_enabled(), Q_RMS_MAX_BLOCKS)
+        if INDEXER_FP8:
+            mq8m.mqa_logits_fp8_decode_out(
+                iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
+                schedule, logits_buf[owned],
+                kv_entries_per_block=mgr.entries_per_block["idx"],
+                kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
+                sin_tab=w["sin"], comp_state=mgr.main_state,
+                comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+                cmp_dst=st["cmp_dst"],
+                comp_state_ring_entries=mgr.state_ring_entries,
+                cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
+                pdl=pdl_enabled())
+            logits = logits_buf[owned]
+        else:
+            mqm.mqa_logits_fp4_decode_out(
+                iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned],
+                ncmp[owned], idx_bt, logits_buf[owned],
+                cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
+                sin_tab=w["sin"], comp_state=mgr.main_state,
+                comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+                cmp_dst=st["cmp_dst"],
+                kv_entries_per_block=mgr.entries_per_block["idx"],
+                kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                comp_state_ring_entries=mgr.state_ring_entries,
+                cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+            logits = logits_buf[owned]
+
+    qr, _ = t_wq.ref_qnorm_quant(y[:, :1536], w["q_norm"])
+    stats["B_xq_match"] = min(stats.get("B_xq_match", 1.0),
+                              (xq.view(torch.uint8) == qr.view(torch.uint8))
+                              .float().mean().item())
+
+    # -- 4. MAIN state is published by FRONT; MQA also writes compressed KV.
     # Assert every live score is finite (no NaN/+inf in logits).
     torch.cuda.synchronize()
     finite = True
@@ -651,22 +667,33 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     else:
         page_idx_full = page_idx
 
-    # -- 7. flashMLA (SWA pool + compressed pool, fused q rms+rope) -------
+    rc = w["cos"][pos_mla].view(B_mla, 1, 32).contiguous()
+    rs = w["sin"][pos_mla].view(B_mla, 1, 32).contiguous()
+    if inplace_query_rms():
+        # yq has been normalized in-place. Reconstruct the raw BF16 GEMM output
+        # from the already-published Q_B inputs for the correctness reference.
+        q_raw = (t_wq.dequant_act(xq, xq_sf)
+                 @ t_wq.dequant_weight(
+                     w["wq_fp8"][t_wq.N_IDX:],
+                     w["wq_sf"].view(torch.uint8)[t_wq.N_IDX // 128:]).t())
+        q_raw = q_raw.bfloat16().view(B, 1, WQ_HEADS, Q_DIM)[:B_mla]
+    else:
+        q_raw = yq.view(B, 1, WQ_HEADS, Q_DIM)[:B_mla]
+    if MLA_DP_MODE:
+        q_raw = q_raw.repeat(1, 1, Q_HEADS // WQ_HEADS, 1)
+    q_ref = q_raw.float()
+    q_ref = q_ref * torch.rsqrt(q_ref.square().mean(-1, keepdim=True) + EPS)
+    even, odd = q_ref[..., 448::2].clone(), q_ref[..., 449::2].clone()
+    rc_heads, rs_heads = rc.unsqueeze(-2), rs.unsqueeze(-2)
+    q_ref[..., 448::2] = even * rc_heads - odd * rs_heads
+    q_ref[..., 449::2] = even * rs_heads + odd * rc_heads
+    stats["Q_rms_rope_diff"] = max(
+        stats.get("Q_rms_rope_diff", 0.0),
+        t_fm.calc_diff(q_ready.float(), q_ref.bfloat16().float()))
+
+    # -- 7. official flashMLA over the native post-RMSNorm+RoPE query ------
     if post_attn_enabled():
-        B_mla = mla_batch(B)
-        if MLA_DP_MODE:
-            # Simulate the peer TP head shard without running a collective.
-            q_shard = yq.view(B, 1, WQ_HEADS, Q_DIM)[owned]
-            ssq_shard = ssq.view(B, 1, WQ_HEADS)[owned]
-            q_raw = torch.cat((q_shard, q_shard), dim=2).contiguous()
-            sum_sq = torch.cat((ssq_shard, ssq_shard), dim=2).contiguous()
-        else:
-            q_raw = yq.view(B, 1, WQ_HEADS, Q_DIM)
-            sum_sq = ssq.view(B, 1, WQ_HEADS)
-        pos_mla = pos[owned] if MLA_DP_MODE else pos
         slots_mla = slots[:B_mla] if MLA_DP_MODE else slots
-        rc = w["cos"][pos_mla].view(B_mla, 1, 32).contiguous()
-        rs = w["sin"][pos_mla].view(B_mla, 1, 32).contiguous()
         swa_idx, swa_len = mgr.swa_indices(slots, pos, SWA_TOPK)
         if MLA_DP_MODE:
             swa_idx, swa_len = swa_idx[owned], swa_len[owned]
@@ -676,18 +703,9 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         # cache_seqlens/topk_length values stay identical (interface doc);
         # our lens advance each step.
         sched, _ = flash_mla.get_mla_metadata()
-        if FMLA_FUSED_Q:
-            q_in, fused_q = q_raw, dict(q_rms_sum_sq=sum_sq,
-                                        q_rope_cos=rc, q_rope_sin=rs)
-        else:   # old wheel: standalone query_rms_rope kernel, plain q after
-            q_in, fused_q = flash_mla.query_rms_rope(q_raw, sum_sq, rc, rs,
-                                                     EPS), {}
-        # attn_sink is orthogonal to the fused-q prologue: it only rescales the
-        # softmax denominator, so it applies to both wheel generations.
-        sink = w["attn_sink"] if FMLA_ATTN_SINK else None
-        sink_kw = {} if sink is None else dict(attn_sink=sink)
+        sink = w["attn_sink"]
         res = flash_mla.flash_mla_with_kvcache(
-            q=q_in, k_cache=mgr.model1_cache_view("swa"),
+            q=q_ready, k_cache=mgr.model1_cache_view("swa"),
             block_table=None, cache_seqlens=None, head_dim_v=Q_DIM,
             tile_scheduler_metadata=sched, num_splits=None,
             softmax_scale=Q_DIM ** -0.5, causal=False, is_fp8_kvcache=True,
@@ -695,17 +713,12 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             extra_k_cache=mgr.model1_cache_view("cmp"),
             extra_indices_in_kvcache=page_idx_full.view(B_mla, 1, TOPK),
             extra_topk_length=cmp_len,
-            **fused_q, **sink_kw)
+            attn_sink=sink)
         out = res[0] if isinstance(res, tuple) else res
         # torch reference over the DEQUANT pools
         for b in range(B_mla):
             p = int(pos_mla[b])
-            qn = (q_raw[b, 0].float()
-                  * torch.rsqrt(sum_sq[b, 0].view(-1, 1) / Q_DIM + EPS))
-            e, o = qn[:, 448::2].clone(), qn[:, 449::2].clone()
-            c, s = rc[b, 0], rs[b, 0]
-            qn[:, 448::2] = e * c - o * s
-            qn[:, 449::2] = e * s + o * c
+            qn = q_ref[b, 0]
             table = mgr.reqs[slots_mla[b]]["swa"]
             n_sw = int(swa_len[b])
             sw = torch.stack([deq_model1_row(mgr.swa_pool,
@@ -725,7 +738,6 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 print(f"  [NaN-diag] b={b} pos={p} "
                       f"out={int(torch.isnan(out[b]).sum())} "
                       f"q={int(torch.isnan(qn).sum())} "
-                      f"ssq0={int((sum_sq[b, 0] == 0).sum())} "
                       f"sw={int(torch.isnan(sw).sum())}/{int(swa_len[b])} "
                       f"cm={int(torch.isnan(cm).sum())}/{int(cmp_len[b])} "
                       f"ref={int(torch.isnan(ref).sum())}")
@@ -741,7 +753,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 torch.arange(dbg_logits.size(1), device=DEV).view(1, -1)
                 >= ncmp[owned].view(-1, 1), float("-inf"))
             dbg.update(y_q=y[:, :1536].clone(), win_y2=win_y2.clone(),
-                       yq=yq.clone(), ssq=ssq.clone(),
+                       yq=yq.clone(), q_ready=q_ready.clone(),
                        logits=dbg_logits, page_idx=page_idx_full.clone(),
                        iq=rets[1].clone())
 
@@ -808,7 +820,7 @@ def probe_kernel_names(fn):
     return tuple(names)
 
 
-def benchmark(mods, w, ncmp=2048):
+def benchmark(mods, w, ncmp=2048, batches=None):
     """COLD-L2 measurement, ONE full CSA layer per call: an 8GB memset (the
     bench_utils.bench_kineto flusher, i.e. what every single-operator test in
     this tree already uses) runs before EVERY chain call, so a layer starts
@@ -816,25 +828,26 @@ def benchmark(mods, w, ncmp=2048):
     consecutive layers hold DIFFERENT weights, so layer N never finds layer
     N-1's 113MB wq_b / 78MB front / 130MB o_proj streams cached, and a hot
     no-flush number would flatter every weight-bound stage.
-      per-stage : kineto device time over R cold chain iters, kernels
+      per-stage : mean Kineto device time over 30 cold eager-chain iterations,
                   bucketed by stage (wq_b bucket = qnorm + merged GEMM;
-                  device-sum slightly double-counts their PDL overlap)
-      graph     : DEVICE span/step of CUDA-graph replay, via CUDA events
-                  (vLLM serving form; THE end-to-end number). Events and
-                  not a wall on purpose: per-call host launch+sync adds
+                  duration sums double-count PDL and intra-stage overlaps)
+      graph     : first GPU kernel start through last GPU kernel end in the
+                  saved Perfetto trace (vLLM serving form; THE end-to-end
+                  number). The CPU graph-launch wall is excluded on purpose:
+                  per-call host launch+sync adds
                   ~17us at B=128 that real serving never pays PER LAYER,
                   because a whole model is ONE graph -- one launch and one
                   sync for all 61 layers, not one each. Cross-checked
-                  against the perfetto trace's replay span at B=128.
+                  against the perfetto trace's first-to-last GPU-kernel span.
     The flush is ONE per layer (never per stage) and is EXCLUDED from every
-    reported number: the kineto buckets name only the chain's own kernels,
-    and the graph timing window is opened stream-ordered behind the flush.
+    reported number: Kineto buckets name only the chain's own kernels, and the
+    graph envelope starts at the first chain kernel after the flush.
     Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
     and lens real, cache bytes arbitrary -- latency-neutral. The chain runs
     through O-proj and mHC post. TPDP fabricates the missing C3 result outside
     timing. The ported O-proj entry point performs host-side validation, which
     does not affect graph replay or Kineto device time."""
-    hcm, fmm, wqm, mqm, mq8m, tkm, mpm = mods
+    hcm, fmm, wqm, qrm, mqm, mq8m, tkm, mpm = mods
     trace_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "docs", "timeline"))
     os.makedirs(trace_dir, exist_ok=True)
@@ -848,25 +861,55 @@ def benchmark(mods, w, ncmp=2048):
     S = 4 * ncmp + 8
     ang = torch.rand(S, 32, device=DEV) * 6.28
     cosl, sinl = ang.cos().contiguous(), ang.sin().contiguous()
-    cols = ["mhc", "front", "wq_b", "mqa", "topk"] + \
-        (["mla", "o_proj"] if post_attn_enabled() else []) + \
-        (["mhc_post"] if mhc_post_enabled() else []) + \
-        ["stages", "graph"]
-    print("  cold L2 (8GB memset per layer call, excluded from every number);"
-          " stages+graph = device us")
-    print("  wq_b = qnorm producer + merged GEMM device-time sum; standalone "
-          "fused(us) reports only the merged GEMM")
+    cols = (["graph+rms", "graph-no-rms", "delta"] if Q_RMS_ABLATION else
+            ["mhc", "front", "wq_b"] +
+            ([] if fused_query_rms() else ["q_rms"]) + ["mqa", "topk"] +
+            (["mla", "o_proj"] if post_attn_enabled() else []) +
+            (["mhc_post"] if mhc_post_enabled() else []) +
+            ["stages", "graph"])
+    l2_bytes = int(getattr(torch.cuda.get_device_properties(DEV),
+                           "L2_cache_size", 128 << 20))
+    flush_bytes = max(2 * l2_bytes, 64 << 20)
+    print(f"  cold L2 ({flush_bytes / (1 << 20):.0f} MiB memset per layer "
+          "call, excluded from every number); all reported values are device us")
+    if Q_RMS_ABLATION:
+        print("  one CUDA graph and identical PDL/grid; only the RMSNorm+RoPE "
+              "body is toggled by a device flag")
+        if inplace_query_rms():
+            print("  full-rank production layout is in-place: FlashMLA consumes "
+                  "normalized query when on and raw Q_B query when off")
+        else:
+            print("  TPDP is out-of-place: the prior normalized output is retained "
+                  "when the body is off")
+        print("  paired samples alternate order; delta = graph+rms - graph-no-rms")
+    else:
+        print("  wq_b = qnorm producer + merged GEMM device-time sum; standalone "
+              "fused(us) reports only the merged GEMM")
+        if fused_query_rms():
+            print("  query RMSNorm+RoPE runs in the MQA tail warpgroup and is "
+                  "included in mqa; use graph for end-to-end latency")
+        else:
+            print("  q_rms and mqa are overlapping kernel durations; stages sums both. "
+                  "Use graph for end-to-end latency")
+        print("  operator columns are 30 cold eager-chain Kineto means; stages sums "
+              "kernel durations and includes overlap")
+        print("  graph is the median of 5 cold Perfetto replays; the saved timeline "
+              "is the replay selected for that median")
+    if not fused_query_rms():
+        print(f"  q_rms persistent grid cap = {Q_RMS_MAX_BLOCKS} CTAs")
     if TPDP_MODE:
         print("  --tpdp: MQA/TopK/MLA run ceil(B/2) rows; MLA H=128; O-proj "
               "remains global B x H=64 with the 8-group TP2 shard")
         print("  TP/DP layout handoffs and the O-proj TP reduction are "
               "fabricated outside timing; communication is not measured")
-    print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in cols))
-    print("  " + "-" * (5 + 9 * len(cols)))
+    col_width = 13 if Q_RMS_ABLATION else 9
+    print(f"  {'B':<5}" + "".join(f"{c:>{col_width}}" for c in cols))
+    print("  " + "-" * (5 + col_width * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
-    # L2 flusher, allocated ONCE: keeps the per-B measured regions
-    # allocation-free and keeps an 8GB buffer out of any CUDA-graph pool.
-    flush_buf = torch.empty(int(8e9 // 4), dtype=torch.int, device=DEV)
+    # Streaming twice the physical L2 capacity evicts prior layer data without
+    # consuming the multi-GB headroom needed by the B128 paged KV pools.
+    flush_buf = torch.empty((flush_bytes + 3) // 4,
+                            dtype=torch.int, device=DEV)
 
     def flush_l2(drain=True):
         """Evict L2.
@@ -881,7 +924,9 @@ def benchmark(mods, w, ncmp=2048):
         if drain:
             torch.cuda.synchronize()
 
-    for B in (2, 16, 32, 48, 64, 80, 96, 112, 128):
+    if batches is None:
+        batches = (2, 16, 32, 48, 64, 80, 96, 112, 128)
+    for B in batches:
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
                              + 4 * B, max_pages_per_req=ncmp // PAGE,
                              indexer_fp8=INDEXER_FP8)
@@ -960,12 +1005,10 @@ def benchmark(mods, w, ncmp=2048):
         xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
         xq_sf = t_wq.as_ue8m0(torch.empty(B, 12, device=DEV,
                                           dtype=torch.uint8))
-        ssq = torch.zeros(B, WQ_HEADS, device=DEV, dtype=torch.float32)
-
         def run_wqb():
             hold["r"] = wqm.wq_b_proj_gemm_merged(
                 xq, xq_sf, w["wq_fp8"], w["wq_sf"], q_pos, cosl, sinl,
-                head_ssq=ssq, mock_post=False, cmp_pos=pos,
+                head_ssq=None, enable_ssq=False, mock_post=False, cmp_pos=pos,
                 idx_norm=w["idx_norm"], cos_tab=cosl,
                 sin_tab=sinl, idx_state=mgr.idx_state,
                 idx_state_row=st["idx_state_row"],
@@ -981,10 +1024,28 @@ def benchmark(mods, w, ncmp=2048):
                 indexer_fp8=INDEXER_FP8,
                 iq_weights=weights64 if INDEXER_FP8 else None,
                 pdl=pdl_enabled())
-        run_wqb()
         nc = mgr.n_compressed(slots, pos)
         B_local = local_batch(B)
         owned = slice(0, B_local)
+        B_mla = mla_batch(B)
+        pos_mla = pos[:B_mla]
+        q_ready = (None if inplace_query_rms() else
+                   torch.empty(B_mla, 1, attention_heads(), Q_DIM,
+                               device=DEV, dtype=torch.bfloat16))
+        q_rms_work_flag = (torch.ones((), device=DEV, dtype=torch.int32)
+                           if Q_RMS_ABLATION else None)
+
+        def query_ready():
+            if inplace_query_rms():
+                return hold["r"][0].view(
+                    B_mla, 1, attention_heads(), Q_DIM)
+            return q_ready
+
+        def run_qrms():
+            qrm.rmsnorm_rope_out(
+                hold["r"][0], pos_mla, cosl, sinl, query_ready(), WQ_HEADS,
+                EPS, pdl_enabled(), Q_RMS_MAX_BLOCKS)
+
         idx_bt = mgr.block_table("idx", slots)[owned]
         logits = torch.full((B, (ncmp + 255) // 256 * 256), float("-inf"),
                             device=DEV)
@@ -997,7 +1058,7 @@ def benchmark(mods, w, ncmp=2048):
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
         def run_mqa():
             r = hold["r"]
-            if INDEXER_FP8:
+            if fused_query_rms():
                 mq8m.mqa_logits_fp8_decode_out(
                     r[1][owned], mgr.idx_pool, r[2][owned],
                     nc[owned].view(-1, 1), idx_bt, fp8_schedule,
@@ -1010,7 +1071,28 @@ def benchmark(mods, w, ncmp=2048):
                     cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
-                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
+                    query_x=r[0], query_positions=pos_mla,
+                    query_cos=cosl, query_sin=sinl, query_out=query_ready(),
+                    query_input_heads=WQ_HEADS, query_eps=EPS,
+                    query_work_flag=q_rms_work_flag,
+                    pdl=pdl_enabled())
+                hold["logits"] = logits[owned]
+            elif INDEXER_FP8:
+                mq8m.mqa_logits_fp8_decode_out(
+                    r[1][owned], mgr.idx_pool, r[2][owned],
+                    nc[owned].view(-1, 1), idx_bt, fp8_schedule,
+                    logits[owned],
+                    kv_entries_per_block=mgr.entries_per_block["idx"],
+                    kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
+                    cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                    sin_tab=sinl, comp_state=mgr.main_state,
+                    comp_state_row=st["main_state_row"],
+                    cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_ring_entries=mgr.state_ring_entries,
+                    cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
+                    pdl=pdl_enabled())
                 hold["logits"] = logits[owned]
             else:
                 mqm.mqa_logits_fp4_decode_out(
@@ -1026,6 +1108,11 @@ def benchmark(mods, w, ncmp=2048):
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
                 hold["logits"] = logits[owned]
+        # FP8: MQA waits directly for Q_B and its tail produces q_ready.
+        # FP4 retains the separate RMS/RoPE relay.
+        run_wqb()
+        if not fused_query_rms():
+            run_qrms()
         run_mqa()
         cmp_bt_full = mgr.block_table("cmp", slots)
         cmp_bt = cmp_bt_full[owned]
@@ -1041,28 +1128,18 @@ def benchmark(mods, w, ncmp=2048):
         run_topk()
 
         stage_fns = [("mhc", run_hc), ("front", run_front),
-                     ("wq_b", run_wqb),
-                     ("mqa", run_mqa), ("topk", run_topk)]
+                     ("wq_b", run_wqb)]
+        if not fused_query_rms():
+            stage_fns.append(("q_rms", run_qrms))
+        stage_fns.extend((("mqa", run_mqa), ("topk", run_topk)))
         if post_attn_enabled():
-            B_mla = mla_batch(B)
-            pos_mla = pos[owned] if MLA_DP_MODE else pos
-            rc = cosl[pos_mla].view(B_mla, 1, 32).contiguous()
-            rs = sinl[pos_mla].view(B_mla, 1, 32).contiguous()
             swa_idx, swa_len = mgr.swa_indices(slots, pos, SWA_TOPK)
             if MLA_DP_MODE:
                 swa_idx, swa_len = swa_idx[owned], swa_len[owned]
-                q_shard = hold["r"][0].view(B, 1, WQ_HEADS, Q_DIM)[owned]
-                ssq_shard = ssq.view(B, 1, WQ_HEADS)[owned]
-                # Receive buffers after the omitted TP->DP all-to-all. Peer
-                # values do not affect kernel timing, so duplicate local data.
-                q_external = torch.cat((q_shard, q_shard), dim=2).contiguous()
-                ssq_external = torch.cat(
-                    (ssq_shard, ssq_shard), dim=2).contiguous()
                 ext_idx = page_idx.view(B_mla, 1, TOPK)
                 cmp_len = torch.minimum(
                     nc[owned], torch.tensor(TOPK, device=DEV)).int()
             else:
-                q_external = ssq_external = None
                 ext_idx = page_idx_full.view(B, 1, TOPK)
                 cmp_len = torch.minimum(
                     nc, torch.tensor(TOPK, device=DEV)).int()
@@ -1072,24 +1149,15 @@ def benchmark(mods, w, ncmp=2048):
                            else dict(attn_sink=w["attn_sink"]))
 
             def run_mla():
-                q_raw = (q_external if MLA_DP_MODE else
-                         hold["r"][0].view(B, 1, WQ_HEADS, Q_DIM))
-                sum_sq = (ssq_external if MLA_DP_MODE else
-                          ssq.view(B, 1, WQ_HEADS))
-                if FMLA_FUSED_Q:
-                    qi, fq = q_raw, dict(q_rms_sum_sq=sum_sq,
-                                         q_rope_cos=rc, q_rope_sin=rs)
-                else:
-                    qi, fq = flash_mla.query_rms_rope(q_raw, sum_sq, rc, rs,
-                                                      EPS), {}
                 res = flash_mla.flash_mla_with_kvcache(
-                    q=qi, k_cache=swa_v, block_table=None, cache_seqlens=None,
+                    q=query_ready(), k_cache=swa_v,
+                    block_table=None, cache_seqlens=None,
                     head_dim_v=Q_DIM, tile_scheduler_metadata=sched,
                     num_splits=None, softmax_scale=Q_DIM ** -0.5,
                     causal=False, is_fp8_kvcache=True, indices=swa_idx,
                     topk_length=swa_len, extra_k_cache=cmp_v,
                     extra_indices_in_kvcache=ext_idx,
-                    extra_topk_length=cmp_len, **fq, **mla_sink_kw)
+                    extra_topk_length=cmp_len, **mla_sink_kw)
                 hold["mla"] = res[0] if isinstance(res, tuple) else res
                 return res
             run_mla()
@@ -1139,36 +1207,74 @@ def benchmark(mods, w, ncmp=2048):
                 f()
 
         # ---- per-layer COLD measurement ---------------------------------
-        def cold_graph_step(f, warmup=5, iters=20, reps=3):
-            """CUDA-event latency with a cold L2 on every graph replay."""
-            for _ in range(warmup):
+        def cold_graph_rms_ablation(f, flag, warmup=6, iters=40, reps=9):
+            """Paired cold-L2 samples toggling only fused query RMS/RoPE work."""
+            for i in range(warmup):
+                flag.fill_(i & 1)
                 flush_l2()
                 f()
             torch.cuda.synchronize()
-            evs = [(torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True))
-                   for _ in range(iters)]
-            best = float("inf")
-            for _ in range(reps):
-                for i in range(iters):
-                    flush_l2(drain=False)
-                    evs[i][0].record()
-                    f()
-                    evs[i][1].record()
-                torch.cuda.synchronize()
-                tot = sum(a.elapsed_time(b) for a, b in evs) / 1e3
-                best = min(best, tot / iters * 1e6)
-            return best
 
-        # per-stage: bucket kineto device time of a COLD R-iter chain loop
-        # (strict probe everywhere: quant/glue are single named Triton
-        # kernels now; mla's q bf16 cast stays unbucketed -> walls only)
+            rep_work, rep_relay, rep_delta = [], [], []
+            for rep in range(reps):
+                samples = {0: [], 1: []}
+                events = []
+                for i in range(iters):
+                    order = (1, 0) if ((rep + i) & 1) == 0 else (0, 1)
+                    for mode in order:
+                        flag.fill_(mode)
+                        flush_l2(drain=False)
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        f()
+                        end.record()
+                        events.append((mode, start, end))
+                torch.cuda.synchronize()
+                for mode, start, end in events:
+                    samples[mode].append(start.elapsed_time(end) * 1e3)
+                work = sum(samples[1]) / len(samples[1])
+                relay = sum(samples[0]) / len(samples[0])
+                rep_work.append(work)
+                rep_relay.append(relay)
+                rep_delta.append(work - relay)
+
+            import statistics
+            return (statistics.median(rep_work), statistics.median(rep_relay),
+                    statistics.median(rep_delta), min(rep_delta), max(rep_delta))
+
+        # In strict ablation mode the graph is captured below, then the exact
+        # same executable is replayed with a device flag. Skip per-stage
+        # profiling because only the end-to-end graph span answers this test.
+        if Q_RMS_ABLATION:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                q_rms_work_flag.fill_(1)
+                chain(); chain()
+            torch.cuda.current_stream().wait_stream(side)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                chain()
+            work, relay, delta, delta_lo, delta_hi = cold_graph_rms_ablation(
+                g.replay, q_rms_work_flag)
+            print(f"  {B:<5}{work:>12.1f}{relay:>12.1f}{delta:>12.2f}"
+                  f"   paired range [{delta_lo:+.2f}, {delta_hi:+.2f}]")
+            bw_rows.append((B, [("graph+rms", work), ("graph-no-rms", relay),
+                                ("delta", delta)]))
+            del g, mgr
+            torch.cuda.empty_cache()
+            continue
+
+        # Per-stage: bucket Kineto device time over 30 cold eager-chain iters.
+        # Each bucket contains only that stage's kernel durations; summing
+        # buckets still double-counts PDL and intra-stage overlap.
         name2stage = {}
         for sname, f in stage_fns:
             for n in probe_kernel_names(f):
                 name2stage.setdefault(n, sname)
         from torch.profiler import profile as _prof, ProfilerActivity
-        R = 30      # 30-iter stage means (n=10 was too jittery)
+        R = 30
         for _ in range(3):
             flush_l2()
             chain()
@@ -1179,27 +1285,18 @@ def benchmark(mods, w, ncmp=2048):
             pctx = _prof(activities=[ProfilerActivity.CUDA])
         with pctx as prof:
             for _ in range(R):
-                # cold L2 for every layer iteration. The memset is never
-                # bucketed: name2stage holds only the chain's own kernel
-                # names, and probe_kernel_names filters memset/zero_ anyway.
                 flush_l2()
                 chain()
-                # STEPPED stage semantics (aligned with the vLLM baseline's
-                # per-decode-step windows): drain between iterations so every
-                # step's first op starts on a quiet GPU -- the vLLM engine
-                # has host scheduling gaps there. Without this, the previous
-                # iteration's MLA tail folds into the mHC GEMM's PDL wait. The
-                # graph envelope remains gapless.
                 torch.cuda.synchronize()
         acc = {sname: 0.0 for sname, _ in stage_fns}
-        for e in prof.events():
-            sname = name2stage.get(e.name[:80])
+        for event in prof.events():
+            sname = name2stage.get(event.name[:80])
             if sname is None:
                 continue
-            d = getattr(e, "device_time", None)
-            if d is None:
-                d = getattr(e, "cuda_time", 0.0)
-            acc[sname] += d
+            duration = getattr(event, "device_time", None)
+            if duration is None:
+                duration = getattr(event, "cuda_time", 0.0)
+            acc[sname] += duration
         ts = [acc[sname] / R for sname, _ in stage_fns]
         # (mhc chain-vs-solo diagnostic removed after the verdict: the
         # chain-solo gemm delta matched the hidden+hc_fn L2-refetch
@@ -1209,8 +1306,9 @@ def benchmark(mods, w, ncmp=2048):
         # removed after their verdicts landed: emit costs +0.1..1.1us vs
         # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
-        # ---- CUDA-graph envelope: the whole chain in ONE replay ----------
+        # ---- CUDA-graph envelope: exact Perfetto GPU-kernel span ----------
         t_graph = float("nan")
+        g = None
         try:
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -1220,20 +1318,56 @@ def benchmark(mods, w, ncmp=2048):
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 chain()
-            t_graph = cold_graph_step(g.replay)
         except Exception as err:
             print(f"  (graph capture failed at B={B}: {err})")
 
-        # ---- perfetto timeline: one cold-L2 graph replay only. ------------
-        if B in (16, 64, 96, 112, 128) and not math.isnan(t_graph):
-            flush_l2()
-            with _prof(activities=[ProfilerActivity.CPU,
-                                   ProfilerActivity.CUDA]) as prof:
-                g.replay()
-                torch.cuda.synchronize()
-            tp = os.path.join(trace_dir, f"e2e_{trace_mode}_B{B}.json")
-            prof.export_chrome_trace(tp)
-            del prof
+        # Profile five cold replays, select the median first-to-last-kernel
+        # envelope, and retain that exact replay as the Perfetto timeline.
+        # This excludes CPU launch/sync spans and CUDA-event scheduling margins
+        # while avoiding a single CUPTI replay outlier.
+        if g is not None:
+            keep_trace = B in (16, 64, 96, 112, 128)
+            trace_samples = []
+            trace_paths = []
+            try:
+                for sample_idx in range(5):
+                    fd, sample_path = tempfile.mkstemp(
+                        prefix=f"e2e_{trace_mode}_B{B}_{sample_idx}_",
+                        suffix=".json", dir=trace_dir)
+                    os.close(fd)
+                    trace_paths.append(sample_path)
+                    flush_l2()
+                    with _prof(activities=[ProfilerActivity.CPU,
+                                           ProfilerActivity.CUDA]) as trace_prof:
+                        g.replay()
+                        torch.cuda.synchronize()
+                    trace_prof.export_chrome_trace(sample_path)
+                    with open(sample_path, "r", encoding="utf-8") as trace_file:
+                        trace = json.load(trace_file)
+                    kernels = [event for event in trace["traceEvents"]
+                               if event.get("ph") == "X"
+                               and event.get("cat") == "kernel"]
+                    if not kernels:
+                        raise RuntimeError(
+                            "Perfetto trace contains no GPU kernels")
+                    first = min(event["ts"] for event in kernels)
+                    last = max(event["ts"] + event["dur"] for event in kernels)
+                    trace_samples.append((last - first, sample_path))
+
+                trace_samples.sort(key=lambda sample: sample[0])
+                t_graph, selected_path = trace_samples[len(trace_samples) // 2]
+                if keep_trace:
+                    tp = os.path.join(
+                        trace_dir, f"e2e_{trace_mode}_B{B}.json")
+                    os.replace(selected_path, tp)
+            except Exception as err:
+                print(f"  (graph trace failed at B={B}: {err})")
+            finally:
+                for sample_path in trace_paths:
+                    if os.path.exists(sample_path):
+                        os.unlink(sample_path)
+                if 'trace_prof' in locals():
+                    del trace_prof
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
               + f"{sum(ts):>9.1f}{t_graph:>9.1f}")
@@ -1241,6 +1375,9 @@ def benchmark(mods, w, ncmp=2048):
                             in zip(stage_fns, ts)]))
         del mgr
         torch.cuda.empty_cache()
+
+    if Q_RMS_ABLATION:
+        return
 
     # ---- Bandwidth table: per-operator traffic / stage time ------------
     # total = ALL bytes the op moves; internal = intermediate activations
@@ -1266,6 +1403,8 @@ def benchmark(mods, w, ncmp=2048):
                   + B * 64 * idx_bytes + B * 512 * 4) / MB
         wq_eff = W_WQB + (B * 8 * 512 * 4 + B * (584 + idx_bytes)) / MB
         t["wq_b"] = (wq_eff + wq_int, wq_int)
+        qr_int = 2 * B_mla * attention_heads() * Q_DIM * 2 / MB
+        t["q_rms"] = (qr_int, qr_int)
         # Attention/logits are request-DP; the fused main-compressor remains
         # replicated over global B so every rank publishes a complete cache.
         mqa_eff = (B_local * ncmp * idx_bytes + B * 8 * 2048 * 4 + B * 584) / MB
@@ -1344,7 +1483,7 @@ def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
                              dbg=dbg)
     snap = (finals.clone(), mgr.swa_pool.clone(), mgr.cmp_pool.clone(),
             mgr.idx_pool.clone(), mgr.main_state.clone(), mgr.idx_state.clone()) + tuple(
-        dbg[k] for k in ("y_q", "win_y2", "yq", "ssq", "logits",
+        dbg[k] for k in ("y_q", "win_y2", "yq", "q_ready", "logits",
                          "page_idx", "iq") if k in dbg)
     return stats, snap
 
@@ -1362,6 +1501,24 @@ if __name__ == "__main__":
         help="on enables the fixed production PDL set; all forces every "
              "E2E-controlled PDL edge; none disables those controlled edges "
              "(FlashMLA internal PDL is unchanged)")
+    parser.add_argument(
+        "--skip-bench", action="store_true",
+        help="run correctness and determinism gates without the latency table")
+    parser.add_argument(
+        "--bench-only", action="store_true",
+        help="skip simulation gates and run the requested latency batches")
+    parser.add_argument(
+        "--bench-batches", default=None,
+        help="comma-separated batch sizes for latency runs (default: full table)")
+    parser.add_argument(
+        "--q-rms-blocks", type=int, default=1024,
+        help="persistent CTA cap for query RMSNorm+RoPE (default: 1024)")
+    parser.add_argument(
+        "--q-rms-ablation", action="store_true",
+        help="paired graph-only ablation of the RMSNorm+RoPE compute body")
+    parser.add_argument(
+        "--separate-query-rms", action="store_true",
+        help="use the original standalone query RMSNorm+RoPE kernel")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -1369,6 +1526,13 @@ if __name__ == "__main__":
     INDEXER_FP8 = not args.indexer_fp4
     configure_geometry(args.tpdp)
     configure_pdl(args.pdl_mode)
+    Q_RMS_MAX_BLOCKS = args.q_rms_blocks
+    Q_RMS_ABLATION = args.q_rms_ablation
+    FUSE_QUERY_RMS = not args.separate_query_rms
+    if Q_RMS_ABLATION and not fused_query_rms():
+        parser.error("--q-rms-ablation requires the default fused FP8 query path")
+    bench_batches = (None if args.bench_batches is None else
+                     tuple(int(x) for x in args.bench_batches.split(",")))
     print(f"Device: {torch.cuda.get_device_name()}")
     geometry = ("TPDP local rank: WQB TP2, MQA/TopK/MLA DP2, O-proj TP2"
                 if args.tpdp else "full-rank e2e")
@@ -1380,6 +1544,7 @@ if __name__ == "__main__":
             t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
                                   'front_mixed_gemm_csa_swapab.cu'),
             t_wq.load_module(tpdp=args.tpdp),
+            None if fused_query_rms() else load_query_rms_rope(),
             mqa_test.load_cuda_module() if not INDEXER_FP8 else None,
             mqa_test.load_cuda_module_fp8() if INDEXER_FP8 else None,
             __import__("test_topk_v2").load_cuda_module(),
@@ -1389,45 +1554,19 @@ if __name__ == "__main__":
         "Python/kernel WQB geometry mismatch"
     w = make_weights()
 
+    if args.bench_only:
+        benchmark(mods, w, ncmp=16384, batches=bench_batches)
+        sys.exit(0)
+
     sim_name = "TPDP MLA-DP local-rank" if args.tpdp else "E2E decode"
     print(f"\n{sim_name} simulation (global B=16, 8 steps, slot reuse at step 5):")
     stats, snap1 = run_sim(mods, w)
     _, snap2 = run_sim(mods, w)                # determinism gate
     det = True
-    # head_ssq is fp32-RED accumulated (arrival order varies run-to-run by
-    # design; the deterministic rewrite measured too slow and was rejected).
-    # Its downstream (finals) may swing ONE quant step on a boundary hit.
-    # Those two get physics-based tolerances; everything else stays BITWISE
-    # (not downstream of any atomic -> any diff there is a real bug).
-    def _lax_ok(name, av, bv):
-        if name == "ssq":   # ulp-level jitter on every element
-            rel = ((av - bv).abs() /
-                   av.abs().clamp_min(1e-6)).max().item()
-            return rel < 1e-5, f"elem rel {rel:.2e} (<1e-5)"
-        # finals: one ssq ulp can flip a SINGLE fp8 code in o_proj's quant,
-        # and wo_b [7168,16384] + mhc_post's post*proj then spread that code
-        # over the WHOLE request (every HC scope) -- so the differing-ELEMENT
-        # fraction is bimodal (0 or ~1/B) and can never sit just under a
-        # small bound (measured on B300: 0 or 2.56e-2, nothing between).
-        # Gate the contaminated-REQUEST count instead: boundary hits touch a
-        # minority, a real race touches all of them.
-        B = av.size(0)
-        nreq = int((av != bv).flatten(1).any(-1).sum())
-        rel = ((av - bv).abs().max() /
-               av.abs().max().clamp_min(1e-6)).item()
-        return (nreq * 4 <= B and rel < 2e-2), \
-            f"{nreq}/{B} req differ (<=25%), max/global {rel:.2e} (<2e-2)"
-
     for name, a, b in zip(("finals", "swa_pool", "cmp_pool", "idx_pool",
                            "main_state", "idx_state", "y_q", "win_y2",
-                           "yq", "ssq", "logits", "page_idx", "iq"),
+                           "yq", "q_ready", "logits", "page_idx", "iq"),
                           snap1, snap2):
-        if name in ("finals", "ssq"):
-            ok, msg = _lax_ok(name, a.float(), b.float())
-            if not ok:
-                det = False
-                print(f"  [F-diag] {name}: TOLERANCE EXCEEDED: {msg}")
-            continue
         # TRUE bitwise compare (byte view): identical NaN bit patterns are
         # EQUAL (torch.equal treats NaN != NaN -> false alarm).
         if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
@@ -1454,6 +1593,8 @@ if __name__ == "__main__":
          stats.get("A_front_d8", 1) < 1e-5),
         ("B wq_b x_fp8 byte match", stats.get("B_xq_match", 0), "> 0.999",
          stats.get("B_xq_match", 0) > 0.999),
+        ("Q query rms+rope calc_diff", stats.get("Q_rms_rope_diff", 1),
+         "< 1e-5", stats.get("Q_rms_rope_diff", 1) < 1e-5),
         ("C mqa logits max rel err", stats.get("C_mqa_rel", 1), "< 5e-2",
          stats.get("C_mqa_rel", 1) < 5e-2),
         ("D topk set match", stats.get("D_topk_ok", False), "== True",
@@ -1476,8 +1617,8 @@ if __name__ == "__main__":
         ok &= bool(passed)
         print(f"  [{'PASS' if passed else 'FAIL'}] {name:<28} = {val} ({cond})")
 
-    if ok:                       # never bench on broken correctness
-        benchmark(mods, w, ncmp=16384)    # 64k ctx (65536 tokens)
+    if ok and not args.skip_bench:  # never bench on broken correctness
+        benchmark(mods, w, ncmp=16384, batches=bench_batches)  # 64k ctx
 
     print("=" * 60)
     result_name = "TPDP MLA-DP LOCAL OPS" if args.tpdp else "E2E"
