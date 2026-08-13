@@ -52,6 +52,7 @@ struct QueryRmsRopeArgs {
     nv_bfloat16* out = nullptr;
     const int* work_flag = nullptr;
     int input_heads = 0;
+    int output_heads = 0;
     uint32_t output_rows = 0;
     float eps = 1e-6f;
 };
@@ -75,11 +76,12 @@ __device__ __forceinline__ void run_query_rms_rope(
         const uint32_t output_row = blockIdx.x + item * gridDim.x;
         if (output_row >= query.output_rows)
             break;
-        // MODEL1 FlashMLA always consumes 128 query heads. Both production
-        // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
-        // repeating runtime integer division/modulo in every lane of every row.
-        const uint32_t batch = output_row >> 7;
-        const uint32_t output_head = output_row & 127u;
+        // Flash and Pro consume 64 and 128 query heads respectively. Both
+        // production geometries are powers of two.
+        const uint32_t output_head_mask = query.output_heads - 1;
+        const uint32_t output_head_shift = query.output_heads == 128 ? 7 : 6;
+        const uint32_t batch = output_row >> output_head_shift;
+        const uint32_t output_head = output_row & output_head_mask;
         const uint32_t input_head = output_head & (query.input_heads - 1);
         const uint32_t input_row = batch * query.input_heads + input_head;
 

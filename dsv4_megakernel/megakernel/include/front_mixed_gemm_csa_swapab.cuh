@@ -16,8 +16,19 @@ namespace fp8d = cluster_mma_fp8::detail;
 using Barrier = base::Barrier;
 
 constexpr int K = base::K;
+#if defined(DSV4_FLASH_CSA)
+constexpr int N = 4160;
+constexpr int N_FP8 = 1536;
+constexpr int Q_RANK = 1024;
+#else
 constexpr int N = 4672;                  // CSA reordered layout
 constexpr int N_FP8 = 2048;
+constexpr int Q_RANK = 1536;
+#endif
+constexpr int WIN_BASE = Q_RANK;
+constexpr int MAIN_BASE = N_FP8;
+constexpr int IDX_BASE = MAIN_BASE + 2048;
+constexpr int WEIGHTS_BASE = IDX_BASE + 512;
 constexpr int CLUSTER_SIZE = 2;
 constexpr int TPB = 256;
 constexpr int FP8_UMMA_M = 128;
@@ -30,6 +41,7 @@ constexpr int BF16_FEATURE_TILES =
 constexpr int TASKS_PER_BATCH = FP8_FEATURE_TILES + BF16_FEATURE_TILES;  // 37
 static_assert((N - N_FP8) == 20 * BF16_UMMA_M + 64,
               "bf16 tail tile has 64 valid feature rows (OOB fill + clip)");
+static_assert(N == WEIGHTS_BASE + 64, "front segment geometry mismatch");
 
 constexpr int FP8_TMA_K = 128;
 constexpr int BF16_TMA_K = 64;
@@ -518,7 +530,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
   }
 
   if (is_fp8) {
-    const bool emit_win = emit.main_state != nullptr && feature_base >= 1536;
+    const bool emit_win = emit.main_state != nullptr && feature_base >= WIN_BASE;
     if (warp >= 4) {
       // 2SM M128 uses the same 2x2 quadrant layout as the BF16 path below:
       // cluster rank selects one 64-feature half, the low epilogue-warp bit
@@ -540,7 +552,7 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
             const float value = __uint_as_float(vals[r]);
             if (emit_win) {
               emit.win_y2[static_cast<size_t>(out_row) * 512 +
-                          out_col - 1536] =
+                          out_col - WIN_BASE] =
                   __bfloat162float(__float2bfloat16_rn(value));
             } else {
               out[static_cast<size_t>(out_row) * N + out_col] =
@@ -554,9 +566,10 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
     // 2SM M128 is a 2x2 quadrant layout: CTA rank selects the 64-feature
     // half, while epilogue warp pairs 0/1 and 2/3 select the two BatchN/2
     // halves. Physical warps 4..7 form the dedicated epilogue warpgroup.
-    // The bf16 TAIL tile (feature_base 4608) has 64 valid rows: rank1's
+    // The bf16 tail tile at WEIGHTS_BASE has 64 valid rows: rank1's
     // columns land at >= N and are clipped.
-    if (warp >= 4 && emit.main_state != nullptr && feature_base >= 4608) {
+    if (warp >= 4 && emit.main_state != nullptr &&
+        feature_base >= WEIGHTS_BASE) {
       const int epi_warp = warp - 4;
       const int out_col = feature_base + rank * BF16_CTA_N +
                           (epi_warp & 1) * 32 + lane;
@@ -572,7 +585,8 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
             const int out_row = batch_base + (epi_warp >> 1) *
                 (BatchN / CLUSTER_SIZE) + c + r;
             if (out_row < problem_m) {
-              emit.w64[static_cast<size_t>(out_row) * 64 + out_col - 4608] =
+              emit.w64[static_cast<size_t>(out_row) * 64 +
+                       out_col - WEIGHTS_BASE] =
                   __bfloat162float(
                       __float2bfloat16_rn(__uint_as_float(vals[r])));
             }
@@ -590,11 +604,12 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
       const int row_half_base = ((warp - 4) >> 1) * (BatchN / CLUSTER_SIZE);
       const int feature_chunk = feature_base + rank * BF16_CTA_N +
                                 ((warp - 4) & 1) * 32;
-      const bool is_main = feature_base < 4096;
-      const int family_base = is_main ? 2048 : 4096;
+      const bool is_main = feature_base < IDX_BASE;
+      const int family_base = is_main ? MAIN_BASE : IDX_BASE;
       const int state_width = is_main ? 2048 : 512;
       const int half_width = state_width / 2;
-      const bool add_ape = feature_base >= (is_main ? 3072 : 4352);
+      const bool add_ape =
+          feature_base >= (is_main ? MAIN_BASE + 1024 : IDX_BASE + 256);
       float* const state = is_main ? emit.main_state : emit.idx_state;
       const float* const ape = is_main ? emit.main_ape : emit.idx_ape;
       const int feature_offset = feature_chunk - family_base;

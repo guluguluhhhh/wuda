@@ -3,7 +3,7 @@
 // wq_b_fp8_gemm.cuh — config + PTX/TMA helpers for the MERGED wq_b projection
 // (kernel/host/usage: kernels/wq_b_fp8_gemm.cu).
 //
-// Shape: x[M,1536] e4m3 @ w[N_MERGED,1536]^T (main q ++ indexer), M_pad in
+// Shape: x[M,K_DIM] e4m3 @ w[N_MERGED,K_DIM]^T (main q ++ indexer), M_pad in
 // {32,64,96,128}. Swap-AB: MMA A = weight (UMMA_M=256 along N), B = activation
 // (UMMA_N = M_pad along M), both K-major 128B-swizzled. Native DSV4 scales:
 // activation 1x128, weight 128x128, UE8M0; warp2 expands each K128 byte to four
@@ -29,11 +29,15 @@
 namespace wq_b {
 
 // ---- Problem dimensions (fixed for wq_b projection) ----
+#if defined(WQ_B_FLASH)
+static constexpr int K_DIM    = 1024;
+static constexpr int N_TOTAL  = 32768;  // 64 main-Q heads x 512 dim
+#elif defined(WQ_B_TPDP)
 static constexpr int K_DIM    = 1536;
-#if defined(WQ_B_TPDP)
 // TPDP keeps all index-Q heads replicated while sharding main-Q heads over TP2.
 static constexpr int N_TOTAL  = 32768;  // 64 main-Q heads x 512 dim
 #else
+static constexpr int K_DIM    = 1536;
 static constexpr int N_TOTAL  = 65536;  // 128 main-Q heads x 512 dim
 #endif
 // ---- Output head geometry (per-head RMSNorm scale folding) ----
@@ -407,11 +411,10 @@ __device__ __forceinline__ void quant_k128_ue8m0(
         *sf_dst = (uint8_t)(scale_exp + 127);
 }
 
-// rmsnorm(gamma) + 1x128 quant of ONE row, QUANT-GROUP wide (warps 2..7, 192
-// threads -- warp0/1 stay OFF the quant path so the weight TMA stream starts
-// at t=0): the group's warps split the 12 K128 blocks (2 each); ONE memory
-// wave loads v AND gamma together; block partial ssq (fixed shfl tree) ->
-// ssq_smem[12] -> group barrier -> every warp sums in FIXED block order
+// rmsnorm(gamma) + 1x128 quant of ONE row, CTA-wide. Pro uses six warps for
+// twelve K128 blocks; Flash uses eight warps for eight blocks. One memory wave
+// loads v AND gamma together; block partial ssq (fixed shfl tree) ->
+// ssq_smem -> CTA barrier -> every warp sums in FIXED block order
 // (bitwise identical) -> r -> qr = bf16((v*r)*gamma) materialized round ->
 // quant_k128 tail. MUST be called by ALL bar_threads of barrier bar_id.
 //
@@ -422,13 +425,13 @@ __device__ __forceinline__ void quant_k128_ue8m0(
 // amax pass), where this split runs 2 trees per warp on 6 warps at once. The
 // barrier pair is cheap next to that.
 __device__ __forceinline__ void qnorm_quant_row_cta(
-    const __nv_bfloat16* __restrict__ yrow,      // [1536] strided row base
-    const float* __restrict__ gamma,             // [1536]
+    const __nv_bfloat16* __restrict__ yrow,      // [K_DIM] strided row base
+    const float* __restrict__ gamma,             // [K_DIM]
     float eps, float* __restrict__ ssq_smem,     // [NUM_K_TILES] CTA scratch
     int warp_id, int lane_id, int nwarps,
     int bar_threads, int bar_id,
-    __nv_fp8_e4m3* __restrict__ qf_row,          // [1536] e4m3 out
-    uint8_t* __restrict__ qsf_row) {             // [12] UE8M0 out
+    __nv_fp8_e4m3* __restrict__ qf_row,          // [K_DIM] e4m3 out
+    uint8_t* __restrict__ qsf_row) {             // [NUM_K_TILES] UE8M0 out
     float v[2][4], g[2][4];
     #pragma unroll
     for (int i = 0; i < 2; ++i) {

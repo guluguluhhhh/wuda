@@ -501,7 +501,7 @@ static void hc_reduce_fuse_out(
                     xsf_out->is_contiguous() &&
                     xq_out->numel() == static_cast<int64_t>(m) * DIM &&
                     xsf_out->numel() == static_cast<int64_t>(m) * (DIM / 128),
-                    "xq_out [m,7168] + xsf_out [m,56] must be given together");
+                    "xq_out [m,DIM] + xsf_out [m,DIM/128] must be given together");
         xq_ptr = reinterpret_cast<uint8_t*>(xq_out->data_ptr());
         xsf_ptr = reinterpret_cast<uint8_t*>(xsf_out->data_ptr());
     }

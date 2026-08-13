@@ -11,7 +11,11 @@
 namespace mega::csa {
 
 constexpr int kMhcResidualStreams = 4;
+#if defined(DSV4_FLASH_CSA)
+constexpr int kMhcHiddenDim = 4096;
+#else
 constexpr int kMhcHiddenDim = 7168;
+#endif
 
 struct MhcPostArgs {
   const __nv_bfloat16* attention_out = nullptr;  // [M,7168]

@@ -87,6 +87,22 @@ def _ceil_ue8m0_scale(amax, fp8_max: tl.constexpr):
     return scale, exponent
 
 
+def configure_model(model: str = "pro") -> None:
+    """Configure the model-wide O-projection geometry before allocating data."""
+    global HEADS, TP2_HEADS, N_GROUPS, TP2_GROUPS
+    global O_INTERMEDIATE_DIM, HIDDEN_DIM, VALID_GEOMETRIES
+    if model == "flash":
+        HEADS, N_GROUPS, HIDDEN_DIM = 64, 8, 4096
+    elif model == "pro":
+        HEADS, N_GROUPS, HIDDEN_DIM = 128, 16, 7168
+    else:
+        raise ValueError(f"unsupported model: {model}")
+    TP2_HEADS = HEADS // 2
+    TP2_GROUPS = N_GROUPS // 2
+    O_INTERMEDIATE_DIM = N_GROUPS * O_LORA_RANK
+    VALID_GEOMETRIES = ((HEADS, N_GROUPS), (TP2_HEADS, TP2_GROUPS))
+
+
 @dataclass(frozen=True)
 class OProjWeights:
     """Prequantized DeepGEMM weights; scale tensors are already TMA layout."""
@@ -263,12 +279,14 @@ def prepare_o_proj_workspace(
     m: int,
     device: torch.device | str,
     *,
-    heads: int = HEADS,
-    groups: int = N_GROUPS,
+    heads: int | None = None,
+    groups: int | None = None,
     quant_module: Any,
 ) -> OProjWorkspace:
     _require(1 <= m <= 128, "O projection requires M in [1,128]")
     _require(quant_module is not None, "MLA O-projection quant module is required")
+    heads = HEADS if heads is None else heads
+    groups = N_GROUPS if groups is None else groups
     heads_per_group, intermediate_dim = _geometry(heads, groups)
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
@@ -403,11 +421,12 @@ def run_o_proj_mhc_post(
     _require(workspace.projected.shape == (m, HIDDEN_DIM) and
              workspace.projected.dtype == projected_dtype and
              workspace.projected.is_contiguous(),
-             f"workspace.projected must be contiguous {projected_dtype} [M,7168]")
+             f"workspace.projected must be contiguous {projected_dtype} "
+             f"[M,{HIDDEN_DIM}]")
     _require(workspace.mhc_output.shape == (m, 4, HIDDEN_DIM) and
              workspace.mhc_output.dtype == torch.bfloat16 and
              workspace.mhc_output.is_contiguous(),
-             "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
+             f"workspace.mhc_output must be contiguous BF16 [M,4,{HIDDEN_DIM}]")
     _require(not run_mhc_post or num_groups == N_GROUPS,
              "TP2 O projection returns an FP32 partial and requires C3 before mHC post")
     _validate_workspace_aliases(

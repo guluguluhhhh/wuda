@@ -51,7 +51,7 @@ def hc_n_splits(m):
     return max(min(n_sms // max((m + 63) // 64, 1), (K_DIM // 64) // 4), 1)
 
 
-def load_cuda_module():
+def load_cuda_module(model="pro"):
     from torch.utils.cpp_extension import load
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -73,8 +73,12 @@ def load_cuda_module():
         "-lineinfo",
         f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
     ]
+    if model == "flash":
+        cuda_flags.append("-DDSV4_FLASH_CSA=1")
+    elif model != "pro":
+        raise ValueError(f"unsupported model: {model}")
     return load(
-        name="hc_fused_tc",
+        name="hc_fused_tc_flash" if model == "flash" else "hc_fused_tc",
         sources=[os.path.join(proj_dir, "kernels", "hc_fused_kernel_tc.cu")],
         extra_include_paths=[os.path.join(proj_dir, "include")],
         extra_cuda_cflags=cuda_flags,

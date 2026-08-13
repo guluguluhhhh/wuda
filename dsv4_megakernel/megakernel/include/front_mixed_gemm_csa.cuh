@@ -15,9 +15,17 @@
 
 namespace front_mixed_csa {
 
+#if defined(DSV4_FLASH_CSA)
+constexpr int K = 4096;
+#else
 constexpr int K = 7168;
+#endif
 constexpr int N = 3072;
+#if defined(DSV4_FLASH_CSA)
+constexpr int N_FP8 = 1536;  // wq_a 1024 | window KV 512
+#else
 constexpr int N_FP8 = 2048;  // wq_a 1536 | window KV 512
+#endif
 constexpr int TMA_K_BF16 = 64;
 constexpr int TMA_K_FP8 = 128;
 

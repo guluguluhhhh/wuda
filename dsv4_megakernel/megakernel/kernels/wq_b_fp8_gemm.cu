@@ -12,7 +12,7 @@
 //       x_fp8, x_sf [M,12] ue8m0, w_fp8, w_sf [N_MERGED/128,12] ue8m0,
 //       q_pos [M] i32, rope_cos, rope_sin [max_pos,32] f32)
 //   iq_fp4/iq_sf are GARBAGE in this mode -- run idx_postprocess(iq_ws, ...).
-//   M in [1,128] dispatches to a 32-row template; TMA handles OOB rows. Optional
+//   M in [1,128] uses BM16 for M<=16, otherwise a 32-row template; TMA handles OOB. Optional
 //   kwargs: head_ssq (caller zero-init buffer), enable_ssq, mock_post. Return order:
 //   [y, iq_fp4, iq_sf, ssq?, iq_ws?, idx_q4?, idx_s4?, timing?] per the flags.
 //
@@ -87,6 +87,7 @@ struct SharedStorage {
 // build box -- otherwise only surfaces at RUNTIME as cudaFuncSetAttribute
 // "invalid argument" (observed: headerless-ssq NS=11 + scratch = 233472 > 232448).
 static_assert(sizeof(SharedStorage<32>)  <= wq_b::SMEM_CAPACITY &&
+              sizeof(SharedStorage<16>)  <= wq_b::SMEM_CAPACITY &&
               sizeof(SharedStorage<64>)  <= wq_b::SMEM_CAPACITY &&
               sizeof(SharedStorage<96>)  <= wq_b::SMEM_CAPACITY &&
               sizeof(SharedStorage<128>) <= wq_b::SMEM_CAPACITY,
@@ -130,13 +131,15 @@ head_ssq_kernel(
 // cudaGridDependencySynchronize -- already after that prologue -- provides the
 // cross-kernel ordering the old in-kernel grid ticket used to (whose sync
 // floor was ~1.5-2us on the activation-TMA critical path).
-// 192 threads = 6 warps, 2 K128 blocks each per 1536-wide row.
+// Pro: 192 threads = 6 warps, 2 K128 blocks each per 1536-wide row.
+// Flash: 256 threads = 8 warps, 1 K128 block each per 1024-wide row.
 //
 // One warp per row was tried and is much WORSE (d_q+norm 2.8 -> 7.9us at M=128,
 // 18us at M=1): a warp then owns all 12 blocks, so its 12 five-step shfl trees
 // serialise instead of running 2-per-warp across 6 warps. See
 // qnorm_quant_row_cta.
-__global__ void __launch_bounds__(192, 1)
+template <int kNumWarps>
+__global__ void __launch_bounds__(kNumWarps * 32, 1)
 qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
                    const float* __restrict__ gamma, float eps,
                    __nv_fp8_e4m3* __restrict__ x_fp8,
@@ -164,13 +167,13 @@ qnorm_quant_kernel(const __nv_bfloat16* __restrict__ y, int64_t lda,
     if (gamma != nullptr) {
         for (int r = blockIdx.x; r < m_total; r += gridDim.x)
             qnorm_quant_row_cta(y + (size_t)r * lda, gamma, eps, ssq_smem,
-                                warp_id, lane_id, /*nwarps=*/6,
-                                /*bar_threads=*/192, /*bar_id=*/0,
+                                warp_id, lane_id, /*nwarps=*/kNumWarps,
+                                /*bar_threads=*/kNumWarps * 32, /*bar_id=*/0,
                                 x_fp8 + (size_t)r * K_DIM,
                                 x_sf + r * NUM_K_TILES);
     } else {
-        const int gwarp = blockIdx.x * 6 + warp_id;
-        const int gwarps = gridDim.x * 6;
+        const int gwarp = blockIdx.x * kNumWarps + warp_id;
+        const int gwarps = gridDim.x * kNumWarps;
         const int nqb = m_total * NUM_K_TILES;
         for (int qb = gwarp; qb < nqb; qb += gwarps) {
             const int m = qb / NUM_K_TILES, b = qb % NUM_K_TILES;
@@ -818,6 +821,7 @@ static CUtensorMap make_tma_desc_bf16_2d(
 template <bool kProfile, bool kSsq, bool kIdxFp8>
 static void* get_kernel_ptr(int M) {
     switch (M) {
+        case 16:  return (void*)&wq_b_proj_kernel<16,  kProfile, kSsq, kIdxFp8>;
         case 32:  return (void*)&wq_b_proj_kernel<32,  kProfile, kSsq, kIdxFp8>;
         case 64:  return (void*)&wq_b_proj_kernel<64,  kProfile, kSsq, kIdxFp8>;
         case 96:  return (void*)&wq_b_proj_kernel<96,  kProfile, kSsq, kIdxFp8>;
@@ -827,6 +831,7 @@ static void* get_kernel_ptr(int M) {
 }
 static int get_smem_bytes(int M) {
     switch (M) {
+        case 16:  return (int)sizeof(SharedStorage<16>);
         case 32:  return (int)sizeof(SharedStorage<32>);
         case 64:  return (int)sizeof(SharedStorage<64>);
         case 96:  return (int)sizeof(SharedStorage<96>);
@@ -865,8 +870,8 @@ static std::vector<torch::Tensor> run_wq_b(
     // local kv window bundle (winkv, CSA stage 4; needs cmp_pos + rope tables too)
     c10::optional<torch::Tensor> win_y2   = c10::nullopt,
     c10::optional<torch::Tensor> win_norm = c10::nullopt,
-    // fused activation-quant prologue: q_y bf16 [M,1536] (front y[:, :1536]
-    // view OK, stride(1)==1). q_norm_w fp32 [1536] additionally fuses the
+    // fused activation-quant prologue: q_y bf16 [M,K_DIM] (a front-output view
+    // is OK, stride(1)==1). q_norm_w fp32 [K_DIM] additionally fuses the
     // rmsnorm (CTA-wide, deterministic); without it: plain 1x128 quant.
     // When q_y is given, x_fp8/x_sf are OUTPUT buffers written by the kernel.
     c10::optional<torch::Tensor> q_y      = c10::nullopt,
@@ -911,10 +916,11 @@ static std::vector<torch::Tensor> run_wq_b(
                 "w_fp8 must be the MERGED weight [", N_MERGED, ",", K_DIM, "]");
     TORCH_CHECK(M >= 1 && M <= 128,
                 "kernel supports M in [1,128] (swap path), got M=", M);
-    // Arbitrary batch: pick the 32-aligned template; TMA zero-fills the padded
+    // Arbitrary batch: use DeepGEMM's BM=16 recipe for M<=16, otherwise pick
+    // the 32-aligned template. TMA zero-fills the padded
     // activation rows (OOB reads) and clips the padded output rows (OOB stores);
     // the SF packer / ssq / drain / xform paths guard on problem_m == M.
-    const int M_pad = (M + 31) / 32 * 32;
+    const int M_pad = M <= 16 ? 16 : (M + 31) / 32 * 32;
     const int num_m_sub = (M_pad + BM - 1) / BM;  // profiling only (== 1)
 
     const int sf_k = K_DIM / QUANT_BLOCK_K;                       // 12
@@ -1310,10 +1316,12 @@ static std::vector<torch::Tensor> run_wq_b(
         // GEMM below is PDL-linked (programmatic stream serialization), so its
         // prologue overlaps the quant and its GDS provides the ordering.
         if (quant_on) {
+            constexpr int kQuantWarps = K_DIM == 1024 ? 8 : 6;
+            constexpr int kQuantThreads = kQuantWarps * 32;
             const int qgrid = qgamma_ptr
                 ? M                                             // one CTA per row
-                : (M * NUM_K_TILES + 5) / 6;                    // one warp per K128 block
-            qnorm_quant_kernel<<<qgrid, 192, 0, stream>>>(
+                : (M * NUM_K_TILES + kQuantWarps - 1) / kQuantWarps;
+            qnorm_quant_kernel<kQuantWarps><<<qgrid, kQuantThreads, 0, stream>>>(
                 qy_ptr, qy_lda, qgamma_ptr, static_cast<float>(q_eps),
                 const_cast<__nv_fp8_e4m3*>(x_ptr),
                 const_cast<uint8_t*>(xsf_ptr), M, ssq_ptr,

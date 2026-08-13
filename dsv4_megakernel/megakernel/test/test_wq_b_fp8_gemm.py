@@ -30,6 +30,8 @@ K_DIM   = 1536
 FULL_N_TOTAL = 65536
 FULL_N_IDX = 64 * 128
 TPDP_N_TOTAL = 32768
+FLASH_K_DIM = 1024
+FLASH_N_TOTAL = 32768
 
 # Importers retain full-rank defaults. Entry points call configure_geometry()
 # before constructing tensors when they need the TPDP idx-replicated geometry.
@@ -42,15 +44,24 @@ SF_K    = K_DIM // QUANT_BLOCK_K          # 12
 UE8M0_ONE = 0x7F                    # exponent 127 -> 2^0 = 1.0
 
 
-def configure_geometry(tpdp=False):
-    """Select full rank or TP2 main-Q with replicated index-Q."""
-    global N_TOTAL, N_IDX, N_MERGED
-    N_TOTAL = TPDP_N_TOTAL if tpdp else FULL_N_TOTAL
+def configure_geometry(tpdp=False, model="pro"):
+    """Select Pro full/TP2 or the independent Flash CSA geometry."""
+    global K_DIM, N_TOTAL, N_IDX, N_MERGED, SF_K
+    if model == "flash":
+        if tpdp:
+            raise ValueError("Flash CSA cannot be combined with --tpdp")
+        K_DIM, N_TOTAL = FLASH_K_DIM, FLASH_N_TOTAL
+    elif model == "pro":
+        K_DIM = 1536
+        N_TOTAL = TPDP_N_TOTAL if tpdp else FULL_N_TOTAL
+    else:
+        raise ValueError(f"unsupported model: {model}")
     N_IDX = FULL_N_IDX
     N_MERGED = N_TOTAL + N_IDX
+    SF_K = K_DIM // QUANT_BLOCK_K
 
 
-def load_module(tpdp=False):
+def load_module(tpdp=False, model="pro"):
     from torch.utils.cpp_extension import load
     this_dir = os.path.dirname(os.path.abspath(__file__))
     proj_dir = os.path.dirname(this_dir)
@@ -72,9 +83,16 @@ def load_module(tpdp=False):
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
         f'-gencode=arch=compute_{sm}a,code=sm_{sm}a',
     ]
-    if tpdp:
+    if model == "flash":
+        if tpdp:
+            raise ValueError("Flash CSA cannot be combined with --tpdp")
+        cuda_flags.append('-DWQ_B_FLASH=1')
+    elif tpdp:
         cuda_flags.append('-DWQ_B_TPDP=1')
-    name = 'wq_b_fp8_gemm_tpdp' if tpdp else 'wq_b_fp8_gemm'
+    elif model != "pro":
+        raise ValueError(f"unsupported model: {model}")
+    name = ('wq_b_fp8_gemm_flash' if model == "flash" else
+            'wq_b_fp8_gemm_tpdp' if tpdp else 'wq_b_fp8_gemm')
     return load(
         name=name,
         sources=[os.path.join(proj_dir, 'kernels', 'wq_b_fp8_gemm.cu')],
@@ -406,17 +424,23 @@ def test_qnorm(module, M):
 
 
 # ==================== benchmark ====================
-def benchmark_merged(module):
+def benchmark_merged(module, model="pro"):
     """Single-table accounting at the configured merged shape:
-      gemm     = plain merged GEMM (mock_post, no ssq/comp/win/quant)
-      d_*      = (that ONE feature on) - gemm : each feature's net latency
-      fused    = EVERYTHING ON in one real run (idxpost + ssq + compressor +
-                 winkv + rmsnorm-quant prologue) -- NOT a sum of the d_ columns
-      d_all    = fused - gemm (measured total net cost of all fusions)
+      gemm     = plain merged GEMM kernel time (DeepGEMM bench_kineto)
+      d_*      = (that ONE feature on) - gemm : each feature's net latency;
+                  d_quant+norm uses the end-to-end CUDA-event span of the
+                  overlapping PDL pair minus the no-quant/no-norm GEMM span
+      fused    = gemm kernel time + d_all; it excludes quant+norm
+      d_all    = fused PDL span - quant+norm PDL span, so this column excludes
+                 quant+norm and reports only the remaining fusion overhead
     comp/win rows use all-compress positions (upper bound; production is 1-in-4).
-    cuBLAS is bare fp8 _scaled_mm at the same local shape; fused_BW uses fused."""
+    cuBLAS is bare fp8 _scaled_mm kernel time at the same local shape. CUDA-event
+    spans are used only as paired differences, so their fixed timing overhead
+    cannot contaminate gemm/cuBLAS or the displayed fused time."""
     print("\n" + "=" * 60)
-    mode = "TPDP (main TP2 + index replicated)" if N_TOTAL == TPDP_N_TOTAL else "full rank"
+    mode = ("Flash" if model == "flash" else
+            "TPDP (main TP2 + index replicated)" if N_TOTAL == TPDP_N_TOTAL
+            else "full rank")
     print(f"Benchmark: MERGED wq_b ({mode}, main={N_TOTAL}, index={N_IDX}, "
           f"N={N_MERGED}), all fusions")
     print("=" * 60)
@@ -436,14 +460,14 @@ def benchmark_merged(module):
     requested_clusters = int(os.environ.get('WQ_B_CLUSTERS', 0))
     if requested_clusters > 0:
         num_clusters = min(requested_clusters, min(num_sms, num_tiles * 2) // 2)
-    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); M dispatches to the "
-          f"next 32-row template (TMA handles OOB rows; no caller-side padding)")
+    print(f"  merged weight {weight_bytes/1e6:.1f} MB (e4m3); M<=16 uses BM16, "
+          f"otherwise the next 32-row template (TMA OOB; no caller padding)")
     print(f"  scheduler {num_tiles} cluster tiles / {num_clusters} resident clusters "
           f"-> max {((num_tiles + num_clusters - 1) // num_clusters)} iterations/cluster")
     print(f"  {'M':<5} {'gemm(us)':<9} {'fused(us)':<10} {'d_post':<7} {'d_ssq':<7} "
-          f"{'d_comp':<7} {'d_win':<7} {'d_quant':<8} {'d_q+norm':<9} {'d_all':<7} "
+          f"{'d_comp':<7} {'d_win':<7} {'d_quant+norm':<12} {'d_all':<7} "
           f"{'cuBLAS(us)':<11} {'fused_BW':<9} {'%cuBLAS':<8}")
-    print("  " + "-" * 116)
+    print("  " + "-" * 115)
     # ADDRESS-PLACEMENT DISCRIMINATOR for the wandering d_ anomalies (they
     # reproduce EXACTLY under a fixed sweep order and move when the order
     # changes -> allocator-history-dependent buffer addresses colliding
@@ -451,12 +475,13 @@ def benchmark_merged(module):
     #   - empty_cache() per cell -> canonical allocator state
     #   - ssqbuf from a FIXED max-size pool -> same address every cell
     ssqbuf_pool = torch.zeros(128, N_TOTAL // 512, device=dev, dtype=torch.float32)
-    # M < 32 shares one specialization, so sample its boundaries and midpoint.
+    # Sample BM16 and each subsequent 32-row specialization boundary.
     for M in [1, 16, 31, 32, 61, 64, 96, 97, 127, 128]:
         torch.cuda.empty_cache()
         x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
         x_sf = make_act_sf_ones(M, dev)
-        q_y = (torch.randn(M, 4672, device=dev) * 0.1).bfloat16()[:, :K_DIM]
+        front_n = 4160 if model == "flash" else 4672
+        q_y = (torch.randn(M, front_n, device=dev) * 0.1).bfloat16()[:, :K_DIM]
         q_gamma = torch.rand(K_DIM, device=dev) + 0.5
         q_pos = torch.randint(0, cos_tab.shape[0], (M,), device=dev, dtype=torch.int32)
         comp = make_comp_inputs(M, dev, all_compress=True)
@@ -480,21 +505,43 @@ def benchmark_merged(module):
                 kw['q_norm_w'] = q_gamma
             return module.wq_b_proj_gemm_merged(
                 x, x_sf, wm, w_sfm, q_pos, cos_tab, sin_tab,
-                head_ssq=ssq, mock_post=mock, enable_ssq=en_ssq, **kw)
+                head_ssq=ssq, mock_post=mock, enable_ssq=en_ssq, pdl=True,
+                **kw)
 
         def bench(**kw):
             return 1e6 * bench_kineto(lambda: run(**kw), 'wq_b_proj_kernel',
                                       suppress_kineto_output=True)
+
+        def bench_span(**kw):
+            """Cold-L2 device span around the whole call, including PDL overlap."""
+            run(**kw)
+            torch.cuda.synchronize()
+            events = [(torch.cuda.Event(enable_timing=True),
+                       torch.cuda.Event(enable_timing=True))
+                      for _ in range(30)]
+            for start, end in events:
+                torch.empty(int(8e9 // 4), dtype=torch.int, device=dev).zero_()
+                start.record()
+                run(**kw)
+                end.record()
+            torch.cuda.synchronize()
+            return sum(start.elapsed_time(end) for start, end in events) * 1e3 / len(events)
 
         ug     = bench()
         upost  = bench(mock=False)
         ussq   = bench(ssq=ssqbuf, en_ssq=True)
         ucomp  = bench(wc=True)
         uwin   = bench(ww=True)
-        uq     = bench(qy=True)
-        uqn    = bench(qy=True, qn=True)
-        uf     = bench(mock=False, ssq=ssqbuf, en_ssq=True, wc=True, ww=True,
-                       qy=True, qn=True)
+        ug_span = bench_span()
+        uqn_span = bench_span(qy=True, qn=True)
+        uf_span = bench_span(mock=False, ssq=ssqbuf, en_ssq=True, wc=True,
+                             ww=True, qy=True, qn=True)
+        dqnorm = uqn_span - ug_span
+        dall = uf_span - uqn_span
+        # Anchor the non-quant fusion delta to the same kernel-time baseline as
+        # cuBLAS. d_quant+norm is reported separately and is deliberately not
+        # included in fused, fused_BW, or %cuBLAS.
+        uf = ug + dall
         try:
             cb_pair = bench_kineto(
                 lambda: torch._scaled_mm(x, wm_t, scale_a=one, scale_b=one,
@@ -511,9 +558,10 @@ def benchmark_merged(module):
         bw = obytes / (uf * 1e-6) / 1e9
         cb_s = f"{cb:<11.1f}" if cb else f"{'n/a':<11}"
         pct  = f"{cb/uf*100:<8.1f}" if cb else f"{'-':<8}"
-        print(f"  {M:<5} {ug:<9.1f} {uf:<10.1f} {upost-ug:<7.2f} {ussq-ug:<7.2f} "
-              f"{ucomp-ug:<7.2f} {uwin-ug:<7.2f} {uq-ug:<8.2f} {uqn-ug:<9.2f} "
-              f"{uf-ug:<7.2f} {cb_s} {bw:<9.1f} {pct}")
+        print(f"  {M:<5} {ug:<9.1f} {uf:<10.1f} "
+              f"{upost-ug:<7.2f} {ussq-ug:<7.2f} "
+              f"{ucomp-ug:<7.2f} {uwin-ug:<7.2f} {dqnorm:<12.2f} "
+              f"{dall:<7.2f} {cb_s} {bw:<9.1f} {pct}")
 
 
 # ==================== fused indexer compressor (delivery port) ====================
@@ -891,6 +939,9 @@ if __name__ == '__main__':
         '--tpdp', action='store_true',
         help='main-Q TP2 plus all 64 index-Q heads replicated '
              '(main=32768/index=8192); default is full rank')
+    parser.add_argument('--model', choices=('pro', 'flash'), default='pro')
+    parser.add_argument('--benchmark-only', action='store_true')
+    parser.add_argument('--smoke', action='store_true')
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -903,42 +954,53 @@ if __name__ == '__main__':
         print(f"ERROR: tcgen05 block-scale requires sm_100+ (Blackwell), got sm_{sm}")
         sys.exit(1)
 
-    configure_geometry(args.tpdp)
-    geo = 'TPDP main TP2 + replicated indexer' if args.tpdp else 'full rank'
+    configure_geometry(args.tpdp, model=args.model)
+    geo = ('Flash' if args.model == 'flash' else
+           'TPDP main TP2 + replicated indexer' if args.tpdp else 'full rank')
     print(f"Geometry: {geo} "
           f"main={N_TOTAL}, index={N_IDX}, merged={N_MERGED}, "
           f"cluster_tiles={N_MERGED // 256}")
-    module = load_module(tpdp=args.tpdp)
+    module = load_module(tpdp=args.tpdp, model=args.model)
     assert (module.n_main, module.n_index, module.n_merged) == \
         (N_TOTAL, N_IDX, N_MERGED), "Python/kernel WQB geometry mismatch"
     assert module.slot_dtype_bits == 64, "FP8 CSA slot ABI must be int64"
 
+    if args.benchmark_only:
+        benchmark_merged(module, model=args.model)
+        raise SystemExit(0)
+
+    merged_ms = [1, 61, 128] if args.smoke else \
+        [1, 31, 32, 61, 64, 96, 97, 127, 128]
+    idx_ms = [1, 128] if args.smoke else [1, 61, 128]
+    feature_ms = [1, 61, 128] if args.smoke else [1, 32, 61, 128]
+
     print("\nCorrectness (merged, non-trivial scales, arbitrary batch):")
-    results = [test_merged(module, M)
-               for M in [1, 31, 32, 61, 64, 96, 97, 127, 128]]
+    results = [test_merged(module, M) for M in merged_ms]
 
     print("\nCorrectness (RTP FP8 Indexer-Q transform):")
-    results += [test_indexer_q_fp8(module, M) for M in [1, 61, 128]]
+    results += [test_indexer_q_fp8(module, M) for M in idx_ms]
 
     print("\nCorrectness (fused indexer compressor, delivery port):")
-    results += [test_comp(module, M) for M in [1, 32, 61, 128]]
-    results += [test_comp(module, M, mock_post=False) for M in [31, 61, 128]]
+    results += [test_comp(module, M) for M in feature_ms]
+    results += [test_comp(module, M, mock_post=False)
+                for M in ([61] if args.smoke else [31, 61, 128])]
 
     print("\nCorrectness (fused local kv window, CSA stage 4):")
-    results += [test_win(module, M) for M in [1, 32, 61, 128]]
-    results += [test_win(module, M, mock_post=False) for M in [61, 128]]
+    results += [test_win(module, M) for M in feature_ms]
+    results += [test_win(module, M, mock_post=False)
+                for M in ([61] if args.smoke else [61, 128])]
     results.append(test_rtp_paged_pool_writes(module))
     results.append(test_rtp_paged_pool_writes(module, indexer_fp8=True))
 
     print("\nCorrectness (fused quant prologue, isolation):")
-    results += [test_quant_iso(module, M) for M in [1, 32, 61, 128]]
+    results += [test_quant_iso(module, M) for M in feature_ms]
 
     print("\nCorrectness (fused rmsnorm+quant prologue, production form):")
-    results += [test_qnorm(module, M) for M in [1, 32, 61, 128]]
+    results += [test_qnorm(module, M) for M in feature_ms]
 
-    benchmark_merged(module)
-
-    profile_pipeline(module, M=128)
+    if not args.smoke:
+        benchmark_merged(module, model=args.model)
+        profile_pipeline(module, M=128)
 
     print("\n" + "=" * 60)
     print(f"Summary: {'ALL PASS' if all(results) else 'SOME FAILED'}")

@@ -49,12 +49,13 @@ torch::Tensor run_op(
   TORCH_CHECK(w_fp8.is_cuda() && w_fp8.is_contiguous() &&
               w_fp8.scalar_type() == torch::kFloat8_e4m3fn &&
               w_fp8.sizes() == torch::IntArrayRef({N_FP8, K}),
-              "w_fp8 must be e4m3 [2048,7168]");
+              "w_fp8 must be e4m3 [", N_FP8, ",", K, "]");
   TORCH_CHECK(w_sf.is_cuda() && w_sf.is_contiguous() &&
               (w_sf.scalar_type() == torch::kUInt8 ||
                w_sf.scalar_type() == torch::kFloat8_e8m0fnu) &&
               w_sf.numel() == static_cast<int64_t>(N_FP8 / 128) * FP8_SCALE_TILES,
-              "w_sf must be u8/ue8m0 [16,56]");
+              "w_sf must be u8/ue8m0 [", N_FP8 / 128, ",",
+              FP8_SCALE_TILES, "]");
 
   torch::Tensor out;
   if (out_opt.has_value() && out_opt->numel() != 0) {

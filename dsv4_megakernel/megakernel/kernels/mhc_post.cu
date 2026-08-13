@@ -145,12 +145,16 @@ void mhc_post_out(torch::Tensor attention_out, torch::Tensor residual,
   const int64_t m = attention_out.size(0);
   TORCH_CHECK(attention_out.is_cuda() && attention_out.scalar_type() == torch::kBFloat16 &&
                   attention_out.is_contiguous() &&
-                  attention_out.sizes() == torch::IntArrayRef({m, 7168}),
-              "attention_out must be contiguous CUDA BF16 [M,7168]");
+                  attention_out.sizes() ==
+                      torch::IntArrayRef({m, mega::csa::kMhcHiddenDim}),
+              "attention_out must be contiguous CUDA BF16 [M,",
+              mega::csa::kMhcHiddenDim, "]");
   TORCH_CHECK(residual.is_cuda() && residual.scalar_type() == torch::kBFloat16 &&
                   residual.is_contiguous() &&
-                  residual.sizes() == torch::IntArrayRef({m, 4, 7168}),
-              "residual must be contiguous CUDA BF16 [M,4,7168]");
+                  residual.sizes() ==
+                      torch::IntArrayRef({m, 4, mega::csa::kMhcHiddenDim}),
+              "residual must be contiguous CUDA BF16 [M,4,",
+              mega::csa::kMhcHiddenDim, "]");
   TORCH_CHECK(post.is_cuda() && post.scalar_type() == torch::kFloat32 &&
                   post.is_contiguous() &&
                   post.sizes() == torch::IntArrayRef({m, 4}),
@@ -161,8 +165,10 @@ void mhc_post_out(torch::Tensor attention_out, torch::Tensor residual,
               "comb must be contiguous CUDA FP32 [M,4,4]");
   TORCH_CHECK(output.is_cuda() && output.scalar_type() == torch::kBFloat16 &&
                   output.is_contiguous() &&
-                  output.sizes() == torch::IntArrayRef({m, 4, 7168}),
-              "output must be contiguous CUDA BF16 [M,4,7168]");
+                  output.sizes() ==
+                      torch::IntArrayRef({m, 4, mega::csa::kMhcHiddenDim}),
+              "output must be contiguous CUDA BF16 [M,4,",
+              mega::csa::kMhcHiddenDim, "]");
 
   mega::csa::MhcPostArgs args{};
   args.attention_out = reinterpret_cast<const __nv_bfloat16*>(attention_out.data_ptr());

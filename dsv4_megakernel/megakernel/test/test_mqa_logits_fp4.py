@@ -36,9 +36,21 @@ HEAD_DIM = 128
 def _deep_gemm_dir():
     override = os.environ.get("DEEP_GEMM_DIR")
     if override:
-        return os.path.abspath(override)
-    return os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "..", "DeepGEMM"))
+        candidates = [os.path.abspath(override)]
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.abspath(os.path.join(
+                here, "..", "..", "..", "DeepGEMM")),
+            os.path.abspath(os.path.join(
+                here, "..", "..", "..", "..", "DeepGEMM")),
+        ]
+    for candidate in candidates:
+        if os.path.isdir(os.path.join(candidate, "deep_gemm", "include")):
+            return candidate
+    source = "DEEP_GEMM_DIR" if override else "local checkout"
+    raise FileNotFoundError(
+        f"{source} has no deep_gemm/include directory: {candidates}")
 
 
 # ==================================================================================

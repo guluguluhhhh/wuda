@@ -21,7 +21,11 @@ namespace hc_tc {
 
 // ---- problem constants (shared with the epilogue) ----
 static constexpr int HC = 4;
+#if defined(DSV4_FLASH_CSA)
+static constexpr int DIM = 4096;
+#else
 static constexpr int DIM = 7168;
+#endif
 static constexpr int K_DIM = HC * DIM;          // 28672
 static constexpr int N_OUT = 24;
 static constexpr int SINKHORN_ITERS = 20;

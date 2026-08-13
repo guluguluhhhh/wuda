@@ -25,6 +25,18 @@ N_FP8 = 2048
 SF_K = K // 128          # 56
 
 
+def configure_geometry(model='pro'):
+    """Select the activation/weight geometry used by shared quant helpers."""
+    global K, N, N_FP8, SF_K
+    if model == 'flash':
+        K, N, N_FP8 = 4096, 4160, 1536
+    elif model == 'pro':
+        K, N, N_FP8 = 7168, 4672, 2048
+    else:
+        raise ValueError(f'unsupported model: {model}')
+    SF_K = K // 128
+
+
 def load_module():
     from torch.utils.cpp_extension import load
     this_dir = os.path.dirname(os.path.abspath(__file__))

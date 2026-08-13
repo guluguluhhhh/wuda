@@ -1,5 +1,6 @@
 """Correctness and performance tests for the independent CSA swap-AB front GEMM."""
 
+import argparse
 import os
 import sys
 
@@ -13,10 +14,21 @@ from test_front_mixed_gemm import (
     K, N_FP8, calc_diff, dequant_fp8, hc_ref, make_hc,
     quant_act_fp8, quant_weight_fp8,
 )
+import test_front_mixed_gemm as t_fm
 
 N = 4672  # CSA shape: fp8 [0,2048) wq_a|wkv + bf16 [2048,4672)
 FP8_TASKS_PER_BATCH = 16
 TASKS_PER_BATCH = 37  # 16 fp8 (N128) + 21 bf16 (N128, tail tile 64 rows)
+Q_RANK = 1536
+
+
+def configure_geometry(model='pro'):
+    global K, N, N_FP8, Q_RANK, FP8_TASKS_PER_BATCH, TASKS_PER_BATCH
+    t_fm.configure_geometry(model)
+    K, N, N_FP8 = t_fm.K, t_fm.N, t_fm.N_FP8
+    Q_RANK = 1024 if model == 'flash' else 1536
+    FP8_TASKS_PER_BATCH = N_FP8 // 128
+    TASKS_PER_BATCH = FP8_TASKS_PER_BATCH + (N - N_FP8 + 127) // 128
 
 
 def batch_n_for(phys_m):
@@ -57,7 +69,7 @@ TAIL_BENCH = (1, 4, 8, 16, 17, 24, 32, 48, 64, 65, 96, 128, 129, 160,
 TIMING_FIELDS = 13
 
 
-def load_module(name, source):
+def load_module(name, source, model='pro'):
     from torch.utils.cpp_extension import load
     this_dir = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(this_dir)
@@ -72,6 +84,10 @@ def load_module(name, source):
         '-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1',
         f'-gencode=arch=compute_{sm}a,code=sm_{sm}a',
     ]
+    if model == 'flash':
+        flags.append('-DDSV4_FLASH_CSA=1')
+    elif model != 'pro':
+        raise ValueError(f'unsupported model: {model}')
     return load(
         name=name,
         sources=[os.path.join(root, 'kernels', source)],
@@ -154,12 +170,13 @@ def direct_emit_correctness(module, weights, smoke=False):
             and calc_diff(idx_actual[:, :256], idx_raw[:, :256]) < 1e-5
             and calc_diff(idx_actual[:, 256:] - idx_ape[phase.long()],
                           idx_raw[:, 256:]) < 1e-5)
-        handoff_ok = (torch.equal(win_y2, plain[:, 1536:2048].float())
-                      and torch.equal(w64, plain[:, 4608:4672].float()))
+        handoff_ok = (torch.equal(
+            win_y2, plain[:, Q_RANK:Q_RANK + 512].float())
+            and torch.equal(w64, plain[:, N - 64:N].float()))
         output_ok = (
-            torch.equal(emitted[:, :1536], plain[:, :1536])
-            and torch.equal(emitted[:, 1536:],
-                            torch.full_like(emitted[:, 1536:], -1234.0)))
+            torch.equal(emitted[:, :Q_RANK], plain[:, :Q_RANK])
+            and torch.equal(emitted[:, Q_RANK:],
+                            torch.full_like(emitted[:, Q_RANK:], -1234.0)))
         if not (hc_ok and untouched and state_ok and handoff_ok and output_ok):
             raise AssertionError(
                 f'B={b}: direct emit mismatch hc={hc_ok} untouched={untouched} '
@@ -240,10 +257,12 @@ def benchmark_tail(swap, weights):
 def benchmark(swap, weights):
     print('\nPerformance (cold L2 kernel us; M<16 caller-padded to physical M=16)')
     print(f'cuBLAS BF16/FP8 are full same-shape [M,{K}] x [{K},{N}] GEMMs.')
-    print(f"  {'M':>4} {'phys':>5} {'tile':>4} {'swapAB':>8} "
-          f"{'cuBLAS16':>9} {'cuBLAS8':>9} "
+    print('Bandwidth uses each path\'s actual operand bytes: mixed FP8/BF16 '
+          'for swapAB, all-BF16/all-FP8 for cuBLAS.')
+    print(f"  {'M':>4} {'phys':>5} {'swapAB':>8} {'mixBW':>7} "
+          f"{'cuBLAS16':>9} {'BW16':>7} {'cuBLAS8':>9} {'BW8':>7} "
           f"{'cb16/swap':>9} {'cb8/swap':>8}")
-    print('  ' + '-' * 72)
+    print('  ' + '-' * 92)
 
     w16, w8, wsf = weights
     w_all_bf16 = torch.cat(
@@ -274,13 +293,23 @@ def benchmark(swap, weights):
                 suppress_kineto_output=True))
             cb8_text = f'{cb8_us:9.2f}'
             cb8_ratio = f'{cb8_us / swap_us:8.3f}'
+            cb8_bytes = (physical_b * K + N * K + physical_b * N * 2)
+            cb8_bw = f'{cb8_bytes / cb8_us / 1e6:7.2f}'
         except Exception as exc:
             cb8_text = f"{'n/a':>9}"
             cb8_ratio = f"{'n/a':>8}"
+            cb8_bw = f"{'n/a':>7}"
             if b == BENCH_B[0]:
                 print(f'  cuBLAS FP8 unavailable: {exc}')
-        print(f'{b:6d} {physical_b:5d} {tile_n8:4d} {swap_us:8.2f} '
-              f'{cb16_us:9.2f} {cb8_text} '
+        mixed_bytes = (physical_b * K * 3 + N_FP8 * K +
+                       (N - N_FP8) * K * 2 + physical_b * N * 2 +
+                       physical_b * (K // 128) +
+                       (N_FP8 // 128) * (K // 128))
+        cb16_bytes = (physical_b * K * 2 + N * K * 2 + physical_b * N * 2)
+        print(f'{b:6d} {physical_b:5d} {swap_us:8.2f} '
+              f'{mixed_bytes / swap_us / 1e6:7.2f} '
+              f'{cb16_us:9.2f} {cb16_bytes / cb16_us / 1e6:7.2f} '
+              f'{cb8_text} {cb8_bw} '
               f'{cb16_us / swap_us:9.3f} '
               f'{cb8_ratio}')
 
@@ -396,20 +425,36 @@ def timeline(module, weights):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=('pro', 'flash'), default='pro')
+    parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--timeline', action='store_true')
+    parser.add_argument('--tail', action='store_true')
+    parser.add_argument('--benchmark-only', action='store_true')
+    args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit('CUDA is required')
+    configure_geometry(args.model)
     print(f'Device: {torch.cuda.get_device_name()} capability='
           f'{torch.cuda.get_device_capability()} torch={torch.__version__}')
+    print(f'Geometry: {args.model} K={K} N={N} fp8_rows={N_FP8} '
+          f'bf16_rows={N - N_FP8}')
+    module_name = ('front_mixed_gemm_csa_swapab_flash'
+                   if args.model == 'flash'
+                   else 'front_mixed_gemm_csa_swapab')
     swap_module = load_module(
-        'front_mixed_gemm_csa_swapab', 'front_mixed_gemm_csa_swapab.cu')
+        module_name, 'front_mixed_gemm_csa_swapab.cu', model=args.model)
     shared_weights = make_weights(seed=4000)
-    if '--timeline' in sys.argv:
+    if args.benchmark_only:
+        benchmark(swap_module, shared_weights)
+        raise SystemExit(0)
+    if args.timeline:
         timeline(swap_module, shared_weights)
         raise SystemExit(0)
-    smoke_mode = '--smoke' in sys.argv
+    smoke_mode = args.smoke
     correctness(swap_module, shared_weights, smoke=smoke_mode)
     direct_emit_correctness(swap_module, shared_weights, smoke=smoke_mode)
-    if '--tail' in sys.argv:
+    if args.tail:
         benchmark_tail(swap_module, shared_weights)
         print('\nALL PASS')
         raise SystemExit(0)

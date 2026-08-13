@@ -15,7 +15,42 @@ names when one call launches several kernels (e.g. cuBLASLt split-K
 """
 import os
 import sys
+import tempfile
 import torch
+
+
+def ensure_build_tmpdir(min_free_bytes=512 * 1024 * 1024):
+    """Keep NVCC/Python temporary files off a full system /tmp filesystem."""
+    configured = os.environ.get("TMPDIR")
+    # NVCC defaults directly to /tmp; unlike Python's tempfile module, it does
+    # not probe /var/tmp when /tmp has no usable space.
+    current = configured or "/tmp"
+    try:
+        stat = os.statvfs(current)
+        free_bytes = stat.f_bavail * stat.f_frsize
+    except OSError:
+        free_bytes = 0
+    if configured or free_bytes >= min_free_bytes:
+        return current
+
+    fallback_root = "/dev/shm"
+    try:
+        stat = os.statvfs(fallback_root)
+        fallback_free = stat.f_bavail * stat.f_frsize
+    except OSError:
+        return current
+    if fallback_free < min_free_bytes:
+        return current
+
+    fallback = os.path.join(fallback_root, f"wuda-tmp-{os.getuid()}")
+    os.makedirs(fallback, mode=0o700, exist_ok=True)
+    os.environ["TMPDIR"] = fallback
+    tempfile.tempdir = fallback
+    print(f"[build] {current} has insufficient free space; TMPDIR={fallback}")
+    return fallback
+
+
+ensure_build_tmpdir()
 
 
 class empty_suppress:
@@ -142,8 +177,7 @@ def get_deep_gemm(pdl: bool = True):
                                   possibly stale installed wheel)
       2. installed wheel       -- `pip install .` inside DeepGEMM works for
                                   anyone, no layout assumptions
-      3. sibling checkout      -- <repo-parent>/DeepGEMM (our box layout
-                                  convention), auto-detected
+      3. local checkout        -- wuda/DeepGEMM, then <repo-parent>/DeepGEMM
     pdl=True enables PDL once (producers emit launch_dependents for our
     PSS consumers; matches vLLM's production ENABLE_PDL form)."""
     global _DEEP_GEMM
@@ -161,13 +195,19 @@ def get_deep_gemm(pdl: bool = True):
                 _DEEP_GEMM = importlib.import_module("deep_gemm")
             except ModuleNotFoundError:
                 here = os.path.dirname(os.path.abspath(__file__))
-                cand = os.path.abspath(
-                    os.path.join(here, "..", "..", "..", "..", "DeepGEMM"))
-                if not os.path.isdir(os.path.join(cand, "deep_gemm")):
+                candidates = [
+                    os.path.abspath(os.path.join(
+                        here, "..", "..", "..", "DeepGEMM")),
+                    os.path.abspath(os.path.join(
+                        here, "..", "..", "..", "..", "DeepGEMM")),
+                ]
+                cand = next((path for path in candidates if os.path.isdir(
+                    os.path.join(path, "deep_gemm"))), None)
+                if cand is None:
                     raise ModuleNotFoundError(
                         "deep_gemm not found. Either `pip install .` inside "
                         "a DeepGEMM checkout, or set DEEP_GEMM_DIR=/path/to/"
-                        f"DeepGEMM, or place the checkout at {cand}")
+                        f"DeepGEMM, or place the checkout at {candidates[0]}")
                 sys.path.insert(0, cand)
                 _DEEP_GEMM = importlib.import_module("deep_gemm")
                 print(f"[deep_gemm] sibling checkout: {cand}")

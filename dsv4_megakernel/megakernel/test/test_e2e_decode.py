@@ -7,7 +7,7 @@ cache management (test/kv_cache_manager.py):
   -> query RMSNorm+RoPE (PDL side branch) + Wuda fused FP8 paged MQA + MAIN
   compressor -> topk_v2(512, page transform) -> official flash_mla(SWA pool +
   compressed pool, native 512-d query, per-head attn_sink) ->
-  o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,7168].
+  o_proj(inv-RoPE + fp8 -> wo_a -> fp8 -> wo_b) -> mhc_post -> [B,4,H].
 
 The tail follows the official mega_csa post-attention boundary. o_proj_csa.py
 adds TP2 support around the two Triton quant kernels and DeepGEMM wo_a/wo_b;
@@ -84,6 +84,9 @@ except Exception as e:
 
 DEV = "cuda"
 HC, DIM = 4, 7168
+MODEL_NAME = "pro"
+Q_RANK = 1536
+FRONT_N_FP8 = 2048
 N_FRONT = 4672
 TOPK = 1024                    # DSV4 Pro index_topk (origin/config.json;
                                # matches the vLLM baseline's hard gate)
@@ -106,12 +109,28 @@ FUSE_QUERY_RMS = True
 MLA_O_QUANT_MODULE = None
 
 
-def configure_geometry(tpdp=False):
-    global WQ_HEADS, TPDP_MODE, MLA_DP_MODE
+def configure_geometry(tpdp=False, model="pro"):
+    global MODEL_NAME, DIM, Q_RANK, FRONT_N_FP8, N_FRONT, TOPK
+    global Q_HEADS, WQ_HEADS, O_GROUPS, O_INTER, TPDP_MODE, MLA_DP_MODE
+    if model == "flash":
+        if tpdp:
+            raise ValueError("--model flash cannot be combined with --tpdp")
+        DIM, Q_RANK, FRONT_N_FP8, N_FRONT = 4096, 1024, 1536, 4160
+        Q_HEADS, O_GROUPS, TOPK = 64, 8, 512
+    elif model == "pro":
+        DIM, Q_RANK, FRONT_N_FP8, N_FRONT = 7168, 1536, 2048, 4672
+        Q_HEADS, O_GROUPS, TOPK = 128, 16, 1024
+    else:
+        raise ValueError(f"unsupported model: {model}")
+    MODEL_NAME = model
+    O_INTER = O_GROUPS * O_LORA
     TPDP_MODE = tpdp
     MLA_DP_MODE = tpdp
-    t_wq.configure_geometry(tpdp)
+    t_fm.configure_geometry(model)
+    t_wq.configure_geometry(tpdp, model=model)
+    o_proj_csa.configure_model(model)
     WQ_HEADS = t_wq.N_TOTAL // Q_DIM
+    _OPROJ_WS.clear()
 
 
 def configure_pdl(mode):
@@ -194,7 +213,7 @@ def fabricate_tp_o_reduce(local_partial):
     return (local_partial + local_partial).to(torch.bfloat16)
 
 
-def load_mhc_post():
+def load_mhc_post(model="pro"):
     """mHC post port with dependency-independent staging before its PDL wait.
 
     The kernel and torch binding share one translation unit because this tree
@@ -205,12 +224,15 @@ def load_mhc_post():
     proj = os.path.dirname(here)
     major, minor = torch.cuda.get_device_capability()
     sm = major * 10 + minor
+    cuda_flags = ["-O3", "-std=c++17", "--use_fast_math",
+                  f"-gencode=arch=compute_{sm}a,code=sm_{sm}a"]
+    if model == "flash":
+        cuda_flags.append("-DDSV4_FLASH_CSA=1")
     return load(
-        name="e2e_mhc_post",
+        name="e2e_mhc_post_flash" if model == "flash" else "e2e_mhc_post",
         sources=[os.path.join(proj, "kernels", "mhc_post.cu")],
         extra_include_paths=[os.path.join(proj, "include")],
-        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math",
-                           f"-gencode=arch=compute_{sm}a,code=sm_{sm}a"],
+        extra_cuda_cflags=cuda_flags,
         verbose=False,
     )
 
@@ -257,10 +279,11 @@ def make_weights(seed=7):
     # kernel widens to fp32 in-flight (lossless, official compute chain).
     w["attn_norm"] = (torch.rand(DIM, device=DEV) + 0.5).bfloat16()
     fw = torch.randn(N_FRONT, DIM, device=DEV, dtype=torch.bfloat16) * 0.02
-    w["front_fp8"], w["front_sf"] = t_fm.quant_weight_fp8(fw[:2048])
-    w["front_bf16"] = fw[2048:].contiguous()
-    w["q_norm"] = torch.rand(1536, device=DEV) + 0.5
-    wq = torch.randn(t_wq.N_MERGED, 1536, device=DEV) * 0.03
+    w["front_fp8"], w["front_sf"] = \
+        t_fm.quant_weight_fp8(fw[:FRONT_N_FP8])
+    w["front_bf16"] = fw[FRONT_N_FP8:].contiguous()
+    w["q_norm"] = torch.rand(Q_RANK, device=DEV) + 0.5
+    wq = torch.randn(t_wq.N_MERGED, Q_RANK, device=DEV) * 0.03
     w["wq_fp8"] = wq.to(torch.float8_e4m3fn)
     w["wq_sf"] = t_wq.make_weight_sf_ones(DEV)
     w["idx_ape"] = torch.randn(4, 256, device=DEV)
@@ -494,7 +517,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     #       comes fused from the mhc epilogue). [FRONT-EMIT]: the epilogue
     #       scatters MAIN and IDX state (fp32 + ape on score halves) into
     #       the pools and emits fp32 win_y2 / w64 side buffers -- no glue
-    #       op, no y writes for cols [1536,4672) --------------------------
+    #       op, no y writes after the Q-LoRA segment -----------------------
     hc = {"hc_mix": mix, "hc_base": w["hc_base"], "hc_scale": w["hc_scale"],
           "hc_post": torch.empty(B, HC, device=DEV, dtype=torch.float32),
           "hc_comb": torch.empty(B, HC * HC, device=DEV,
@@ -511,14 +534,14 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         pdl=pdl_enabled())
     ref8 = (t_fm.dequant_fp8(x_fp8, x_sf, True)
             @ t_fm.dequant_fp8(w["front_fp8"], w["front_sf"], False).t())
-    d8 = max(t_fm.calc_diff(y[:, :1536].float(), ref8[:, :1536]),
-             t_fm.calc_diff(win_y2, ref8[:, 1536:]))
+    d8 = max(t_fm.calc_diff(y[:, :Q_RANK].float(), ref8[:, :Q_RANK]),
+             t_fm.calc_diff(win_y2, ref8[:, Q_RANK:]))
     stats["A_front_d8"] = max(stats.get("A_front_d8", 0.0), d8)
 
     # -- 3. wq_b ALL fusions; the KERNEL reads the folded idx state ring,
     #       the indexer fused pages AND the SWA MODEL1 pages directly --------
-    xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
-    xq_sf = torch.empty(B, 12, device=DEV, dtype=torch.uint8)
+    xq = torch.empty(B, Q_RANK, device=DEV, dtype=torch.float8_e4m3fn)
+    xq_sf = torch.empty(B, Q_RANK // 128, device=DEV, dtype=torch.uint8)
     weights64 = w64
     B_mla = mla_batch(B)
     pos_mla = pos[:B_mla]
@@ -553,7 +576,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         idx_state=mgr.idx_state, idx_state_row=st["idx_state_row"],
         state_ring_entries=mgr.state_ring_entries,
         win_y2=win_y2, win_norm=w["win_norm"],
-        q_y=y[:, :1536], q_norm_w=w["q_norm"],
+        q_y=y[:, :Q_RANK], q_norm_w=w["q_norm"],
         idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
         idx_entries_per_block=mgr.entries_per_block["idx"],
         idx_block_stride_bytes=mgr.block_stride_bytes["idx"],
@@ -623,7 +646,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
             logits = logits_buf[owned]
 
-    qr, _ = t_wq.ref_qnorm_quant(y[:, :1536], w["q_norm"])
+    qr, _ = t_wq.ref_qnorm_quant(y[:, :Q_RANK], w["q_norm"])
     stats["B_xq_match"] = min(stats.get("B_xq_match", 1.0),
                               (xq.view(torch.uint8) == qr.view(torch.uint8))
                               .float().mean().item())
@@ -764,7 +787,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             dbg_logits.masked_fill_(
                 torch.arange(dbg_logits.size(1), device=DEV).view(1, -1)
                 >= ncmp[owned].view(-1, 1), float("-inf"))
-            dbg.update(y_q=y[:, :1536].clone(), win_y2=win_y2.clone(),
+            dbg.update(y_q=y[:, :Q_RANK].clone(), win_y2=win_y2.clone(),
                        yq=yq.clone(), q_ready=q_ready.clone(),
                        logits=dbg_logits, page_idx=page_idx_full.clone(),
                        iq=rets[1].clone())
@@ -795,9 +818,9 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             t_fm.calc_diff(projected.float(), ref_final.float()))
         return projected.reshape(B, -1)
     # No flash_mla: the VALID y segment only -- under FRONT-EMIT the cols
-    # [1536,4672) are never written (side buffers replace them), so the
+    # Non-Q Front columns are never written (side buffers replace them), so the
     # full-y snapshot would compare uninitialized memory.
-    return y[:, :1536].contiguous()
+    return y[:, :Q_RANK].contiguous()
 
 
 # ==================== per-operator latency ====================
@@ -841,8 +864,9 @@ def benchmark(mods, w, ncmp=2048, batches=None):
     N-1's 113MB wq_b / 78MB front / 130MB o_proj streams cached, and a hot
     no-flush number would flatter every weight-bound stage.
       per-stage : mean Kineto device time over 30 cold eager-chain iterations,
-                  bucketed by stage (wq_b bucket = qnorm + merged GEMM;
-                  duration sums double-count PDL and intra-stage overlaps)
+                  bucketed by stage. WQ_B is the exception: its column is a
+                  producer-start to consumer-end GPU envelope from the same
+                  selected Perfetto replay as graph, so overlap is counted once.
       graph     : first GPU kernel start through last GPU kernel end in the
                   saved Perfetto trace (vLLM serving form; THE end-to-end
                   number). The CPU graph-launch wall is excluded on purpose:
@@ -899,8 +923,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                   "when the body is off")
         print("  paired samples alternate order; delta = graph+rms - graph-no-rms")
     else:
-        print("  wq_b = qnorm producer + merged GEMM device-time sum; standalone "
-              "fused(us) reports only the merged GEMM")
+        print("  wq_b = qnorm-producer start to merged-GEMM consumer end from "
+              "the selected graph replay; standalone fused(us) excludes qnorm")
         if fused_query_rms():
             print("  query RMSNorm+RoPE runs in the MQA tail warpgroup and is "
                   "included in mqa; use graph for end-to-end latency")
@@ -1018,8 +1042,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                 pdl=pdl_enabled())
         run_hc(); run_front()
 
-        xq = torch.empty(B, 1536, device=DEV, dtype=torch.float8_e4m3fn)
-        xq_sf = t_wq.as_ue8m0(torch.empty(B, 12, device=DEV,
+        xq = torch.empty(B, Q_RANK, device=DEV, dtype=torch.float8_e4m3fn)
+        xq_sf = t_wq.as_ue8m0(torch.empty(B, Q_RANK // 128, device=DEV,
                                           dtype=torch.uint8))
         def run_wqb():
             hold["r"] = wqm.wq_b_proj_gemm_merged(
@@ -1030,7 +1054,7 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                 idx_state_row=st["idx_state_row"],
                 state_ring_entries=mgr.state_ring_entries,
                 win_y2=win_y2, win_norm=w["win_norm"],
-                q_y=y[:, :1536], q_norm_w=w["q_norm"],
+                q_y=y[:, :Q_RANK], q_norm_w=w["q_norm"],
                 idx_cache=mgr.idx_pool, idx_dst=st["idx_dst"],
                 idx_entries_per_block=mgr.entries_per_block["idx"],
                 idx_block_stride_bytes=mgr.block_stride_bytes["idx"],
@@ -1336,6 +1360,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                 duration = getattr(event, "cuda_time", 0.0)
             acc[sname] += duration
         ts = [acc[sname] / R for sname, _ in stage_fns]
+        wqb_idx = next(i for i, (sname, _) in enumerate(stage_fns)
+                       if sname == "wq_b")
         # (mhc chain-vs-solo diagnostic removed after the verdict: the
         # chain-solo gemm delta matched the hidden+hc_fn L2-refetch
         # bandwidth at every B -- real input refetch, not a timing bug.)
@@ -1390,10 +1416,23 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                             "Perfetto trace contains no GPU kernels")
                     first = min(event["ts"] for event in kernels)
                     last = max(event["ts"] + event["dur"] for event in kernels)
-                    trace_samples.append((last - first, sample_path))
+                    wqb_pair = [
+                        event for event in kernels
+                        if any(name in event.get("name", "") for name in
+                               ("qnorm_quant_kernel", "wq_b_proj_kernel"))]
+                    if len(wqb_pair) != 2:
+                        raise RuntimeError(
+                            f"expected qnorm+wq_b kernels, found "
+                            f"{len(wqb_pair)}")
+                    wqb_first = min(event["ts"] for event in wqb_pair)
+                    wqb_last = max(event["ts"] + event["dur"]
+                                   for event in wqb_pair)
+                    trace_samples.append(
+                        (last - first, sample_path, wqb_last - wqb_first))
 
                 trace_samples.sort(key=lambda sample: sample[0])
-                t_graph, selected_path = trace_samples[len(trace_samples) // 2]
+                t_graph, selected_path, ts[wqb_idx] = \
+                    trace_samples[len(trace_samples) // 2]
                 if keep_trace:
                     tp = os.path.join(
                         trace_dir, f"e2e_{trace_mode}_B{B}.json")
@@ -1425,8 +1464,9 @@ def benchmark(mods, w, ncmp=2048, batches=None):
         MB = 1e6
         B_local = local_batch(B)
         B_mla = mla_batch(B)
-        W_FRONT = (2048 * DIM + 2624 * DIM * 2) / MB          # fp8 + bf16
-        W_WQB = t_wq.N_MERGED * 1536 / MB
+        W_FRONT = (FRONT_N_FP8 * DIM +
+                   (N_FRONT - FRONT_N_FP8) * DIM * 2) / MB
+        W_WQB = t_wq.N_MERGED * Q_RANK / MB
         eff_state_w = B * (1024 + 1024 + 256 + 256) * 4 / MB  # front fresh rows
         idx_bytes = 132 if INDEXER_FP8 else 68
         t = {}   # stage -> (total_MB, internal_MB)
@@ -1434,9 +1474,9 @@ def benchmark(mods, w, ncmp=2048, batches=None):
         mhc_int = B * (DIM * 2 + DIM + 24 * 4 + 4 * 8 + 16 * 4) / MB
         t["mhc"] = (hid + 1.5 + mhc_int, mhc_int)
         fr_int = (B * (DIM * 2 + DIM)            # collapsed + x8 (re)read
-                  + B * 1536 * 2 + B * 512 * 4 + B * 64 * 4) / MB
+                  + B * Q_RANK * 2 + B * 512 * 4 + B * 64 * 4) / MB
         t["front"] = (W_FRONT + fr_int + eff_state_w, fr_int)
-        wq_int = (B * 1536 * 3                   # xq write + qnorm y read
+        wq_int = (B * Q_RANK * 3                 # xq write + qnorm y read
                   + B * t_wq.N_TOTAL * 2         # y bf16 write (q for mla)
                   + B * 64 * idx_bytes + B * 512 * 4) / MB
         wq_eff = W_WQB + (B * 8 * 512 * 4 + B * (584 + idx_bytes)) / MB
@@ -1530,6 +1570,13 @@ if __name__ == "__main__":
     MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--model", choices=("pro", "flash"), default="pro",
+        help="model geometry; flash uses the native DSV4-Flash CSA shapes")
+    parser.add_argument(
+        "--context-length", type=int, default=None,
+        help="benchmark context tokens; defaults to 32K for Flash and 64K "
+             "for Pro")
+    parser.add_argument(
         "--tpdp", action="store_true",
         help="WQB TP2, MQA/TopK/MLA DP2, and O-proj TP2; default is full rank")
     parser.add_argument(
@@ -1563,7 +1610,7 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("CUDA not available"); sys.exit(0)
     INDEXER_FP8 = not args.indexer_fp4
-    configure_geometry(args.tpdp)
+    configure_geometry(args.tpdp, model=args.model)
     configure_pdl(args.pdl_mode)
     Q_RMS_MAX_BLOCKS = args.q_rms_blocks
     Q_RMS_ABLATION = args.q_rms_ablation
@@ -1572,29 +1619,41 @@ if __name__ == "__main__":
         parser.error("--q-rms-ablation requires the default fused query path")
     bench_batches = (None if args.bench_batches is None else
                      tuple(int(x) for x in args.bench_batches.split(",")))
+    context_length = (args.context_length if args.context_length is not None
+                      else 32768 if args.model == "flash" else 65536)
+    context_alignment = RATIO * PAGE
+    if context_length <= 0 or context_length % context_alignment:
+        parser.error(
+            f"--context-length must be a positive multiple of "
+            f"{context_alignment} tokens")
     print(f"Device: {torch.cuda.get_device_name()}")
     geometry = ("TPDP local rank: WQB TP2, MQA/TopK/MLA DP2, O-proj TP2"
-                if args.tpdp else "full-rank e2e")
+                if args.tpdp else f"{args.model} full-rank e2e")
     print(f"Geometry: {geometry} main={t_wq.N_TOTAL}, index={t_wq.N_IDX}, "
           f"merged={t_wq.N_MERGED}, "
           f"indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}, PDL={PDL_MODE}")
     mqa_test = __import__("test_mqa_logits_fp4")
-    mods = (t_hc.load_cuda_module(),
-            t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
-                                  'front_mixed_gemm_csa_swapab.cu'),
-            t_wq.load_module(tpdp=args.tpdp),
+    front_module_name = ('front_mixed_gemm_csa_swapab_flash'
+                         if args.model == 'flash'
+                         else 'front_mixed_gemm_csa_swapab')
+    mods = (t_hc.load_cuda_module(model=args.model),
+            t_fm_swap.load_module(front_module_name,
+                                  'front_mixed_gemm_csa_swapab.cu',
+                                  model=args.model),
+            t_wq.load_module(tpdp=args.tpdp, model=args.model),
             None if fused_query_rms() else load_query_rms_rope(),
             mqa_test.load_cuda_module() if not INDEXER_FP8 else None,
             mqa_test.load_cuda_module_fp8() if INDEXER_FP8 else None,
             __import__("test_topk_v2").load_cuda_module(),
-            load_mhc_post() if mhc_post_enabled() else None)
+            load_mhc_post(model=args.model) if mhc_post_enabled() else None)
     assert (mods[2].n_main, mods[2].n_index, mods[2].n_merged) == \
         (t_wq.N_TOTAL, t_wq.N_IDX, t_wq.N_MERGED), \
         "Python/kernel WQB geometry mismatch"
     w = make_weights()
 
     if args.bench_only:
-        benchmark(mods, w, ncmp=16384, batches=bench_batches)
+        benchmark(mods, w, ncmp=context_length // RATIO,
+                  batches=bench_batches)
         sys.exit(0)
 
     sim_name = "TPDP MLA-DP local-rank" if args.tpdp else "E2E decode"
@@ -1657,7 +1716,8 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if passed else 'FAIL'}] {name:<28} = {val} ({cond})")
 
     if ok and not args.skip_bench:  # never bench on broken correctness
-        benchmark(mods, w, ncmp=16384, batches=bench_batches)  # 64k ctx
+        benchmark(mods, w, ncmp=context_length // RATIO,
+                  batches=bench_batches)
 
     print("=" * 60)
     result_name = "TPDP MLA-DP LOCAL OPS" if args.tpdp else "E2E"
