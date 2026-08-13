@@ -99,9 +99,12 @@ static deep_gemm::QueryRmsRopeArgs make_query_args(
     const int64_t input_batch =
         query_x->numel() / (query_input_heads * 512);
     const int64_t output_heads = query_out->numel() / (output_batch * 512);
-    TORCH_CHECK(output_batch <= input_batch && output_heads == 128
+    TORCH_CHECK(output_batch <= input_batch && output_heads > 0
+                && output_heads % query_input_heads == 0,
+                "invalid fused query batch/head geometry");
+    TORCH_CHECK((output_heads == 64 || output_heads == 128)
                 && (query_input_heads == 64 || query_input_heads == 128),
-                "fused MODEL1 query requires output_heads=128 and "
+                "fused MODEL1 query requires output_heads=64 or 128 and "
                 "query_input_heads=64 or 128");
     TORCH_CHECK(output_batch <= UINT32_MAX / output_heads,
                 "fused query row count exceeds uint32 range");
@@ -124,6 +127,7 @@ static deep_gemm::QueryRmsRopeArgs make_query_args(
     args.sin_tab = query_sin->data_ptr<float>();
     args.out = reinterpret_cast<nv_bfloat16*>(query_out->data_ptr());
     args.input_heads = static_cast<int>(query_input_heads);
+    args.output_heads = static_cast<int>(output_heads);
     args.output_rows = static_cast<uint32_t>(output_batch * output_heads);
     args.eps = static_cast<float>(query_eps);
     args.wait_primary = pdl;

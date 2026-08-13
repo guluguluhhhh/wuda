@@ -401,10 +401,10 @@ def test_query_rms_rope(module):
     cos_tab, sin_tab = torch.cos(angles).contiguous(), torch.sin(angles).contiguous()
     eps = 1e-6
     ok_all = True
-    for input_heads in (64, 128):
+    for input_heads, output_heads in ((64, 64), (64, 128), (128, 128)):
         query_x = torch.randn(batch, input_heads, 512, device=dev,
                               dtype=torch.bfloat16)
-        query_out = torch.empty(batch, 128, 512, device=dev,
+        query_out = torch.empty(batch, output_heads, 512, device=dev,
                                 dtype=torch.bfloat16)
         module.mqa_logits_fp4_decode_out(
             q, q_sf, cache, weights, context_lens, block_table, logits, 0, 0,
@@ -413,8 +413,7 @@ def test_query_rms_rope(module):
             query_input_heads=input_heads, query_eps=eps)
         torch.cuda.synchronize()
 
-        source = (query_x if input_heads == 128
-                  else query_x.repeat(1, 2, 1))
+        source = query_x.repeat(1, output_heads // input_heads, 1)
         source_f = source.float()
         ref = source_f * torch.rsqrt(source_f.square().mean(-1, keepdim=True) + eps)
         even, odd = ref[..., 448::2].clone(), ref[..., 449::2].clone()
@@ -425,7 +424,7 @@ def test_query_rms_rope(module):
         diff = (query_out.float() - ref.bfloat16().float()).abs().max().item()
         ok = diff == 0.0
         ok_all &= ok
-        print(f"  input_heads={input_heads}: max_abs={diff:.3e} "
+        print(f"  heads={input_heads}->{output_heads}: max_abs={diff:.3e} "
               f"{'PASS' if ok else 'FAIL'}")
     return ok_all
 
