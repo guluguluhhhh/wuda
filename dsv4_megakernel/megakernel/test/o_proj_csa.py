@@ -2,8 +2,9 @@
 
 Port of mega_csa python/mega_csa/o_proj.py (Flash_DeepSeek_V4_Pro). The local
 version supports both the original full-rank geometry and the exact TP2 shard:
-64 heads map to 8 complete O groups and wo_b emits an FP32 partial. Package-
-internal imports are inlined so this remains standalone in the test tree.
+64 heads map to 8 complete O groups, and the TP2 ProjB publishes BF16 partials
+to symmetric memory. Package-internal imports are inlined so this remains
+standalone in the test tree.
 
 The ownership boundary matches vLLM's DeepSeek-V4 implementation:
 raw FlashMLA BF16 output -> inverse RoPE + FP8 quant -> DeepGEMM wo_a ->
@@ -104,9 +105,85 @@ class OProjWorkspace:
     z: torch.Tensor           # BF16 [M,groups,1024]
     z_fp8: torch.Tensor       # FP8 [M,groups*1024]
     z_scale: torch.Tensor     # I32 [M,groups*2], MN-major
-    projected: torch.Tensor   # BF16 full output or FP32 TP partial [M,7168]
+    projected: torch.Tensor   # BF16 full output or local TP reference [M,7168]
     mhc_output: torch.Tensor  # BF16 [M,4,7168]
     quant_module: Any
+    tp2_comm: Any | None = None
+
+
+class TP2Comm:
+    """Graph-stable symmetric ProjB output and completion state for TP2."""
+
+    def __init__(self, module: Any, group: Any, device: torch.device, rank: int):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        _require(rank in (0, 1), "TP2 rank must be 0 or 1")
+        symm_mem.set_signal_pad_size(4096)
+        self.module = module
+        self.partials = symm_mem.empty(
+            (2, 128, HIDDEN_DIM), dtype=torch.bfloat16, device=device
+        )
+        self.handle = symm_mem.rendezvous(self.partials, group=group)
+        self.grid_done = torch.zeros(1, device=device, dtype=torch.int64)
+        self.generation = torch.zeros(1, device=device, dtype=torch.int32)
+        self.local_second_output = torch.empty(
+            (128, HIDDEN_DIM), device=device, dtype=torch.bfloat16
+        )
+        self.select_grid_done = torch.zeros(
+            1, device=device, dtype=torch.int64
+        )
+        self.select_generation = torch.zeros(
+            1, device=device, dtype=torch.int32
+        )
+        self.benchmark_mode = torch.ones(
+            1, device=device, dtype=torch.int32
+        )
+        self.benchmark_generation = torch.zeros(
+            1, device=device, dtype=torch.int32
+        )
+        self.rank = rank
+        group.barrier()
+        torch.cuda.synchronize(device)
+
+    @property
+    def pointers(self) -> list[int]:
+        return [int(value) for value in self.handle.buffer_ptrs]
+
+    @property
+    def signal_pad_pointers(self) -> list[int]:
+        return [int(value) for value in self.handle.signal_pad_ptrs]
+
+
+def load_tp2_comm_module() -> Any:
+    """Build the production symmetric ProjB + reduce/mHC-post extension."""
+
+    import deep_gemm
+    from torch.utils.cpp_extension import load
+
+    root = Path(__file__).resolve().parents[1]
+    dg_include = Path(deep_gemm.__file__).resolve().parent / "include"
+    _require((dg_include / "deep_gemm/scheduler/gemm.cuh").is_file(),
+             f"DeepGEMM headers are missing from {dg_include}")
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    host_cxx = Path("/opt/rh/gcc-toolset-12/root/usr/bin/g++")
+    host_compiler_flag = ([f"-ccbin={host_cxx}"]
+                          if host_cxx.is_file() else [])
+    return load(
+        name="wuda_o_proj_b_tp2_comm",
+        sources=[str(root / "kernels/o_proj_b_tp2_symm.cu")],
+        extra_include_paths=[str(root / "include"), str(dg_include)],
+        extra_cflags=["-O3", "-std=c++20"],
+        extra_cuda_cflags=[
+            "-O3", "-std=c++20", "--expt-relaxed-constexpr", "-lineinfo",
+            "-DCUTLASS_ARCH_MMA_SM100_SUPPORTED=1",
+            "-DCUTE_ARCH_TCGEN05_MMA_ENABLED=1",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+            f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
+        ] + host_compiler_flag,
+        extra_ldflags=["-lcuda"],
+        verbose=False,
+    )
 
 
 def load_mla_o_quant_module() -> Any:
@@ -129,6 +206,26 @@ def load_mla_o_quant_module() -> Any:
             "-O3", "-std=c++17", "-lineinfo",
             f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
         ] + host_compiler_flag,
+        verbose=False,
+    )
+
+
+def load_mhc_post_module() -> Any:
+    """Build the single-rank mHC post reference from the megakernel source."""
+
+    from torch.utils.cpp_extension import load
+
+    root = Path(__file__).resolve().parents[1]
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    return load(
+        name="e2e_mhc_post",
+        sources=[str(root / "kernels/mhc_post.cu")],
+        extra_include_paths=[str(root / "include")],
+        extra_cuda_cflags=[
+            "-O3", "-std=c++17", "--use_fast_math",
+            f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
+        ],
         verbose=False,
     )
 
@@ -266,10 +363,13 @@ def prepare_o_proj_workspace(
     heads: int = HEADS,
     groups: int = N_GROUPS,
     quant_module: Any,
+    tp2_comm: TP2Comm | None = None,
 ) -> OProjWorkspace:
     _require(1 <= m <= 128, "O projection requires M in [1,128]")
     _require(quant_module is not None, "MLA O-projection quant module is required")
     heads_per_group, intermediate_dim = _geometry(heads, groups)
+    _require((tp2_comm is None) == (groups != TP2_GROUPS),
+             "TP2 geometry requires a symmetric communication workspace")
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
 
@@ -306,12 +406,13 @@ def prepare_o_proj_workspace(
         z_scale=z_scale,
         projected=torch.empty(
             (m, HIDDEN_DIM), device=device,
-            dtype=torch.float32 if groups == TP2_GROUPS else torch.bfloat16,
+            dtype=torch.bfloat16,
         ),
         mhc_output=torch.empty(
             (m, 4, HIDDEN_DIM), device=device, dtype=torch.bfloat16
         ),
         quant_module=quant_module,
+        tp2_comm=tp2_comm,
     )
 
 
@@ -330,13 +431,15 @@ def run_o_proj_mhc_post(
     use_pdl: bool = True,
     force_pdl: bool = False,
     run_mhc_post: bool = True,
+    tp2_benchmark_select: bool = False,
 ) -> torch.Tensor:
     """Run allocation-free O projection and mHC post on the current stream.
 
-    run_mhc_post=False stops after wo_b and returns workspace.projected: the
-    caller then owns the mHC-post launch (the e2e bench does this to time the
-    two halves as separate operators). TP2 always uses run_mhc_post=False and
-    returns an FP32 partial for C3.
+    Full-rank run_mhc_post=False stops after wo_b and returns
+    workspace.projected so a benchmark can time mHC post separately. TP2 uses
+    the symmetric ProjB and fused reduce+mHC post as one communication stage.
+    tp2_benchmark_select is the paired-measurement path: one captured graph
+    selects the second ProjB destination through a device flag.
     """
 
     import deep_gemm
@@ -399,17 +502,24 @@ def run_o_proj_mhc_post(
              workspace.z_scale.dtype == torch.int32 and
              workspace.z_scale.stride() == (1, aligned_m),
              "workspace.z_scale has the wrong shape, dtype, or MN-major layout")
-    projected_dtype = torch.float32 if num_groups == TP2_GROUPS else torch.bfloat16
     _require(workspace.projected.shape == (m, HIDDEN_DIM) and
-             workspace.projected.dtype == projected_dtype and
+             workspace.projected.dtype == torch.bfloat16 and
              workspace.projected.is_contiguous(),
-             f"workspace.projected must be contiguous {projected_dtype} [M,7168]")
+             "workspace.projected must be contiguous BF16 [M,7168]")
     _require(workspace.mhc_output.shape == (m, 4, HIDDEN_DIM) and
              workspace.mhc_output.dtype == torch.bfloat16 and
              workspace.mhc_output.is_contiguous(),
              "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
-    _require(not run_mhc_post or num_groups == N_GROUPS,
-             "TP2 O projection returns an FP32 partial and requires C3 before mHC post")
+    tp2_comm = workspace.tp2_comm
+    _require((tp2_comm is None) == (num_groups != TP2_GROUPS),
+             "TP2 geometry requires a symmetric communication workspace")
+    _require(not tp2_benchmark_select or num_groups == TP2_GROUPS,
+             "tp2_benchmark_select requires TP2 geometry")
+    _require(run_mhc_post or num_groups == N_GROUPS,
+             "the symmetric TP2 producer and fused post must run together")
+    _require(not (run_mhc_post and tp2_comm is None)
+             or mhc_post_module is not None,
+             "the ordinary mHC post module is required")
     _validate_workspace_aliases(
         (
             ("workspace.o_fp8", workspace.o_fp8),
@@ -477,13 +587,60 @@ def run_o_proj_mhc_post(
                 num_warps=4,
                 num_stages=1,
             )
-            deep_gemm.fp8_gemm_nt(
-                (workspace.z_fp8, workspace.z_scale),
-                (weights.wo_b, weights.wo_b_scale),
-                workspace.projected,
-                recipe=(1, 1, 128),
-            )
-            if run_mhc_post:
+            if tp2_comm is not None:
+                if tp2_benchmark_select:
+                    tp2_comm.module.o_proj_b_select(
+                        workspace.z_fp8,
+                        workspace.z_scale,
+                        weights.wo_b,
+                        weights.wo_b_scale,
+                        tp2_comm.partials,
+                        tp2_comm.local_second_output,
+                        tp2_comm.select_grid_done,
+                        tp2_comm.select_generation,
+                        tp2_comm.benchmark_mode,
+                        tp2_comm.pointers,
+                        tp2_comm.signal_pad_pointers,
+                        tp2_comm.rank,
+                    )
+                    tp2_comm.module.mhc_post_select(
+                        tp2_comm.partials,
+                        tp2_comm.local_second_output,
+                        tp2_comm.benchmark_mode,
+                        residual,
+                        post,
+                        comb,
+                        workspace.mhc_output,
+                        tp2_comm.rank,
+                    )
+                else:
+                    tp2_comm.module.o_proj_b(
+                        workspace.z_fp8,
+                        workspace.z_scale,
+                        weights.wo_b,
+                        weights.wo_b_scale,
+                        tp2_comm.partials,
+                        tp2_comm.grid_done,
+                        tp2_comm.generation,
+                        tp2_comm.pointers,
+                        tp2_comm.signal_pad_pointers,
+                        tp2_comm.rank,
+                    )
+                    tp2_comm.module.mhc_post(
+                        tp2_comm.partials,
+                        residual,
+                        post,
+                        comb,
+                        workspace.mhc_output,
+                    )
+            else:
+                deep_gemm.fp8_gemm_nt(
+                    (workspace.z_fp8, workspace.z_scale),
+                    (weights.wo_b, weights.wo_b_scale),
+                    workspace.projected,
+                    recipe=(1, 1, 128),
+                )
+            if run_mhc_post and tp2_comm is None:
                 mhc_post_module.mhc_post_out(
                     workspace.projected,
                     residual,
