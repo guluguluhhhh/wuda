@@ -129,7 +129,7 @@ def pdl_forced():
 
 
 def fused_query_rms():
-    return INDEXER_FP8 and FUSE_QUERY_RMS
+    return FUSE_QUERY_RMS
 
 
 def inplace_query_rms():
@@ -561,9 +561,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     if inplace_query_rms():
         q_ready = yq.view(B_mla, 1, attention_heads(), Q_DIM)
     if fused_query_rms():
-        mq8m.mqa_logits_fp8_decode_out(
-            iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
-            schedule, logits_buf[owned],
+        common = dict(
             kv_entries_per_block=mgr.entries_per_block["idx"],
             kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
             cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
@@ -577,6 +575,14 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             query_sin=w["sin"], query_out=q_ready,
             query_input_heads=WQ_HEADS, query_eps=EPS,
             pdl=pdl_enabled())
+        if INDEXER_FP8:
+            mq8m.mqa_logits_fp8_decode_out(
+                iq_fp4[owned], mgr.idx_pool, iq_sf[owned], ctx2, idx_bt,
+                schedule, logits_buf[owned], **common)
+        else:
+            mqm.mqa_logits_fp4_decode_out(
+                iq_fp4[owned], iq_sf[owned], mgr.idx_pool, weights64[owned],
+                ncmp[owned], idx_bt, logits_buf[owned], **common)
         logits = logits_buf[owned]
     else:
         qrm.rmsnorm_rope_out(yq, pos_mla, w["cos"], w["sin"], q_ready,
@@ -852,6 +858,10 @@ def benchmark(mods, w, ncmp=2048, batches=None):
         os.path.dirname(__file__), "..", "..", "docs", "timeline"))
     os.makedirs(trace_dir, exist_ok=True)
     trace_mode = "tpdp" if TPDP_MODE else "full"
+    if not INDEXER_FP8:
+        trace_mode += "_idx-fp4"
+    if not fused_query_rms():
+        trace_mode += "_qrms-separate"
     if PDL_MODE != "on":
         trace_mode += f"_pdl-{PDL_MODE}"
     print("\n" + "=" * 76)
@@ -1058,7 +1068,7 @@ def benchmark(mods, w, ncmp=2048, batches=None):
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
         def run_mqa():
             r = hold["r"]
-            if fused_query_rms():
+            if fused_query_rms() and INDEXER_FP8:
                 mq8m.mqa_logits_fp8_decode_out(
                     r[1][owned], mgr.idx_pool, r[2][owned],
                     nc[owned].view(-1, 1), idx_bt, fp8_schedule,
@@ -1069,6 +1079,25 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     sin_tab=sinl, comp_state=mgr.main_state,
                     comp_state_row=st["main_state_row"],
                     cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_ring_entries=mgr.state_ring_entries,
+                    cmp_entries_per_block=mgr.entries_per_block["cmp"],
+                    cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
+                    query_x=r[0], query_positions=pos_mla,
+                    query_cos=cosl, query_sin=sinl, query_out=query_ready(),
+                    query_input_heads=WQ_HEADS, query_eps=EPS,
+                    query_work_flag=q_rms_work_flag,
+                    pdl=pdl_enabled())
+                hold["logits"] = logits[owned]
+            elif fused_query_rms():
+                mqm.mqa_logits_fp4_decode_out(
+                    r[1][owned], r[2][owned], mgr.idx_pool, weights64[owned],
+                    nc[owned], idx_bt, logits[owned],
+                    cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
+                    sin_tab=sinl, comp_state=mgr.main_state,
+                    comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
+                    cmp_dst=st["cmp_dst"],
+                    kv_entries_per_block=mgr.entries_per_block["idx"],
+                    kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
@@ -1108,8 +1137,7 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"])
                 hold["logits"] = logits[owned]
-        # FP8: MQA waits directly for Q_B and its tail produces q_ready.
-        # FP4 retains the separate RMS/RoPE relay.
+        # MQA waits directly for Q_B and its worker warps produce q_ready.
         run_wqb()
         if not fused_query_rms():
             run_qrms()
@@ -1530,7 +1558,7 @@ if __name__ == "__main__":
     Q_RMS_ABLATION = args.q_rms_ablation
     FUSE_QUERY_RMS = not args.separate_query_rms
     if Q_RMS_ABLATION and not fused_query_rms():
-        parser.error("--q-rms-ablation requires the default fused FP8 query path")
+        parser.error("--q-rms-ablation requires the default fused query path")
     bench_batches = (None if args.bench_batches is None else
                      tuple(int(x) for x in args.bench_batches.split(",")))
     print(f"Device: {torch.cuda.get_device_name()}")

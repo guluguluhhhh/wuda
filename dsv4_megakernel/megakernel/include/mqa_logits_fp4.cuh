@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <cutlass/numeric_types.h>
 
+#include "query_rms_rope.cuh"
+
 // ============================================================
 // inlined from deep_gemm/common/compile.cuh
 // ============================================================
@@ -567,8 +569,8 @@ CUTLASS_DEVICE uint64_t make_runtime_instr_desc_with_sf_id(
 // with `// [MEGAKERNEL EDIT]` below:
 //   1. template param `kNumSMs` removed -> use `gridDim.x` (JIT baked it in
 //      DeepGEMM; AOT can't, and gridDim.x always equals the launch grid).
-//   2. `cudaGridDependencySynchronize()` neutralized (PDL-only; we launch
-//      standalone, not as a programmatic-dependent-launch megakernel).
+//   2. PDL dependency waits are enabled only in the query-producing
+//      specialization; the legacy standalone specialization remains independent.
 //   3. tile-pool decode schedule: all 4 warp roles enumerate tasks through a
 //      shared `for_each_task` closure (the legacy per-q-block contiguous
 //      enumeration has been removed together with the contiguous-KV path).
@@ -684,6 +686,70 @@ struct MainCompressorArgs {
     // of the attention kernel's local seq_len.
     uint32_t seq_len = 0;
 };
+
+struct QueryRmsRopeArgs {
+    const nv_bfloat16* x = nullptr;
+    const long long* positions = nullptr;
+    const float* cos_tab = nullptr;
+    const float* sin_tab = nullptr;
+    nv_bfloat16* out = nullptr;
+    const int* work_flag = nullptr;
+    int input_heads = 0;
+    uint32_t output_rows = 0;
+    float eps = 1e-6f;
+    bool wait_primary = false;
+};
+
+__device__ __forceinline__ void run_query_rms_rope(
+        const QueryRmsRopeArgs& query, uint32_t* next, uint32_t lane) {
+    using namespace wuda_query_rms_rope;
+    if (query.work_flag != nullptr && *query.work_flag == 0)
+        return;
+
+    while (true) {
+        uint32_t item = 0;
+        if (lane == 0)
+            item = atomicAdd(next, 1u);
+        item = __shfl_sync(0xffffffffu, item, 0);
+        const uint32_t output_row = blockIdx.x + item * gridDim.x;
+        if (output_row >= query.output_rows)
+            break;
+
+        const uint32_t batch = output_row >> 7;
+        const uint32_t output_head = output_row & 127u;
+        const uint32_t input_head = output_head & (query.input_heads - 1);
+        const uint32_t input_row = batch * query.input_heads + input_head;
+        const uint4* input = reinterpret_cast<const uint4*>(
+            query.x + static_cast<uint64_t>(input_row) * kHidden) + lane;
+        uint4* output = reinterpret_cast<uint4*>(
+            query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        uint4 values[kVecsPerThread];
+        #pragma unroll
+        for (int i = 0; i < kVecsPerThread; ++i)
+            values[i] = input[i * kWarp];
+
+        float sumsq = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kVecsPerThread; ++i)
+            sumsq += vec_sumsq(values[i]);
+        const float scale = rsqrtf(
+            warp_sum(sumsq) / static_cast<float>(kHidden) + query.eps);
+
+        const long long position = query.positions[batch];
+        const float* cos = query.cos_tab
+            + static_cast<uint64_t>(position) * (kRope / 2);
+        const float* sin = query.sin_tab
+            + static_cast<uint64_t>(position) * (kRope / 2);
+        output[0] = scale_vec(values[0], scale);
+        if (lane >= 24) {
+            const int pair_base = (lane - 24) * (kElemsPerVec / 2);
+            output[kWarp] = scale_rope_vec(
+                values[1], scale, cos, sin, pair_base);
+        } else {
+            output[kWarp] = scale_vec(values[1], scale);
+        }
+    }
+}
 
 // MODEL1_FP8Sparse page geometry (FlashMLA quant.py, d=512): body = 64 x
 // (448B e4m3 nope + 128B bf16 rope), tail = 64 x 8B (7 e8m0 scales + pad),
@@ -891,7 +957,8 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           // [MEGAKERNEL EDIT] CUDA-core tail warpgroup (0 disables the branch entirely)
           uint32_t kNumTailThreads,
           typename logits_dtype_t,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
+          bool kHasQuery = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads + kNumTailThreads, 1)
 void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           const uint32_t logits_stride,
@@ -923,6 +990,7 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           // attention threads exit before the prologue, leaving the
                           // tail warpgroup running ALONE in its in-situ launch shape.
                           const bool attn_mock,
+                          const QueryRmsRopeArgs query,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -938,6 +1006,13 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
     constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+
+    __shared__ uint32_t query_next;
+    if constexpr (kHasQuery) {
+        if (threadIdx.x == 0)
+            query_next = 0;
+        __syncthreads();
+    }
 
     // [MEGAKERNEL EDIT] CUDA-core tail warpgroup (warps 12-15), hoisted ABOVE the
     // whole prologue — gemm_fuse_norm_b discipline: the attention path and the tail
@@ -970,6 +1045,11 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                                         /*barrier_id=*/2, prof);
             }
         }
+        if constexpr (kHasQuery) {
+            if (query.wait_primary)
+                cudaGridDependencySynchronize();
+            run_query_rms_rope(query, &query_next, lane_idx);
+        }
         // Tail end = the LATEST tail warp (atomicMax): a single-warp stamp would
         // under-report compress CTAs by the whole compressor duration.
         if (prof != nullptr and lane_idx == 0)
@@ -979,8 +1059,14 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // [MEGAKERNEL EDIT] benchmark tail_us: attention mocked out -- the remaining
     // 384 threads leave BEFORE any prologue state (mbarrier init / TMEM alloc /
     // scan), so the kernel degenerates to the tail warpgroup alone, in situ.
-    if (attn_mock)
+    if (attn_mock) {
+        if constexpr (kHasQuery) {
+            if (query.wait_primary)
+                cudaGridDependencySynchronize();
+            run_query_rms_rope(query, &query_next, lane_idx);
+        }
         return;
+    }
 
     // Prefetch TMA descriptors
     if (warp_idx == kSpecWarpStart) {
@@ -1137,6 +1223,11 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // sides never share a block-wide barrier, so __syncthreads is forbidden).
     // NamedBarrier id 1; id 0 is the math-only barrier at the epilogue.
     cutlass::arch::NamedBarrier(kNumSpecializedThreads + kNumMathThreads, 1).sync();
+
+    if constexpr (kHasQuery) {
+        if (query.wait_primary)
+            cudaGridDependencySynchronize();
+    }
 
     // [MEGAKERNEL EDIT] attention-path start stamp (post-prologue; the tail's t2 is
     // stamped at CTA start above, so t2 <= t0 is expected on the timeline)
@@ -1487,6 +1578,9 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         if (warp_idx == 0)
             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
     }
+
+    if constexpr (kHasQuery)
+        run_query_rms_rope(query, &query_next, lane_idx);
 }
 
 } // namespace deep_gemm

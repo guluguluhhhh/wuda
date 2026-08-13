@@ -63,6 +63,80 @@ static int get_num_sms() {
     return num_sms;
 }
 
+static deep_gemm::QueryRmsRopeArgs make_query_args(
+    const c10::optional<torch::Tensor>& query_x,
+    const c10::optional<torch::Tensor>& query_positions,
+    const c10::optional<torch::Tensor>& query_cos,
+    const c10::optional<torch::Tensor>& query_sin,
+    const c10::optional<torch::Tensor>& query_out,
+    int64_t query_input_heads, double query_eps,
+    const c10::optional<torch::Tensor>& query_work_flag,
+    bool pdl) {
+    deep_gemm::QueryRmsRopeArgs args{};
+    if (!query_x.has_value())
+        return args;
+
+    TORCH_CHECK(query_positions && query_cos && query_sin && query_out,
+                "query RMSNorm+RoPE tensors must be provided together");
+    auto check = [](const torch::Tensor& tensor, at::ScalarType dtype,
+                    const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous()
+                    && tensor.scalar_type() == dtype,
+                    name, " must be contiguous CUDA with the expected dtype");
+    };
+    check(*query_x, torch::kBFloat16, "query_x");
+    check(*query_positions, torch::kInt64, "query_positions");
+    check(*query_cos, torch::kFloat32, "query_cos");
+    check(*query_sin, torch::kFloat32, "query_sin");
+    check(*query_out, torch::kBFloat16, "query_out");
+    TORCH_CHECK(query_input_heads > 0
+                && query_x->numel() % (query_input_heads * 512) == 0,
+                "query_x must contain complete [B,input_heads,512] rows");
+    const int64_t output_batch = query_positions->numel();
+    TORCH_CHECK(output_batch > 0
+                && query_out->numel() % (output_batch * 512) == 0,
+                "query_out must contain complete [B,output_heads,512] rows");
+    const int64_t input_batch =
+        query_x->numel() / (query_input_heads * 512);
+    const int64_t output_heads = query_out->numel() / (output_batch * 512);
+    TORCH_CHECK(output_batch <= input_batch && output_heads == 128
+                && (query_input_heads == 64 || query_input_heads == 128),
+                "fused MODEL1 query requires output_heads=128 and "
+                "query_input_heads=64 or 128");
+    TORCH_CHECK(output_batch <= UINT32_MAX / output_heads,
+                "fused query row count exceeds uint32 range");
+    TORCH_CHECK(query_cos->dim() == 2 && query_cos->size(1) == 32
+                && query_sin->sizes() == query_cos->sizes(),
+                "query cos/sin tables must be float32 [max_pos,32]");
+    TORCH_CHECK(query_x->get_device() == query_out->get_device()
+                && query_positions->get_device() == query_x->get_device()
+                && query_cos->get_device() == query_x->get_device()
+                && query_sin->get_device() == query_x->get_device(),
+                "fused query tensors must be on one device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(query_x->data_ptr()) % 16 == 0
+                && reinterpret_cast<uintptr_t>(query_out->data_ptr()) % 16 == 0,
+                "query_x and query_out must be 16-byte aligned");
+
+    args.x = reinterpret_cast<const nv_bfloat16*>(query_x->data_ptr());
+    args.positions = reinterpret_cast<const long long*>(
+        query_positions->data_ptr<int64_t>());
+    args.cos_tab = query_cos->data_ptr<float>();
+    args.sin_tab = query_sin->data_ptr<float>();
+    args.out = reinterpret_cast<nv_bfloat16*>(query_out->data_ptr());
+    args.input_heads = static_cast<int>(query_input_heads);
+    args.output_rows = static_cast<uint32_t>(output_batch * output_heads);
+    args.eps = static_cast<float>(query_eps);
+    args.wait_primary = pdl;
+    if (query_work_flag.has_value()) {
+        check(*query_work_flag, torch::kInt32, "query_work_flag");
+        TORCH_CHECK(query_work_flag->numel() == 1
+                    && query_work_flag->get_device() == query_x->get_device(),
+                    "query_work_flag must be a CUDA int32 scalar on query_x device");
+        args.work_flag = query_work_flag->data_ptr<int>();
+    }
+    return args;
+}
+
 static CUtensorMapSwizzle to_swizzle(int mode) {
     switch (mode) {
         case 32:  return CU_TENSOR_MAP_SWIZZLE_32B;
@@ -176,34 +250,62 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
                          float comp_eps, unsigned long long* prof,
                          const deep_gemm::MainCompressorArgs& comp,
                          bool attn_mock,
+                         const deep_gemm::QueryRmsRopeArgs& query,
                          const CUtensorMap& dQ, const CUtensorMap& dSFQ,
                          const CUtensorMap& dKV, const CUtensorMap& dSFKV,
                          const CUtensorMap& dW, dim3 grid, int smem,
                          cudaStream_t stream) {
-    auto kernel = &deep_gemm::sm100_fp4_mqa_logits<
-        NUM_HEADS, HEAD_DIM,
-        BLOCK_Q, BLOCK_KV, kPageKV, NUM_Q_STAGES, kKVStages,
-        NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS, logits_dtype_t>;
+    using KernelPtr = void (*)(
+        uint32_t, uint32_t, uint32_t, const uint32_t*, const uint32_t*,
+        uint32_t, logits_dtype_t*, float, unsigned long long*,
+        deep_gemm::MainCompressorArgs, bool, deep_gemm::QueryRmsRopeArgs,
+        cute::TmaDescriptor, cute::TmaDescriptor, cute::TmaDescriptor,
+        cute::TmaDescriptor, cute::TmaDescriptor);
+    KernelPtr kernel = query.x == nullptr
+        ? &deep_gemm::sm100_fp4_mqa_logits<
+            NUM_HEADS, HEAD_DIM,
+            BLOCK_Q, BLOCK_KV, kPageKV, NUM_Q_STAGES, kKVStages,
+            NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS,
+            logits_dtype_t, NUM_MATH_THREADS / 128, false>
+        : &deep_gemm::sm100_fp4_mqa_logits<
+            NUM_HEADS, HEAD_DIM,
+            BLOCK_Q, BLOCK_KV, kPageKV, NUM_Q_STAGES, kKVStages,
+            NUM_SPECIALIZED_THREADS, NUM_MATH_THREADS, NUM_TAIL_THREADS,
+            logits_dtype_t, NUM_MATH_THREADS / 128, true>;
 
     // cudaFuncSetAttribute is PER DEVICE state, so this cache is indexed by device
     // ordinal: a single `static bool` lets the first card configure the function and
     // every launch on the second one fail, which is why one process could never
     // drive two GPUs.
     static constexpr int kMaxDevices = 16;
-    static bool configured[kMaxDevices] = {};
+    static bool configured[kMaxDevices][2] = {};
     int cfg_dev = 0;
     TORCH_CHECK(cudaGetDevice(&cfg_dev) == cudaSuccess, "cudaGetDevice failed");
     TORCH_CHECK(cfg_dev >= 0 && cfg_dev < kMaxDevices,
                 "device ordinal ", cfg_dev, " exceeds kMaxDevices=", kMaxDevices);
-    if (!configured[cfg_dev]) {
+    const int query_idx = query.x != nullptr ? 1 : 0;
+    if (!configured[cfg_dev][query_idx]) {
         auto e = cudaFuncSetAttribute((void*)kernel,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         TORCH_CHECK(e == cudaSuccess, "cudaFuncSetAttribute: ", cudaGetErrorString(e),
                     " smem=", smem);
-        configured[cfg_dev] = true;
+        configured[cfg_dev][query_idx] = true;
     }
 
-    kernel<<<grid, TPB, smem, stream>>>(
+    cudaLaunchConfig_t config{};
+    config.gridDim = grid;
+    config.blockDim = dim3(TPB, 1, 1);
+    config.dynamicSmemBytes = smem;
+    config.stream = stream;
+    cudaLaunchAttribute attribute{};
+    if (query.x != nullptr && query.wait_primary) {
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+    }
+    const cudaError_t err = cudaLaunchKernelEx(
+        &config, kernel,
         (uint32_t)seq_len, (uint32_t)seq_len_kv,
         (uint32_t)stride_logits,
         reinterpret_cast<const uint32_t*>(context_lens),
@@ -211,9 +313,8 @@ static void launch_typed(int seq_len, int seq_len_kv, int stride_logits,
         (uint32_t)bt_stride,
         reinterpret_cast<logits_dtype_t*>(logits),
         comp_eps, prof,
-        comp, attn_mock,
+        comp, attn_mock, query,
         dQ, dSFQ, dKV, dSFKV, dW);
-    auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "mqa_logits_fp4 launch failed: ", cudaGetErrorString(err));
 }
 
@@ -234,6 +335,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
                             float comp_eps, unsigned long long* prof,
                             const deep_gemm::MainCompressorArgs& comp,
                             bool attn_mock,
+                            const deep_gemm::QueryRmsRopeArgs& query,
                             void* lp) {
     constexpr int H = NUM_HEADS, D = HEAD_DIM;
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -285,7 +387,7 @@ static void dispatch_launch(torch::Tensor q, torch::Tensor sf_q,
     #define MQA_LT_PAGE(dtype_t, stages_, page_) \
         launch_typed<dtype_t, stages_, page_>(B, seq_len_kv_cap, stride_logits, \
                                               context_lens, block_table, bt_stride, lp, \
-                                              comp_eps, prof, comp, attn_mock, \
+                                              comp_eps, prof, comp, attn_mock, query, \
                                               dQ,dSFQ,dKV,dSFKV,dW, grid, smem, stream)
     #define MQA_LT(dtype_t, stages_) \
         do { \
@@ -395,6 +497,7 @@ static torch::Tensor mqa_logits_fp4_decode(
                     /*comp_eps=*/1e-6f, /*prof=*/nullptr,
                     /*comp=*/deep_gemm::MainCompressorArgs{},
                     /*attn_mock=*/false,
+                    /*query=*/deep_gemm::QueryRmsRopeArgs{},
                     buf.data_ptr());
     return buf.index({torch::indexing::Slice(0, B),
                       torch::indexing::Slice(0, max_context_len)});
@@ -422,7 +525,16 @@ static void mqa_logits_fp4_decode_out(
     int64_t kv_block_stride_bytes = 0,
     int64_t comp_state_ring_entries = 0,
     int64_t cmp_entries_per_block = 0,
-    int64_t cmp_block_stride_bytes = 0) {
+    int64_t cmp_block_stride_bytes = 0,
+    c10::optional<torch::Tensor> query_x = c10::nullopt,
+    c10::optional<torch::Tensor> query_positions = c10::nullopt,
+    c10::optional<torch::Tensor> query_cos = c10::nullopt,
+    c10::optional<torch::Tensor> query_sin = c10::nullopt,
+    c10::optional<torch::Tensor> query_out = c10::nullopt,
+    int64_t query_input_heads = 0,
+    double query_eps = 1e-6,
+    c10::optional<torch::Tensor> query_work_flag = c10::nullopt,
+    bool pdl = false) {
     auto [B, num_blocks, max_pages] = check_paged(q, sf_q, kv_cache, weights,
                                                   context_lens, block_table,
                                                   logits.scalar_type(),
@@ -520,6 +632,10 @@ static void mqa_logits_fp4_decode_out(
         }
     }
 
+    const auto query = make_query_args(
+        query_x, query_positions, query_cos, query_sin, query_out,
+        query_input_heads, query_eps, query_work_flag, pdl);
+
     dispatch_launch(q, sf_q, kv_cache, weights,
                     context_lens.data_ptr<int>(), block_table.data_ptr<int>(), max_pages,
                     num_blocks, (int)kv_entries_per_block, kv_block_stride_bytes,
@@ -529,6 +645,7 @@ static void mqa_logits_fp4_decode_out(
                     (float)comp_eps, prof_ptr,
                     comp,
                     /*attn_mock=*/mock_attn,
+                    query,
                     logits.data_ptr());
 }
 
@@ -662,5 +779,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("kv_block_stride_bytes") = 0,
           py::arg("comp_state_ring_entries") = 0,
           py::arg("cmp_entries_per_block") = 0,
-          py::arg("cmp_block_stride_bytes") = 0);
+          py::arg("cmp_block_stride_bytes") = 0,
+          py::arg("query_x") = c10::nullopt,
+          py::arg("query_positions") = c10::nullopt,
+          py::arg("query_cos") = c10::nullopt,
+          py::arg("query_sin") = c10::nullopt,
+          py::arg("query_out") = c10::nullopt,
+          py::arg("query_input_heads") = 0,
+          py::arg("query_eps") = 1e-6,
+          py::arg("query_work_flag") = c10::nullopt,
+          py::arg("pdl") = false);
 }

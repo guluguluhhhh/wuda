@@ -365,6 +365,59 @@ def test_runtime_page_geometry(module):
     return ok_all
 
 
+def test_query_rms_rope(module):
+    """Idle MQA warps produce the normalized, RoPE-applied FlashMLA query."""
+    print("\n[query-rms-rope] fused MQA worker path vs torch ref")
+    torch.manual_seed(20260814)
+    dev, batch = "cuda", 3
+
+    # Minimal valid attention tensors; mock_attn leaves all non-tail warps
+    # available to exercise the shared query work queue.
+    q = torch.zeros(batch, NUM_HEADS, HEAD_DIM // 2, device=dev,
+                    dtype=torch.int8)
+    q_sf = torch.zeros(batch, NUM_HEADS, device=dev, dtype=torch.int32)
+    cache = torch.zeros(batch, PAGE_BYTES, device=dev, dtype=torch.uint8)
+    weights = torch.zeros(batch, NUM_HEADS, device=dev)
+    context_lens = torch.ones(batch, device=dev, dtype=torch.int32)
+    block_table = torch.arange(batch, device=dev, dtype=torch.int32).view(batch, 1)
+    logits = torch.empty(batch, BLOCK_KV, device=dev)
+
+    positions = torch.tensor([0, 7, 31], device=dev, dtype=torch.int64)
+    angles = torch.outer(
+        torch.arange(32, device=dev, dtype=torch.float32),
+        1.0 / (10000.0 ** (torch.arange(32, device=dev) / 32.0)))
+    cos_tab, sin_tab = torch.cos(angles).contiguous(), torch.sin(angles).contiguous()
+    eps = 1e-6
+    ok_all = True
+    for input_heads in (64, 128):
+        query_x = torch.randn(batch, input_heads, 512, device=dev,
+                              dtype=torch.bfloat16)
+        query_out = torch.empty(batch, 128, 512, device=dev,
+                                dtype=torch.bfloat16)
+        module.mqa_logits_fp4_decode_out(
+            q, q_sf, cache, weights, context_lens, block_table, logits, 0, 0,
+            mock_attn=True, query_x=query_x, query_positions=positions,
+            query_cos=cos_tab, query_sin=sin_tab, query_out=query_out,
+            query_input_heads=input_heads, query_eps=eps)
+        torch.cuda.synchronize()
+
+        source = (query_x if input_heads == 128
+                  else query_x.repeat(1, 2, 1))
+        source_f = source.float()
+        ref = source_f * torch.rsqrt(source_f.square().mean(-1, keepdim=True) + eps)
+        even, odd = ref[..., 448::2].clone(), ref[..., 449::2].clone()
+        cos = cos_tab[positions, None, :]
+        sin = sin_tab[positions, None, :]
+        ref[..., 448::2] = even * cos - odd * sin
+        ref[..., 449::2] = even * sin + odd * cos
+        diff = (query_out.float() - ref.bfloat16().float()).abs().max().item()
+        ok = diff == 0.0
+        ok_all &= ok
+        print(f"  input_heads={input_heads}: max_abs={diff:.3e} "
+              f"{'PASS' if ok else 'FAIL'}")
+    return ok_all
+
+
 def kernel_us(fn, name_substr="mqa_logits", num_tests=30):
     """Thin adapter over bench_utils.bench_kineto (DeepGEMM's bench, vendored
     verbatim): 8GB L2 flush before EVERY call (cold-HBM KV reads + GPU chill
@@ -1113,6 +1166,7 @@ def main():
     if not args.skip_correctness:
         ok &= test_runtime_page_geometry(module)
         ok &= test_decode(module)
+        ok &= test_query_rms_rope(module)
         ok &= test_main_compressor(module)
         ok &= test_main_compressor_pool_write(module)
         print("\nALL PASSED" if ok else "\nCORRECTNESS FAILED")
