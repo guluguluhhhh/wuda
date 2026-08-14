@@ -87,6 +87,10 @@ struct TopKLaunchParams {
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
+  const uint32_t* __restrict__ query_generation;
+  const uint32_t* __restrict__ query_ready;
+  const uint32_t* __restrict__ query_comm_mode;
+  uint32_t query_ready_offset;
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -116,6 +120,33 @@ struct TopKLaunchParams {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
+
+SGL_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
+  uint32_t value;
+  asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+               : "=r"(value) : "l"(ptr) : "memory");
+  return value;
+}
+
+SGL_DEVICE void wait_query_heads(const TopKLaunchParams& params) {
+  if (params.query_generation == nullptr || threadIdx.x != 0) return;
+  if (params.query_comm_mode != nullptr && *params.query_comm_mode == 0) return;
+  uint32_t expected;
+  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
+               : "=r"(expected) : "l"(params.query_generation) : "memory");
+  auto ready0 = load_relaxed_sys(
+      params.query_ready + params.query_ready_offset);
+  auto ready1 = load_relaxed_sys(
+      params.query_ready + params.query_ready_offset + 1);
+  while (ready0 < expected || ready1 < expected) {
+    asm volatile("nanosleep.u32 128;");
+    ready0 = load_relaxed_sys(
+        params.query_ready + params.query_ready_offset);
+    ready1 = load_relaxed_sys(
+        params.query_ready + params.query_ready_offset + 1);
+  }
+  asm volatile("fence.acquire.sys;" ::: "memory");
+}
 
 /**
  * \brief Persistent cluster kernel for the long items (short items are handled
@@ -176,7 +207,11 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (problem.seq_len <= problem.topk) {
+    trivial_transform<kPDL>(problem);
+    if (blockIdx.x == 0) wait_query_heads(params);
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -207,6 +242,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  if (blockIdx.x == 0) wait_query_heads(params);
 }
 
 template <bool kPDL>
@@ -214,7 +250,11 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (problem.seq_len <= problem.topk) {
+    trivial_transform<kPDL>(problem);
+    if (blockIdx.x == 0 && blockIdx.y == 0) wait_query_heads(params);
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -236,6 +276,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
   if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  if (blockIdx.x == 0 && blockIdx.y == 0) wait_query_heads(params);
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -348,7 +389,12 @@ static void topk_v2_plan(torch::Tensor seq_lens, torch::Tensor metadata,
 static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
                               torch::Tensor page_table, torch::Tensor page_indices,
                               int64_t page_size, torch::Tensor metadata,
-                              c10::optional<torch::Tensor> raw_indices) {
+                              c10::optional<torch::Tensor> raw_indices,
+                              c10::optional<torch::Tensor> query_generation,
+                              std::vector<int64_t> query_signal_pad_ptrs,
+                              int64_t query_tp_rank,
+                              int64_t query_ready_offset,
+                              c10::optional<torch::Tensor> query_comm_mode) {
     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == torch::kFloat &&
                 scores.dim() == 2 && scores.stride(1) == 1,
                 "scores must be CUDA fp32 [B, L] row-major");
@@ -398,6 +444,34 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     params.topk              = static_cast<uint32_t>(K);
     params.page_bits         = page_bits;
     params.cluster_floor     = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor;
+    params.query_generation  = nullptr;
+    params.query_ready       = nullptr;
+    params.query_comm_mode   = nullptr;
+    params.query_ready_offset = static_cast<uint32_t>(query_ready_offset);
+    if (query_generation.has_value()) {
+        TORCH_CHECK(query_generation->is_cuda()
+                    && query_generation->is_contiguous()
+                    && query_generation->scalar_type() == torch::kInt32
+                    && query_generation->numel() == 1,
+                    "query_generation must be a contiguous CUDA int32 scalar");
+        TORCH_CHECK(query_signal_pad_ptrs.size() == 2
+                    && (query_tp_rank == 0 || query_tp_rank == 1)
+                    && query_ready_offset >= 0,
+                    "query wait requires two signal pads, rank 0/1, and nonnegative offset");
+        params.query_generation = reinterpret_cast<const uint32_t*>(
+            query_generation->data_ptr<int>());
+        params.query_ready = reinterpret_cast<const uint32_t*>(
+            static_cast<uintptr_t>(query_signal_pad_ptrs[query_tp_rank]));
+        if (query_comm_mode.has_value()) {
+            TORCH_CHECK(query_comm_mode->is_cuda()
+                        && query_comm_mode->is_contiguous()
+                        && query_comm_mode->scalar_type() == torch::kInt32
+                        && query_comm_mode->numel() == 1,
+                        "query_comm_mode must be a contiguous CUDA int32 scalar");
+            params.query_comm_mode = reinterpret_cast<const uint32_t*>(
+                query_comm_mode->data_ptr<int>());
+        }
+    }
 
     constexpr bool kUsePDL = false;
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
@@ -434,7 +508,9 @@ static torch::Tensor topk_v2(torch::Tensor scores, torch::Tensor seq_lens,
     auto metadata = torch::zeros({B + 1, 2}, i32);
     if ((uint64_t)scores.size(1) > 32768)   // plan needed only for possible cluster routing
         topk_v2_plan(seq_lens, metadata, /*static_cluster_threshold=*/0);
-    topk_v2_transform(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices);
+    topk_v2_transform(scores, seq_lens, page_table, page_indices, page_size,
+                      metadata, raw_indices, c10::nullopt, {}, -1, 0,
+                      c10::nullopt);
     return page_indices;
 }
 
@@ -447,7 +523,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "(+ optional raw indices). scores fp32 [B,L], row stride % 4 == 0",
           py::arg("scores"), py::arg("seq_lens"), py::arg("page_table"),
           py::arg("page_indices"), py::arg("page_size"), py::arg("metadata"),
-          py::arg("raw_indices") = c10::nullopt);
+          py::arg("raw_indices") = c10::nullopt,
+          py::arg("query_generation") = c10::nullopt,
+          py::arg("query_signal_pad_ptrs") = std::vector<int64_t>{},
+          py::arg("query_tp_rank") = -1,
+          py::arg("query_ready_offset") = 0,
+          py::arg("query_comm_mode") = c10::nullopt);
     m.def("topk_v2", &topk_v2,
           "one-shot convenience (alloc + plan + transform) -> page_indices [B, topk] i32",
           py::arg("scores"), py::arg("seq_lens"), py::arg("page_table"),

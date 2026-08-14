@@ -54,7 +54,66 @@ struct QueryRmsRopeArgs {
     int input_heads = 0;
     uint32_t output_rows = 0;
     float eps = 1e-6f;
+    nv_bfloat16* peer_out = nullptr;
+    nv_bfloat16* local_second_out = nullptr;
+    // 0: local payload/no handshake, 1: local payload/handshake,
+    // 2: peer payload/handshake. nullptr is the production peer mode.
+    const uint32_t* comm_mode = nullptr;
+    uint32_t batch_total = 0;
+    uint32_t rank0_batch = 0;
+    uint32_t tp_rank = 0;
+    unsigned long long* completed_ctas = nullptr;
+    uint32_t* generation = nullptr;
+    uint32_t* local_ready = nullptr;
+    uint32_t* peer_ready = nullptr;
+    uint32_t ready_offset = 0;
 };
+
+__device__ __forceinline__ uint64_t load_query_counter(
+        const unsigned long long* ptr) {
+    uint64_t value;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];"
+                 : "=l"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+__device__ __forceinline__ void publish_query_cta(
+        const QueryRmsRopeArgs& query, uint32_t lane) {
+    if (query.completed_ctas == nullptr
+            || (query.comm_mode != nullptr && *query.comm_mode == 0))
+        return;
+    // All query stores from this warp precede its release arrival. CTA 0's
+    // first tail warp is the sole publisher, matching TP2 O-proj's protocol.
+    __syncwarp();
+    if (lane != 0)
+        return;
+    asm volatile("red.release.gpu.global.add.u64 [%0], 1;" ::
+                 "l"(query.completed_ctas) : "memory");
+    constexpr uint32_t kQueryWorkersPerCta = 4;
+    const uint32_t warp = threadIdx.x >> 5;
+    if (blockIdx.x != 0 || warp != 12)
+        return;
+    const uint32_t current = [&]() {
+        uint32_t value;
+        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
+                     : "=r"(value) : "l"(query.generation) : "memory");
+        return value;
+    }();
+    const uint32_t next = current + 1;
+    const uint64_t expected = static_cast<uint64_t>(next) * gridDim.x
+                            * kQueryWorkersPerCta;
+    while (load_query_counter(query.completed_ctas) < expected)
+        asm volatile("nanosleep.u32 128;");
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::
+                 "l"(query.generation), "r"(next) : "memory");
+    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
+                 "l"(query.peer_ready + query.ready_offset + query.tp_rank),
+                 "r"(next) : "memory");
+    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
+                 "l"(query.local_ready + query.ready_offset + query.tp_rank),
+                 "r"(next) : "memory");
+}
 
 // Any warp that has finished its primary role claims one query row from a
 // per-CTA shared queue. A full warp owns one complete 512-wide RMS reduction.
@@ -62,10 +121,7 @@ template <bool kAblation>
 __device__ __forceinline__ void run_query_rms_rope(
         const QueryRmsRopeArgs& query, uint32_t* next, uint32_t lane) {
     using namespace wuda_query_rms_rope;
-    if constexpr (kAblation) {
-        if (*query.work_flag == 0)
-            return;
-    }
+    const bool do_work = !kAblation || *query.work_flag != 0;
 
     while (true) {
         uint32_t item = 0;
@@ -78,15 +134,41 @@ __device__ __forceinline__ void run_query_rms_rope(
         // MODEL1 FlashMLA always consumes 128 query heads. Both production
         // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
         // repeating runtime integer division/modulo in every lane of every row.
-        const uint32_t batch = output_row >> 7;
-        const uint32_t output_head = output_row & 127u;
+        const bool tp2 = query.peer_out != nullptr;
+        const uint32_t batch = tp2
+            ? output_row / static_cast<uint32_t>(query.input_heads)
+            : output_row >> 7;
+        const uint32_t output_head = tp2
+            ? output_row % static_cast<uint32_t>(query.input_heads)
+            : output_row & 127u;
         const uint32_t input_head = output_head & (query.input_heads - 1);
         const uint32_t input_row = batch * query.input_heads + input_head;
 
+        if (!do_work)
+            continue;
         const uint4* input = reinterpret_cast<const uint4*>(
             query.x + static_cast<uint64_t>(input_row) * kHidden) + lane;
-        uint4* output = reinterpret_cast<uint4*>(
-            query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        uint4* output;
+        if (tp2) {
+            const uint32_t owner = batch >= query.rank0_batch;
+            const uint32_t owner_row = owner == 0 ? batch : batch - query.rank0_batch;
+            const uint32_t full_head = query.tp_rank * 64 + input_head;
+            nv_bfloat16* destination;
+            if (owner == query.tp_rank) {
+                destination = query.out;
+            } else {
+                const bool remote = query.comm_mode == nullptr
+                    || *query.comm_mode >= 2;
+                destination = remote ? query.peer_out : query.local_second_out;
+            }
+            output = reinterpret_cast<uint4*>(
+                destination
+                + (static_cast<uint64_t>(owner_row) * 128 + full_head) * kHidden)
+                + lane;
+        } else {
+            output = reinterpret_cast<uint4*>(
+                query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        }
         uint4 values[kVecsPerThread];
         #pragma unroll
         for (int i = 0; i < kVecsPerThread; ++i)
@@ -113,6 +195,8 @@ __device__ __forceinline__ void run_query_rms_rope(
         } else
             output[kWarp] = scale_vec(values[1], scale);
     }
+    if (query.peer_out != nullptr)
+        publish_query_cta(query, lane);
 }
 
 constexpr int kM1TokenBodyBytes = 576;
@@ -918,9 +1002,12 @@ void sm100_fp8_paged_mqa_logits_fused(
             tensor_map_q, tensor_map_sf_q, tensor_map_kv,
             tensor_map_sf_kv, tensor_map_weights, make_scheduler);
 
-    if constexpr (kHasQuery)
+    if constexpr (kHasQuery) {
+        if (query.peer_out != nullptr)
+            return;
         wuda_fp8_mqa::run_query_rms_rope<kQueryAblation>(
             query, &query_next, lane);
+    }
 }
 
 } // namespace deep_gemm

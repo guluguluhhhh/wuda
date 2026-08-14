@@ -317,7 +317,15 @@ static wuda_fp8_mqa::QueryRmsRopeArgs make_query_args(
     const c10::optional<torch::Tensor>& query_sin,
     const c10::optional<torch::Tensor>& query_out,
     int64_t query_input_heads, double query_eps,
-    const c10::optional<torch::Tensor>& query_work_flag) {
+    const c10::optional<torch::Tensor>& query_work_flag,
+    const std::vector<int64_t>& query_symmetric_ptrs,
+    int64_t query_tp_rank, int64_t query_batch_total,
+    const c10::optional<torch::Tensor>& query_local_second_out,
+    const c10::optional<torch::Tensor>& query_comm_mode,
+    const c10::optional<torch::Tensor>& query_completed_ctas,
+    const c10::optional<torch::Tensor>& query_generation,
+    const std::vector<int64_t>& query_signal_pad_ptrs,
+    int64_t query_ready_offset) {
     wuda_fp8_mqa::QueryRmsRopeArgs args{};
     if (!query_x.has_value())
         return args;
@@ -338,7 +346,10 @@ static wuda_fp8_mqa::QueryRmsRopeArgs make_query_args(
     TORCH_CHECK(query_input_heads > 0
                 && query_x->numel() % (query_input_heads * 512) == 0,
                 "query_x must contain complete [B,input_heads,512] rows");
-    const int64_t output_batch = query_positions->numel();
+    const bool tp2 = !query_symmetric_ptrs.empty();
+    const int64_t output_batch = tp2
+        ? (query_batch_total + 1 - query_tp_rank) / 2
+        : query_positions->numel();
     TORCH_CHECK(output_batch > 0
                 && query_out->numel() % (output_batch * 512) == 0,
                 "query_out must contain complete [B,output_heads,512] rows");
@@ -375,6 +386,59 @@ static wuda_fp8_mqa::QueryRmsRopeArgs make_query_args(
     args.input_heads = static_cast<int>(query_input_heads);
     args.output_rows = static_cast<uint32_t>(output_batch * output_heads);
     args.eps = static_cast<float>(query_eps);
+    if (tp2) {
+        TORCH_CHECK(query_symmetric_ptrs.size() == 2
+                    && (query_tp_rank == 0 || query_tp_rank == 1)
+                    && query_batch_total > 0
+                    && query_positions->numel() == query_batch_total
+                    && input_batch == query_batch_total
+                    && query_input_heads == 64,
+                    "TP2 query requires two symmetric pointers, rank 0/1, "
+                    "positions/input batch equal to query_batch_total, and 64 heads");
+        TORCH_CHECK(query_local_second_out.has_value(),
+                    "TP2 query requires a local benchmark destination");
+        check(*query_local_second_out, torch::kBFloat16,
+              "query_local_second_out");
+        TORCH_CHECK(query_local_second_out->numel()
+                        >= ((query_batch_total + 1) / 2) * 128 * 512,
+                    "query_local_second_out is too small");
+        args.out = reinterpret_cast<nv_bfloat16*>(
+            static_cast<uintptr_t>(query_symmetric_ptrs[query_tp_rank]));
+        args.peer_out = reinterpret_cast<nv_bfloat16*>(
+            static_cast<uintptr_t>(query_symmetric_ptrs[query_tp_rank ^ 1]));
+        args.local_second_out = reinterpret_cast<nv_bfloat16*>(
+            query_local_second_out->data_ptr());
+        args.batch_total = static_cast<uint32_t>(query_batch_total);
+        args.rank0_batch = static_cast<uint32_t>((query_batch_total + 1) / 2);
+        args.tp_rank = static_cast<uint32_t>(query_tp_rank);
+        args.output_rows = static_cast<uint32_t>(
+            query_batch_total * query_input_heads);
+        TORCH_CHECK(query_completed_ctas && query_generation
+                    && query_signal_pad_ptrs.size() == 2
+                    && query_ready_offset >= 0,
+                    "TP2 query requires completion counters and two signal pads");
+        check(*query_completed_ctas, torch::kInt64, "query_completed_ctas");
+        check(*query_generation, torch::kInt32, "query_generation");
+        TORCH_CHECK(query_completed_ctas->numel() == 1
+                    && query_generation->numel() == 1,
+                    "TP2 query completion counters must be scalars");
+        args.completed_ctas = reinterpret_cast<unsigned long long*>(
+            query_completed_ctas->data_ptr<int64_t>());
+        args.generation = reinterpret_cast<uint32_t*>(
+            query_generation->data_ptr<int>());
+        args.local_ready = reinterpret_cast<uint32_t*>(
+            static_cast<uintptr_t>(query_signal_pad_ptrs[query_tp_rank]));
+        args.peer_ready = reinterpret_cast<uint32_t*>(
+            static_cast<uintptr_t>(query_signal_pad_ptrs[query_tp_rank ^ 1]));
+        args.ready_offset = static_cast<uint32_t>(query_ready_offset);
+        if (query_comm_mode.has_value()) {
+            check(*query_comm_mode, torch::kInt32, "query_comm_mode");
+            TORCH_CHECK(query_comm_mode->numel() == 1,
+                        "query_comm_mode must be a CUDA int32 scalar");
+            args.comm_mode = reinterpret_cast<const uint32_t*>(
+                query_comm_mode->data_ptr<int>());
+        }
+    }
     if (query_work_flag.has_value()) {
         check(*query_work_flag, torch::kInt32, "query_work_flag");
         TORCH_CHECK(query_work_flag->numel() == 1
@@ -413,6 +477,15 @@ static void mqa_logits_fp8_decode_out(
     int64_t query_input_heads,
     double query_eps,
     c10::optional<torch::Tensor> query_work_flag,
+    std::vector<int64_t> query_symmetric_ptrs,
+    int64_t query_tp_rank,
+    int64_t query_batch_total,
+    c10::optional<torch::Tensor> query_local_second_out,
+    c10::optional<torch::Tensor> query_comm_mode,
+    c10::optional<torch::Tensor> query_completed_ctas,
+    c10::optional<torch::Tensor> query_generation,
+    std::vector<int64_t> query_signal_pad_ptrs,
+    int64_t query_ready_offset,
     bool pdl) {
     TORCH_CHECK(q.is_cuda() && q.is_contiguous()
                 && q.scalar_type() == torch::kFloat8_e4m3fn
@@ -481,7 +554,11 @@ static void mqa_logits_fp8_decode_out(
         cmp_block_stride_bytes);
     const auto query = make_query_args(
         query_x, query_positions, query_cos, query_sin, query_out,
-        query_input_heads, query_eps, query_work_flag);
+        query_input_heads, query_eps, query_work_flag,
+        query_symmetric_ptrs, query_tp_rank, query_batch_total,
+        query_local_second_out, query_comm_mode,
+        query_completed_ctas, query_generation,
+        query_signal_pad_ptrs, query_ready_offset);
 
     CUtensorMap q_map = make_tma_2d(
         "q", q.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
@@ -572,6 +649,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("query_input_heads") = 0,
         py::arg("query_eps") = 1e-6,
         py::arg("query_work_flag") = c10::nullopt,
+        py::arg("query_symmetric_ptrs") = std::vector<int64_t>{},
+        py::arg("query_tp_rank") = -1,
+        py::arg("query_batch_total") = 0,
+        py::arg("query_local_second_out") = c10::nullopt,
+        py::arg("query_comm_mode") = c10::nullopt,
+        py::arg("query_completed_ctas") = c10::nullopt,
+        py::arg("query_generation") = c10::nullopt,
+        py::arg("query_signal_pad_ptrs") = std::vector<int64_t>{},
+        py::arg("query_ready_offset") = 16,
         py::arg("pdl") = false);
 
     module.def(

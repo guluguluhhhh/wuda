@@ -31,10 +31,9 @@ states and final outputs bitwise identical (run-to-run determinism).
 flash_mla is optional (import-guarded): without it stages A-D still run, and
 the o_proj/mhc_post tail (which consumes the MLA output) is skipped with it.
 The default is the RTP-compatible FP8 Indexer; --indexer-fp4 is the explicit
-legacy A/B path. The default geometry is the full-rank e2e chain. --tpdp benchmarks the mixed
-local rank: main-Q TP2 with replicated index-Q, request-DP2 MQA/TopK/FlashMLA,
-and the original global-B TP2 O-proj shard (64 heads, 8 groups). Layout handoffs
-remain outside this two-process test.
+legacy A/B path. The default geometry is the full-rank e2e chain. --tpdp uses
+main-Q TP2 with replicated index-Q, a symmetric TP-head gather into request-DP2
+MQA/TopK/FlashMLA, and the global-B TP2 O-proj shard (64 heads, 8 groups).
 """
 import argparse
 import json, os, sys, math, tempfile, warnings, torch
@@ -103,6 +102,7 @@ TP_RANK = 0
 TP_WORLD_SIZE = 1
 TP2_COMM_MODULE = None
 TP_SYNC_GROUP = None
+QUERY_READY_OFFSET = 32
 INDEXER_FP8 = True
 PDL_MODE = "on"
 Q_RMS_MAX_BLOCKS = 1024
@@ -165,7 +165,17 @@ def local_o_groups():
 
 
 def local_batch(B):
-    return (B + 1) // 2 if TPDP_MODE else B
+    if not TPDP_MODE:
+        return B
+    split = (B + 1) // 2
+    return split if TP_RANK == 0 else B - split
+
+
+def owned_slice(B):
+    if not TPDP_MODE:
+        return slice(0, B)
+    split = (B + 1) // 2
+    return slice(0, split) if TP_RANK == 0 else slice(split, B)
 
 
 def mla_batch(B):
@@ -180,12 +190,12 @@ def mla_dp_output_to_tp(mla3, B):
     """
     if not MLA_DP_MODE:
         return mla3
-    B_local = local_batch(B)
-    peer_rows = B - B_local
     local_heads = mla3[:, :WQ_HEADS]
-    if not peer_rows:
-        return local_heads.contiguous()
-    return torch.cat((local_heads, local_heads[:peer_rows]), dim=0).contiguous()
+    B_local = local_heads.size(0)
+    repeats = (B + B_local - 1) // B_local
+    global_rows = local_heads.repeat(repeats, 1, 1)[:B].contiguous()
+    global_rows[owned_slice(B)].copy_(local_heads)
+    return global_rows
 
 
 def init_tpdp_distributed():
@@ -248,6 +258,48 @@ def load_query_rms_rope():
 
 
 _OPROJ_WS = {}
+_QUERY_TP2_WS = {}
+
+
+class QueryTP2Comm:
+    """Graph-stable TP-head gather workspace consumed directly by FlashMLA."""
+
+    def __init__(self, B):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        symm_mem.set_signal_pad_size(4096)
+        max_local = (B + 1) // 2
+        self.buffer = symm_mem.empty(
+            (max_local, 1, Q_HEADS, Q_DIM), dtype=torch.bfloat16,
+            device=torch.device("cuda", torch.cuda.current_device()))
+        self.handle = symm_mem.rendezvous(
+            self.buffer, group=dist.group.WORLD)
+        self.local_second_output = torch.empty_like(self.buffer)
+        self.completed_ctas = torch.zeros(
+            1, device=DEV, dtype=torch.int64)
+        self.generation = torch.zeros(
+            1, device=DEV, dtype=torch.int32)
+        self.comm_mode = torch.full(
+            (1,), 2, device=DEV, dtype=torch.int32)
+        dist.barrier()
+        torch.cuda.synchronize()
+
+    @property
+    def pointers(self):
+        return [int(value) for value in self.handle.buffer_ptrs]
+
+    @property
+    def signal_pad_pointers(self):
+        return [int(value) for value in self.handle.signal_pad_ptrs]
+
+    def output(self, B):
+        return self.buffer[:local_batch(B)]
+
+
+def query_tp2_ws(B):
+    if B not in _QUERY_TP2_WS:
+        _QUERY_TP2_WS[B] = QueryTP2Comm(B)
+    return _QUERY_TP2_WS[B]
 
 
 def oproj_ws(B):
@@ -282,7 +334,16 @@ def make_weights(seed=7):
     w["front_fp8"], w["front_sf"] = t_fm.quant_weight_fp8(fw[:2048])
     w["front_bf16"] = fw[2048:].contiguous()
     w["q_norm"] = torch.rand(1536, device=DEV) + 0.5
-    wq = torch.randn(t_wq.N_MERGED, 1536, device=DEV) * 0.03
+    wq_idx = torch.randn(t_wq.N_IDX, 1536, device=DEV) * 0.03
+    if TPDP_MODE:
+        # Different main-Q shards make the TP-head gather correctness-visible;
+        # the indexer projection and all following weights remain replicated.
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(seed + 2000 + TP_RANK)
+            wq_main = torch.randn(t_wq.N_TOTAL, 1536, device=DEV) * 0.03
+    else:
+        wq_main = torch.randn(t_wq.N_TOTAL, 1536, device=DEV) * 0.03
+    wq = torch.cat((wq_idx, wq_main), dim=0)
     w["wq_fp8"] = wq.to(torch.float8_e4m3fn)
     w["wq_sf"] = t_wq.make_weight_sf_ones(DEV)
     w["idx_ape"] = torch.randn(4, 256, device=DEV)
@@ -546,8 +607,11 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     xq_sf = torch.empty(B, 12, device=DEV, dtype=torch.uint8)
     weights64 = w64
     B_mla = mla_batch(B)
-    pos_mla = pos[:B_mla]
-    q_ready = (None if inplace_query_rms() else
+    owned = owned_slice(B)
+    pos_mla = pos[owned] if MLA_DP_MODE else pos
+    query_comm = query_tp2_ws(B) if TPDP_MODE and fused_query_rms() else None
+    q_ready = (query_comm.output(B) if query_comm is not None else
+               None if inplace_query_rms() else
                torch.empty(B_mla, 1, attention_heads(), Q_DIM,
                            device=DEV, dtype=torch.bfloat16))
 
@@ -555,7 +619,6 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     ncmp = mgr.n_compressed(slots, pos)
     logits_buf.fill_(float("-inf"))
     B_local = local_batch(B)
-    owned = slice(0, B_local)
     idx_bt = mgr.block_table("idx", slots)[owned]
     if INDEXER_FP8:
         ctx2 = ncmp[owned].view(-1, 1).contiguous()
@@ -602,9 +665,22 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             comp_state_ring_entries=mgr.state_ring_entries,
             cmp_entries_per_block=mgr.entries_per_block["cmp"],
             cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
-            query_x=yq, query_positions=pos_mla, query_cos=w["cos"],
+            query_x=yq, query_positions=pos if query_comm else pos_mla,
+            query_cos=w["cos"],
             query_sin=w["sin"], query_out=q_ready,
             query_input_heads=WQ_HEADS, query_eps=EPS,
+            query_symmetric_ptrs=(query_comm.pointers if query_comm else []),
+            query_tp_rank=TP_RANK,
+            query_batch_total=B if query_comm else 0,
+            query_local_second_out=(query_comm.local_second_output
+                                    if query_comm else None),
+            query_comm_mode=(query_comm.comm_mode if query_comm else None),
+            query_completed_ctas=(query_comm.completed_ctas
+                                  if query_comm else None),
+            query_generation=(query_comm.generation if query_comm else None),
+            query_signal_pad_ptrs=(query_comm.signal_pad_pointers
+                                   if query_comm else []),
+            query_ready_offset=QUERY_READY_OFFSET,
             pdl=pdl_enabled())
         if INDEXER_FP8:
             mq8m.mqa_logits_fp8_decode_out(
@@ -658,7 +734,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     torch.cuda.synchronize()
     finite = True
     for b in range(B_local):
-        n = int(ncmp[b])
+        global_b = (owned.start or 0) + b
+        n = int(ncmp[global_b])
         if n:
             lg = logits[b, :n]
             finite &= bool((torch.isnan(lg) | torch.isinf(lg)).sum().item() == 0)
@@ -667,10 +744,11 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     kv_rows = deq_idx_pool(mgr, slots, pos)
     refs = ref_mqa_logits(iq_fp4, iq_sf, weights64, kv_rows)
     for b in range(B_local):
-        n = int(ncmp[b])
+        global_b = (owned.start or 0) + b
+        n = int(ncmp[global_b])
         if n:
-            d = (logits[b, :n].float() - refs[b]).abs().max().item()
-            rel = d / (refs[b].abs().max().item() + 1e-6)
+            d = (logits[b, :n].float() - refs[global_b]).abs().max().item()
+            rel = d / (refs[global_b].abs().max().item() + 1e-6)
             stats["C_mqa_rel"] = max(stats.get("C_mqa_rel", 0.0), rel)
 
     # -- 6. topk_v2 (512, page transform -> compressed physical) ----------
@@ -679,15 +757,27 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
     # tiny ncmp). -inf tail beyond seq_len is never read.
     cmp_bt = mgr.block_table("cmp", slots)[owned]
     L = max(int(ncmp[owned].max()), 1)
-    page_idx = tkm.topk_v2(logits[owned, :L], ncmp[owned], cmp_bt,
-                           TOPK, PAGE, None)
+    if query_comm is None:
+        page_idx = tkm.topk_v2(logits[:, :L], ncmp[owned], cmp_bt,
+                               TOPK, PAGE, None)
+    else:
+        page_idx = torch.empty(
+            B_local, TOPK, device=DEV, dtype=torch.int32)
+        topk_meta = torch.zeros(
+            B_local + 1, 2, device=DEV, dtype=torch.int32)
+        tkm.topk_v2_transform(
+            logits[:, :L], ncmp[owned], cmp_bt, page_idx, PAGE,
+            topk_meta, None, query_comm.generation,
+            query_comm.signal_pad_pointers, TP_RANK, QUERY_READY_OFFSET,
+            query_comm.comm_mode)
     for b in range(B_local):
-        n = int(ncmp[b])
+        global_b = (owned.start or 0) + b
+        n = int(ncmp[global_b])
         k = min(n, TOPK)
         if k == 0:
             ok = bool((page_idx[b] == -1).all())
         else:
-            ref_raw = torch.topk(refs[b], k).indices if n > TOPK else \
+            ref_raw = torch.topk(refs[global_b], k).indices if n > TOPK else \
                 torch.arange(n, device=DEV)
             ref_phys = cmp_bt[b][ref_raw // PAGE] * PAGE + ref_raw % PAGE
             ok = (torch.sort(page_idx[b][:k])[0]
@@ -715,9 +805,13 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                      w["wq_sf"].view(torch.uint8)[t_wq.N_IDX // 128:]).t())
         q_raw = q_raw.bfloat16().view(B, 1, WQ_HEADS, Q_DIM)[:B_mla]
     else:
-        q_raw = yq.view(B, 1, WQ_HEADS, Q_DIM)[:B_mla]
-    if MLA_DP_MODE:
-        q_raw = q_raw.repeat(1, 1, Q_HEADS // WQ_HEADS, 1)
+        q_raw = yq.view(B, 1, WQ_HEADS, Q_DIM)
+    if TPDP_MODE:
+        gathered = [torch.empty_like(q_raw) for _ in range(TP_WORLD_SIZE)]
+        dist.all_gather(gathered, q_raw)
+        q_raw = torch.cat(gathered, dim=2)[owned]
+    else:
+        q_raw = q_raw[:B_mla]
     q_ref = q_raw.float()
     q_ref = q_ref * torch.rsqrt(q_ref.square().mean(-1, keepdim=True) + EPS)
     even, odd = q_ref[..., 448::2].clone(), q_ref[..., 449::2].clone()
@@ -730,7 +824,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
 
     # -- 7. official flashMLA over the native post-RMSNorm+RoPE query ------
     if post_attn_enabled():
-        slots_mla = slots[:B_mla] if MLA_DP_MODE else slots
+        slots_mla = slots[owned] if MLA_DP_MODE else slots
         swa_idx, swa_len = mgr.swa_indices(slots, pos, SWA_TOPK)
         if MLA_DP_MODE:
             swa_idx, swa_len = swa_idx[owned], swa_len[owned]
@@ -854,7 +948,8 @@ def probe_kernel_names(fn):
     return tuple(names)
 
 
-def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
+def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
+              query_tp_overhead_only=False):
     """COLD-L2 measurement, ONE full CSA layer per call: an 8GB memset (the
     bench_utils.bench_kineto flusher, i.e. what every single-operator test in
     this tree already uses) runs before EVERY chain call, so a layer starts
@@ -893,7 +988,9 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
     if PDL_MODE != "on":
         trace_mode += f"_pdl-{PDL_MODE}"
     print("\n" + "=" * 76)
-    title = ("Paired TP2 communication overhead"
+    title = ("Paired query TP-head communication overhead"
+             if query_tp_overhead_only else
+             "Paired TP2 communication overhead"
              if tp2_overhead_only else "Per-operator latency")
     print(f"{title} (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
@@ -912,16 +1009,22 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
     flush_bytes = max(2 * l2_bytes, 64 << 20)
     print(f"  cold L2 ({flush_bytes / (1 << 20):.0f} MiB memset per layer "
           "call, excluded from every number); all reported values are device us")
-    if tp2_overhead_only:
+    if query_tp_overhead_only:
+        print("  one CUDA graph uses device modes: off=no peer payload/signal/wait, "
+              "signal=local payload plus peer handshake, comm=peer payload plus handshake")
+        print("  every replay keeps identical RMSNorm+RoPE compute and query-payload store volume")
+        print("  modes rotate order and report the slower TP rank; deltas are paired per repetition")
+        print("  an excluded device rendezvous removes cross-process graph-launch "
+              "skew before every timed replay")
+    elif tp2_overhead_only:
         print("  local and comm replay the same CUDA graph and kernels; a device "
-              "flag changes only the second TMA destination from local to peer "
-              "memory")
+              "flag changes only the communication destination")
         print("  samples alternate order and take the slower TP rank")
         print("  delta is paired per repetition then medianed; it is not the "
               "difference of the two independently reported medians")
         print("  an excluded device rendezvous removes cross-process graph-launch "
               "skew before every timed replay")
-    if tp2_overhead_only:
+    if tp2_overhead_only or query_tp_overhead_only:
         pass
     elif Q_RMS_ABLATION:
         print("  one CUDA graph and identical PDL/grid; only the RMSNorm+RoPE "
@@ -954,12 +1057,12 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
     if not fused_query_rms():
         print(f"  q_rms persistent grid cap = {Q_RMS_MAX_BLOCKS} CTAs")
     if TPDP_MODE:
-        print("  --tpdp: MQA/TopK/MLA run ceil(B/2) rows; MLA H=128; O-proj "
+        print("  --tpdp: MQA/TopK/MLA own disjoint half-batches; MLA H=128; O-proj "
               "remains global B x H=64 with the 8-group TP2 shard")
-        print("  O-proj includes symmetric peer publication and fused BF16 "
-              "reduce+mHC post; TP/DP layout handoffs remain outside timing")
+        print("  MQA gathers TP query heads through symmetric memory; O-proj "
+              "includes symmetric peer publication and fused BF16 reduce+mHC post")
     col_width = 13 if Q_RMS_ABLATION else 9
-    if not tp2_overhead_only:
+    if not (tp2_overhead_only or query_tp_overhead_only):
         print(f"  {'B':<5}" + "".join(f"{c:>{col_width}}" for c in cols))
         print("  " + "-" * (5 + col_width * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
@@ -1083,10 +1186,13 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
                 pdl=pdl_enabled())
         nc = mgr.n_compressed(slots, pos)
         B_local = local_batch(B)
-        owned = slice(0, B_local)
+        owned = owned_slice(B)
         B_mla = mla_batch(B)
-        pos_mla = pos[:B_mla]
-        q_ready = (None if inplace_query_rms() else
+        pos_mla = pos[owned] if MLA_DP_MODE else pos
+        query_comm = (query_tp2_ws(B)
+                      if TPDP_MODE and fused_query_rms() else None)
+        q_ready = (query_comm.output(B) if query_comm is not None else
+                   None if inplace_query_rms() else
                    torch.empty(B_mla, 1, attention_heads(), Q_DIM,
                                device=DEV, dtype=torch.bfloat16))
         q_rms_work_flag = (torch.ones((), device=DEV, dtype=torch.int32)
@@ -1152,10 +1258,26 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
-                    query_x=r[0], query_positions=pos_mla,
+                    query_x=r[0],
+                    query_positions=pos if query_comm else pos_mla,
                     query_cos=cosl, query_sin=sinl, query_out=query_ready(),
                     query_input_heads=WQ_HEADS, query_eps=EPS,
                     query_work_flag=q_rms_work_flag,
+                    query_symmetric_ptrs=(query_comm.pointers
+                                          if query_comm else []),
+                    query_tp_rank=TP_RANK,
+                    query_batch_total=B if query_comm else 0,
+                    query_local_second_out=(query_comm.local_second_output
+                                            if query_comm else None),
+                    query_comm_mode=(query_comm.comm_mode
+                                     if query_comm else None),
+                    query_completed_ctas=(query_comm.completed_ctas
+                                          if query_comm else None),
+                    query_generation=(query_comm.generation
+                                      if query_comm else None),
+                    query_signal_pad_ptrs=(query_comm.signal_pad_pointers
+                                           if query_comm else []),
+                    query_ready_offset=QUERY_READY_OFFSET,
                     pdl=pdl_enabled())
                 hold["logits"] = logits[owned]
             elif INDEXER_FP8:
@@ -1203,7 +1325,12 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
         def run_topk():
             tkm.topk_v2_transform(
                 hold["logits"][:, :ncmp], nc[owned], cmp_bt, page_idx,
-                PAGE, meta, None)
+                PAGE, meta, None,
+                query_comm.generation if query_comm else None,
+                query_comm.signal_pad_pointers if query_comm else [],
+                TP_RANK if query_comm else -1,
+                QUERY_READY_OFFSET if query_comm else 0,
+                query_comm.comm_mode if query_comm else None)
         run_topk()
 
         stage_fns = [("mhc", run_hc), ("front", run_front),
@@ -1280,32 +1407,36 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
             for f in chain_fns:
                 f()
 
-        def measure_tp2_graph_pair(graph, reps=7, pairs=12,
-                                   split_event=None, mode_tensor=None):
-            """Measure two modes of one graph and retain critical-path data."""
-            local_reps, comm_reps, delta_reps = [], [], []
+        def measure_tp2_graph_modes(graph, mode_values, reps=7, cycles=12,
+                                    split_event=None, mode_tensor=None):
+            """Measure device-selected modes of one graph on both TP ranks."""
+            modes = tuple(mode_values)
+            mode_reps = {mode: [] for mode in modes}
             rank_reps = {
                 mode: [[[], [], []] for _ in range(2)]
-                for mode in ("local", "comm")
+                for mode in modes
             }
-            critical_counts = {"local": [0, 0], "comm": [0, 0]}
+            critical_counts = {mode: [0, 0] for mode in modes}
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             end.record()
             end.synchronize()
             for rep in range(reps):
-                samples = {"local": [], "comm": []}
+                samples = {mode: [] for mode in modes}
                 rank_samples = {
                     mode: [[[], [], []] for _ in range(2)]
-                    for mode in ("local", "comm")
+                    for mode in modes
                 }
-                for sample_idx in range(pairs):
-                    order = (("local", "comm") if (rep + sample_idx) % 2 == 0
-                             else ("comm", "local"))
+                for sample_idx in range(cycles):
+                    sequence = rep + sample_idx
+                    shift = sequence % len(modes)
+                    order = modes[shift:] + modes[:shift]
+                    if (sequence // len(modes)) & 1:
+                        order = order[::-1]
                     for mode in order:
                         if mode_tensor is not None:
-                            mode_tensor.fill_(mode == "comm")
+                            mode_tensor.fill_(mode_values[mode])
                         # Keep the cold-L2 memset in flight while both hosts
                         # enqueue the rendezvous, events, and graph replay. The
                         # rendezvous sits after the memset and before `start`,
@@ -1338,20 +1469,41 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
                             for metric in range(3):
                                 rank_samples[mode][measured_rank][metric].append(
                                     values[measured_rank][metric])
-                local_mean = sum(samples["local"]) / len(samples["local"])
-                comm_mean = sum(samples["comm"]) / len(samples["comm"])
-                local_reps.append(local_mean)
-                comm_reps.append(comm_mean)
-                delta_reps.append(comm_mean - local_mean)
-                for mode in ("local", "comm"):
+                for mode in modes:
+                    mode_reps[mode].append(
+                        sum(samples[mode]) / len(samples[mode]))
                     for measured_rank in range(2):
                         for metric in range(3):
                             values = rank_samples[mode][measured_rank][metric]
                             rank_reps[mode][measured_rank][metric].append(
                                 sum(values) / len(values))
             import statistics
+            rank_medians = {mode: [] for mode in modes}
+            for measured_rank in range(2):
+                for mode in modes:
+                    rank_medians[mode].append(tuple(
+                        statistics.median(
+                            rank_reps[mode][measured_rank][metric])
+                        for metric in range(3)
+                    ))
+            medians = {
+                mode: statistics.median(mode_reps[mode]) for mode in modes
+            }
+            return medians, mode_reps, rank_reps, rank_medians, critical_counts
+
+        def measure_tp2_graph_pair(graph, reps=7, pairs=12,
+                                   split_event=None, mode_tensor=None):
+            """Measure local and peer modes and retain critical-path data."""
+            import statistics
+            (medians, mode_reps, rank_reps,
+             rank_medians, critical_counts) = measure_tp2_graph_modes(
+                graph, {"local": 0, "comm": 1}, reps=reps, cycles=pairs,
+                split_event=split_event, mode_tensor=mode_tensor)
+            delta_reps = [
+                comm - local for comm, local in zip(
+                    mode_reps["comm"], mode_reps["local"])
+            ]
             rank_deltas = []
-            rank_medians = {"local": [], "comm": []}
             for measured_rank in range(2):
                 rank_deltas.append(tuple(
                     statistics.median([
@@ -1362,21 +1514,11 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
                     ])
                     for metric in range(3)
                 ))
-                for mode in ("local", "comm"):
-                    rank_medians[mode].append(tuple(
-                        statistics.median(
-                            rank_reps[mode][measured_rank][metric])
-                        for metric in range(3)
-                    ))
             return (
-                statistics.median(local_reps),
-                statistics.median(comm_reps),
+                medians["local"], medians["comm"],
                 statistics.median(delta_reps),
-                min(delta_reps),
-                max(delta_reps),
-                rank_deltas,
-                rank_medians,
-                critical_counts,
+                min(delta_reps), max(delta_reps), rank_deltas,
+                rank_medians, critical_counts,
             )
 
         def measure_tp2_graph(graph, reps=7, samples_per_rep=16):
@@ -1452,6 +1594,88 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
             import statistics
             return (statistics.median(rep_work), statistics.median(rep_relay),
                     statistics.median(rep_delta), min(rep_delta), max(rep_delta))
+
+        if query_tp_overhead_only:
+            assert TPDP_MODE and query_comm is not None
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                query_comm.comm_mode.fill_(2)
+                chain(); chain()
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            select_g = capture_tp2_graph(chain)
+
+            peer_heads = slice((TP_RANK ^ 1) * WQ_HEADS,
+                               (TP_RANK ^ 1) * WQ_HEADS + WQ_HEADS)
+
+            def probe_query_mode(mode, sentinel):
+                peer_view = query_ready()[:, :, peer_heads, :]
+                peer_view.fill_(sentinel)
+                query_comm.comm_mode.fill_(mode)
+                torch.cuda.synchronize()
+                generation_before = int(query_comm.generation.item())
+                tp_host_barrier()
+                tp_device_barrier(ows.tp2_comm)
+                select_g.replay()
+                torch.cuda.synchronize()
+                tp_host_barrier()
+                unchanged = bool((peer_view == sentinel).all().item())
+                generation_after = int(query_comm.generation.item())
+                return unchanged, generation_after - generation_before
+
+            off_probe = probe_query_mode(0, -7.0)
+            signal_probe = probe_query_mode(1, -9.0)
+            comm_probe = probe_query_mode(2, -11.0)
+            if off_probe != (True, 0):
+                raise RuntimeError(f"query off-mode control failed: {off_probe}")
+            if signal_probe != (True, 1):
+                raise RuntimeError(
+                    f"query signal-mode control failed: {signal_probe}")
+            if comm_probe != (False, 1):
+                raise RuntimeError(f"query comm-mode control failed: {comm_probe}")
+            if TP_RANK == 0:
+                print("  control gate: off=no peer payload/generation; "
+                      "signal=no peer payload+generation; comm=peer payload+generation")
+
+            result = measure_tp2_graph_modes(
+                select_g, {"off": 0, "signal": 1, "comm": 2},
+                reps=9, cycles=18, mode_tensor=query_comm.comm_mode)
+            if TP_RANK == 0:
+                import statistics
+                medians, mode_reps, rank_reps, _, critical = result
+
+                def paired_delta(high, low):
+                    values = [h - l for h, l in zip(
+                        mode_reps[high], mode_reps[low])]
+                    return (statistics.median(values), min(values), max(values))
+
+                sync = paired_delta("signal", "off")
+                payload = paired_delta("comm", "signal")
+                total = paired_delta("comm", "off")
+                rank_total = []
+                for rank in range(2):
+                    values = [comm - off for comm, off in zip(
+                        rank_reps["comm"][rank][0],
+                        rank_reps["off"][rank][0])]
+                    rank_total.append(statistics.median(values))
+                print(f"  B={B} query TP-head E2E modes: "
+                      f"off={medians['off']:.2f} us, "
+                      f"signal={medians['signal']:.2f} us, "
+                      f"comm={medians['comm']:.2f} us")
+                print(f"    total comm-off={total[0]:+.2f} us "
+                      f"(rep range {total[1]:+.2f}..{total[2]:+.2f})")
+                print(f"    sync signal-off={sync[0]:+.2f} us; "
+                      f"payload comm-signal={payload[0]:+.2f} us")
+                print("    rank total deltas: " + ", ".join(
+                    f"r{rank}={delta:+.2f} us"
+                    for rank, delta in enumerate(rank_total))
+                    + "; critical " + ", ".join(
+                        f"{mode}={critical[mode]}"
+                        for mode in ("off", "signal", "comm")))
+            del select_g, mgr
+            torch.cuda.empty_cache()
+            continue
 
         if tp2_overhead_only:
             assert TPDP_MODE
@@ -1669,7 +1893,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False):
         del mgr
         torch.cuda.empty_cache()
 
-    if Q_RMS_ABLATION or tp2_overhead_only:
+    if Q_RMS_ABLATION or tp2_overhead_only or query_tp_overhead_only:
         return
 
     # ---- Bandwidth table: per-operator traffic / stage time ------------
@@ -1820,6 +2044,10 @@ if __name__ == "__main__":
         help="skip profiler/timelines and run paired local-vs-communication "
              "TP2 graph measurements (requires --tpdp --bench-only)")
     parser.add_argument(
+        "--query-tp-overhead-only", action="store_true",
+        help="three-mode graph-only off-vs-signal-vs-peer TP-head ablation "
+             "(requires --tpdp --bench-only)")
+    parser.add_argument(
         "--separate-query-rms", action="store_true",
         help="use the original standalone query RMSNorm+RoPE kernel")
     args = parser.parse_args()
@@ -1837,6 +2065,11 @@ if __name__ == "__main__":
         parser.error("--q-rms-ablation requires the default fused query path")
     if args.tp2_overhead_only and not (args.tpdp and args.bench_only):
         parser.error("--tp2-overhead-only requires --tpdp --bench-only")
+    if args.query_tp_overhead_only and not (args.tpdp and args.bench_only):
+        parser.error(
+            "--query-tp-overhead-only requires --tpdp --bench-only")
+    if args.query_tp_overhead_only and args.tp2_overhead_only:
+        parser.error("select only one TP2 communication ablation")
     bench_batches = (None if args.bench_batches is None else
                      tuple(int(x) for x in args.bench_batches.split(",")))
     print(f"Device: {torch.cuda.get_device_name()}"
@@ -1873,7 +2106,8 @@ if __name__ == "__main__":
 
     if args.bench_only:
         benchmark(mods, w, ncmp=16384, batches=bench_batches,
-                  tp2_overhead_only=args.tp2_overhead_only)
+                  tp2_overhead_only=args.tp2_overhead_only,
+                  query_tp_overhead_only=args.query_tp_overhead_only)
         if dist.is_initialized():
             dist.destroy_process_group()
         sys.exit(0)
