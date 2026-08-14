@@ -20,14 +20,29 @@ namespace deep_gemm {
 namespace o_proj_b_tp2_symm {
 
 constexpr uint32_t kGridDoneElements = 1;
+constexpr uint32_t kTileReadyOffset = 256;
+constexpr uint32_t kMaxOutputTiles = 128;
+constexpr uint32_t kMaxConsumerTiles = 512;
+constexpr uint32_t kTileGenerationElements =
+    kMaxOutputTiles + kMaxConsumerTiles;
 
-CUTLASS_DEVICE void arrive_grid(uint64_t* ptr) {
-    asm volatile("red.release.gpu.global.add.u64 [%0], 1;" :: "l"(ptr) : "memory");
+CUTLASS_DEVICE uint64_t arrive_grid(uint64_t* ptr) {
+    uint64_t previous;
+    asm volatile("atom.release.gpu.global.add.u64 %0, [%1], 1;"
+                 : "=l"(previous) : "l"(ptr) : "memory");
+    return previous + 1;
 }
 
 CUTLASS_DEVICE uint64_t load_relaxed_gpu_u64(const uint64_t* ptr) {
     uint64_t value;
     asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];"
+                 : "=l"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+CUTLASS_DEVICE uint64_t load_acquire_gpu_u64(const uint64_t* ptr) {
+    uint64_t value;
+    asm volatile("ld.acquire.gpu.global.u64 %0, [%1];"
                  : "=l"(value) : "l"(ptr) : "memory");
     return value;
 }
@@ -46,12 +61,24 @@ CUTLASS_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
     return value;
 }
 
+CUTLASS_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
+    uint32_t value;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                 : "=r"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
 CUTLASS_DEVICE void store_relaxed_gpu(uint32_t* ptr, uint32_t value) {
     asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
 }
 
 CUTLASS_DEVICE void store_relaxed_sys(uint32_t* ptr, uint32_t value) {
     asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
+                 "l"(ptr), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void store_release_sys(uint32_t* ptr, uint32_t value) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::
                  "l"(ptr), "r"(value) : "memory");
 }
 
@@ -99,6 +126,9 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
           bool kRuntimeSelect,
+          bool kTilePublish,
+          bool kStoreSecondDestination,
+          bool kVectorPeerStore,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
@@ -121,7 +151,9 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
                              uint32_t rank,
                              const uint32_t* runtime_mode,
                              uint32_t static_use_peer,
-                             uint32_t ready_offset) {
+                             uint32_t ready_offset,
+                             uint32_t* tile_generations,
+                             cd_dtype_t* vector_store_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -205,7 +237,8 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_local_cd);
         if constexpr (kRuntimeSelect)
             cute::prefetch_tma_descriptor(&tensor_map_local_second_cd);
-        cute::prefetch_tma_descriptor(&tensor_map_peer_cd);
+        if constexpr (kStoreSecondDestination)
+            cute::prefetch_tma_descriptor(&tensor_map_peer_cd);
     }
 
     // Overwrite shape constants if the compiler gives
@@ -571,9 +604,15 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
         uint32_t tma_stage_idx = 0;
         DG_STATIC_ASSERT(kSwapAB,
                          "TP2 symmetric O-proj requires swap-AB");
+        bool produced_tile = false;
+        uint32_t produced_m_block = 0;
+        uint32_t produced_n_block = 0;
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            produced_tile = true;
+            produced_m_block = m_block_idx;
+            produced_n_block = n_block_idx;
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
@@ -587,14 +626,16 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
             const auto effective_m =
                 scheduler.get_aligned_effective_m_in_block(m_block_idx);
             const auto use_peer = kRuntimeSelect
-                ? o_proj_b_tp2_symm::load_relaxed_gpu(runtime_mode)
-                : static_use_peer;
+                ? o_proj_b_tp2_symm::load_relaxed_gpu(runtime_mode) >= 2
+                : static_use_peer != 0;
             const auto& tensor_map_second_cd = use_peer != 0
                 ? tensor_map_peer_cd
                 : tensor_map_local_second_cd;
             epilogue::sm100_store_cd_swap_ab_dual<
                 BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                 kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                kStoreSecondDestination,
+                kVectorPeerStore,
                 kGemmType, kWithAccumulation,
                 cd_dtype_t, epilogue_type_t>
             (smem_cd, tma_stage_idx, tmem_base_addr,
@@ -602,13 +643,35 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
              effective_m,
              epilogue_warp_idx, lane_idx,
              tmem_empty_barriers[accum_stage_idx],
-             tensor_map_local_cd, tensor_map_second_cd);
+             tensor_map_local_cd, tensor_map_second_cd,
+             vector_store_cd, shape_m, shape_n);
         }
 
         // The generation may be published only after both destinations of the
         // final TMA group are globally complete.
         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
             cute::tma_store_wait<0>();
+            if constexpr (kTilePublish) {
+                if (produced_tile) {
+                    const auto num_n_blocks =
+                        math::ceil_div(shape_n, BLOCK_N);
+                    const auto tile_id =
+                        produced_m_block * num_n_blocks + produced_n_block;
+                    const auto next =
+                        o_proj_b_tp2_symm::load_relaxed_gpu(
+                            tile_generations + tile_id) + 1;
+                    const auto flag_idx =
+                        o_proj_b_tp2_symm::kTileReadyOffset +
+                        rank * o_proj_b_tp2_symm::kMaxOutputTiles + tile_id;
+                    o_proj_b_tp2_symm::store_release_sys(
+                        local_ready + flag_idx, next);
+                    o_proj_b_tp2_symm::store_release_sys(
+                        peer_ready + flag_idx, next);
+                    o_proj_b_tp2_symm::store_relaxed_gpu(
+                        tile_generations + tile_id, next);
+                }
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
         }
     }
 
@@ -618,52 +681,23 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
 
-    // Every CTA publishes a fire-and-forget arrival. CTA 0 performs the only
-    // grid-wide poll and the only system ordering point.
-    if (threadIdx.x == 0) {
-        o_proj_b_tp2_symm::arrive_grid(grid_done);
-        if (blockIdx.x == 0) {
-            const auto current =
-                o_proj_b_tp2_symm::load_relaxed_gpu(generation);
-            const auto next = current + 1;
-            const auto done_wait_start =
-                o_proj_b_tp2_symm::globaltimer();
-            uint32_t done_spins = 0;
-            const auto expected = static_cast<uint64_t>(next) * gridDim.x;
-            auto arrived = o_proj_b_tp2_symm::load_relaxed_gpu_u64(
-                grid_done);
-            while (arrived < expected) {
-                o_proj_b_tp2_symm::spin_pause();
-                arrived = o_proj_b_tp2_symm::load_relaxed_gpu_u64(
-                    grid_done);
-                o_proj_b_tp2_symm::check_spin_timeout(
-                    done_wait_start, ++done_spins, "grid", expected, arrived,
-                    rank);
+    // Benchmark-only rank-ready path retained for paired historical controls.
+    if constexpr (not kRuntimeSelect and not kTilePublish and
+                  kStoreSecondDestination) {
+        if (threadIdx.x == 0) {
+            const auto expected_arrivals = gridDim.x;
+            const auto arrived = o_proj_b_tp2_symm::arrive_grid(grid_done);
+            if (arrived % expected_arrivals == 0) {
+                while (o_proj_b_tp2_symm::load_acquire_gpu_u64(grid_done)
+                       < arrived) {
+                    o_proj_b_tp2_symm::spin_pause();
+                }
+                const auto next =
+                    static_cast<uint32_t>(arrived / expected_arrivals);
+                o_proj_b_tp2_symm::store_relaxed_gpu(generation, next);
+                o_proj_b_tp2_symm::store_release_sys(
+                    peer_ready + ready_offset, next);
             }
-            o_proj_b_tp2_symm::fence_acq_rel_sys();
-            o_proj_b_tp2_symm::store_relaxed_gpu(generation, next);
-            o_proj_b_tp2_symm::store_relaxed_sys(
-                peer_ready + ready_offset + rank, next);
-            o_proj_b_tp2_symm::store_relaxed_sys(
-                local_ready + ready_offset + rank, next);
-            const auto peer_wait_start =
-                o_proj_b_tp2_symm::globaltimer();
-            uint32_t peer_spins = 0;
-            auto ready0 = o_proj_b_tp2_symm::load_relaxed_sys(
-                local_ready + ready_offset);
-            auto ready1 = o_proj_b_tp2_symm::load_relaxed_sys(
-                local_ready + ready_offset + 1);
-            while (ready0 < next || ready1 < next) {
-                o_proj_b_tp2_symm::spin_pause();
-                ready0 = o_proj_b_tp2_symm::load_relaxed_sys(
-                    local_ready + ready_offset);
-                ready1 = o_proj_b_tp2_symm::load_relaxed_sys(
-                    local_ready + ready_offset + 1);
-                o_proj_b_tp2_symm::check_spin_timeout(
-                    peer_wait_start, ++peer_spins, "peer", next,
-                    ready0 < next ? ready0 : ready1, rank);
-            }
-            o_proj_b_tp2_symm::fence_acquire_sys();
         }
     }
 

@@ -15,6 +15,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kSwizzleCDMode,
           uint32_t kNumTMAStoreStages,
           uint32_t kNumUMMAStoreThreads,
+          bool kStoreSecondDestination,
+          bool kVectorPeerStore,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
           typename epilogue_type_t,
@@ -27,7 +29,9 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
                        const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
                        const cute::TmaDescriptor& tensor_map_local_cd,
-                       const cute::TmaDescriptor& tensor_map_peer_cd) {
+                       const cute::TmaDescriptor& tensor_map_peer_cd,
+                       cd_dtype_t* vector_store_cd,
+                       uint32_t shape_m, uint32_t shape_n) {
     // NOTES: The epilogue requires a full warpgroup to read all 128 TMEM rows,
     //          implying STORE_BLOCK_N must be 128.
     DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "STORE_BLOCK_N must be 128 to match TMEM rows");
@@ -41,6 +45,8 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
     DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
     DG_STATIC_ASSERT(STORE_BLOCK_M % kNumSwizzleAtomRows == 0, "Invalid swizzling");
     DG_STATIC_ASSERT(STORE_BLOCK_N % STORE_BLOCK_N_ATOM == 0, "Invalid swizzling");
+    DG_STATIC_ASSERT(not kVectorPeerStore or not kStoreSecondDestination,
+                     "vector peer stores replace the second TMA destination");
 
     // Share store pipeline between blocks
     auto advance_store_pipeline = [&]() {
@@ -118,6 +124,43 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
         // Synchronize all threads and issue TMA
         cute::tma_store_fence();
         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+        if constexpr (kVectorPeerStore) {
+            DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
+                             "vector peer epilogue currently requires BF16");
+            constexpr uint32_t kValuesPerVector = 16 / sizeof(cd_dtype_t);
+            constexpr uint32_t kVectorsPerRow = STORE_BLOCK_N / kValuesPerVector;
+            constexpr uint32_t kTotalVectors = STORE_BLOCK_M * kVectorsPerRow;
+            const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
+            auto* stage_bytes = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
+            #pragma unroll
+            for (uint32_t vector = epilogue_thread_idx;
+                 vector < kTotalVectors; vector += kNumUMMAStoreThreads) {
+                const uint32_t row = vector / kVectorsPerRow;
+                const uint32_t vector_in_row = vector % kVectorsPerRow;
+                const uint32_t n_atom = vector_in_row / 8;
+                const uint32_t bank_group = vector_in_row % 8;
+                const uint32_t swizzled_group = bank_group ^ (row % 8);
+                const auto* smem_ptr = reinterpret_cast<const uint4*>(
+                    stage_bytes + n_atom * STORE_BLOCK_M * kSwizzleCDMode +
+                    row * kSwizzleCDMode + swizzled_group * 16);
+                const uint4 bits = *smem_ptr;
+                const uint32_t global_m =
+                    base_m_idx + s * STORE_BLOCK_M + row;
+                const uint32_t global_n =
+                    epilogue_type_t::apply_index_n<kValuesPerVector>(
+                        base_n_idx + vector_in_row * kValuesPerVector);
+                if (global_m < shape_m) {
+                    auto* global_ptr = vector_store_cd +
+                        static_cast<uint64_t>(global_m) * shape_n + global_n;
+                    asm volatile(
+                        "st.relaxed.sys.global.v4.u32 "
+                        "[%0], {%1, %2, %3, %4};" ::
+                        "l"(global_ptr), "r"(bits.x), "r"(bits.y),
+                        "r"(bits.z), "r"(bits.w) : "memory");
+                }
+            }
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+        }
         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
             #pragma unroll
             for (uint32_t i = 0; i < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ i) {
@@ -130,12 +173,14 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
                         cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                     cute_tma_t::copy(&tensor_map_local_cd, smem_ptr, n_idx, m_idx, batch_idx);
-                    cute_tma_t::copy(&tensor_map_peer_cd, smem_ptr, n_idx, m_idx, batch_idx);
+                    if constexpr (kStoreSecondDestination and not kVectorPeerStore)
+                        cute_tma_t::copy(&tensor_map_peer_cd, smem_ptr, n_idx, m_idx, batch_idx);
                 } else {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
                         cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                     cute_tma_t::copy(&tensor_map_local_cd, smem_ptr, n_idx, m_idx);
-                    cute_tma_t::copy(&tensor_map_peer_cd, smem_ptr, n_idx, m_idx);
+                    if constexpr (kStoreSecondDestination and not kVectorPeerStore)
+                        cute_tma_t::copy(&tensor_map_peer_cd, smem_ptr, n_idx, m_idx);
                 }
             }
             cute::tma_store_arrive();

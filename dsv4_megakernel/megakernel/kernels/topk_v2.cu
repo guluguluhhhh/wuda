@@ -87,10 +87,12 @@ struct TopKLaunchParams {
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
-  const uint32_t* __restrict__ query_generation;
+  uint32_t* __restrict__ query_generation;
   const uint32_t* __restrict__ query_ready;
+  uint32_t* __restrict__ query_peer_ready;
   const uint32_t* __restrict__ query_comm_mode;
   uint32_t query_ready_offset;
+  uint32_t query_tp_rank;
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -128,24 +130,28 @@ SGL_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
   return value;
 }
 
-SGL_DEVICE void wait_query_heads(const TopKLaunchParams& params) {
+SGL_DEVICE void rendezvous_query_heads(const TopKLaunchParams& params) {
   if (params.query_generation == nullptr || threadIdx.x != 0) return;
   if (params.query_comm_mode != nullptr && *params.query_comm_mode == 0) return;
-  uint32_t expected;
+  uint32_t current;
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-               : "=r"(expected) : "l"(params.query_generation) : "memory");
-  auto ready0 = load_relaxed_sys(
-      params.query_ready + params.query_ready_offset);
-  auto ready1 = load_relaxed_sys(
-      params.query_ready + params.query_ready_offset + 1);
-  while (ready0 < expected || ready1 < expected) {
+               : "=r"(current) : "l"(params.query_generation) : "memory");
+  const uint32_t expected = current + 1;
+  asm volatile("st.release.sys.global.u32 [%0], %1;" ::
+               "l"(params.query_peer_ready + params.query_ready_offset
+                     + params.query_tp_rank),
+               "r"(expected) : "memory");
+  const uint32_t peer_rank = params.query_tp_rank ^ 1u;
+  auto ready = load_relaxed_sys(
+      params.query_ready + params.query_ready_offset + peer_rank);
+  while (ready < expected) {
     asm volatile("nanosleep.u32 128;");
-    ready0 = load_relaxed_sys(
-        params.query_ready + params.query_ready_offset);
-    ready1 = load_relaxed_sys(
-        params.query_ready + params.query_ready_offset + 1);
+    ready = load_relaxed_sys(
+        params.query_ready + params.query_ready_offset + peer_rank);
   }
   asm volatile("fence.acquire.sys;" ::: "memory");
+  asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::
+               "l"(params.query_generation), "r"(expected) : "memory");
 }
 
 /**
@@ -204,12 +210,19 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
 template <bool kPDL, int kLevel>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
-  auto problem = params.problem(blockIdx.x);
+  uint32_t batch_id = blockIdx.x;
+  if (params.query_generation != nullptr) {
+    if (blockIdx.x == 0) {
+      rendezvous_query_heads(params);
+      return;
+    }
+    batch_id -= 1;
+  }
+  auto problem = params.problem(batch_id);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
-    if (blockIdx.x == 0) wait_query_heads(params);
     return;
   }
   __shared__ int32_t topk_indices[kMaxTopK];
@@ -232,7 +245,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     } else if (problem.seq_len <= cluster_threshold) {
       Streaming::forward<kPDLEarly>(problem, &smem);
     } else {  // cluster path do nothing here
-      problem.out = params.get_output_ptr(blockIdx.x);
+      problem.out = params.get_output_ptr(batch_id);
     }
     device::PDLWaitPrimary<kPDLFinal>();
   }
@@ -241,18 +254,17 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   // then trigger the dependent kernel only after the full output is written.
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  problem_transform(problem, params.get_output_ptr(blockIdx.x));
-  if (blockIdx.x == 0) wait_query_heads(params);
+  problem_transform(problem, params.get_output_ptr(batch_id));
 }
 
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  if (blockIdx.x == 0 && blockIdx.y == 0) rendezvous_query_heads(params);
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
-    if (blockIdx.x == 0 && blockIdx.y == 0) wait_query_heads(params);
     return;
   }
   __shared__ int32_t topk_indices[kMaxTopK];
@@ -276,7 +288,6 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
   if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
-  if (blockIdx.x == 0 && blockIdx.y == 0) wait_query_heads(params);
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -446,8 +457,10 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     params.cluster_floor     = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor;
     params.query_generation  = nullptr;
     params.query_ready       = nullptr;
+    params.query_peer_ready  = nullptr;
     params.query_comm_mode   = nullptr;
     params.query_ready_offset = static_cast<uint32_t>(query_ready_offset);
+    params.query_tp_rank     = 0;
     if (query_generation.has_value()) {
         TORCH_CHECK(query_generation->is_cuda()
                     && query_generation->is_contiguous()
@@ -458,10 +471,14 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
                     && (query_tp_rank == 0 || query_tp_rank == 1)
                     && query_ready_offset >= 0,
                     "query wait requires two signal pads, rank 0/1, and nonnegative offset");
-        params.query_generation = reinterpret_cast<const uint32_t*>(
+        params.query_generation = reinterpret_cast<uint32_t*>(
             query_generation->data_ptr<int>());
         params.query_ready = reinterpret_cast<const uint32_t*>(
             static_cast<uintptr_t>(query_signal_pad_ptrs[query_tp_rank]));
+        params.query_peer_ready = reinterpret_cast<uint32_t*>(
+            static_cast<uintptr_t>(
+                query_signal_pad_ptrs[query_tp_rank ^ 1]));
+        params.query_tp_rank = static_cast<uint32_t>(query_tp_rank);
         if (query_comm_mode.has_value()) {
             TORCH_CHECK(query_comm_mode->is_cuda()
                         && query_comm_mode->is_contiguous()
@@ -474,6 +491,8 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     }
 
     constexpr bool kUsePDL = false;
+    const uint32_t main_grid = batch_size
+        + (params.query_generation != nullptr ? 1u : 0u);
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     if (use_cluster) {
         if (batch_size <= kNumPersistentClusters) {
@@ -483,14 +502,14 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
             const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
             dim3 grid(num_clusters, kClusterSize);
             topk_persistent_cluster_kernel<kUsePDL><<<grid, kBlockSize, 0, stream>>>(params);
-            topk_main_kernel<kUsePDL, /*kLevel=*/3><<<batch_size, kBlockSize, 0, stream>>>(params);
+            topk_main_kernel<kUsePDL, /*kLevel=*/3><<<main_grid, kBlockSize, 0, stream>>>(params);
         }
     } else if (max_seq_len <= kReg2MaxSeqLen) {
-        topk_main_kernel<kUsePDL, /*kLevel=*/0><<<batch_size, kBlockSize, 0, stream>>>(params);
+        topk_main_kernel<kUsePDL, /*kLevel=*/0><<<main_grid, kBlockSize, 0, stream>>>(params);
     } else if (max_seq_len <= kReg4MaxSeqLen) {
-        topk_main_kernel<kUsePDL, /*kLevel=*/1><<<batch_size, kBlockSize, 0, stream>>>(params);
+        topk_main_kernel<kUsePDL, /*kLevel=*/1><<<main_grid, kBlockSize, 0, stream>>>(params);
     } else {
-        topk_main_kernel<kUsePDL, /*kLevel=*/2><<<batch_size, kBlockSize, 0, stream>>>(params);
+        topk_main_kernel<kUsePDL, /*kLevel=*/2><<<main_grid, kBlockSize, 0, stream>>>(params);
     }
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "topk launch failed: ", cudaGetErrorString(err));

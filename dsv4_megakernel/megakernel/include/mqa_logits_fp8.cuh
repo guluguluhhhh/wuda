@@ -62,58 +62,7 @@ struct QueryRmsRopeArgs {
     uint32_t batch_total = 0;
     uint32_t rank0_batch = 0;
     uint32_t tp_rank = 0;
-    unsigned long long* completed_ctas = nullptr;
-    uint32_t* generation = nullptr;
-    uint32_t* local_ready = nullptr;
-    uint32_t* peer_ready = nullptr;
-    uint32_t ready_offset = 0;
 };
-
-__device__ __forceinline__ uint64_t load_query_counter(
-        const unsigned long long* ptr) {
-    uint64_t value;
-    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];"
-                 : "=l"(value) : "l"(ptr) : "memory");
-    return value;
-}
-
-__device__ __forceinline__ void publish_query_cta(
-        const QueryRmsRopeArgs& query, uint32_t lane) {
-    if (query.completed_ctas == nullptr
-            || (query.comm_mode != nullptr && *query.comm_mode == 0))
-        return;
-    // All query stores from this warp precede its release arrival. CTA 0's
-    // first tail warp is the sole publisher, matching TP2 O-proj's protocol.
-    __syncwarp();
-    if (lane != 0)
-        return;
-    asm volatile("red.release.gpu.global.add.u64 [%0], 1;" ::
-                 "l"(query.completed_ctas) : "memory");
-    constexpr uint32_t kQueryWorkersPerCta = 4;
-    const uint32_t warp = threadIdx.x >> 5;
-    if (blockIdx.x != 0 || warp != 12)
-        return;
-    const uint32_t current = [&]() {
-        uint32_t value;
-        asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                     : "=r"(value) : "l"(query.generation) : "memory");
-        return value;
-    }();
-    const uint32_t next = current + 1;
-    const uint64_t expected = static_cast<uint64_t>(next) * gridDim.x
-                            * kQueryWorkersPerCta;
-    while (load_query_counter(query.completed_ctas) < expected)
-        asm volatile("nanosleep.u32 128;");
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
-    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::
-                 "l"(query.generation), "r"(next) : "memory");
-    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
-                 "l"(query.peer_ready + query.ready_offset + query.tp_rank),
-                 "r"(next) : "memory");
-    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
-                 "l"(query.local_ready + query.ready_offset + query.tp_rank),
-                 "r"(next) : "memory");
-}
 
 // Any warp that has finished its primary role claims one query row from a
 // per-CTA shared queue. A full warp owns one complete 512-wide RMS reduction.
@@ -195,8 +144,6 @@ __device__ __forceinline__ void run_query_rms_rope(
         } else
             output[kWarp] = scale_vec(values[1], scale);
     }
-    if (query.peer_out != nullptr)
-        publish_query_cta(query, lane);
 }
 
 constexpr int kM1TokenBodyBytes = 576;

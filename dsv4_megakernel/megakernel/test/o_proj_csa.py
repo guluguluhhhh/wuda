@@ -105,10 +105,11 @@ class OProjWorkspace:
     z: torch.Tensor           # BF16 [M,groups,1024]
     z_fp8: torch.Tensor       # FP8 [M,groups*1024]
     z_scale: torch.Tensor     # I32 [M,groups*2], MN-major
-    projected: torch.Tensor   # BF16 full output or local TP reference [M,7168]
+    projected: torch.Tensor   # BF16 full output or no-comm TP partial
     mhc_output: torch.Tensor  # BF16 [M,4,7168]
     quant_module: Any
     tp2_comm: Any | None = None
+    tp2_no_comm: bool = False
 
 
 class TP2Comm:
@@ -126,18 +127,8 @@ class TP2Comm:
         self.handle = symm_mem.rendezvous(self.partials, group=group)
         self.grid_done = torch.zeros(1, device=device, dtype=torch.int64)
         self.generation = torch.zeros(1, device=device, dtype=torch.int32)
-        self.local_second_output = torch.empty(
-            (128, HIDDEN_DIM), device=device, dtype=torch.bfloat16
-        )
-        self.select_grid_done = torch.zeros(
-            1, device=device, dtype=torch.int64
-        )
-        self.select_generation = torch.zeros(
-            1, device=device, dtype=torch.int32
-        )
-        self.benchmark_mode = torch.ones(
-            1, device=device, dtype=torch.int32
-        )
+        self.tile_generations = torch.zeros(
+            640, device=device, dtype=torch.int32)
         self.benchmark_generation = torch.zeros(
             1, device=device, dtype=torch.int32
         )
@@ -152,7 +143,6 @@ class TP2Comm:
     @property
     def signal_pad_pointers(self) -> list[int]:
         return [int(value) for value in self.handle.signal_pad_ptrs]
-
 
 def load_tp2_comm_module() -> Any:
     """Build the production symmetric ProjB + reduce/mHC-post extension."""
@@ -364,12 +354,18 @@ def prepare_o_proj_workspace(
     groups: int = N_GROUPS,
     quant_module: Any,
     tp2_comm: TP2Comm | None = None,
+    tp2_no_comm: bool = False,
 ) -> OProjWorkspace:
     _require(1 <= m <= 128, "O projection requires M in [1,128]")
     _require(quant_module is not None, "MLA O-projection quant module is required")
     heads_per_group, intermediate_dim = _geometry(heads, groups)
-    _require((tp2_comm is None) == (groups != TP2_GROUPS),
-             "TP2 geometry requires a symmetric communication workspace")
+    if groups == TP2_GROUPS:
+        _require((tp2_comm is not None) != tp2_no_comm,
+                 "TP2 geometry requires exactly one of symmetric communication "
+                 "or the benchmark-only no-communication path")
+    else:
+        _require(tp2_comm is None and not tp2_no_comm,
+                 "full-rank geometry cannot use TP2 communication modes")
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
 
@@ -413,6 +409,7 @@ def prepare_o_proj_workspace(
         ),
         quant_module=quant_module,
         tp2_comm=tp2_comm,
+        tp2_no_comm=tp2_no_comm,
     )
 
 
@@ -431,15 +428,12 @@ def run_o_proj_mhc_post(
     use_pdl: bool = True,
     force_pdl: bool = False,
     run_mhc_post: bool = True,
-    tp2_benchmark_select: bool = False,
 ) -> torch.Tensor:
     """Run allocation-free O projection and mHC post on the current stream.
 
     Full-rank run_mhc_post=False stops after wo_b and returns
     workspace.projected so a benchmark can time mHC post separately. TP2 uses
     the symmetric ProjB and fused reduce+mHC post as one communication stage.
-    tp2_benchmark_select is the paired-measurement path: one captured graph
-    selects the second ProjB destination through a device flag.
     """
 
     import deep_gemm
@@ -502,20 +496,24 @@ def run_o_proj_mhc_post(
              workspace.z_scale.dtype == torch.int32 and
              workspace.z_scale.stride() == (1, aligned_m),
              "workspace.z_scale has the wrong shape, dtype, or MN-major layout")
+    projected_dtype = torch.bfloat16
     _require(workspace.projected.shape == (m, HIDDEN_DIM) and
-             workspace.projected.dtype == torch.bfloat16 and
+             workspace.projected.dtype == projected_dtype and
              workspace.projected.is_contiguous(),
-             "workspace.projected must be contiguous BF16 [M,7168]")
+             f"workspace.projected must be contiguous {projected_dtype} "
+             "[M,7168]")
     _require(workspace.mhc_output.shape == (m, 4, HIDDEN_DIM) and
              workspace.mhc_output.dtype == torch.bfloat16 and
              workspace.mhc_output.is_contiguous(),
              "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
     tp2_comm = workspace.tp2_comm
-    _require((tp2_comm is None) == (num_groups != TP2_GROUPS),
-             "TP2 geometry requires a symmetric communication workspace")
-    _require(not tp2_benchmark_select or num_groups == TP2_GROUPS,
-             "tp2_benchmark_select requires TP2 geometry")
-    _require(run_mhc_post or num_groups == N_GROUPS,
+    if num_groups == TP2_GROUPS:
+        _require((tp2_comm is not None) != workspace.tp2_no_comm,
+                 "TP2 workspace has an invalid communication mode")
+    else:
+        _require(tp2_comm is None and not workspace.tp2_no_comm,
+                 "full-rank workspace cannot use TP2 communication modes")
+    _require(run_mhc_post or num_groups == N_GROUPS or workspace.tp2_no_comm,
              "the symmetric TP2 producer and fused post must run together")
     _require(not (run_mhc_post and tp2_comm is None)
              or mhc_post_module is not None,
@@ -588,51 +586,24 @@ def run_o_proj_mhc_post(
                 num_stages=1,
             )
             if tp2_comm is not None:
-                if tp2_benchmark_select:
-                    tp2_comm.module.o_proj_b_select(
-                        workspace.z_fp8,
-                        workspace.z_scale,
-                        weights.wo_b,
-                        weights.wo_b_scale,
-                        tp2_comm.partials,
-                        tp2_comm.local_second_output,
-                        tp2_comm.select_grid_done,
-                        tp2_comm.select_generation,
-                        tp2_comm.benchmark_mode,
-                        tp2_comm.pointers,
-                        tp2_comm.signal_pad_pointers,
-                        tp2_comm.rank,
-                    )
-                    tp2_comm.module.mhc_post_select(
-                        tp2_comm.partials,
-                        tp2_comm.local_second_output,
-                        tp2_comm.benchmark_mode,
-                        residual,
-                        post,
-                        comb,
-                        workspace.mhc_output,
-                        tp2_comm.rank,
-                    )
-                else:
-                    tp2_comm.module.o_proj_b(
-                        workspace.z_fp8,
-                        workspace.z_scale,
-                        weights.wo_b,
-                        weights.wo_b_scale,
-                        tp2_comm.partials,
-                        tp2_comm.grid_done,
-                        tp2_comm.generation,
-                        tp2_comm.pointers,
-                        tp2_comm.signal_pad_pointers,
-                        tp2_comm.rank,
-                    )
-                    tp2_comm.module.mhc_post(
-                        tp2_comm.partials,
-                        residual,
-                        post,
-                        comb,
-                        workspace.mhc_output,
-                    )
+                tp2_comm.module.o_proj_b(
+                    workspace.z_fp8,
+                    workspace.z_scale,
+                    weights.wo_b,
+                    weights.wo_b_scale,
+                    tp2_comm.partials,
+                    tp2_comm.grid_done,
+                    tp2_comm.generation,
+                    tp2_comm.tile_generations,
+                    tp2_comm.pointers,
+                    tp2_comm.signal_pad_pointers,
+                    workspace.projected,
+                    residual,
+                    post,
+                    comb,
+                    workspace.mhc_output,
+                    tp2_comm.rank,
+                )
             else:
                 deep_gemm.fp8_gemm_nt(
                     (workspace.z_fp8, workspace.z_scale),
