@@ -113,18 +113,39 @@ class OProjWorkspace:
 
 
 class TP2Comm:
-    """Graph-stable symmetric ProjB output and completion state for TP2."""
+    """Graph-stable symmetric MLA handoff and ProjB state for TP2."""
 
-    def __init__(self, module: Any, group: Any, device: torch.device, rank: int):
+    def __init__(self, module: Any, group: Any, device: torch.device,
+                 rank: int, m: int):
         import torch.distributed._symmetric_memory as symm_mem
 
         _require(rank in (0, 1), "TP2 rank must be 0 or 1")
+        _require(1 <= m <= 128, "TP2 batch must be in [1,128]")
         symm_mem.set_signal_pad_size(4096)
         self.module = module
+        self.m = m
         self.partials = symm_mem.empty(
             (2, 128, HIDDEN_DIM), dtype=torch.bfloat16, device=device
         )
         self.handle = symm_mem.rendezvous(self.partials, group=group)
+        # Exact DeepGEMM grouped layouts. FlashMLA's BF16 output is inverse-
+        # RoPE'd and quantized directly into the owning TP rank's allocation.
+        self.mla_o_fp8_base = symm_mem.empty(
+            (TP2_GROUPS, m, TP2_HEADS // TP2_GROUPS * HEAD_DIM),
+            dtype=torch.uint8, device=device)
+        self.mla_o_fp8_handle = symm_mem.rendezvous(
+            self.mla_o_fp8_base, group=group)
+        self.mla_o_fp8_peer_base = self.mla_o_fp8_handle.get_buffer(
+            rank ^ 1, self.mla_o_fp8_base.shape, torch.uint8)
+        aligned_m = _align(m, 4)
+        self.mla_o_scale_base = symm_mem.empty(
+            TP2_GROUPS * (TP2_HEADS // TP2_GROUPS) * aligned_m,
+            dtype=torch.int32, device=device)
+        self.mla_o_scale_handle = symm_mem.rendezvous(
+            self.mla_o_scale_base, group=group)
+        self.mla_o_scale_peer_base = self.mla_o_scale_handle.get_buffer(
+            rank ^ 1, self.mla_o_scale_base.shape, torch.int32)
+        self.mla_grid_done = torch.zeros(1, device=device, dtype=torch.int64)
         self.grid_done = torch.zeros(1, device=device, dtype=torch.int64)
         self.generation = torch.zeros(1, device=device, dtype=torch.int32)
         self.tile_generations = torch.zeros(
@@ -143,6 +164,11 @@ class TP2Comm:
     @property
     def signal_pad_pointers(self) -> list[int]:
         return [int(value) for value in self.handle.signal_pad_ptrs]
+
+    @property
+    def mla_signal_pad_pointers(self) -> list[int]:
+        return [int(value) for value in self.mla_o_fp8_handle.signal_pad_ptrs]
+
 
 def load_tp2_comm_module() -> Any:
     """Build the production symmetric ProjB + reduce/mHC-post extension."""
@@ -369,15 +395,20 @@ def prepare_o_proj_workspace(
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
 
-    o_fp8_base = torch.empty(
-        (groups, m, d), device=device, dtype=torch.float8_e4m3fn
-    )
-    o_scale_base = torch.empty(
-        groups * heads_per_group * aligned_m,
-        device=device,
-        dtype=torch.int32,
-    )
-    o_scale_base = o_scale_base.as_strided(
+    if tp2_comm is None:
+        o_fp8_base = torch.empty(
+            (groups, m, d), device=device, dtype=torch.float8_e4m3fn
+        )
+        o_scale_storage = torch.empty(
+            groups * heads_per_group * aligned_m,
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        _require(tp2_comm.m == m, "TP2 communication batch mismatch")
+        o_fp8_base = tp2_comm.mla_o_fp8_base.view(torch.float8_e4m3fn)
+        o_scale_storage = tp2_comm.mla_o_scale_base
+    o_scale_base = o_scale_storage.as_strided(
         (groups, m, heads_per_group),
         (heads_per_group * aligned_m, 1, aligned_m),
     )
@@ -428,6 +459,7 @@ def run_o_proj_mhc_post(
     use_pdl: bool = True,
     force_pdl: bool = False,
     run_mhc_post: bool = True,
+    tpdp_mla_scatter: bool = False,
 ) -> torch.Tensor:
     """Run allocation-free O projection and mHC post on the current stream.
 
@@ -442,11 +474,21 @@ def run_o_proj_mhc_post(
         _require(mla_out.shape[1] == 1, "4D mla_out must have singleton scope dim")
         mla_out = mla_out[:, 0]
     _require(mla_out.dim() == 3, "mla_out must be [M,H,512] or [M,1,H,512]")
-    m, heads, head_dim = mla_out.shape
+    input_m, input_heads, head_dim = mla_out.shape
+    m = positions.numel() if tpdp_mla_scatter else input_m
+    heads = TP2_HEADS if tpdp_mla_scatter else input_heads
+    tp2_comm = workspace.tp2_comm
     _require(mla_out.dtype == torch.bfloat16 and mla_out.is_cuda and
              mla_out.is_contiguous(), "mla_out must be contiguous CUDA BF16")
-    _require(1 <= m <= 128 and head_dim == HEAD_DIM,
+    _require(1 <= input_m <= 128 and 1 <= m <= 128 and head_dim == HEAD_DIM,
              f"mla_out must have M in [1,128] and head_dim={HEAD_DIM}")
+    if tpdp_mla_scatter:
+        _require(tp2_comm is not None,
+                 "TPDP MLA scatter requires symmetric communication")
+        expected_local_m = ((m + 1) // 2 if tp2_comm.rank == 0
+                            else m // 2)
+        _require(input_m == expected_local_m and input_heads == HEADS,
+                 "TPDP MLA output must be [local_M,128,512]")
     _require(positions.shape == (m,) and positions.dtype == torch.int64 and
              positions.is_cuda and positions.is_contiguous(),
              "positions must be contiguous CUDA I64 [M]")
@@ -496,17 +538,14 @@ def run_o_proj_mhc_post(
              workspace.z_scale.dtype == torch.int32 and
              workspace.z_scale.stride() == (1, aligned_m),
              "workspace.z_scale has the wrong shape, dtype, or MN-major layout")
-    projected_dtype = torch.bfloat16
     _require(workspace.projected.shape == (m, HIDDEN_DIM) and
-             workspace.projected.dtype == projected_dtype and
+             workspace.projected.dtype == torch.bfloat16 and
              workspace.projected.is_contiguous(),
-             f"workspace.projected must be contiguous {projected_dtype} "
-             "[M,7168]")
+             "workspace.projected must be contiguous BF16 [M,7168]")
     _require(workspace.mhc_output.shape == (m, 4, HIDDEN_DIM) and
              workspace.mhc_output.dtype == torch.bfloat16 and
              workspace.mhc_output.is_contiguous(),
              "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
-    tp2_comm = workspace.tp2_comm
     if num_groups == TP2_GROUPS:
         _require((tp2_comm is not None) != workspace.tp2_no_comm,
                  "TP2 workspace has an invalid communication mode")
@@ -552,13 +591,27 @@ def run_o_proj_mhc_post(
         with deepgemm_pdl_enqueue_scope(
             deep_gemm, False, device.index
         ):
-            workspace.quant_module.inv_rope_quant(
-                mla_out,
-                positions,
-                cos_sin_cache,
-                workspace.o_fp8,
-                workspace.o_scale,
-            )
+            if tpdp_mla_scatter:
+                workspace.quant_module.inv_rope_quant_tp2(
+                    mla_out,
+                    positions,
+                    cos_sin_cache,
+                    workspace.o_fp8,
+                    tp2_comm.mla_o_fp8_peer_base,
+                    workspace.o_scale,
+                    tp2_comm.mla_o_scale_peer_base,
+                    tp2_comm.mla_grid_done,
+                    tp2_comm.mla_signal_pad_pointers,
+                    tp2_comm.rank,
+                )
+            else:
+                workspace.quant_module.inv_rope_quant(
+                    mla_out,
+                    positions,
+                    cos_sin_cache,
+                    workspace.o_fp8,
+                    workspace.o_scale,
+                )
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (workspace.o_fp8, workspace.o_scale),

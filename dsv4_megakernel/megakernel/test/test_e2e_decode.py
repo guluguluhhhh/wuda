@@ -101,6 +101,7 @@ MLA_DP_MODE = False
 TP_RANK = 0
 TP_WORLD_SIZE = 1
 TP2_COMM_MODULE = None
+MLA_O_QUANT_MODULE = None
 TP_SYNC_GROUP = None
 QUERY_READY_OFFSET = 32
 INDEXER_FP8 = True
@@ -108,7 +109,6 @@ PDL_MODE = "on"
 Q_RMS_MAX_BLOCKS = 1024
 Q_RMS_ABLATION = False
 FUSE_QUERY_RMS = True
-MLA_O_QUANT_MODULE = None
 
 
 def configure_geometry(tpdp=False):
@@ -180,22 +180,6 @@ def owned_slice(B):
 
 def mla_batch(B):
     return local_batch(B) if MLA_DP_MODE else B
-
-
-def mla_dp_output_to_tp(mla3, B):
-    """Fabricate this TP rank's global-B head shard after DP MLA.
-
-    The real path redistributes peer request rows. Communication is explicitly
-    out of scope here, so peer rows reuse deterministic local results.
-    """
-    if not MLA_DP_MODE:
-        return mla3
-    local_heads = mla3[:, :WQ_HEADS]
-    B_local = local_heads.size(0)
-    repeats = (B + B_local - 1) // B_local
-    global_rows = local_heads.repeat(repeats, 1, 1)[:B].contiguous()
-    global_rows[owned_slice(B)].copy_(local_heads)
-    return global_rows
 
 
 def init_tpdp_distributed():
@@ -311,7 +295,7 @@ def oproj_ws(B):
             assert TP2_COMM_MODULE is not None and dist.is_initialized()
             tp2_comm = o_proj_csa.TP2Comm(
                 TP2_COMM_MODULE, dist.group.WORLD,
-                torch.device("cuda", torch.cuda.current_device()), TP_RANK)
+                torch.device("cuda", torch.cuda.current_device()), TP_RANK, B)
         _OPROJ_WS[key] = o_proj_csa.prepare_o_proj_workspace(
             B, DEV, heads=oproj_heads(), groups=local_o_groups(),
             quant_module=MLA_O_QUANT_MODULE,
@@ -326,6 +310,7 @@ def oproj_no_comm_ws(B):
     if key not in _OPROJ_NO_COMM_WS:
         _OPROJ_NO_COMM_WS[key] = o_proj_csa.prepare_o_proj_workspace(
             B, DEV, heads=oproj_heads(), groups=local_o_groups(),
+            quant_module=MLA_O_QUANT_MODULE,
             tp2_no_comm=True)
     return _OPROJ_NO_COMM_WS[key]
 
@@ -894,15 +879,30 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
 
         # -- 8. O projection -> TP2 symmetric publish/reduce -> mHC post. ----
         mla3_dp = (out[:, 0] if out.dim() == 4 else out).contiguous()
-        mla3 = mla_dp_output_to_tp(mla3_dp, B)
         pos64 = pos.to(torch.int64).contiguous()
         post_t, comb_t = hc["hc_post"], hc["hc_comb"].view(B, HC, HC)
         projected = o_proj_csa.run_o_proj_mhc_post(
-            mla3, pos64, w["cos_sin"], hidden, post_t, comb_t,
+            mla3_dp, pos64, w["cos_sin"], hidden, post_t, comb_t,
             w["o_proj"], oproj_ws(B), mpm, use_pdl=pdl_enabled(),
-            force_pdl=pdl_forced(), run_mhc_post=True)
+            force_pdl=pdl_forced(), run_mhc_post=True,
+            tpdp_mla_scatter=MLA_DP_MODE)
+        if MLA_DP_MODE:
+            max_local = (B + 1) // 2
+            padded = torch.zeros(
+                max_local, Q_HEADS, Q_DIM, device=DEV,
+                dtype=torch.bfloat16)
+            padded[:mla3_dp.size(0)].copy_(mla3_dp)
+            gathered = [torch.empty_like(padded) for _ in range(2)]
+            dist.all_gather(gathered, padded, group=TP_SYNC_GROUP)
+            split = (B + 1) // 2
+            mla_full = torch.cat(
+                (gathered[0][:split], gathered[1][:B - split]), dim=0)
+            head_begin = TP_RANK * WQ_HEADS
+            mla3_ref = mla_full[:, head_begin:head_begin + WQ_HEADS].contiguous()
+        else:
+            mla3_ref = mla3_dp
         ref_partial = ref_o_proj_mhc(
-            mla3, pos64, w["cos_sin"], hidden, post_t, comb_t,
+            mla3_ref, pos64, w["cos_sin"], hidden, post_t, comb_t,
             w["wo_a"], w["wo_b"], run_mhc_post=False)
         if TPDP_MODE:
             ref_partial = tp2_reference_reduce(ref_partial)
@@ -1026,8 +1026,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         print("  off is a separately captured static graph with no symmetric "
               "pointers, generation, ready wait, dual-store ProjB, handshake, "
               "or two-partial reduction")
-        print("  on is the unmodified production graph with MQA head gather and "
-              "symmetric O-proj publication")
+        print("  on is the unmodified production graph with MQA head gather, "
+              "MLA-to-O-proj handoff, and symmetric ProjB publication")
         print("  cold Perfetto samples alternate graph order, use first-to-last "
               "GPU kernel span, and report the slower TP rank")
     if tp2_overhead_only or query_tp_overhead_only:
@@ -1065,8 +1065,9 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
     if TPDP_MODE:
         print("  --tpdp: MQA/TopK/MLA own disjoint half-batches; MLA H=128; O-proj "
               "remains global B x H=64 with the 8-group TP2 shard")
-        print("  MQA gathers TP query heads through symmetric memory; O-proj "
-              "includes symmetric peer publication and fused BF16 reduce+mHC post")
+        print("  MQA gathers TP query heads through symmetric memory; post-attention "
+              "includes the MLA handoff, symmetric ProjB publication, and fused "
+              "BF16 reduce+mHC post")
     col_width = 13 if Q_RMS_ABLATION else 9
     if not (tp2_overhead_only or query_tp_overhead_only):
         print(f"  {'B':<5}" + "".join(f"{c:>{col_width}}" for c in cols))
@@ -1392,28 +1393,21 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             run_mla()
             stage_fns.append(("mla", run_mla))
 
-            # O-proj remains TP2. In MLA-DP mode, fabricate its post-handoff
-            # global-B/64-head input once, outside every timed region.
             cos_sin_l = torch.cat((cosl, sinl), dim=-1).contiguous()
             pos64 = pos.to(torch.int64).contiguous()
             ows = oproj_ws(B)
             post_b = hcd["hc_post"][:B]
             comb_b = hcd["hc_comb"][:B].view(B, HC, HC)
-            mla_o = hold["mla"]
-            mla3 = (mla_o[:, 0] if mla_o.dim() == 4 else mla_o).contiguous()
-            mla_tp_external = mla_dp_output_to_tp(mla3, B)
 
             def run_oproj():
-                if MLA_DP_MODE:
-                    mla_tp = mla_tp_external
-                else:
-                    mla_o = hold["mla"]
-                    mla_tp = (mla_o[:, 0] if mla_o.dim() == 4
-                              else mla_o).contiguous()
+                mla_o = hold["mla"]
+                mla_tp = (mla_o[:, 0] if mla_o.dim() == 4
+                          else mla_o).contiguous()
                 return o_proj_csa.run_o_proj_mhc_post(
                     mla_tp, pos64, cos_sin_l, hidden, post_b, comb_b,
                     w["o_proj"], ows, mpm, use_pdl=pdl_enabled(),
-                    force_pdl=pdl_forced(), run_mhc_post=TPDP_MODE)
+                    force_pdl=pdl_forced(), run_mhc_post=TPDP_MODE,
+                    tpdp_mla_scatter=MLA_DP_MODE)
 
             def run_mhcpost():
                 mpm.mhc_post_out(ows.projected, hidden, post_b, comb_b,
@@ -1710,6 +1704,15 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         if tp2_overhead_only:
             assert (TPDP_MODE and query_comm is not None
                     and fused_query_rms() and post_attn_enabled())
+            # Fabricate a global-B/64-head input only for the static
+            # no-communication control. Production consumes FlashMLA directly.
+            mla_o = hold["mla"]
+            mla3 = (mla_o[:, 0] if mla_o.dim() == 4 else mla_o).contiguous()
+            head_begin = TP_RANK * WQ_HEADS
+            local_heads = mla3[:, head_begin:head_begin + WQ_HEADS]
+            repeats = (B + local_heads.size(0) - 1) // local_heads.size(0)
+            mla_tp_control = local_heads.repeat(repeats, 1, 1)[:B].contiguous()
+            mla_tp_control[owned_slice(B)].copy_(local_heads)
             q_ready_no_comm = torch.empty(
                 B_mla, 1, attention_heads(), Q_DIM,
                 device=DEV, dtype=torch.bfloat16)
@@ -1726,7 +1729,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
 
             def run_oproj_no_comm():
                 return o_proj_csa.run_o_proj_mhc_post(
-                    mla_tp_external, pos64, cos_sin_l, hidden, post_b, comb_b,
+                    mla_tp_control, pos64, cos_sin_l, hidden, post_b, comb_b,
                     w["o_proj"], ows_no_comm, mpm, use_pdl=pdl_enabled(),
                     force_pdl=pdl_forced(), run_mhc_post=False)
 
@@ -2067,7 +2070,6 @@ def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
 
 
 if __name__ == "__main__":
-    MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tpdp", action="store_true",
@@ -2140,11 +2142,15 @@ if __name__ == "__main__":
         get_dg()  # Resolve the checkout before the extension imports headers.
         # Compile once, then let the peer load the same cached extension.
         if TP_RANK == 0:
+            MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
             TP2_COMM_MODULE = o_proj_csa.load_tp2_comm_module()
         dist.barrier()
         if TP_RANK == 1:
+            MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
             TP2_COMM_MODULE = o_proj_csa.load_tp2_comm_module()
         dist.barrier()
+    else:
+        MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
     mods = (t_hc.load_cuda_module(),
             t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
                                   'front_mixed_gemm_csa_swapab.cu'),
