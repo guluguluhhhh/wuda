@@ -67,19 +67,19 @@ torch::Tensor run_op(
     out = torch::empty({m, N}, x.options().dtype(torch::kBFloat16));
   }
 
-  // Batch splits into AT MOST TWO tiles: M<=16 -> one BN16 tile; otherwise
-  // two tiles of the smallest ladder step covering ceil(M/2) -- N-side
-  // parallelism (29 feature tiles) carries the machine.
+  // One batch tile launches only 37 two-CTA clusters, occupying half of B300's
+  // 148 SMs. Above M=48, use exactly two tiles so both SM waves can overlap.
+  // Use BN128 for M>192 to retain its deeper FP8 pipeline.
   int batch_n = batch_n_override;
   if (batch_n == 0) {
-    batch_n = m <= 16 ? 16
-            : m <= 32 ? 16
-            : m <= 64 ? 32
-            : m <= 128 ? 64 : 128;
+    batch_n = m <= 48 ? ((m + 15) / 16) * 16
+            : m <= 192 ? ((m + 31) / 32) * 16
+            : 128;
   }
-  TORCH_CHECK(batch_n == 16 || batch_n == 32 || batch_n == 64 ||
+  TORCH_CHECK(batch_n == 16 || batch_n == 32 || batch_n == 48 ||
+              batch_n == 64 || batch_n == 80 || batch_n == 96 ||
               batch_n == 128,
-              "batch_n_override must be 0, 16, 32, 64, or 128");
+              "batch_n_override must be 0, 16, 32, 48, 64, 80, 96, or 128");
 
   uint64_t* task_times = nullptr;
   if (task_times_opt.has_value() && task_times_opt->numel() != 0) {
@@ -207,72 +207,48 @@ torch::Tensor run_op(
            "w_fp8");
     cached_w8 = w_fp8.data_ptr();
   }
-  static bool configured = false;
-  if (!configured) {
-    const cudaError_t s16 = configure_kernel<16, false>();
-    const cudaError_t s32 = configure_kernel<32, false>();
-    const cudaError_t s64 = configure_kernel<64, false>();
-    const cudaError_t s128 = configure_kernel<128, false>();
-    const cudaError_t status = s16 != cudaSuccess ? s16 :
-                               (s32 != cudaSuccess ? s32 :
-                               (s64 != cudaSuccess ? s64 : s128));
-    TORCH_CHECK(status == cudaSuccess, "swapAB cudaFuncSetAttribute failed: ",
-                cudaGetErrorString(status));
-    configured = true;
-  }
-  static bool timing_configured = false;
-  if (task_times != nullptr && !timing_configured) {
-    const cudaError_t s16 = configure_kernel<16, true>();
-    const cudaError_t s32 = configure_kernel<32, true>();
-    const cudaError_t s64 = configure_kernel<64, true>();
-    const cudaError_t s128 = configure_kernel<128, true>();
-    const cudaError_t status = s16 != cudaSuccess ? s16 :
-                               (s32 != cudaSuccess ? s32 :
-                               (s64 != cudaSuccess ? s64 : s128));
-    TORCH_CHECK(status == cudaSuccess,
-                "swapAB timing cudaFuncSetAttribute failed: ",
-                cudaGetErrorString(status));
-    timing_configured = true;
-  }
-
   const auto stream = at::cuda::getCurrentCUDAStream();
   const auto* xsf = reinterpret_cast<const uint8_t*>(x_sf.data_ptr());
   const auto* wsf = reinterpret_cast<const uint8_t*>(w_sf.data_ptr());
   auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   cudaError_t status = cudaSuccess;
-  if (batch_n == 16) {
-    status = task_times != nullptr
-        ? launch<16, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
-                           pdl)
-        : launch<16, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
-                            pdl);
-  } else if (batch_n == 32) {
-    status = task_times != nullptr
-        ? launch<32, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
-                           pdl)
-        : launch<32, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
-                            pdl);
-  } else if (batch_n == 64) {
-    status = task_times != nullptr
-        ? launch<64, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                           xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
-                           pdl)
-        : launch<64, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
-                            pdl);
-  } else {
-    status = task_times != nullptr
-        ? launch<128, true>(desc_x16, desc_w16, desc_x8, desc_w8,
-                            xsf, wsf, out_ptr, hc, emit, m, task_times, stream,
-                            pdl)
-        : launch<128, false>(desc_x16, desc_w16, desc_x8, desc_w8,
-                             xsf, wsf, out_ptr, hc, emit, m, nullptr, stream,
-                             pdl);
+#define DISPATCH_BATCH_N(BatchN)                                             \
+  case BatchN: {                                                            \
+    if (task_times != nullptr) {                                            \
+      static bool timing_configured = false;                                \
+      if (!timing_configured) {                                             \
+        status = configure_kernel<BatchN, true>();                           \
+        if (status != cudaSuccess) break;                                   \
+        timing_configured = true;                                           \
+      }                                                                     \
+      status = launch<BatchN, true>(                                        \
+          desc_x16, desc_w16, desc_x8, desc_w8, xsf, wsf, out_ptr, hc, emit,\
+          m, task_times, stream, pdl);                                       \
+    } else {                                                                \
+      static bool configured = false;                                       \
+      if (!configured) {                                                    \
+        status = configure_kernel<BatchN, false>();                          \
+        if (status != cudaSuccess) break;                                   \
+        configured = true;                                                  \
+      }                                                                     \
+      status = launch<BatchN, false>(                                       \
+          desc_x16, desc_w16, desc_x8, desc_w8, xsf, wsf, out_ptr, hc, emit,\
+          m, nullptr, stream, pdl);                                          \
+    }                                                                       \
+    break;                                                                  \
   }
+  switch (batch_n) {
+    DISPATCH_BATCH_N(16)
+    DISPATCH_BATCH_N(32)
+    DISPATCH_BATCH_N(48)
+    DISPATCH_BATCH_N(64)
+    DISPATCH_BATCH_N(80)
+    DISPATCH_BATCH_N(96)
+    DISPATCH_BATCH_N(128)
+    default:
+      TORCH_CHECK(false, "unreachable BatchN dispatch: ", batch_n);
+  }
+#undef DISPATCH_BATCH_N
   TORCH_CHECK(status == cudaSuccess, "swapAB launch failed: ",
               cudaGetErrorString(status));
   return out;

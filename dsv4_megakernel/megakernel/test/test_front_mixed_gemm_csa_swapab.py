@@ -15,14 +15,17 @@ from test_front_mixed_gemm import (
 )
 
 N = 4672  # CSA shape: fp8 [0,2048) wq_a|wkv + bf16 [2048,4672)
-TASKS_PER_BATCH = 29   # 8 fp8 (N256) + 21 bf16 (N128, tail tile 64 rows)
+FP8_TASKS_PER_BATCH = 16
+TASKS_PER_BATCH = 37  # 16 fp8 (N128) + 21 bf16 (N128, tail tile 64 rows)
 
 
 def batch_n_for(phys_m):
-    """Host ladder: one BN16 tile at M<=16, otherwise exactly TWO tiles."""
-    return (16 if phys_m <= 32 else
-            32 if phys_m <= 64 else
-            64 if phys_m <= 128 else 128)
+    """Use one batch tile through M=48, then two tiles to fill all B300 SMs."""
+    if phys_m <= 48:
+        return max(16, (phys_m + 15) // 16 * 16)
+    if phys_m <= 192:
+        return (phys_m + 31) // 32 * 16
+    return 128
 
 
 def make_activations(m, seed=0):
@@ -43,9 +46,9 @@ def make_weights(seed=0):
 
 
 BENCH_B = (
-    1, 2, 4, 8, 12, 15, 16, 17, 20, 24, 31, 32, 33, 40, 48, 56,
-    63, 64, 65, 80, 96, 112, 127, 128, 129, 144, 160, 176, 192,
-    208, 224, 240, 256,
+    1, 2, 4, 8, 12, 15, 16, 17, 20, 24, 31, 32, 33, 40, 48, 49, 56,
+    63, 64, 65, 80, 96, 97, 112, 127, 128, 129, 144, 160, 161, 176,
+    192, 193, 208, 224, 240, 256,
 )
 TIMELINE_M = (16, 17, 64, 65, 128, 129, 256)
 TAIL_B = (1, 16, 17, 64, 65, 128, 129, 256)
@@ -311,11 +314,16 @@ def timeline(module, weights):
             torch.cuda.synchronize()
             host = times.cpu()
             required = host[:, (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12)]
-            fp8_rows = torch.arange(num_tasks).remainder(TASKS_PER_BATCH) < 8
+            fp8_rows = (
+                torch.arange(num_tasks).remainder(TASKS_PER_BATCH)
+                < FP8_TASKS_PER_BATCH
+            )
             if (required <= 0).any() or (host[fp8_rows, 3] <= 0).any():
                 raise AssertionError(f'M={m}: invalid task timestamps')
             task_ids = torch.arange(num_tasks)
-            fp8 = task_ids.remainder(TASKS_PER_BATCH) < 8
+            fp8 = (
+                task_ids.remainder(TASKS_PER_BATCH) < FP8_TASKS_PER_BATCH
+            )
             bf16 = ~fp8
             origin = host[:, 0].min()
             task_end = torch.maximum(host[:, 11], host[:, 12])

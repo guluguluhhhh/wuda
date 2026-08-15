@@ -293,14 +293,15 @@ def benchmark(module):
         # Match E2E's FRONT-EMIT production bundle. Each row owns one of the
         # pool's eight state slots; the physical addresses and traffic match
         # the cache-manager layout without constructing a full KV manager.
+        state_rows = torch.arange(
+            mp, device='cuda', dtype=torch.int32) * 8
         emit = {
-            'main_kv': torch.empty(mp, 8, 1024, device='cuda'),
-            'main_sc': torch.empty(mp, 8, 1024, device='cuda'),
+            'main_state': torch.empty(mp, 8, 2048, device='cuda'),
             'main_ape': torch.randn(4, 1024, device='cuda'),
-            'state_row': torch.arange(mp, device='cuda', dtype=torch.int32) * 8,
+            'main_state_row': state_rows,
             'ape_phase': torch.arange(mp, device='cuda', dtype=torch.int32) & 3,
-            'idx_kv': torch.empty(mp, 8, 256, device='cuda'),
-            'idx_sc': torch.empty(mp, 8, 256, device='cuda'),
+            'idx_state': torch.empty(mp, 8, 512, device='cuda'),
+            'idx_state_row': state_rows,
             'idx_ape': torch.randn(4, 256, device='cuda'),
             'win_y2': torch.empty(mp, 512, device='cuda'),
             'w64': torch.empty(mp, 64, device='cuda'),
