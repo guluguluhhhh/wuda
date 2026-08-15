@@ -513,16 +513,20 @@ void launch_mhc_post_rank_ready(
               "exactly two symmetric pointers required");
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
 
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank])) + rank * kSlotStride;
-  const auto* peer_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank ^ 1])) +
-      (rank ^ 1) * kSlotStride;
+  const auto* local_partial =
+      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
+  const auto* peer_partial =
+      partials_view.peer_base<const __nv_bfloat16>() +
+      partials_view.peer_rank() * kSlotStride;
   launch_mhc_post_impl<true, false, false, true>(
       local_partial, peer_partial, nullptr, nullptr, nullptr,
       reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>()),
-      reinterpret_cast<const uint32_t*>(signal_pad_ptrs[rank]),
+      signals.local<const uint32_t>(),
       nullptr,
       residual, post, comb, output, m);
 }
@@ -549,17 +553,20 @@ void launch_mhc_post_one_shot(
               "exactly two signal-pad pointers required");
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
 
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank])) + rank * kSlotStride;
-  const auto* peer_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank ^ 1]))
-      + (rank ^ 1) * kSlotStride;
+  const auto* local_partial =
+      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
+  const auto* peer_partial =
+      partials_view.peer_base<const __nv_bfloat16>() +
+      partials_view.peer_rank() * kSlotStride;
   launch_mhc_post_impl<true, false, true>(
       local_partial, peer_partial, nullptr, nullptr, nullptr,
       reinterpret_cast<uint32_t*>(block_generations.data_ptr<int>()),
-      reinterpret_cast<const uint32_t*>(signal_pad_ptrs[rank]),
-      reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank ^ 1]),
+      signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
       residual, post, comb, output, m);
 }
 
@@ -577,12 +584,14 @@ void launch_mhc_post_peer(
               "exactly two symmetric pointers required");
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
 
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank])) + rank * kSlotStride;
-  const auto* peer_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank ^ 1]))
-      + (rank ^ 1) * kSlotStride;
+  const auto* local_partial =
+      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
+  const auto* peer_partial =
+      partials_view.peer_base<const __nv_bfloat16>() +
+      partials_view.peer_rank() * kSlotStride;
   launch_mhc_post_impl<true>(
       local_partial, peer_partial, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr,
@@ -603,11 +612,13 @@ void launch_peer_copy(
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
   TORCH_CHECK(m >= 1 && m <= kMMax, "M must be in [1,128]");
 
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  auto* local_slot = reinterpret_cast<__nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank])) + rank * kSlotStride;
-  auto* peer_slot = reinterpret_cast<__nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank ^ 1])) + rank * kSlotStride;
+  auto* local_slot =
+      partials_view.local<__nv_bfloat16>() + rank * kSlotStride;
+  auto* peer_slot =
+      partials_view.peer_base<__nv_bfloat16>() + rank * kSlotStride;
   const size_t bytes = static_cast<size_t>(m) * kN * sizeof(__nv_bfloat16);
   check_cuda(
       cudaMemcpyAsync(
@@ -751,12 +762,13 @@ void launch_peer_handshake_impl(
         runtime_mode->data_ptr<int32_t>());
   }
 
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   peer_handshake_kernel<kSelectMode><<<1, 1, 0, stream>>>(
       reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>()),
-      reinterpret_cast<const uint32_t*>(signal_pad_ptrs[rank]),
-      reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank ^ 1]),
-      mode_ptr, ready_offset, static_cast<uint32_t>(rank));
+      signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
+      mode_ptr, ready_offset, signals.rank);
   check_cuda(cudaGetLastError(), "peer_handshake_kernel launch");
 }
 
@@ -819,12 +831,12 @@ void launch_benchmark_barrier(
   TORCH_CHECK(signal_pad_ptrs.size() == 2,
               "exactly two signal-pad pointers required");
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-  auto* local_ready = reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank]);
-  auto* peer_ready = reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank ^ 1]);
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   benchmark_barrier_kernel<<<1, 1, 0, stream>>>(
       reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>()),
-      local_ready, peer_ready, static_cast<uint32_t>(rank));
+      signals.local<uint32_t>(), signals.peer_base<uint32_t>(), signals.rank);
   check_cuda(cudaGetLastError(), "benchmark_barrier_kernel launch");
 }
 
@@ -885,9 +897,13 @@ void launch_impl(
   const CUtensorMap tensor_map_b = make_b_map(b);
   const CUtensorMap tensor_map_sfa = make_scale_map(sfa, m, kBlockM);
   const CUtensorMap tensor_map_sfb = make_scale_map(sfb, kN, kBlockN);
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotElements =
       static_cast<int64_t>(kMMax) * kN;
-  auto* local_slot = reinterpret_cast<KernelDType*>(symmetric_ptrs[rank]) +
+  auto* local_slot = partials_view.local<KernelDType>() +
                      (common_local_slot ? 0 : rank) * kSlotElements;
   if constexpr (kVectorPeerStore) {
     TORCH_CHECK(local_second_destination != nullptr,
@@ -897,7 +913,7 @@ void launch_impl(
   auto* local_second_slot = local_second_destination == nullptr
       ? local_slot
       : reinterpret_cast<KernelDType*>(local_second_destination);
-  auto* peer_slot = reinterpret_cast<KernelDType*>(symmetric_ptrs[rank ^ 1]) +
+  auto* peer_slot = partials_view.peer_base<KernelDType>() +
                     rank * kSlotElements;
   auto* vector_store_slot = kVectorPeerStore ? peer_slot : nullptr;
   const CUtensorMap tensor_map_local_cd = make_output_map(local_slot, m);
@@ -916,12 +932,12 @@ void launch_impl(
 
   auto* grid_done_ptr = reinterpret_cast<uint64_t*>(grid_done.data_ptr<int64_t>());
   auto* generation_ptr = reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>());
-  auto* local_ready = reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank]);
-  auto* peer_ready = reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank ^ 1]);
+  auto* local_ready = signals.local<uint32_t>();
+  auto* peer_ready = signals.peer_base<uint32_t>();
   uint32_t shape_m = static_cast<uint32_t>(m);
   uint32_t shape_n = kN;
   uint32_t shape_k = kK;
-  uint32_t rank_u32 = static_cast<uint32_t>(rank);
+  uint32_t rank_u32 = partials_view.rank;
   int* grouped_layout = nullptr;
 
   void* args[] = {
@@ -1025,6 +1041,10 @@ void launch(
               "local_projected must be contiguous BF16 [M,7168]");
   auto* tile_generation_ptr = reinterpret_cast<uint32_t*>(
       tile_generations.data_ptr<int32_t>());
+  const auto partials_view = wuda::tp2::make_symmetric_view(
+      symmetric_ptrs, static_cast<uint32_t>(rank));
+  const auto signals = wuda::tp2::make_symmetric_view(
+      signal_pad_ptrs, static_cast<uint32_t>(rank));
   launch_mode<false, false, false, true>(
       a, sfa, b, sfb, symmetric_partials, grid_done, generation,
       symmetric_ptrs, signal_pad_ptrs, rank, false,
@@ -1033,15 +1053,14 @@ void launch(
   const auto* local_partial = reinterpret_cast<const __nv_bfloat16*>(
       local_projected.data_ptr<at::BFloat16>());
   constexpr int64_t kSlotElements = static_cast<int64_t>(kMMax) * kN;
-  const auto* peer_partial = reinterpret_cast<const __nv_bfloat16*>(
-      static_cast<uintptr_t>(symmetric_ptrs[rank])) +
-      (rank ^ 1) * kSlotElements;
+  const auto* peer_partial =
+      partials_view.local<const __nv_bfloat16>() +
+      partials_view.peer_rank() * kSlotElements;
   launch_mhc_post_impl<true, false, true>(
       local_partial, peer_partial,
       nullptr, nullptr, nullptr,
       tile_generation_ptr,
-      reinterpret_cast<const uint32_t*>(signal_pad_ptrs[rank]),
-      reinterpret_cast<uint32_t*>(signal_pad_ptrs[rank ^ 1]),
+      signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
       residual, post, comb, output, m);
 }
 

@@ -19,6 +19,7 @@
 #include <deep_gemm/scheduler/sm100_paged_mqa_logits.cuh>
 
 #include "query_rms_rope.cuh"
+#include "tp2_symmetric.cuh"
 
 // FP8 MQA uses DeepGEMM's paged scheduler and device math. This local copy keeps
 // that attention path isolated from the existing FP4 implementation and adds a
@@ -54,14 +55,13 @@ struct QueryRmsRopeArgs {
     int input_heads = 0;
     uint32_t output_rows = 0;
     float eps = 1e-6f;
-    nv_bfloat16* peer_out = nullptr;
+    wuda::tp2::SymmetricView symmetric_output;
     nv_bfloat16* local_second_out = nullptr;
     // 0: local payload/no handshake, 1: local payload/handshake,
     // 2: peer payload/handshake. nullptr is the production peer mode.
     const uint32_t* comm_mode = nullptr;
     uint32_t batch_total = 0;
     uint32_t rank0_batch = 0;
-    uint32_t tp_rank = 0;
 };
 
 // Any warp that has finished its primary role claims one query row from a
@@ -83,7 +83,7 @@ __device__ __forceinline__ void run_query_rms_rope(
         // MODEL1 FlashMLA always consumes 128 query heads. Both production
         // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
         // repeating runtime integer division/modulo in every lane of every row.
-        const bool tp2 = query.peer_out != nullptr;
+        const bool tp2 = static_cast<bool>(query.symmetric_output);
         const uint32_t batch = tp2
             ? output_row / static_cast<uint32_t>(query.input_heads)
             : output_row >> 7;
@@ -101,14 +101,17 @@ __device__ __forceinline__ void run_query_rms_rope(
         if (tp2) {
             const uint32_t owner = batch >= query.rank0_batch;
             const uint32_t owner_row = owner == 0 ? batch : batch - query.rank0_batch;
-            const uint32_t full_head = query.tp_rank * 64 + input_head;
+            const uint32_t full_head =
+                query.symmetric_output.rank * 64 + input_head;
             nv_bfloat16* destination;
-            if (owner == query.tp_rank) {
+            if (owner == query.symmetric_output.rank) {
                 destination = query.out;
             } else {
                 const bool remote = query.comm_mode == nullptr
                     || *query.comm_mode >= 2;
-                destination = remote ? query.peer_out : query.local_second_out;
+                destination = remote
+                    ? query.symmetric_output.peer_base<nv_bfloat16>()
+                    : query.local_second_out;
             }
             output = reinterpret_cast<uint4*>(
                 destination
@@ -950,7 +953,7 @@ void sm100_fp8_paged_mqa_logits_fused(
             tensor_map_sf_kv, tensor_map_weights, make_scheduler);
 
     if constexpr (kHasQuery) {
-        if (query.peer_out != nullptr)
+        if (query.symmetric_output)
             return;
         wuda_fp8_mqa::run_query_rms_rope<kQueryAblation>(
             query, &query_next, lane);

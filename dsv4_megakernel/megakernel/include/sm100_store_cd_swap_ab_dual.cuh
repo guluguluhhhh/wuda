@@ -8,6 +8,8 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 
+#include "tp2_symmetric.cuh"
+
 namespace deep_gemm::epilogue {
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N,
@@ -152,11 +154,7 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
                 if (global_m < shape_m) {
                     auto* global_ptr = vector_store_cd +
                         static_cast<uint64_t>(global_m) * shape_n + global_n;
-                    asm volatile(
-                        "st.relaxed.sys.global.v4.u32 "
-                        "[%0], {%1, %2, %3, %4};" ::
-                        "l"(global_ptr), "r"(bits.x), "r"(bits.y),
-                        "r"(bits.z), "r"(bits.w) : "memory");
+                    wuda::tp2::store_relaxed_sys_v4_u32(global_ptr, bits);
                 }
             }
             cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);

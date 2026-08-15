@@ -398,15 +398,13 @@ static wuda_fp8_mqa::QueryRmsRopeArgs make_query_args(
         TORCH_CHECK(query_local_second_out->numel()
                         >= ((query_batch_total + 1) / 2) * 128 * 512,
                     "query_local_second_out is too small");
-        args.out = reinterpret_cast<nv_bfloat16*>(
-            static_cast<uintptr_t>(query_symmetric_ptrs[query_tp_rank]));
-        args.peer_out = reinterpret_cast<nv_bfloat16*>(
-            static_cast<uintptr_t>(query_symmetric_ptrs[query_tp_rank ^ 1]));
+        args.symmetric_output = wuda::tp2::make_symmetric_view(
+            query_symmetric_ptrs, static_cast<uint32_t>(query_tp_rank));
+        args.out = args.symmetric_output.local<nv_bfloat16>();
         args.local_second_out = reinterpret_cast<nv_bfloat16*>(
             query_local_second_out->data_ptr());
         args.batch_total = static_cast<uint32_t>(query_batch_total);
         args.rank0_batch = static_cast<uint32_t>((query_batch_total + 1) / 2);
-        args.tp_rank = static_cast<uint32_t>(query_tp_rank);
         args.output_rows = static_cast<uint32_t>(
             query_batch_total * query_input_heads);
         if (query_comm_mode.has_value()) {

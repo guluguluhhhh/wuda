@@ -36,6 +36,7 @@
 #include <limits>
 
 #include "topk_v2.cuh"
+#include "tp2_symmetric.cuh"
 
 namespace {
 
@@ -88,11 +89,9 @@ struct TopKLaunchParams {
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
   uint32_t* __restrict__ query_generation;
-  const uint32_t* __restrict__ query_ready;
-  uint32_t* __restrict__ query_peer_ready;
+  wuda::tp2::SymmetricView query_signals;
   const uint32_t* __restrict__ query_comm_mode;
   uint32_t query_ready_offset;
-  uint32_t query_tp_rank;
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -123,33 +122,27 @@ struct TopKLaunchParams {
   }
 };
 
-SGL_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
-  uint32_t value;
-  asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-               : "=r"(value) : "l"(ptr) : "memory");
-  return value;
-}
-
 SGL_DEVICE void rendezvous_query_heads(const TopKLaunchParams& params) {
   if (params.query_generation == nullptr || threadIdx.x != 0) return;
   if (params.query_comm_mode != nullptr && *params.query_comm_mode == 0) return;
+  const auto* local_ready = params.query_signals.local<const uint32_t>();
+  auto* peer_ready = params.query_signals.peer_base<uint32_t>();
   uint32_t current;
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
                : "=r"(current) : "l"(params.query_generation) : "memory");
   const uint32_t expected = current + 1;
-  asm volatile("st.release.sys.global.u32 [%0], %1;" ::
-               "l"(params.query_peer_ready + params.query_ready_offset
-                     + params.query_tp_rank),
-               "r"(expected) : "memory");
-  const uint32_t peer_rank = params.query_tp_rank ^ 1u;
-  auto ready = load_relaxed_sys(
-      params.query_ready + params.query_ready_offset + peer_rank);
+  wuda::tp2::store_release_sys(
+      peer_ready + params.query_ready_offset + params.query_signals.rank,
+      expected);
+  const uint32_t peer_rank = params.query_signals.peer_rank();
+  auto ready = wuda::tp2::load_relaxed_sys(
+      local_ready + params.query_ready_offset + peer_rank);
   while (ready < expected) {
-    asm volatile("nanosleep.u32 128;");
-    ready = load_relaxed_sys(
-        params.query_ready + params.query_ready_offset + peer_rank);
+    wuda::tp2::spin_pause();
+    ready = wuda::tp2::load_relaxed_sys(
+        local_ready + params.query_ready_offset + peer_rank);
   }
-  asm volatile("fence.acquire.sys;" ::: "memory");
+  wuda::tp2::fence_acquire_sys();
   asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::
                "l"(params.query_generation), "r"(expected) : "memory");
 }
@@ -456,11 +449,9 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     params.page_bits         = page_bits;
     params.cluster_floor     = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor;
     params.query_generation  = nullptr;
-    params.query_ready       = nullptr;
-    params.query_peer_ready  = nullptr;
+    params.query_signals     = {};
     params.query_comm_mode   = nullptr;
     params.query_ready_offset = static_cast<uint32_t>(query_ready_offset);
-    params.query_tp_rank     = 0;
     if (query_generation.has_value()) {
         TORCH_CHECK(query_generation->is_cuda()
                     && query_generation->is_contiguous()
@@ -473,12 +464,8 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
                     "query wait requires two signal pads, rank 0/1, and nonnegative offset");
         params.query_generation = reinterpret_cast<uint32_t*>(
             query_generation->data_ptr<int>());
-        params.query_ready = reinterpret_cast<const uint32_t*>(
-            static_cast<uintptr_t>(query_signal_pad_ptrs[query_tp_rank]));
-        params.query_peer_ready = reinterpret_cast<uint32_t*>(
-            static_cast<uintptr_t>(
-                query_signal_pad_ptrs[query_tp_rank ^ 1]));
-        params.query_tp_rank = static_cast<uint32_t>(query_tp_rank);
+        params.query_signals = wuda::tp2::make_symmetric_view(
+            query_signal_pad_ptrs, static_cast<uint32_t>(query_tp_rank));
         if (query_comm_mode.has_value()) {
             TORCH_CHECK(query_comm_mode->is_cuda()
                         && query_comm_mode->is_contiguous()

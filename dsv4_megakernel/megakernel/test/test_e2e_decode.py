@@ -964,22 +964,24 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
       per-stage : mean Kineto device time over 30 cold eager-chain iterations,
                   bucketed by stage (wq_b bucket = qnorm + merged GEMM;
                   duration sums double-count PDL and intra-stage overlaps)
-      graph     : first GPU kernel start through last GPU kernel end in the
+      perfetto  : first GPU kernel start through last GPU kernel end in the
                   saved Perfetto trace (vLLM serving form; THE end-to-end
-                  number). The CPU graph-launch wall is excluded on purpose:
-                  per-call host launch+sync adds
-                  ~17us at B=128 that real serving never pays PER LAYER,
-                  because a whole model is ONE graph -- one launch and one
-                  sync for all 61 layers, not one each. Cross-checked
-                  against the perfetto trace's first-to-last GPU-kernel span.
+                  number). The per-layer CUDA-event graph envelope and CPU
+                  graph-launch wall are excluded on purpose:
+                  a whole model is ONE graph, so its launch, synchronization,
+                  and graph-envelope cost is paid once for all 61 layers,
+                  not once per layer.
     The flush is ONE per layer (never per stage) and is EXCLUDED from every
     reported number: Kineto buckets name only the chain's own kernels, and the
-    graph envelope starts at the first chain kernel after the flush.
+    Perfetto span starts at the first chain kernel after the flush.
     Context ops (mqa/topk/mla) at a FABRICATED long context: page tables
     and lens real, cache bytes arbitrary -- latency-neutral. The chain runs
     through O-proj and mHC post. TPDP uses the symmetric dual-write ProjB and
     fused BF16 reduce+mHC post. The O-proj entry point performs validation, which
     does not affect graph replay or Kineto device time."""
+    import builtins
+    print = (builtins.print if not TPDP_MODE or TP_RANK == 0
+             else lambda *args, **kwargs: None)
     hcm, fmm, wqm, qrm, mqm, mq8m, tkm, mpm = mods
     trace_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "docs", "timeline"))
@@ -1007,7 +1009,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             ([] if fused_query_rms() else ["q_rms"]) + ["mqa", "topk"] +
             (["mla", "o_proj"] if post_attn_enabled() else []) +
             (["mhc_post"] if mhc_post_enabled() and not TPDP_MODE else []) +
-            ["stages", "graph"])
+            ["stages", "perfetto"])
     l2_bytes = int(getattr(torch.cuda.get_device_properties(DEV),
                            "L2_cache_size", 128 << 20))
     flush_bytes = max(2 * l2_bytes, 64 << 20)
@@ -1045,18 +1047,18 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
               "fused(us) reports only the merged GEMM")
         if fused_query_rms():
             print("  query RMSNorm+RoPE runs in the MQA tail warpgroup and is "
-                  "included in mqa; use graph for end-to-end latency")
+                  "included in mqa; use perfetto for end-to-end latency")
         else:
             print("  q_rms and mqa are overlapping kernel durations; stages sums both. "
-                  "Use graph for end-to-end latency")
+                  "Use perfetto for end-to-end latency")
         print("  operator columns are 30 cold eager-chain Kineto means; stages sums "
               "kernel durations and includes overlap")
         if TPDP_MODE:
-            print("  graph uses aligned cold event replays and reports the slower "
-                  "TP rank; use --tp2-overhead-only for static on/off Perfetto")
-            print("  Perfetto timelines are still saved per rank for inspection")
+            print("  perfetto is the slower-rank median first-to-last GPU kernel "
+                  "span over 5 cold replays")
+            print("  the selected Perfetto timeline is saved per rank for inspection")
         else:
-            print("  graph is the median of 5 cold Perfetto replays; the saved "
+            print("  perfetto is the median of 5 cold Perfetto replays; the saved "
                   "timeline is the replay selected for that median")
     if not fused_query_rms():
         print(f"  q_rms persistent grid cap = {Q_RMS_MAX_BLOCKS} CTAs")
@@ -1512,33 +1514,6 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             }
             return medians, mode_reps, rank_reps, rank_medians, critical_counts
 
-        def measure_tp2_graph(graph, reps=7, samples_per_rep=16):
-            """Return a median-of-means cold time for one aligned TP2 graph."""
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            end.record()
-            end.synchronize()
-            rep_means = []
-            for _ in range(reps):
-                samples = []
-                for _ in range(samples_per_rep):
-                    flush_l2(drain=False)
-                    tp_host_barrier()
-                    tp_device_barrier(ows.tp2_comm)
-                    start.record()
-                    graph.replay()
-                    end.record()
-                    end.synchronize()
-                    slower_rank = torch.tensor(
-                        start.elapsed_time(end) * 1e3, dtype=torch.float64)
-                    dist.all_reduce(slower_rank, op=dist.ReduceOp.MAX,
-                                    group=TP_SYNC_GROUP)
-                    samples.append(float(slower_rank.item()))
-                rep_means.append(sum(samples) / len(samples))
-            import statistics
-            return statistics.median(rep_means)
-
         def measure_tp2_perfetto_modes(graphs, samples=11):
             """Measure static graphs by slower-rank first-to-last GPU span."""
             from torch.profiler import profile as _trace_profile
@@ -1890,8 +1865,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         # removed after their verdicts landed: emit costs +0.1..1.1us vs
         # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
-        # ---- CUDA-graph envelope: exact Perfetto GPU-kernel span ----------
-        t_graph = float("nan")
+        # ---- End-to-end: exact Perfetto GPU-kernel span -------------------
+        t_perfetto = float("nan")
         g = None
         try:
             side = torch.cuda.Stream()
@@ -1945,7 +1920,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                     trace_samples.append((last - first, sample_path))
 
                 trace_samples.sort(key=lambda sample: sample[0])
-                t_graph, selected_path = trace_samples[len(trace_samples) // 2]
+                t_perfetto, selected_path = trace_samples[
+                    len(trace_samples) // 2]
                 if keep_trace:
                     tp = os.path.join(
                         trace_dir, f"e2e_{trace_mode}_B{B}.json")
@@ -1959,22 +1935,15 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                 if 'trace_prof' in locals():
                     del trace_prof
 
-        # CUPTI perturbs communicating ranks' relative host progress. Replace
-        # the trace-derived production-table value with aligned cold events.
-        # The explicit static communication ablation intentionally uses
-        # Perfetto for both graphs and lives in --tp2-overhead-only.
-        if g is not None and TPDP_MODE:
-            t_graph = measure_tp2_graph(g)
-
         if TPDP_MODE:
             rank_times = torch.tensor(
-                ts + [t_graph], device=DEV, dtype=torch.float64)
+                ts + [t_perfetto], device=DEV, dtype=torch.float64)
             dist.all_reduce(rank_times, op=dist.ReduceOp.MAX)
             ts = rank_times[:-1].tolist()
-            t_graph = float(rank_times[-1].item())
+            t_perfetto = float(rank_times[-1].item())
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
-              + f"{sum(ts):>9.1f}{t_graph:>9.1f}")
+              + f"{sum(ts):>9.1f}{t_perfetto:>9.1f}")
         bw_rows.append((B, [(sname, t) for (sname, _), t
                             in zip(stage_fns, ts)]))
         del mgr

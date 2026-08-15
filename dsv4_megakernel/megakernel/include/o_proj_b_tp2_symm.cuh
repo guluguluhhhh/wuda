@@ -14,10 +14,19 @@
 #include <deep_gemm/ptx/utils.cuh>
 
 #include "sm100_store_cd_swap_ab_dual.cuh"
+#include "tp2_symmetric.cuh"
 
 namespace deep_gemm {
 
 namespace o_proj_b_tp2_symm {
+
+using wuda::tp2::fence_acq_rel_sys;
+using wuda::tp2::fence_acquire_sys;
+using wuda::tp2::load_acquire_sys;
+using wuda::tp2::load_relaxed_sys;
+using wuda::tp2::spin_pause;
+using wuda::tp2::store_relaxed_sys;
+using wuda::tp2::store_release_sys;
 
 constexpr uint32_t kGridDoneElements = 1;
 constexpr uint32_t kTileReadyOffset = 256;
@@ -54,44 +63,8 @@ CUTLASS_DEVICE uint32_t load_relaxed_gpu(const uint32_t* ptr) {
     return value;
 }
 
-CUTLASS_DEVICE uint32_t load_relaxed_sys(const uint32_t* ptr) {
-    uint32_t value;
-    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
-                 : "=r"(value) : "l"(ptr) : "memory");
-    return value;
-}
-
-CUTLASS_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
-    uint32_t value;
-    asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
-                 : "=r"(value) : "l"(ptr) : "memory");
-    return value;
-}
-
 CUTLASS_DEVICE void store_relaxed_gpu(uint32_t* ptr, uint32_t value) {
     asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
-}
-
-CUTLASS_DEVICE void store_relaxed_sys(uint32_t* ptr, uint32_t value) {
-    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::
-                 "l"(ptr), "r"(value) : "memory");
-}
-
-CUTLASS_DEVICE void store_release_sys(uint32_t* ptr, uint32_t value) {
-    asm volatile("st.release.sys.global.u32 [%0], %1;" ::
-                 "l"(ptr), "r"(value) : "memory");
-}
-
-CUTLASS_DEVICE void fence_acq_rel_sys() {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
-}
-
-CUTLASS_DEVICE void fence_acquire_sys() {
-    asm volatile("fence.acquire.sys;" ::: "memory");
-}
-
-CUTLASS_DEVICE void spin_pause() {
-    asm volatile("nanosleep.u32 128;");
 }
 
 CUTLASS_DEVICE uint64_t globaltimer() {
