@@ -171,8 +171,8 @@ class KVCacheManager:
             pos=t(pos, torch.int64), q_pos=t(pos, torch.int32),
             main_state_row=self.state_rows(slots, pos),
             idx_state_row=self.state_rows(slots, pos),
-            idx_dst=t(idx_dst, torch.int32), cmp_dst=t(cmp_dst, torch.int32),
-            swa_dst=t(swa_dst, torch.int32))
+            idx_dst=t(idx_dst, torch.int64), cmp_dst=t(cmp_dst, torch.int64),
+            swa_dst=t(swa_dst, torch.int64))
 
     def block_table(self, name, slots):
         bt = torch.zeros(len(slots), self.max_pages, dtype=torch.int32,
@@ -201,7 +201,7 @@ class KVCacheManager:
         p = torch.as_tensor(pos, dtype=torch.long, device=self.device) \
             % self.state_ring_entries
         s = torch.tensor(slots, dtype=torch.long, device=self.device)
-        return (s * self.state_ring_entries + p).int()
+        return s * self.state_ring_entries + p
 
     def geometry(self, name):
         return dict(entries_per_block=self.entries_per_block[name],

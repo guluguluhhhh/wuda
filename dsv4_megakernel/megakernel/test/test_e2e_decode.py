@@ -534,6 +534,10 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         ctx2 = ncmp[owned].view(-1, 1).contiguous()
         schedule = get_dg().get_paged_mqa_logits_metadata(
             ctx2, mgr.entries_per_block["idx"], get_dg().get_num_sms())
+    mqa_state_row = (st["main_state_row"] if INDEXER_FP8 else
+                     st["main_state_row"].to(torch.int32))
+    mqa_cmp_dst = (st["cmp_dst"] if INDEXER_FP8 else
+                   st["cmp_dst"].to(torch.int32))
 
     # Submit the PDL pair without intervening CUDA work. The FP8 MQA grid waits
     # for Q_B, then its independent tail warpgroup produces q_ready alongside
@@ -566,8 +570,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
             cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
             sin_tab=w["sin"], comp_state=mgr.main_state,
-            comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-            cmp_dst=st["cmp_dst"],
+            comp_state_row=mqa_state_row, cmp_cache=mgr.cmp_pool,
+            cmp_dst=mqa_cmp_dst,
             comp_state_ring_entries=mgr.state_ring_entries,
             cmp_entries_per_block=mgr.entries_per_block["cmp"],
             cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
@@ -595,8 +599,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                 cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
                 sin_tab=w["sin"], comp_state=mgr.main_state,
-                comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-                cmp_dst=st["cmp_dst"],
+                comp_state_row=mqa_state_row, cmp_cache=mgr.cmp_pool,
+                cmp_dst=mqa_cmp_dst,
                 comp_state_ring_entries=mgr.state_ring_entries,
                 cmp_entries_per_block=mgr.entries_per_block["cmp"],
                 cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
@@ -608,8 +612,8 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
                 ncmp[owned], idx_bt, logits_buf[owned],
                 cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=w["cos"],
                 sin_tab=w["sin"], comp_state=mgr.main_state,
-                comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-                cmp_dst=st["cmp_dst"],
+                comp_state_row=mqa_state_row, cmp_cache=mgr.cmp_pool,
+                cmp_dst=mqa_cmp_dst,
                 kv_entries_per_block=mgr.entries_per_block["idx"],
                 kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                 comp_state_ring_entries=mgr.state_ring_entries,
@@ -993,7 +997,7 @@ def benchmark(mods, w, ncmp=2048, batches=None):
         w64_p = torch.empty(Bp, 64, device=DEV, dtype=torch.float32)
         win_y2, weights64 = win_y2_p[:B], w64_p[:B]
         p0 = 4 * ncmp - 1                       # same pos for every request
-        main_state_row = torch.full((Bp,), -1, dtype=torch.int32, device=DEV)
+        main_state_row = torch.full((Bp,), -1, dtype=torch.int64, device=DEV)
         main_state_row[:B] = mgr.state_rows(slots, pos)
         idx_state_row = main_state_row.clone()
         ape_phase = torch.full((Bp,), p0 % 4, dtype=torch.int32, device=DEV)
@@ -1064,6 +1068,10 @@ def benchmark(mods, w, ncmp=2048, batches=None):
             fp8_schedule = get_dg().get_paged_mqa_logits_metadata(
                 nc[owned].view(-1, 1).contiguous(),
                 mgr.entries_per_block["idx"], get_dg().get_num_sms())
+        mqa_state_row = (st["main_state_row"] if INDEXER_FP8 else
+                         st["main_state_row"].to(torch.int32))
+        mqa_cmp_dst = (st["cmp_dst"] if INDEXER_FP8 else
+                       st["cmp_dst"].to(torch.int32))
 
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
         def run_mqa():
@@ -1077,8 +1085,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                     cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
                     sin_tab=sinl, comp_state=mgr.main_state,
-                    comp_state_row=st["main_state_row"],
-                    cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_row=mqa_state_row,
+                    cmp_cache=mgr.cmp_pool, cmp_dst=mqa_cmp_dst,
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
@@ -1094,8 +1102,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     nc[owned], idx_bt, logits[owned],
                     cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
                     sin_tab=sinl, comp_state=mgr.main_state,
-                    comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-                    cmp_dst=st["cmp_dst"],
+                    comp_state_row=mqa_state_row, cmp_cache=mgr.cmp_pool,
+                    cmp_dst=mqa_cmp_dst,
                     kv_entries_per_block=mgr.entries_per_block["idx"],
                     kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                     comp_state_ring_entries=mgr.state_ring_entries,
@@ -1116,8 +1124,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                     cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
                     sin_tab=sinl, comp_state=mgr.main_state,
-                    comp_state_row=st["main_state_row"],
-                    cmp_cache=mgr.cmp_pool, cmp_dst=st["cmp_dst"],
+                    comp_state_row=mqa_state_row,
+                    cmp_cache=mgr.cmp_pool, cmp_dst=mqa_cmp_dst,
                     comp_state_ring_entries=mgr.state_ring_entries,
                     cmp_entries_per_block=mgr.entries_per_block["cmp"],
                     cmp_block_stride_bytes=mgr.block_stride_bytes["cmp"],
@@ -1129,8 +1137,8 @@ def benchmark(mods, w, ncmp=2048, batches=None):
                     nc[owned], idx_bt, logits[owned],
                     cmp_pos=pos, comp_norm=w["comp_norm"], cos_tab=cosl,
                     sin_tab=sinl, comp_state=mgr.main_state,
-                    comp_state_row=st["main_state_row"], cmp_cache=mgr.cmp_pool,
-                    cmp_dst=st["cmp_dst"],
+                    comp_state_row=mqa_state_row, cmp_cache=mgr.cmp_pool,
+                    cmp_dst=mqa_cmp_dst,
                     kv_entries_per_block=mgr.entries_per_block["idx"],
                     kv_block_stride_bytes=mgr.block_stride_bytes["idx"],
                     comp_state_ring_entries=mgr.state_ring_entries,

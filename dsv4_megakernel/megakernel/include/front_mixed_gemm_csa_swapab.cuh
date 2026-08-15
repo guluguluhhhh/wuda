@@ -624,8 +624,8 @@ static __global__ void __launch_bounds__(TPB, 1) swapab_kernel(
         const int out_row = batch_base + row_half_base + row_in_half;
         if (row_in_half < BatchN / CLUSTER_SIZE &&
             out_row < problem_m) {
-          const int state_row = is_main ? emit.main_state_row[out_row]
-                                        : emit.idx_state_row[out_row];
+          const int64_t state_row = is_main ? emit.main_state_row[out_row]
+                                            : emit.idx_state_row[out_row];
           if (state_row >= 0) {
             float* const dst_row = state +
                 static_cast<size_t>(state_row) * state_width + feature_offset;

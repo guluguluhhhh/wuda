@@ -104,8 +104,8 @@ def direct_emit_correctness(module, weights, smoke=False):
         plain = run_swap(module, x, x8, xsf, weights)
 
         phase = (torch.arange(b, device='cuda') % 4).int()
-        main_rows = (torch.arange(b, device='cuda') * 2 + 1).int()
-        idx_rows = (torch.arange(b, device='cuda') * 3 + 2).int()
+        main_rows = (torch.arange(b, device='cuda') * 2 + 1).long()
+        idx_rows = (torch.arange(b, device='cuda') * 3 + 2).long()
         main_state = torch.randn(2 * b + 1, 2048, device='cuda')
         idx_state = torch.randn(3 * b + 1, 512, device='cuda')
         main_before, idx_before = main_state.clone(), idx_state.clone()

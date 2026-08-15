@@ -212,10 +212,10 @@ constexpr int APE_RATIO = 4;
 struct FrontEmitArgs {
   float* main_state = nullptr;         // [blocks, ring, 2048]
   const float* main_ape = nullptr;     // [4,1024]
-  const int* main_state_row = nullptr; // [M], -1 skips a row
+  const int64_t* main_state_row = nullptr; // [M], -1 skips a row
   const int* ape_phase = nullptr;      // [M]
   float* idx_state = nullptr;          // [blocks, ring, 512]
-  const int* idx_state_row = nullptr;  // [M], -1 skips a row
+  const int64_t* idx_state_row = nullptr;  // [M], -1 skips a row
   const float* idx_ape = nullptr;      // [4,256]
   float* win_y2 = nullptr;             // [M,512]
   float* w64 = nullptr;                // [M,64]

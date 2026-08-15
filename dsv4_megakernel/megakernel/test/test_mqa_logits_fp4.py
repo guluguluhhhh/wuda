@@ -564,7 +564,7 @@ def make_main_compressor_inputs(B):
     cos_tab = torch.cos(angle).contiguous()
     sin_tab = torch.sin(angle).contiguous()
     state = torch.randn(B, 8, 2048, device="cuda")
-    state_row = (torch.arange(B, device="cuda") * 8 + positions % 8).int()
+    state_row = (torch.arange(B, device="cuda") * 8 + positions % 8).long()
     return positions, norm, cos_tab, sin_tab, state, state_row
 
 
@@ -592,7 +592,7 @@ def test_fp8_main_compressor(module):
     cmp_stride = cmp_payload + 128
     cmp_cache = torch.full((2, cmp_stride), 0xA5, dtype=torch.uint8,
                            device="cuda")
-    cmp_dst = torch.arange(B, dtype=torch.int32, device="cuda")
+    cmp_dst = torch.arange(B, dtype=torch.int64, device="cuda")
     compressor = dict(
         cmp_pos=pos, comp_norm=norm, cos_tab=cos_tab, sin_tab=sin_tab,
         comp_state=state, comp_state_row=state_row,

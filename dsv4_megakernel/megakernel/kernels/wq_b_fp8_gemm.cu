@@ -1122,11 +1122,11 @@ static std::vector<torch::Tensor> run_wq_b(
         TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == ty,
                     n, " must be contiguous CUDA ", ty);
     };
-    auto i32m = [&](const torch::Tensor& t, const char* n) {
+    auto slot_i64 = [&](const torch::Tensor& t, const char* n) {
         TORCH_CHECK(t.is_cuda() && t.is_contiguous() &&
-                    t.scalar_type() == torch::kInt32 && t.numel() >= M,
-                    n, " must be CUDA i32 [>=M]");
-        return t.data_ptr<int>();
+                    t.scalar_type() == torch::kInt64 && t.numel() >= M,
+                    n, " must be CUDA int64 [>=M]");
+        return t.data_ptr<int64_t>();
     };
     if (comp_on || win_on) {
         TORCH_CHECK(cmp_pos && cos_tab && sin_tab,
@@ -1176,7 +1176,7 @@ static std::vector<torch::Tensor> run_wq_b(
                     "idx_state requires idx_state_row");
         TORCH_CHECK(state_ring_entries >= idx_comp::SROWS,
                     "state_ring_entries must be >= ", idx_comp::SROWS);
-        comp.state_row = i32m(*idx_state_row, "idx_state_row");
+        comp.state_row = slot_i64(*idx_state_row, "idx_state_row");
         comp.state_ring_entries = (int)state_ring_entries;
     }
     if (win_on) {
@@ -1217,7 +1217,7 @@ static std::vector<torch::Tensor> run_wq_b(
                     idx_cache->numel() % idx_block_stride_bytes == 0,
                     "idx_cache must be uint8 physical pages with the supplied stride");
         comp.idx_cache = reinterpret_cast<uint8_t*>(idx_cache->data_ptr());
-        comp.idx_dst = i32m(*idx_dst, "idx_dst");
+        comp.idx_dst = slot_i64(*idx_dst, "idx_dst");
         comp.idx_entries_per_block = (int)idx_entries_per_block;
         comp.idx_block_stride_bytes = (size_t)idx_block_stride_bytes;
     }
@@ -1233,7 +1233,7 @@ static std::vector<torch::Tensor> run_wq_b(
                     swa_cache->numel() % swa_block_stride_bytes == 0,
                     "swa_cache must be uint8 physical pages with the supplied stride");
         comp.swa_cache = reinterpret_cast<uint8_t*>(swa_cache->data_ptr());
-        comp.swa_dst = i32m(*swa_dst, "swa_dst");
+        comp.swa_dst = slot_i64(*swa_dst, "swa_dst");
         comp.swa_entries_per_block = (int)swa_entries_per_block;
         comp.swa_block_stride_bytes = (size_t)swa_block_stride_bytes;
     }
@@ -1371,6 +1371,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("n_merged") = N_MERGED;
     m.attr("num_main_heads") = NUM_HEADS_OUT;
     m.attr("num_index_heads") = IDX_NUM_HEADS;
+    m.attr("slot_dtype_bits") = 64;
     m.def("wq_b_proj_gemm_merged",
           [](torch::Tensor x_fp8, torch::Tensor x_sf,
              torch::Tensor w_fp8, torch::Tensor w_sf,

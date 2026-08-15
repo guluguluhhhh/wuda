@@ -55,7 +55,7 @@ struct Args {
     // [kv(WK_I) | score(WK_I)]. state_row is already folded to
     // block_id * state_ring_entries + pos % state_ring_entries.
     const float* state = nullptr;     // [blocks, ring, 2 * WK_I] fp32
-    const int* state_row = nullptr;   // [M], -1 skips the row
+    const int64_t* state_row = nullptr; // [M], -1 skips the row
     int state_ring_entries = 0;
     uint8_t* q4 = nullptr;            // [M, D_I/2]  packed e2m1 (compress rows)
     uint8_t* s4 = nullptr;            // [M, D_I/32] block-32 ue8m0 exponents
@@ -68,11 +68,11 @@ struct Args {
     // Flat destinations use block_id * entries_per_block + offset. Logical
     // geometry and physical page stride are deliberately independent.
     uint8_t* idx_cache  = nullptr;
-    const int* idx_dst  = nullptr;    // [M] compressed-token dst (compress rows)
+    const int64_t* idx_dst = nullptr; // [M] compressed-token dst (compress rows)
     int idx_entries_per_block = 0;
     size_t idx_block_stride_bytes = 0;
     uint8_t* swa_cache  = nullptr;
-    const int* swa_dst  = nullptr;    // [M] token dst (every row)
+    const int64_t* swa_dst = nullptr; // [M] token dst (every row)
     int swa_entries_per_block = 0;
     size_t swa_block_stride_bytes = 0;
 };
@@ -102,7 +102,7 @@ __device__ inline void process_row(const Args& a, int m, int lane,
     if (((p + 1) & (RATIO - 1)) != 0)
         return;                            // not a compress row (row-uniform)
 
-    const int srow = a.state_row[m];
+    const int64_t srow = a.state_row[m];
     if (srow < 0)
         return;
     const int c0 = 4 * lane;
@@ -203,7 +203,7 @@ __device__ inline void process_row(const Args& a, int m, int lane,
         if (lane == 0 && a.s4 != nullptr)
             *reinterpret_cast<float*>(a.s4 + (size_t)m * sizeof(float)) = scale;
         if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
-            const int dst = a.idx_dst[m];
+            const int64_t dst = a.idx_dst[m];
             const int epb = a.idx_entries_per_block;
             uint8_t* page = a.idx_cache
                 + (size_t)(dst / epb) * a.idx_block_stride_bytes;
@@ -260,7 +260,7 @@ __device__ inline void process_row(const Args& a, int m, int lane,
             *reinterpret_cast<uint16_t*>(a.q4 + (size_t)m * (D_I / 2) + lane * 2) = packed;
         // Direct store into the RTP physical indexer page.
         if (a.idx_cache != nullptr && a.idx_dst != nullptr && a.idx_dst[m] >= 0) {
-            const int dst = a.idx_dst[m];
+            const int64_t dst = a.idx_dst[m];
             const int epb = a.idx_entries_per_block;
             uint8_t* page = a.idx_cache
                 + (size_t)(dst / epb) * a.idx_block_stride_bytes;
@@ -337,7 +337,7 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         // kvcache design: DIRECT store into the SWA MODEL1 page (body nope
         // bytes + tail e8m0 scale; same quant chain as the compact outputs).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
-            const int dst = a.swa_dst[m];
+            const int64_t dst = a.swa_dst[m];
             const int epb = a.swa_entries_per_block;
             uint8_t* page = a.swa_cache
                 + (size_t)(dst / epb) * a.swa_block_stride_bytes;
@@ -369,7 +369,7 @@ __device__ inline void process_win_row(const Args& a, int m, int lane,
         }
         // kvcache design: rope tail into the SWA MODEL1 body (cols 448..511).
         if (a.swa_cache != nullptr && a.swa_dst != nullptr && a.swa_dst[m] >= 0) {
-            const int dst = a.swa_dst[m];
+            const int64_t dst = a.swa_dst[m];
             const int epb = a.swa_entries_per_block;
             uint8_t* base = a.swa_cache
                 + (size_t)(dst / epb) * a.swa_block_stride_bytes

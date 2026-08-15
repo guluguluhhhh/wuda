@@ -256,7 +256,7 @@ static wuda_fp8_mqa::MainCompressorArgs make_compressor_args(
     check(*cos_tab, torch::kFloat32, "cos_tab");
     check(*sin_tab, torch::kFloat32, "sin_tab");
     check(*comp_state, torch::kFloat32, "comp_state");
-    check(*comp_state_row, torch::kInt32, "comp_state_row");
+    check(*comp_state_row, torch::kInt64, "comp_state_row");
     TORCH_CHECK(rows >= attention_batch && comp_norm->numel() == 512
                 && cos_tab->dim() == 2 && cos_tab->size(1) == 32
                 && sin_tab->sizes() == cos_tab->sizes()
@@ -270,7 +270,7 @@ static wuda_fp8_mqa::MainCompressorArgs make_compressor_args(
     args.cos_tab = cos_tab->data_ptr<float>();
     args.sin_tab = sin_tab->data_ptr<float>();
     args.state = comp_state->data_ptr<float>();
-    args.state_row = comp_state_row->data_ptr<int>();
+    args.state_row = comp_state_row->data_ptr<int64_t>();
     args.state_ring_entries = static_cast<int>(comp_state_ring_entries);
     args.seq_len = static_cast<uint32_t>(rows);
 
@@ -294,7 +294,7 @@ static wuda_fp8_mqa::MainCompressorArgs make_compressor_args(
         TORCH_CHECK(cmp_dst && cmp_entries_per_block > 0,
                     "cmp_cache requires cmp_dst and entries_per_block");
         check(*cmp_cache, torch::kUInt8, "cmp_cache");
-        check(*cmp_dst, torch::kInt32, "cmp_dst");
+        check(*cmp_dst, torch::kInt64, "cmp_dst");
         const int64_t payload = cmp_entries_per_block
             * (wuda_fp8_mqa::kM1TokenBodyBytes
                + wuda_fp8_mqa::kM1ScaleRecordBytes);
@@ -303,7 +303,7 @@ static wuda_fp8_mqa::MainCompressorArgs make_compressor_args(
                     && cmp_dst->numel() >= rows,
                     "invalid MAIN compressed-cache geometry");
         args.cmp_cache = cmp_cache->data_ptr<uint8_t>();
-        args.cmp_dst = cmp_dst->data_ptr<int>();
+        args.cmp_dst = cmp_dst->data_ptr<int64_t>();
         args.cmp_entries_per_block = static_cast<int>(cmp_entries_per_block);
         args.cmp_block_stride_bytes = static_cast<size_t>(cmp_block_stride_bytes);
     }

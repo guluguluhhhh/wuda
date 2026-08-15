@@ -32,13 +32,13 @@ struct MainCompressorArgs {
     const float* cos_tab = nullptr;
     const float* sin_tab = nullptr;
     const float* state = nullptr;
-    const int* state_row = nullptr;
+    const int64_t* state_row = nullptr;
     int state_ring_entries = 0;
     uint8_t* q8 = nullptr;
     float* s8 = nullptr;
     nv_bfloat16* rope = nullptr;
     uint8_t* cmp_cache = nullptr;
-    const int* cmp_dst = nullptr;
+    const int64_t* cmp_dst = nullptr;
     int cmp_entries_per_block = 0;
     size_t cmp_block_stride_bytes = 0;
     uint32_t seq_len = 0;
@@ -139,7 +139,7 @@ __device__ __forceinline__ void run_main_compressor_row(
     constexpr uint32_t kRatio = 4;
     __shared__ float ssq_smem[4];
 
-    const int state_row = comp.state_row[m];
+    const int64_t state_row = comp.state_row[m];
     if (state_row < 0)
         return;
     const int ring = comp.state_ring_entries;
@@ -234,7 +234,7 @@ __device__ __forceinline__ void run_main_compressor_row(
     int page_offset = 0;
     if (comp.cmp_cache != nullptr && comp.cmp_dst != nullptr
         && comp.cmp_dst[m] >= 0) {
-        const int destination = comp.cmp_dst[m];
+        const int64_t destination = comp.cmp_dst[m];
         page = comp.cmp_cache
             + static_cast<uint64_t>(destination / comp.cmp_entries_per_block)
                 * comp.cmp_block_stride_bytes;

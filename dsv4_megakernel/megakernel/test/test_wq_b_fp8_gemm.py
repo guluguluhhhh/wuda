@@ -526,7 +526,7 @@ def make_comp_inputs(M, dev, all_compress=False):
     pos = (torch.full((M,), 3, dtype=torch.int64, device=dev) if all_compress
            else torch.randint(3, 4000, (M,), dtype=torch.int64, device=dev))
     state = torch.randn(M, 8, 512, device=dev)
-    state_rows = (torch.arange(M, device=dev) * 8 + pos % 8).int()
+    state_rows = (torch.arange(M, device=dev) * 8 + pos % 8).long()
     return dict(
         cmp_pos=pos,
         _y4=torch.randn(M, 512, device=dev),
@@ -704,7 +704,7 @@ def test_rtp_paged_pool_writes(module, indexer_fp8=False):
     win = make_win_inputs(M, dev)
 
     block_ids = torch.arange(M + 1, 2 * M + 1, device=dev)
-    state_rows = (block_ids * 8 + pos % 8).int()
+    state_rows = (block_ids * 8 + pos % 8).long()
     idx_state = torch.randn((2 * M + 1) * 8, 512, device=dev)
     y4 = torch.randn(M, 512, device=dev)
     ape = torch.randn(4, 256, device=dev)
@@ -719,7 +719,7 @@ def test_rtp_paged_pool_writes(module, indexer_fp8=False):
     idx_stride = idx_epb * (idx_body + idx_scale) + 128
     idx_cache = torch.full((5, idx_stride), 0xA5, device=dev,
                            dtype=torch.uint8)
-    idx_dst = torch.full((M,), -1, device=dev, dtype=torch.int32)
+    idx_dst = torch.full((M,), -1, device=dev, dtype=torch.int64)
     idx_dst[0] = idx_epb + 63
     idx_dst[4] = 2 * idx_epb + 7
     idx_dst[7] = 3 * idx_epb + 19
@@ -732,7 +732,7 @@ def test_rtp_paged_pool_writes(module, indexer_fp8=False):
     swa_dst = torch.tensor([
         swa_epb + 3, 2 * swa_epb + 255, 3 * swa_epb + 64, -1,
         4 * swa_epb + 128, 5 * swa_epb + 7, 6 * swa_epb + 200,
-        7 * swa_epb + 1], device=dev, dtype=torch.int32)
+        7 * swa_epb + 1], device=dev, dtype=torch.int64)
 
     x = (torch.randn(M, K_DIM, device=dev) * 0.1).to(torch.float8_e4m3fn)
     w = (torch.randn(N_MERGED, K_DIM, device=dev) * 0.05).to(
@@ -911,6 +911,7 @@ if __name__ == '__main__':
     module = load_module(tpdp=args.tpdp)
     assert (module.n_main, module.n_index, module.n_merged) == \
         (N_TOTAL, N_IDX, N_MERGED), "Python/kernel WQB geometry mismatch"
+    assert module.slot_dtype_bits == 64, "FP8 CSA slot ABI must be int64"
 
     print("\nCorrectness (merged, non-trivial scales, arbitrary batch):")
     results = [test_merged(module, M)

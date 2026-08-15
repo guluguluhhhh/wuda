@@ -144,30 +144,33 @@ torch::Tensor run_op(
                   name, " must be contiguous CUDA fp32 with >= ", min_numel,
                   " elements");
     };
-    auto i32 = [m](const torch::Tensor& tensor, const char* name) {
+    auto slot_i64 = [m](const torch::Tensor& tensor, const char* name) {
       TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() &&
-                  tensor.scalar_type() == torch::kInt32 && tensor.numel() >= m,
-                  name, " must be contiguous CUDA int32 with >= M elements");
+                  tensor.scalar_type() == torch::kInt64 && tensor.numel() >= m,
+                  name, " must be contiguous CUDA int64 with >= M elements");
     };
     f32(*main_state_opt, 2048, "main_state");
     TORCH_CHECK(main_state_opt->size(-1) == 2048,
                 "main_state last dimension must be 2048");
     f32(*main_ape_opt, base::APE_RATIO * 1024, "main_ape");
-    i32(*main_state_row_opt, "main_state_row");
-    i32(*ape_phase_opt, "ape_phase");
+    slot_i64(*main_state_row_opt, "main_state_row");
+    TORCH_CHECK(ape_phase_opt->is_cuda() && ape_phase_opt->is_contiguous() &&
+                ape_phase_opt->scalar_type() == torch::kInt32 &&
+                ape_phase_opt->numel() >= m,
+                "ape_phase must be contiguous CUDA int32 with >= M elements");
     f32(*idx_state_opt, 512, "idx_state");
     TORCH_CHECK(idx_state_opt->size(-1) == 512,
                 "idx_state last dimension must be 512");
-    i32(*idx_state_row_opt, "idx_state_row");
+    slot_i64(*idx_state_row_opt, "idx_state_row");
     f32(*idx_ape_opt, base::APE_RATIO * 256, "idx_ape");
     f32(*win_y2_opt, static_cast<int64_t>(m) * 512, "win_y2");
     f32(*w64_opt, static_cast<int64_t>(m) * 64, "w64");
     emit.main_state = main_state_opt->data_ptr<float>();
     emit.main_ape = main_ape_opt->data_ptr<float>();
-    emit.main_state_row = main_state_row_opt->data_ptr<int>();
+    emit.main_state_row = main_state_row_opt->data_ptr<int64_t>();
     emit.ape_phase = ape_phase_opt->data_ptr<int>();
     emit.idx_state = idx_state_opt->data_ptr<float>();
-    emit.idx_state_row = idx_state_row_opt->data_ptr<int>();
+    emit.idx_state_row = idx_state_row_opt->data_ptr<int64_t>();
     emit.idx_ape = idx_ape_opt->data_ptr<float>();
     emit.win_y2 = win_y2_opt->data_ptr<float>();
     emit.w64 = w64_opt->data_ptr<float>();
