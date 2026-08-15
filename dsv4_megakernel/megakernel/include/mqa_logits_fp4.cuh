@@ -22,6 +22,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "query_rms_rope.cuh"
+#include "tp2_symmetric.cuh"
 
 // ============================================================
 // inlined from deep_gemm/common/compile.cuh
@@ -697,6 +698,11 @@ struct QueryRmsRopeArgs {
     int input_heads = 0;
     uint32_t output_rows = 0;
     float eps = 1e-6f;
+    wuda::tp2::SymmetricView symmetric_output;
+    nv_bfloat16* local_second_out = nullptr;
+    const uint32_t* comm_mode = nullptr;
+    uint32_t batch_total = 0;
+    uint32_t rank0_batch = 0;
     bool wait_primary = false;
 };
 
@@ -715,14 +721,42 @@ __device__ __forceinline__ void run_query_rms_rope(
         if (output_row >= query.output_rows)
             break;
 
-        const uint32_t batch = output_row >> 7;
-        const uint32_t output_head = output_row & 127u;
+        const bool tp2 = static_cast<bool>(query.symmetric_output);
+        const uint32_t batch = tp2
+            ? output_row / static_cast<uint32_t>(query.input_heads)
+            : output_row >> 7;
+        const uint32_t output_head = tp2
+            ? output_row % static_cast<uint32_t>(query.input_heads)
+            : output_row & 127u;
         const uint32_t input_head = output_head & (query.input_heads - 1);
         const uint32_t input_row = batch * query.input_heads + input_head;
         const uint4* input = reinterpret_cast<const uint4*>(
             query.x + static_cast<uint64_t>(input_row) * kHidden) + lane;
-        uint4* output = reinterpret_cast<uint4*>(
-            query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        uint4* output;
+        if (tp2) {
+            const uint32_t owner = batch >= query.rank0_batch;
+            const uint32_t owner_row = owner == 0
+                ? batch : batch - query.rank0_batch;
+            const uint32_t full_head =
+                query.symmetric_output.rank * 64 + input_head;
+            nv_bfloat16* destination;
+            if (owner == query.symmetric_output.rank) {
+                destination = query.out;
+            } else {
+                const bool remote = query.comm_mode == nullptr
+                    || *query.comm_mode >= 2;
+                destination = remote
+                    ? query.symmetric_output.peer_base<nv_bfloat16>()
+                    : query.local_second_out;
+            }
+            output = reinterpret_cast<uint4*>(
+                destination
+                + (static_cast<uint64_t>(owner_row) * 128 + full_head) * kHidden)
+                + lane;
+        } else {
+            output = reinterpret_cast<uint4*>(
+                query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        }
         uint4 values[kVecsPerThread];
         #pragma unroll
         for (int i = 0; i < kVecsPerThread; ++i)
