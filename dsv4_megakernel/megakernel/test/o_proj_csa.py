@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 from typing import Any, Iterator
 
@@ -68,15 +69,22 @@ HEADS = 128              # num_attention_heads
 TP2_HEADS = HEADS // 2
 HEAD_DIM = 512           # head_dim
 ROPE_DIM = 64            # qk_rope_head_dim
-NOPE_DIM = HEAD_DIM - ROPE_DIM
 N_GROUPS = 16            # o_groups
 TP2_GROUPS = N_GROUPS // 2
 O_LORA_RANK = 1024       # o_lora_rank
-O_INTERMEDIATE_DIM = N_GROUPS * O_LORA_RANK
 HIDDEN_DIM = 7168        # hidden_size
 QUANT_GROUP_SIZE = 128
 FP8_MAX = 448.0
 VALID_GEOMETRIES = ((HEADS, N_GROUPS), (TP2_HEADS, TP2_GROUPS))
+
+
+@triton.jit
+def _ceil_ue8m0_scale(amax, fp8_max: tl.constexpr):
+    bits = (amax / fp8_max).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0)
+    exponent = tl.maximum(1, tl.minimum(254, exponent))
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    return scale, exponent
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,31 @@ class OProjWorkspace:
     z_scale: torch.Tensor     # I32 [M,groups*2], MN-major
     projected: torch.Tensor   # BF16 full output or FP32 TP partial [M,7168]
     mhc_output: torch.Tensor  # BF16 [M,4,7168]
+    quant_module: Any
+
+
+def load_mla_o_quant_module() -> Any:
+    """Build the single-launch MLA inverse-RoPE and FP8 producer."""
+
+    from torch.utils.cpp_extension import load
+
+    root = Path(__file__).resolve().parents[1]
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    host_cxx = Path("/opt/rh/gcc-toolset-12/root/usr/bin/g++")
+    host_compiler_flag = ([f"-ccbin={host_cxx}"]
+                          if host_cxx.is_file() else [])
+    return load(
+        name="wuda_mla_o_inv_rope_quant",
+        sources=[str(root / "kernels/mla_o_inv_rope_quant.cu")],
+        extra_include_paths=[str(root / "include")],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=[
+            "-O3", "-std=c++17", "-lineinfo",
+            f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
+        ] + host_compiler_flag,
+        verbose=False,
+    )
 
 
 def _align(value: int, alignment: int) -> int:
@@ -163,90 +196,6 @@ def _validate_workspace_aliases(
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
-def _inv_rope_quant_kernel(
-    o_ptr,
-    positions_ptr,
-    cos_sin_ptr,
-    fp8_ptr,
-    scale_ptr,
-    num_tokens,
-    heads_per_group: tl.constexpr,
-    o_stride_token,
-    o_stride_head,
-    cache_stride_pos,
-    fp8_stride_group,
-    fp8_stride_token,
-    scale_stride_group,
-    scale_stride_k,
-    HEAD_DIM_T: tl.constexpr,
-    NOPE_DIM_T: tl.constexpr,
-    ROPE_DIM_T: tl.constexpr,
-    QUANT_GROUP_SIZE_T: tl.constexpr,
-    FP8_MAX_T: tl.constexpr,
-    TRIGGER_PDL: tl.constexpr,
-    launch_pdl: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    global_head = tl.program_id(1).to(tl.int64)
-    group = global_head // heads_per_group
-    head_in_group = global_head % heads_per_group
-    if TRIGGER_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-    if token >= num_tokens:
-        tl.store(
-            scale_ptr + group * scale_stride_group + token
-            + head_in_group * scale_stride_k,
-            tl.zeros((), dtype=tl.int32),
-        )
-        return
-
-    offsets = tl.arange(0, HEAD_DIM_T)
-    base = o_ptr + token * o_stride_token + global_head * o_stride_head
-    x = tl.load(base + offsets).to(tl.float32)
-
-    is_rope = offsets >= NOPE_DIM_T
-    rope_local = offsets - NOPE_DIM_T
-    partner = tl.load(base + (offsets ^ 1), mask=is_rope, other=0.0).to(tl.float32)
-    position = tl.load(positions_ptr + token)
-    cache = cos_sin_ptr + position * cache_stride_pos
-    pair = tl.maximum(rope_local >> 1, 0)
-    cos = tl.load(cache + pair, mask=is_rope, other=1.0)
-    sin = tl.load(cache + ROPE_DIM_T // 2 + pair, mask=is_rope, other=0.0)
-    even = x * cos + partner * sin
-    odd = x * cos - partner * sin
-    rotated = tl.where((rope_local & 1) == 0, even, odd)
-    x = tl.where(is_rope, rotated, x)
-    # Official apply_rotary_emb writes back into BF16 `o` before wo_a. Keep
-    # that model-dtype boundary in registers before DeepGEMM activation cast.
-    x = x.to(tl.bfloat16).to(tl.float32)
-
-    absolute = tl.reshape(tl.abs(x), (4, QUANT_GROUP_SIZE_T))
-    # Match official DeepGEMM per-token activation quantization exactly.
-    amax = tl.maximum(tl.max(absolute, axis=1), 1e-4)
-    scale = tl.math.exp2(tl.ceil(tl.log2(amax / FP8_MAX_T)))
-    expanded = tl.reshape(
-        tl.broadcast_to(tl.reshape(scale, (4, 1)), (4, QUANT_GROUP_SIZE_T)),
-        (HEAD_DIM_T,),
-    )
-    quantized = tl.clamp(x / expanded, -FP8_MAX_T, FP8_MAX_T).to(tl.float8e4nv)
-    fp8_base = (
-        fp8_ptr + group * fp8_stride_group + token * fp8_stride_token
-        + head_in_group * HEAD_DIM_T
-    )
-    tl.store(fp8_base + offsets, quantized)
-
-    exponent = (scale.to(tl.int32, bitcast=True) >> 23) & 0xFF
-    shifts = tl.arange(0, 4) * 8
-    packed = tl.sum(exponent << shifts)
-    tl.store(
-        scale_ptr + group * scale_stride_group + token
-        + head_in_group * scale_stride_k,
-        packed,
-    )
-
-
-@triton.jit(do_not_specialize=["num_tokens"])
 def _quant_o_lora_kernel(
     x_ptr,
     fp8_ptr,
@@ -272,14 +221,13 @@ def _quant_o_lora_kernel(
     x = tl.load(x_ptr + token * x_stride_token + offsets).to(tl.float32)
     absolute = tl.reshape(tl.abs(x), (4, QUANT_GROUP_SIZE_T))
     amax = tl.maximum(tl.max(absolute, axis=1), 1e-4)
-    scale = tl.math.exp2(tl.ceil(tl.log2(amax / FP8_MAX_T)))
+    scale, exponent = _ceil_ue8m0_scale(amax, FP8_MAX_T)
     expanded = tl.reshape(
         tl.broadcast_to(tl.reshape(scale, (4, 1)), (4, QUANT_GROUP_SIZE_T)),
         (512,),
     )
     quantized = tl.clamp(x / expanded, -FP8_MAX_T, FP8_MAX_T).to(tl.float8e4nv)
     tl.store(fp8_ptr + token * fp8_stride_token + offsets, quantized)
-    exponent = (scale.to(tl.int32, bitcast=True) >> 23) & 0xFF
     packed = tl.sum(exponent << (tl.arange(0, 4) * 8))
     tl.store(scale_ptr + token + packed_block * scale_stride_k, packed)
 
@@ -317,8 +265,10 @@ def prepare_o_proj_workspace(
     *,
     heads: int = HEADS,
     groups: int = N_GROUPS,
+    quant_module: Any,
 ) -> OProjWorkspace:
     _require(1 <= m <= 128, "O projection requires M in [1,128]")
+    _require(quant_module is not None, "MLA O-projection quant module is required")
     heads_per_group, intermediate_dim = _geometry(heads, groups)
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
@@ -361,6 +311,7 @@ def prepare_o_proj_workspace(
         mhc_output=torch.empty(
             (m, 4, HIDDEN_DIM), device=device, dtype=torch.bfloat16
         ),
+        quant_module=quant_module,
     )
 
 
@@ -483,42 +434,22 @@ def run_o_proj_mhc_post(
         ),
     )
 
-    # These two producer/consumer pairs did not show stable overlap in E2E
-    # traces. Keep them batch-independent and enable them only for the
-    # force-all ablation mode.
-    pdl_inv_to_wo_a = use_pdl and force_pdl
+    # This producer/consumer pair did not show stable overlap in E2E traces.
+    # Enable it only for the force-all ablation mode.
     pdl_quant_to_wo_b = use_pdl and force_pdl
 
     # Serialize the process-wide DeepGEMM PDL setting and all affected enqueues.
     assert device.index is not None
     with torch.cuda.device(device):
         with deepgemm_pdl_enqueue_scope(
-            deep_gemm, pdl_inv_to_wo_a, device.index
+            deep_gemm, False, device.index
         ):
-            _inv_rope_quant_kernel[(aligned_m, heads)](
+            workspace.quant_module.inv_rope_quant(
                 mla_out,
                 positions,
                 cos_sin_cache,
                 workspace.o_fp8,
                 workspace.o_scale,
-                m,
-                heads_per_group=heads_per_group,
-                o_stride_token=mla_out.stride(0),
-                o_stride_head=mla_out.stride(1),
-                cache_stride_pos=cos_sin_cache.stride(0),
-                fp8_stride_group=workspace.o_fp8.stride(1),
-                fp8_stride_token=workspace.o_fp8.stride(0),
-                scale_stride_group=workspace.o_scale.stride(1),
-                scale_stride_k=workspace.o_scale.stride(2),
-                HEAD_DIM_T=HEAD_DIM,
-                NOPE_DIM_T=NOPE_DIM,
-                ROPE_DIM_T=ROPE_DIM,
-                QUANT_GROUP_SIZE_T=QUANT_GROUP_SIZE,
-                FP8_MAX_T=FP8_MAX,
-                TRIGGER_PDL=pdl_inv_to_wo_a,
-                launch_pdl=False,
-                num_warps=1,
-                num_stages=1,
             )
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",

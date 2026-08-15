@@ -103,6 +103,7 @@ PDL_MODE = "on"
 Q_RMS_MAX_BLOCKS = 1024
 Q_RMS_ABLATION = False
 FUSE_QUERY_RMS = True
+MLA_O_QUANT_MODULE = None
 
 
 def configure_geometry(tpdp=False):
@@ -240,7 +241,8 @@ def oproj_ws(B):
     key = (B, oproj_heads(), local_o_groups())
     if key not in _OPROJ_WS:
         _OPROJ_WS[key] = o_proj_csa.prepare_o_proj_workspace(
-            B, DEV, heads=oproj_heads(), groups=local_o_groups())
+            B, DEV, heads=oproj_heads(), groups=local_o_groups(),
+            quant_module=MLA_O_QUANT_MODULE)
     return _OPROJ_WS[key]
 
 
@@ -1525,6 +1527,7 @@ def run_sim(mods, w, B=16, steps=8, seed=42, reuse_at=5):
 
 
 if __name__ == "__main__":
+    MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tpdp", action="store_true",
