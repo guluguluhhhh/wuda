@@ -1073,6 +1073,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         print(f"  {'B':<5}" + "".join(f"{c:>{col_width}}" for c in cols))
         print("  " + "-" * (5 + col_width * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
+    tp2_off_rows = []
+    tp2_perfetto_rows = []
     # Streaming twice the physical L2 capacity evicts prior layer data without
     # consuming the multi-GB headroom needed by the B128 paged KV pools.
     flush_buf = torch.empty((flush_bytes + 3) // 4,
@@ -1090,6 +1092,41 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         flush_buf.zero_()
         if drain:
             torch.cuda.synchronize()
+
+    def measure_eager_stage_chain(stage_functions, chain_fn, reps=30):
+        """Bucket eager-chain CUDA kernel time by the probed stage names."""
+        name2stage = {}
+        for stage_name, stage_fn in stage_functions:
+            for kernel_name in probe_kernel_names(stage_fn):
+                name2stage.setdefault(kernel_name, stage_name)
+        from torch.profiler import profile as profiler
+        from torch.profiler import ProfilerActivity
+        for _ in range(3):
+            flush_l2()
+            tp_host_barrier()
+            chain_fn()
+        torch.cuda.synchronize()
+        try:
+            profile_ctx = profiler(
+                activities=[ProfilerActivity.CUDA], acc_events=True)
+        except TypeError:
+            profile_ctx = profiler(activities=[ProfilerActivity.CUDA])
+        with profile_ctx as profile_result:
+            for _ in range(reps):
+                flush_l2()
+                tp_host_barrier()
+                chain_fn()
+                torch.cuda.synchronize()
+        accumulated = {name: 0.0 for name, _ in stage_functions}
+        for event in profile_result.events():
+            stage_name = name2stage.get(event.name[:80])
+            if stage_name is None:
+                continue
+            duration = getattr(event, "device_time", None)
+            if duration is None:
+                duration = getattr(event, "cuda_time", 0.0)
+            accumulated[stage_name] += duration
+        return [accumulated[name] / reps for name, _ in stage_functions]
 
     if batches is None:
         batches = (2, 16, 32, 48, 64, 80, 96, 112, 128)
@@ -1232,9 +1269,11 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         # PRODUCTION form: compact comp outputs omitted (cache direct write).
         def run_mqa_for(query_workspace, query_output):
             r = hold["r"]
-            if fused_query_rms() and INDEXER_FP8:
-                query_x = (r[0] if query_workspace is not None or not TPDP_MODE
+            if fused_query_rms():
+                query_x = (r[0]
+                           if query_workspace is not None or not TPDP_MODE
                            else r[0][owned])
+            if fused_query_rms() and INDEXER_FP8:
                 mq8m.mqa_logits_fp8_decode_out(
                     r[1][owned], mgr.idx_pool, r[2][owned],
                     nc[owned].view(-1, 1), idx_bt, fp8_schedule,
@@ -1738,6 +1777,10 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                     ows_no_comm.projected, hidden, post_b, comb_b,
                     ows_no_comm.mhc_output)
 
+            def run_oproj_post_no_comm():
+                run_oproj_no_comm()
+                run_mhcpost_no_comm()
+
             def chain_no_comm():
                 run_hc()
                 run_front()
@@ -1745,8 +1788,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                 run_mqa_no_comm()
                 run_topk_no_comm()
                 run_mla_no_comm()
-                run_oproj_no_comm()
-                run_mhcpost_no_comm()
+                run_oproj_post_no_comm()
 
             def chain_query_only():
                 run_hc()
@@ -1755,8 +1797,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                 run_mqa()
                 run_topk()
                 run_mla()
-                run_oproj_no_comm()
-                run_mhcpost_no_comm()
+                run_oproj_post_no_comm()
 
             def chain_oproj_only():
                 run_hc()
@@ -1789,16 +1830,28 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                 "oproj": oproj_only_g,
                 "on": comm_on_g,
             })
-            if TP_RANK == 0:
-                print(f"  B={B} TPDP static communication ablation (Perfetto): "
-                      f"off={perfetto['off']:.2f} us, "
-                      f"query={perfetto['query']:.2f} us, "
-                      f"oproj={perfetto['oproj']:.2f} us, "
-                      f"on={perfetto['on']:.2f} us, "
-                      f"delta={perfetto['on'] - perfetto['off']:+.2f} us")
-                print("    isolated deltas: "
-                      f"query={perfetto['query'] - perfetto['off']:+.2f} us, "
-                      f"oproj={perfetto['oproj'] - perfetto['off']:+.2f} us")
+
+            # The communication-off chain has no peer signal, wait, or remote
+            # access, so its eager Kineto buckets remain useful operator
+            # diagnostics.  O-proj and mHC post are separate kernels here and
+            # can therefore be reported independently.
+            off_stage_fns = [
+                ("mhc", run_hc),
+                ("front", run_front),
+                ("wq_b", run_wqb),
+                ("mqa", run_mqa_no_comm),
+                ("topk", run_topk_no_comm),
+                ("mla", run_mla_no_comm),
+                ("o_proj", run_oproj_no_comm),
+                ("mhc_post", run_mhcpost_no_comm),
+            ]
+            off_ts = measure_eager_stage_chain(
+                off_stage_fns, chain_no_comm)
+            rank_times = torch.tensor(
+                off_ts, device=DEV, dtype=torch.float64)
+            dist.all_reduce(rank_times, op=dist.ReduceOp.MAX)
+            tp2_off_rows.append((B, rank_times.tolist(), perfetto["off"]))
+            tp2_perfetto_rows.append((B, perfetto))
             del comm_on_g, no_comm_g, query_only_g, oproj_only_g, mgr
             torch.cuda.empty_cache()
             continue
@@ -1829,37 +1882,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         # Per-stage: bucket Kineto device time over 30 cold eager-chain iters.
         # Each bucket contains only that stage's kernel durations; summing
         # buckets still double-counts PDL and intra-stage overlap.
-        name2stage = {}
-        for sname, f in stage_fns:
-            for n in probe_kernel_names(f):
-                name2stage.setdefault(n, sname)
-        from torch.profiler import profile as _prof, ProfilerActivity
-        R = 30
-        for _ in range(3):
-            flush_l2()
-            tp_host_barrier()
-            chain()
-        torch.cuda.synchronize()
-        try:
-            pctx = _prof(activities=[ProfilerActivity.CUDA], acc_events=True)
-        except TypeError:
-            pctx = _prof(activities=[ProfilerActivity.CUDA])
-        with pctx as prof:
-            for _ in range(R):
-                flush_l2()
-                tp_host_barrier()
-                chain()
-                torch.cuda.synchronize()
-        acc = {sname: 0.0 for sname, _ in stage_fns}
-        for event in prof.events():
-            sname = name2stage.get(event.name[:80])
-            if sname is None:
-                continue
-            duration = getattr(event, "device_time", None)
-            if duration is None:
-                duration = getattr(event, "cuda_time", 0.0)
-            acc[sname] += duration
-        ts = [acc[sname] / R for sname, _ in stage_fns]
+        ts = measure_eager_stage_chain(stage_fns, chain)
         # (mhc chain-vs-solo diagnostic removed after the verdict: the
         # chain-solo gemm delta matched the hidden+hc_fn L2-refetch
         # bandwidth at every B -- real input refetch, not a timing bug.)
@@ -1869,6 +1892,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
         # ---- End-to-end: exact Perfetto GPU-kernel span -------------------
+        from torch.profiler import profile as _prof, ProfilerActivity
         t_perfetto = float("nan")
         g = None
         try:
@@ -1952,7 +1976,36 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         del mgr
         torch.cuda.empty_cache()
 
-    if Q_RMS_ABLATION or tp2_overhead_only or query_tp_overhead_only:
+    if tp2_overhead_only:
+        print("\n  Communication-off operator latency "
+              "(30 cold eager-chain Kineto means)")
+        print("  o_proj and mHC post are separate local stages; no symmetric "
+              "publication, peer wait, or reduction")
+        off_cols = ("mhc", "front", "wq_b", "mqa", "topk", "mla",
+                    "o_proj", "mhc_post", "stages", "perfetto")
+        print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in off_cols))
+        print("  " + "-" * (5 + 9 * len(off_cols)))
+        for B, off_ts, off_perfetto in tp2_off_rows:
+            print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in off_ts)
+                  + f"{sum(off_ts):>9.1f}{off_perfetto:>9.1f}")
+
+        print("\n  Static communication ablation (Perfetto)")
+        ablation_cols = ("off", "query", "oproj", "on", "on-off",
+                         "query-off", "oproj-off")
+        print(f"  {'B':<5}" + "".join(f"{c:>11}" for c in ablation_cols))
+        print("  " + "-" * (5 + 11 * len(ablation_cols)))
+        for B, perfetto in tp2_perfetto_rows:
+            absolute = (perfetto["off"], perfetto["query"],
+                        perfetto["oproj"], perfetto["on"])
+            deltas = (perfetto["on"] - perfetto["off"],
+                      perfetto["query"] - perfetto["off"],
+                      perfetto["oproj"] - perfetto["off"])
+            print(f"  {B:<5}" + "".join(f"{value:>11.2f}"
+                                         for value in absolute)
+                  + "".join(f"{value:>+11.2f}" for value in deltas))
+        return
+
+    if Q_RMS_ABLATION or query_tp_overhead_only:
         return
 
     # ---- Bandwidth table: per-operator traffic / stage time ------------
@@ -2092,6 +2145,9 @@ if __name__ == "__main__":
         "--bench-batches", default=None,
         help="comma-separated batch sizes for latency runs (default: full table)")
     parser.add_argument(
+        "--context-length", type=int, default=65536,
+        help="uncompressed context length for latency runs (default: 65536)")
+    parser.add_argument(
         "--q-rms-blocks", type=int, default=1024,
         help="persistent CTA cap for query RMSNorm+RoPE (default: 1024)")
     parser.add_argument(
@@ -2128,6 +2184,13 @@ if __name__ == "__main__":
             "--query-tp-overhead-only requires --tpdp --bench-only")
     if args.query_tp_overhead_only and args.tp2_overhead_only:
         parser.error("select only one TP2 communication ablation")
+    context_granularity = RATIO * PAGE
+    if (args.context_length <= 0
+            or args.context_length % context_granularity != 0):
+        parser.error(
+            f"--context-length must be a positive multiple of "
+            f"{context_granularity}")
+    bench_ncmp = args.context_length // RATIO
     bench_batches = (None if args.bench_batches is None else
                      tuple(int(x) for x in args.bench_batches.split(",")))
     print(f"Device: {torch.cuda.get_device_name()}"
@@ -2167,7 +2230,7 @@ if __name__ == "__main__":
     w = make_weights()
 
     if args.bench_only:
-        benchmark(mods, w, ncmp=16384, batches=bench_batches,
+        benchmark(mods, w, ncmp=bench_ncmp, batches=bench_batches,
                   tp2_overhead_only=args.tp2_overhead_only,
                   query_tp_overhead_only=args.query_tp_overhead_only)
         if dist.is_initialized():
@@ -2234,7 +2297,7 @@ if __name__ == "__main__":
         print(f"  [{'PASS' if passed else 'FAIL'}] {name:<28} = {val} ({cond})")
 
     if ok and not args.skip_bench:  # never bench on broken correctness
-        benchmark(mods, w, ncmp=16384, batches=bench_batches)  # 64k ctx
+        benchmark(mods, w, ncmp=bench_ncmp, batches=bench_batches)
 
     print("=" * 60)
     result_name = "TPDP TWO-RANK E2E" if args.tpdp else "E2E"
