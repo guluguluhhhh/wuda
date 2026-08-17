@@ -59,6 +59,9 @@ struct QueryRmsRopeArgs {
     nv_bfloat16* local_second_out = nullptr;
     // 0: local payload/no handshake, 1: local payload/handshake,
     // 2: peer payload/handshake. nullptr is the production peer mode.
+    // Ablation-only extensions: 3 dense-order local control (row r -> slot r
+    // of local_second_out, no handshake), 4 clustered local (one warp owns 16
+    // consecutive heads, no handshake), 5 clustered peer payload/handshake.
     const uint32_t* comm_mode = nullptr;
     uint32_t batch_total = 0;
     uint32_t rank0_batch = 0;
@@ -71,56 +74,15 @@ __device__ __forceinline__ void run_query_rms_rope(
         const QueryRmsRopeArgs& query, uint32_t* next, uint32_t lane) {
     using namespace wuda_query_rms_rope;
     const bool do_work = !kAblation || *query.work_flag != 0;
+    const bool tp2 = static_cast<bool>(query.symmetric_output);
+    // The mode is stable across one launch; read it once per claiming warp.
+    const uint32_t mode = query.comm_mode == nullptr ? 2u : *query.comm_mode;
+    const bool clustered = tp2 && mode >= 4u;
+    const bool remote_payload = mode == 2u || mode == 5u;
 
-    while (true) {
-        uint32_t item = 0;
-        if (lane == 0)
-            item = atomicAdd(next, 1u);
-        item = __shfl_sync(0xffffffffu, item, 0);
-        const uint32_t output_row = blockIdx.x + item * gridDim.x;
-        if (output_row >= query.output_rows)
-            break;
-        // MODEL1 FlashMLA always consumes 128 query heads. Both production
-        // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
-        // repeating runtime integer division/modulo in every lane of every row.
-        const bool tp2 = static_cast<bool>(query.symmetric_output);
-        const uint32_t batch = tp2
-            ? output_row / static_cast<uint32_t>(query.input_heads)
-            : output_row >> 7;
-        const uint32_t output_head = tp2
-            ? output_row % static_cast<uint32_t>(query.input_heads)
-            : output_row & 127u;
-        const uint32_t input_head = output_head & (query.input_heads - 1);
-        const uint32_t input_row = batch * query.input_heads + input_head;
-
-        if (!do_work)
-            continue;
+    auto process_row = [&](uint32_t input_row, uint32_t batch, uint4* output) {
         const uint4* input = reinterpret_cast<const uint4*>(
             query.x + static_cast<uint64_t>(input_row) * kHidden) + lane;
-        uint4* output;
-        if (tp2) {
-            const uint32_t owner = batch >= query.rank0_batch;
-            const uint32_t owner_row = owner == 0 ? batch : batch - query.rank0_batch;
-            const uint32_t full_head =
-                query.symmetric_output.rank * 64 + input_head;
-            nv_bfloat16* destination;
-            if (owner == query.symmetric_output.rank) {
-                destination = query.out;
-            } else {
-                const bool remote = query.comm_mode == nullptr
-                    || *query.comm_mode >= 2;
-                destination = remote
-                    ? query.symmetric_output.peer_base<nv_bfloat16>()
-                    : query.local_second_out;
-            }
-            output = reinterpret_cast<uint4*>(
-                destination
-                + (static_cast<uint64_t>(owner_row) * 128 + full_head) * kHidden)
-                + lane;
-        } else {
-            output = reinterpret_cast<uint4*>(
-                query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
-        }
         uint4 values[kVecsPerThread];
         #pragma unroll
         for (int i = 0; i < kVecsPerThread; ++i)
@@ -146,6 +108,101 @@ __device__ __forceinline__ void run_query_rms_rope(
                 values[1], scale, cos, sin, pair_base);
         } else
             output[kWarp] = scale_vec(values[1], scale);
+    };
+
+    while (true) {
+        uint32_t item = 0;
+        if (lane == 0)
+            item = atomicAdd(next, 1u);
+        item = __shfl_sync(0xffffffffu, item, 0);
+        if (clustered) {
+            // Clustered claim: one warp owns 16 consecutive heads of one
+            // batch, so its reads and its writes each form one contiguous
+            // 16KB run instead of 16 scattered 1KB rows.
+            constexpr uint32_t kClusterHeads = 16;
+            const uint32_t tasks_per_batch =
+                static_cast<uint32_t>(query.input_heads) / kClusterHeads;
+            const uint32_t task = blockIdx.x + item * gridDim.x;
+            if (task >= query.output_rows / kClusterHeads)
+                break;
+            if (!do_work)
+                continue;
+            const uint32_t batch = task / tasks_per_batch;
+            const uint32_t head_base = (task % tasks_per_batch) * kClusterHeads;
+            const uint32_t owner = batch >= query.rank0_batch;
+            const uint32_t owner_row =
+                owner == 0 ? batch : batch - query.rank0_batch;
+            nv_bfloat16* destination;
+            if (owner == query.symmetric_output.rank) {
+                destination = query.out;
+            } else {
+                destination = remote_payload
+                    ? query.symmetric_output.peer_base<nv_bfloat16>()
+                    : query.local_second_out;
+            }
+            const uint32_t full_head_base =
+                query.symmetric_output.rank * 64 + head_base;
+            #pragma unroll 1
+            for (uint32_t h = 0; h < kClusterHeads; ++h) {
+                const uint32_t input_row =
+                    batch * query.input_heads + head_base + h;
+                uint4* output = reinterpret_cast<uint4*>(
+                    destination
+                    + (static_cast<uint64_t>(owner_row) * 128
+                       + full_head_base + h) * kHidden) + lane;
+                process_row(input_row, batch, output);
+            }
+            continue;
+        }
+        const uint32_t output_row = blockIdx.x + item * gridDim.x;
+        if (output_row >= query.output_rows)
+            break;
+        // MODEL1 FlashMLA always consumes 128 query heads. Both production
+        // input geometries (TP=64 and full-rank=128) are powers of two, so avoid
+        // repeating runtime integer division/modulo in every lane of every row.
+        const uint32_t batch = tp2
+            ? output_row / static_cast<uint32_t>(query.input_heads)
+            : output_row >> 7;
+        const uint32_t output_head = tp2
+            ? output_row % static_cast<uint32_t>(query.input_heads)
+            : output_row & 127u;
+        const uint32_t input_head = output_head & (query.input_heads - 1);
+        const uint32_t input_row = batch * query.input_heads + input_head;
+
+        if (!do_work)
+            continue;
+        uint4* output;
+        if (tp2) {
+            if (mode == 3u) {
+                // Dense-order control: identical reads and volume, but row r
+                // lands in slot r of the plain benchmark buffer.
+                output = reinterpret_cast<uint4*>(
+                    query.local_second_out
+                    + static_cast<uint64_t>(output_row) * kHidden) + lane;
+            } else {
+                const uint32_t owner = batch >= query.rank0_batch;
+                const uint32_t owner_row =
+                    owner == 0 ? batch : batch - query.rank0_batch;
+                const uint32_t full_head =
+                    query.symmetric_output.rank * 64 + input_head;
+                nv_bfloat16* destination;
+                if (owner == query.symmetric_output.rank) {
+                    destination = query.out;
+                } else {
+                    destination = remote_payload
+                        ? query.symmetric_output.peer_base<nv_bfloat16>()
+                        : query.local_second_out;
+                }
+                output = reinterpret_cast<uint4*>(
+                    destination
+                    + (static_cast<uint64_t>(owner_row) * 128 + full_head)
+                        * kHidden) + lane;
+            }
+        } else {
+            output = reinterpret_cast<uint4*>(
+                query.out + static_cast<uint64_t>(output_row) * kHidden) + lane;
+        }
+        process_row(input_row, batch, output);
     }
 }
 
@@ -953,8 +1010,10 @@ void sm100_fp8_paged_mqa_logits_fused(
             tensor_map_sf_kv, tensor_map_weights, make_scheduler);
 
     if constexpr (kHasQuery) {
-        if (query.symmetric_output)
-            return;
+        // Attention warps that finished their primary role join the query
+        // queue in every geometry. The TP2 gather was previously excluded and
+        // left all 8192 rows to the four tail warps, which exposed the tail
+        // as the short-context critical path.
         wuda_fp8_mqa::run_query_rms_rope<kQueryAblation>(
             query, &query_next, lane);
     }

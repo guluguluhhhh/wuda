@@ -124,7 +124,12 @@ struct TopKLaunchParams {
 
 SGL_DEVICE void rendezvous_query_heads(const TopKLaunchParams& params) {
   if (params.query_generation == nullptr || threadIdx.x != 0) return;
-  if (params.query_comm_mode != nullptr && *params.query_comm_mode == 0) return;
+  if (params.query_comm_mode != nullptr) {
+    // 0 and the ablation-only local controls (3 dense, 4 clustered) publish
+    // nothing; only the handshake modes (1/2/5) advance the generation.
+    const uint32_t mode = *params.query_comm_mode;
+    if (mode == 0u || mode == 3u || mode == 4u) return;
+  }
   const auto* local_ready = params.query_signals.local<const uint32_t>();
   auto* peer_ready = params.query_signals.peer_base<uint32_t>();
   uint32_t current;
