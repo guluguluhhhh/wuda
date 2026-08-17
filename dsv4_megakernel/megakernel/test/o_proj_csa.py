@@ -146,10 +146,9 @@ class TP2Comm:
         self.mla_o_scale_peer_base = self.mla_o_scale_handle.get_buffer(
             rank ^ 1, self.mla_o_scale_base.shape, torch.int32)
         self.mla_grid_done = torch.zeros(1, device=device, dtype=torch.int64)
-        self.grid_done = torch.zeros(1, device=device, dtype=torch.int64)
-        self.generation = torch.zeros(1, device=device, dtype=torch.int32)
-        self.tile_generations = torch.zeros(
-            640, device=device, dtype=torch.int32)
+        # One CUDA-graph-safe generation counter per fused mHC-post CTA.
+        self.mhc_block_generations = torch.zeros(
+            128 * 4, device=device, dtype=torch.int32)
         self.benchmark_generation = torch.zeros(
             1, device=device, dtype=torch.int32
         )
@@ -645,9 +644,7 @@ def run_o_proj_mhc_post(
                     weights.wo_b,
                     weights.wo_b_scale,
                     tp2_comm.partials,
-                    tp2_comm.grid_done,
-                    tp2_comm.generation,
-                    tp2_comm.tile_generations,
+                    tp2_comm.mhc_block_generations,
                     tp2_comm.pointers,
                     tp2_comm.signal_pad_pointers,
                     workspace.projected,

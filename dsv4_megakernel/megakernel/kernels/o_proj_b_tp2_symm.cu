@@ -22,12 +22,9 @@ constexpr int kNumSMs = 148;
 constexpr int kClusterSize = 2;
 constexpr int kThreads = 256;
 constexpr int kDynamicSmemBytes = 230188;
-constexpr int kGridDoneElements =
-    deep_gemm::o_proj_b_tp2_symm::kGridDoneElements;
 constexpr int kValuesPerVector = 8;
 constexpr int kVectorsPerRow = kN / kValuesPerVector;
 constexpr int kBenchmarkReadyOffset = 16;
-constexpr int kSelectReadyOffset = 4;
 constexpr int kMhcReadyOffset = 64;
 constexpr uint64_t kBenchmarkEnqueueGraceNs = 1'000'000;
 
@@ -104,9 +101,7 @@ CUtensorMap make_scale_map(
       block_mn, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
 }
 
-template <uint32_t kLoadStages, uint32_t kStoreStages, uint32_t kBlockM,
-          bool kRuntimeSelect, bool kTilePublish,
-          bool kStoreSecondDestination, bool kVectorPeerStore>
+template <uint32_t kLoadStages, uint32_t kStoreStages, uint32_t kBlockM>
 auto kernel_ptr() {
   return &deep_gemm::o_proj_b_tp2_symm_impl<
       cute::UMMA::Major::K, cute::UMMA::Major::K,
@@ -119,10 +114,6 @@ auto kernel_ptr() {
       128, 128,
       2, true,
       kNumSMs,
-      kRuntimeSelect,
-      kTilePublish,
-      kStoreSecondDestination,
-      kVectorPeerStore,
       true, true,
       deep_gemm::GemmType::Normal, false,
       cutlass::float_e4m3_t, cutlass::float_e4m3_t, KernelDType,
@@ -155,13 +146,8 @@ __device__ __forceinline__ uint4 add_bf16x8(
       add_bf16x2(lhs.z, rhs.z), add_bf16x2(lhs.w, rhs.w)};
 }
 
-template <bool kReducePartials, bool kSelectMode = false,
-          bool kPeerOneShot = false, bool kPeerRankReady = false>
 __global__ void mhc_post_kernel(
     const __nv_bfloat16* partial0, const __nv_bfloat16* partial1,
-    const __nv_bfloat16* local_partial0,
-    const __nv_bfloat16* local_partial1,
-    const uint32_t* runtime_mode,
     uint32_t* block_generations,
     const uint32_t* local_ready,
     uint32_t* peer_ready,
@@ -173,39 +159,22 @@ __global__ void mhc_post_kernel(
 
   if (threadIdx.x < 4) mix[threadIdx.x] = post[row * 4 + threadIdx.x];
   if (threadIdx.x < 16) mix[4 + threadIdx.x] = comb[row * 16 + threadIdx.x];
-  if constexpr (kPeerRankReady) {
-    if (threadIdx.x == 0) {
-      using namespace deep_gemm::o_proj_b_tp2_symm;
-      const uint32_t expected = load_relaxed_gpu(block_generations);
-      const uint64_t wait_start = globaltimer();
-      uint32_t spins = 0;
-      uint32_t ready = load_relaxed_sys(local_ready);
-      while (ready < expected) {
-        spin_pause();
-        ready = load_relaxed_sys(local_ready);
-        check_spin_timeout(
-            wait_start, ++spins, "consumer", expected, ready, 0);
-      }
-      while (load_acquire_sys(local_ready) < expected) spin_pause();
-    }
-  } else if constexpr (kPeerOneShot) {
-    if (threadIdx.x == 0) {
-      const uint32_t cta = row * gridDim.x + blockIdx.x;
-      const uint32_t next = block_generations[cta] + 1;
-      // This is a start barrier: the preceding GEMM kernel boundary already
-      // completed the local partial, so no release fence is required here.
-      asm volatile("st.volatile.global.u32 [%0], %1;" ::
-                   "l"(peer_ready + kMhcReadyOffset + cta), "r"(next)
+  if (threadIdx.x == 0) {
+    const uint32_t cta = row * gridDim.x + blockIdx.x;
+    const uint32_t next = block_generations[cta] + 1;
+    // This is a start barrier: the preceding GEMM kernel boundary already
+    // completed the local partial, so no release fence is required here.
+    asm volatile("st.volatile.global.u32 [%0], %1;" ::
+                 "l"(peer_ready + kMhcReadyOffset + cta), "r"(next)
+                 : "memory");
+    uint32_t ready;
+    do {
+      asm volatile("ld.volatile.global.u32 %0, [%1];"
+                   : "=r"(ready)
+                   : "l"(local_ready + kMhcReadyOffset + cta)
                    : "memory");
-      uint32_t ready;
-      do {
-        asm volatile("ld.volatile.global.u32 %0, [%1];"
-                     : "=r"(ready)
-                     : "l"(local_ready + kMhcReadyOffset + cta)
-                     : "memory");
-      } while (ready != next);
-      block_generations[cta] = next;
-    }
+    } while (ready != next);
+    block_generations[cta] = next;
   }
   __syncthreads();
 
@@ -213,17 +182,11 @@ __global__ void mhc_post_kernel(
        vector < kVectorsPerRow;
        vector += static_cast<int>(gridDim.x) * blockDim.x) {
     const int dim = vector * kValuesPerVector;
-    const auto use_peer = !kSelectMode ||
-        deep_gemm::o_proj_b_tp2_symm::load_relaxed_gpu(runtime_mode) >= 2;
-    const auto* x0_base = use_peer ? partial0 : local_partial0;
-    const auto* x1_base = use_peer ? partial1 : local_partial1;
-    const auto* x0_ptr = x0_base + row * kN + dim;
-    uint4 x_bits = *reinterpret_cast<const uint4*>(x0_ptr);
-    if constexpr (kReducePartials) {
-      const auto* x1_ptr = x1_base + row * kN + dim;
-      x_bits = add_bf16x8(
-          x_bits, *reinterpret_cast<const uint4*>(x1_ptr));
-    }
+    const auto* x0_ptr = partial0 + row * kN + dim;
+    const auto* x1_ptr = partial1 + row * kN + dim;
+    uint4 x_bits = add_bf16x8(
+        *reinterpret_cast<const uint4*>(x0_ptr),
+        *reinterpret_cast<const uint4*>(x1_ptr));
 
     alignas(16) __nv_bfloat16 x[8];
     alignas(16) __nv_bfloat16 r[4][8];
@@ -253,127 +216,20 @@ __global__ void mhc_post_kernel(
   }
 }
 
-template <int kProducerBlockM>
-__global__ void tile_mhc_post_kernel(
-    const __nv_bfloat16* local_partial,
-    const __nv_bfloat16* peer_partial,
-    uint32_t* tile_generations,
-    const uint32_t* local_ready,
-    const __nv_bfloat16* residual,
-    const float* post,
-    const float* comb,
-    __nv_bfloat16* output,
-    int m,
-    uint32_t rank) {
-  __shared__ float mix[kProducerBlockM][20];
-  constexpr uint32_t kNumNBlocks = kN / kBlockN;
-  constexpr uint32_t kVectorsPerNBlock = kBlockN / kValuesPerVector;
-  const uint32_t n_block = blockIdx.x;
-  const uint32_t m_block = blockIdx.y;
-  const uint32_t row_begin = m_block * kProducerBlockM;
-  const uint32_t rows = min(
-      static_cast<uint32_t>(kProducerBlockM),
-      static_cast<uint32_t>(m) - row_begin);
-  const uint32_t post_tile_id = m_block * kNumNBlocks + n_block;
-  const uint32_t consumer_generation_idx =
-      deep_gemm::o_proj_b_tp2_symm::kMaxOutputTiles + post_tile_id;
-  const uint32_t expected =
-      deep_gemm::o_proj_b_tp2_symm::load_relaxed_gpu(
-          tile_generations + consumer_generation_idx) + 1;
-
-  for (uint32_t idx = threadIdx.x; idx < rows * 20; idx += blockDim.x) {
-    const uint32_t row_in_block = idx / 20;
-    const uint32_t coefficient = idx % 20;
-    const uint32_t row = row_begin + row_in_block;
-    mix[row_in_block][coefficient] = coefficient < 4
-        ? post[row * 4 + coefficient]
-        : comb[row * 16 + coefficient - 4];
-  }
-  __syncthreads();
-
-  if (threadIdx.x == 0) {
-    using namespace deep_gemm::o_proj_b_tp2_symm;
-    const uint32_t peer_rank = rank ^ 1u;
-    const uint64_t wait_start = globaltimer();
-    uint32_t spins = 0;
-    const uint32_t local_flag_idx =
-        kTileReadyOffset + rank * kMaxOutputTiles + post_tile_id;
-    const uint32_t peer_flag_idx =
-        kTileReadyOffset + peer_rank * kMaxOutputTiles + post_tile_id;
-    uint32_t local_flag = load_relaxed_sys(local_ready + local_flag_idx);
-    uint32_t peer_flag = load_relaxed_sys(local_ready + peer_flag_idx);
-    while (local_flag < expected || peer_flag < expected) {
-      spin_pause();
-      local_flag = load_relaxed_sys(local_ready + local_flag_idx);
-      peer_flag = load_relaxed_sys(local_ready + peer_flag_idx);
-      check_spin_timeout(
-          wait_start, ++spins, "tile-consumer", expected,
-          local_flag < expected ? local_flag : peer_flag, rank);
-    }
-    while (load_acquire_sys(local_ready + local_flag_idx) < expected ||
-           load_acquire_sys(local_ready + peer_flag_idx) < expected) {
-      spin_pause();
-    }
-  }
-  __syncthreads();
-
-  const uint32_t tile_vectors = rows * kVectorsPerNBlock;
-  for (uint32_t vector = threadIdx.x; vector < tile_vectors;
-       vector += blockDim.x) {
-    const uint32_t row_in_block = vector / kVectorsPerNBlock;
-    const uint32_t row = row_begin + row_in_block;
-    const uint32_t vector_in_row = vector % kVectorsPerNBlock;
-    const uint32_t dim =
-        n_block * kBlockN + vector_in_row * kValuesPerVector;
-    const uint32_t offset = row * kN + dim;
-    uint4 x_bits = add_bf16x8(
-        *reinterpret_cast<const uint4*>(local_partial + offset),
-        *reinterpret_cast<const uint4*>(peer_partial + offset));
-
-    alignas(16) __nv_bfloat16 x[8];
-    alignas(16) __nv_bfloat16 r[4][8];
-    *reinterpret_cast<uint4*>(x) = x_bits;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      *reinterpret_cast<uint4*>(r[i]) = *reinterpret_cast<const uint4*>(
-          residual + (row * 4 + i) * kN + dim);
-    }
-
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      alignas(16) __nv_bfloat16 out[8];
-#pragma unroll
-      for (int lane = 0; lane < 8; ++lane) {
-        float value = mix[row_in_block][j] * __bfloat162float(x[lane]);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          value = fmaf(
-              mix[row_in_block][4 + i * 4 + j],
-              __bfloat162float(r[i][lane]), value);
-        }
-        out[lane] = __float2bfloat16_rn(value);
-      }
-      *reinterpret_cast<uint4*>(
-          output + (row * 4 + j) * kN + dim) =
-          *reinterpret_cast<const uint4*>(out);
-    }
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    deep_gemm::o_proj_b_tp2_symm::store_relaxed_gpu(
-        tile_generations + consumer_generation_idx, expected);
-  }
-}
-
-void validate_mhc_common(
-    const torch::Tensor& residual,
+void validate_mhc_inputs(
+    const torch::Tensor& partials, const torch::Tensor& residual,
     const torch::Tensor& post, const torch::Tensor& comb,
     const torch::Tensor& output, int m) {
+  validate_tensor(partials, torch::kBFloat16, "partials");
   validate_tensor(residual, torch::kBFloat16, "residual");
   validate_tensor(post, torch::kFloat32, "post");
   validate_tensor(comb, torch::kFloat32, "comb");
   validate_tensor(output, torch::kBFloat16, "output");
   TORCH_CHECK(m >= 1 && m <= kMMax, "M must be in [1,128]");
+  TORCH_CHECK(partials.sizes() ==
+                  torch::IntArrayRef({2, kMMax, kN}) &&
+                  partials.is_contiguous(),
+              "partials must be contiguous BF16 [2,128,7168]");
   TORCH_CHECK(residual.sizes() == torch::IntArrayRef({m, 4, kN}) &&
                   residual.is_contiguous(),
               "residual must be contiguous BF16 [M,4,7168]");
@@ -388,66 +244,9 @@ void validate_mhc_common(
               "output must be contiguous BF16 [M,4,7168]");
 }
 
-void validate_mhc_inputs(
-    const torch::Tensor& partials, const torch::Tensor& residual,
-    const torch::Tensor& post, const torch::Tensor& comb,
-    const torch::Tensor& output, int m) {
-  validate_tensor(partials, torch::kBFloat16, "partials");
-  validate_mhc_common(residual, post, comb, output, m);
-  TORCH_CHECK(partials.sizes() ==
-                  torch::IntArrayRef({2, kMMax, kN}) &&
-                  partials.is_contiguous(),
-              "partials must be contiguous BF16 [2,128,7168]");
-}
-
-template <int kProducerBlockM>
-void launch_tile_mhc_post(
-    const __nv_bfloat16* local_partial,
-    const __nv_bfloat16* peer_partial,
-    uint32_t* tile_generations,
-    const uint32_t* local_ready,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int m,
-    uint32_t rank) {
-  auto* residual_ptr = reinterpret_cast<const __nv_bfloat16*>(
-      residual.data_ptr<at::BFloat16>());
-  auto* output_ptr = reinterpret_cast<__nv_bfloat16*>(
-      output.data_ptr<at::BFloat16>());
-  const float* post_ptr = post.data_ptr<float>();
-  const float* comb_ptr = comb.data_ptr<float>();
-  void* args[] = {
-      &local_partial, &peer_partial, &tile_generations, &local_ready,
-      &residual_ptr, &post_ptr, &comb_ptr, &output_ptr, &m, &rank};
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(
-      kN / kBlockN, (m + kProducerBlockM - 1) / kProducerBlockM, 1);
-  config.blockDim = dim3(kThreads, 1, 1);
-  config.dynamicSmemBytes = 0;
-  config.stream = at::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attribute{};
-  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute.val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = &attribute;
-  config.numAttrs = 1;
-  check_cuda(
-      cudaLaunchKernelExC(
-          &config,
-          reinterpret_cast<void*>(tile_mhc_post_kernel<kProducerBlockM>),
-          args),
-      "tile_mhc_post_kernel launch");
-}
-
-template <bool kReducePartials, bool kSelectMode = false,
-          bool kPeerOneShot = false, bool kPeerRankReady = false>
 void launch_mhc_post_impl(
     const __nv_bfloat16* partial0,
     const __nv_bfloat16* partial1,
-    const __nv_bfloat16* local_partial0,
-    const __nv_bfloat16* local_partial1,
-    const uint32_t* runtime_mode,
     uint32_t* block_generations,
     const uint32_t* local_ready,
     uint32_t* peer_ready,
@@ -467,327 +266,11 @@ void launch_mhc_post_impl(
       residual.data_ptr<at::BFloat16>());
   auto* output_ptr = reinterpret_cast<__nv_bfloat16*>(
       output.data_ptr<at::BFloat16>());
-  mhc_post_kernel<kReducePartials, kSelectMode, kPeerOneShot, kPeerRankReady>
-      <<<grid, block, 0, stream>>>(
-      partial0, partial1, local_partial0, local_partial1, runtime_mode,
-      block_generations, local_ready, peer_ready,
+  mhc_post_kernel<<<grid, block, 0, stream>>>(
+      partial0, partial1, block_generations, local_ready, peer_ready,
       residual_ptr, post.data_ptr<float>(),
       comb.data_ptr<float>(), output_ptr, m);
   check_cuda(cudaGetLastError(), "mhc_post_kernel launch");
-}
-
-void launch_mhc_post(
-    const torch::Tensor& partials, const torch::Tensor& residual,
-    const torch::Tensor& post, const torch::Tensor& comb,
-    const torch::Tensor& output) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  const auto* base = reinterpret_cast<const __nv_bfloat16*>(
-      partials.data_ptr<at::BFloat16>());
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* partial1 = base + kSlotStride;
-  launch_mhc_post_impl<true>(
-      base, partial1, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      residual, post, comb, output, m);
-}
-
-void launch_mhc_post_rank_ready(
-    const torch::Tensor& partials,
-    const torch::Tensor& generation,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int64_t rank) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  validate_tensor(generation, torch::kInt32, "generation");
-  TORCH_CHECK(generation.numel() == 1,
-              "generation must contain one INT32");
-  TORCH_CHECK(signal_pad_ptrs.size() == 2,
-              "exactly two signal-pad pointers required");
-  TORCH_CHECK(symmetric_ptrs.size() == 2,
-              "exactly two symmetric pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-
-  const auto partials_view = wuda::tp2::make_symmetric_view(
-      symmetric_ptrs, static_cast<uint32_t>(rank));
-  const auto signals = wuda::tp2::make_symmetric_view(
-      signal_pad_ptrs, static_cast<uint32_t>(rank));
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial =
-      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
-  const auto* peer_partial =
-      partials_view.peer_base<const __nv_bfloat16>() +
-      partials_view.peer_rank() * kSlotStride;
-  launch_mhc_post_impl<true, false, false, true>(
-      local_partial, peer_partial, nullptr, nullptr, nullptr,
-      reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>()),
-      signals.local<const uint32_t>(),
-      nullptr,
-      residual, post, comb, output, m);
-}
-
-void launch_mhc_post_one_shot(
-    const torch::Tensor& partials,
-    const torch::Tensor& block_generations,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int64_t rank) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  validate_tensor(block_generations, torch::kInt32, "block_generations");
-  TORCH_CHECK(block_generations.is_contiguous()
-                  && block_generations.numel() >= kNumSMs,
-              "block_generations must contain at least one int32 per SM");
-  TORCH_CHECK(symmetric_ptrs.size() == 2,
-              "exactly two symmetric pointers required");
-  TORCH_CHECK(signal_pad_ptrs.size() == 2,
-              "exactly two signal-pad pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-
-  const auto partials_view = wuda::tp2::make_symmetric_view(
-      symmetric_ptrs, static_cast<uint32_t>(rank));
-  const auto signals = wuda::tp2::make_symmetric_view(
-      signal_pad_ptrs, static_cast<uint32_t>(rank));
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial =
-      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
-  const auto* peer_partial =
-      partials_view.peer_base<const __nv_bfloat16>() +
-      partials_view.peer_rank() * kSlotStride;
-  launch_mhc_post_impl<true, false, true>(
-      local_partial, peer_partial, nullptr, nullptr, nullptr,
-      reinterpret_cast<uint32_t*>(block_generations.data_ptr<int>()),
-      signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
-      residual, post, comb, output, m);
-}
-
-void launch_mhc_post_peer(
-    const torch::Tensor& partials,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int64_t rank) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  TORCH_CHECK(symmetric_ptrs.size() == 2,
-              "exactly two symmetric pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-
-  const auto partials_view = wuda::tp2::make_symmetric_view(
-      symmetric_ptrs, static_cast<uint32_t>(rank));
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* local_partial =
-      partials_view.local<const __nv_bfloat16>() + rank * kSlotStride;
-  const auto* peer_partial =
-      partials_view.peer_base<const __nv_bfloat16>() +
-      partials_view.peer_rank() * kSlotStride;
-  launch_mhc_post_impl<true>(
-      local_partial, peer_partial, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      residual, post, comb, output, m);
-}
-
-void launch_peer_copy(
-    const torch::Tensor& partials,
-    const std::vector<int64_t>& symmetric_ptrs,
-    int64_t rank,
-    int64_t m) {
-  validate_tensor(partials, torch::kBFloat16, "partials");
-  TORCH_CHECK(partials.sizes() == torch::IntArrayRef({2, kMMax, kN})
-                  && partials.is_contiguous(),
-              "partials must be contiguous BF16 [2,128,7168]");
-  TORCH_CHECK(symmetric_ptrs.size() == 2,
-              "exactly two symmetric pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-  TORCH_CHECK(m >= 1 && m <= kMMax, "M must be in [1,128]");
-
-  const auto partials_view = wuda::tp2::make_symmetric_view(
-      symmetric_ptrs, static_cast<uint32_t>(rank));
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  auto* local_slot =
-      partials_view.local<__nv_bfloat16>() + rank * kSlotStride;
-  auto* peer_slot =
-      partials_view.peer_base<__nv_bfloat16>() + rank * kSlotStride;
-  const size_t bytes = static_cast<size_t>(m) * kN * sizeof(__nv_bfloat16);
-  check_cuda(
-      cudaMemcpyAsync(
-          peer_slot, local_slot, bytes, cudaMemcpyDeviceToDevice,
-          at::cuda::getCurrentCUDAStream()),
-      "cudaMemcpyAsync partial");
-}
-
-void launch_mhc_post_plain(
-    const torch::Tensor& reduced, const torch::Tensor& residual,
-    const torch::Tensor& post, const torch::Tensor& comb,
-    const torch::Tensor& output) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_tensor(reduced, torch::kBFloat16, "reduced");
-  TORCH_CHECK(reduced.sizes() == torch::IntArrayRef({m, kN}) &&
-                  reduced.is_contiguous(),
-              "reduced must be contiguous BF16 [M,7168]");
-  validate_mhc_common(residual, post, comb, output, m);
-  const auto* reduced_ptr = reinterpret_cast<const __nv_bfloat16*>(
-      reduced.data_ptr<at::BFloat16>());
-  launch_mhc_post_impl<false>(
-      reduced_ptr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      residual, post, comb, output, m);
-}
-
-void launch_mhc_post_local_benchmark(
-    const torch::Tensor& partials,
-    const torch::Tensor& local_second_output,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int64_t rank) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  validate_tensor(
-      local_second_output, torch::kBFloat16, "local_second_output");
-  TORCH_CHECK(
-      local_second_output.sizes() == torch::IntArrayRef({kMMax, kN}) &&
-          local_second_output.is_contiguous(),
-      "local_second_output must be contiguous BF16 [128,7168]");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* partials_base = reinterpret_cast<const __nv_bfloat16*>(
-      partials.data_ptr<at::BFloat16>());
-  const auto* local_partial = partials_base + rank * kSlotStride;
-  const auto* second_partial = reinterpret_cast<const __nv_bfloat16*>(
-      local_second_output.data_ptr<at::BFloat16>());
-  launch_mhc_post_impl<true>(
-      local_partial, second_partial, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      residual, post, comb, output, m);
-}
-
-void launch_mhc_post_select_benchmark(
-    const torch::Tensor& partials,
-    const torch::Tensor& local_second_output,
-    const torch::Tensor& runtime_mode,
-    const torch::Tensor& residual,
-    const torch::Tensor& post,
-    const torch::Tensor& comb,
-    const torch::Tensor& output,
-    int64_t rank) {
-  const int m = static_cast<int>(residual.size(0));
-  validate_mhc_inputs(partials, residual, post, comb, output, m);
-  validate_tensor(
-      local_second_output, torch::kBFloat16, "local_second_output");
-  validate_tensor(runtime_mode, torch::kInt32, "runtime_mode");
-  TORCH_CHECK(
-      local_second_output.sizes() == torch::IntArrayRef({kMMax, kN}) &&
-          local_second_output.is_contiguous(),
-      "local_second_output must be contiguous BF16 [128,7168]");
-  TORCH_CHECK(runtime_mode.numel() == 1,
-              "runtime_mode must contain one INT32");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-  constexpr int64_t kSlotStride = static_cast<int64_t>(kMMax) * kN;
-  const auto* base = reinterpret_cast<const __nv_bfloat16*>(
-      partials.data_ptr<at::BFloat16>());
-  const auto* local_partial = base + rank * kSlotStride;
-  const auto* local_second = reinterpret_cast<const __nv_bfloat16*>(
-      local_second_output.data_ptr<at::BFloat16>());
-  launch_mhc_post_impl<true, true>(
-      base, base + kSlotStride, local_partial, local_second,
-      reinterpret_cast<const uint32_t*>(runtime_mode.data_ptr<int32_t>()),
-      nullptr, nullptr, nullptr,
-      residual, post, comb, output, m);
-}
-
-template <bool kSelectMode>
-__global__ void peer_handshake_kernel(
-    uint32_t* generation, const uint32_t* local_ready, uint32_t* peer_ready,
-    const uint32_t* runtime_mode, uint32_t ready_offset, uint32_t rank) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  if constexpr (kSelectMode) {
-    if (deep_gemm::o_proj_b_tp2_symm::load_relaxed_gpu(runtime_mode) == 0)
-      return;
-  }
-
-  using namespace deep_gemm::o_proj_b_tp2_symm;
-  const uint32_t next = load_relaxed_gpu(generation) + 1;
-  // Start-barrier semantics match vLLM's one-stage custom all-reduce: the
-  // preceding producer kernel boundary already completed the partial.
-  asm volatile("st.volatile.global.u32 [%0], %1;" ::
-               "l"(peer_ready + ready_offset + rank), "r"(next)
-               : "memory");
-
-  const uint64_t wait_start = globaltimer();
-  uint32_t spins = 0;
-  const uint32_t peer_rank = rank ^ 1u;
-  uint32_t ready;
-  do {
-    asm volatile("ld.volatile.global.u32 %0, [%1];"
-                 : "=r"(ready)
-                 : "l"(local_ready + ready_offset + peer_rank)
-                 : "memory");
-    check_spin_timeout(wait_start, ++spins, "peer", next, ready, rank);
-  } while (ready != next);
-  store_relaxed_gpu(generation, next);
-}
-
-template <bool kSelectMode>
-void launch_peer_handshake_impl(
-    const torch::Tensor& generation,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank,
-    const torch::Tensor* runtime_mode,
-    uint32_t ready_offset) {
-  validate_tensor(generation, torch::kInt32, "generation");
-  TORCH_CHECK(generation.numel() == 1, "generation must contain one INT32");
-  TORCH_CHECK(signal_pad_ptrs.size() == 2,
-              "exactly two signal-pad pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
-  const uint32_t* mode_ptr = nullptr;
-  if constexpr (kSelectMode) {
-    TORCH_CHECK(runtime_mode != nullptr, "select handshake requires mode");
-    validate_tensor(*runtime_mode, torch::kInt32, "runtime_mode");
-    TORCH_CHECK(runtime_mode->numel() == 1,
-                "runtime_mode must contain one INT32");
-    mode_ptr = reinterpret_cast<const uint32_t*>(
-        runtime_mode->data_ptr<int32_t>());
-  }
-
-  const auto signals = wuda::tp2::make_symmetric_view(
-      signal_pad_ptrs, static_cast<uint32_t>(rank));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  peer_handshake_kernel<kSelectMode><<<1, 1, 0, stream>>>(
-      reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>()),
-      signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
-      mode_ptr, ready_offset, signals.rank);
-  check_cuda(cudaGetLastError(), "peer_handshake_kernel launch");
-}
-
-void launch_peer_handshake(
-    const torch::Tensor& generation,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank) {
-  launch_peer_handshake_impl<false>(
-      generation, signal_pad_ptrs, rank, nullptr, 0);
-}
-
-void launch_peer_handshake_select(
-    const torch::Tensor& generation,
-    const torch::Tensor& runtime_mode,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank) {
-  launch_peer_handshake_impl<true>(
-      generation, signal_pad_ptrs, rank, &runtime_mode,
-      kSelectReadyOffset);
 }
 
 __global__ void benchmark_barrier_kernel(
@@ -840,31 +323,17 @@ void launch_benchmark_barrier(
   check_cuda(cudaGetLastError(), "benchmark_barrier_kernel launch");
 }
 
-template <uint32_t kLoadStages, uint32_t kStoreStages, uint32_t kBlockM,
-          bool kRuntimeSelect, bool kTilePublish,
-          bool kStoreSecondDestination, bool kVectorPeerStore>
+template <uint32_t kLoadStages, uint32_t kStoreStages, uint32_t kBlockM>
 void launch_impl(
     const torch::Tensor& a, const torch::Tensor& sfa,
     const torch::Tensor& b, const torch::Tensor& sfb,
-    const torch::Tensor& symmetric_partials,
-    const torch::Tensor& grid_done,
-    const torch::Tensor& generation,
     const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
     int64_t rank,
-    bool static_use_peer,
-    void* local_second_destination,
-    const uint32_t* runtime_mode,
-    uint32_t ready_offset,
-    uint32_t* tile_generations,
-    bool common_local_slot) {
+    void* local_destination) {
   validate_tensor(a, torch::kFloat8_e4m3fn, "a");
   validate_tensor(sfa, torch::kInt32, "sfa");
   validate_tensor(b, torch::kFloat8_e4m3fn, "b");
   validate_tensor(sfb, torch::kInt32, "sfb");
-  validate_tensor(symmetric_partials, torch::kBFloat16, "symmetric_partials");
-  validate_tensor(grid_done, torch::kInt64, "grid_done");
-  validate_tensor(generation, torch::kInt32, "generation");
 
   TORCH_CHECK(a.dim() == 2 && a.size(1) == kK, "a must be [M,8192]");
   const int m = static_cast<int>(a.size(0));
@@ -878,20 +347,6 @@ void launch_impl(
   TORCH_CHECK(sfb.dim() == 2 && sfb.size(0) == kN && sfb.size(1) == 16 &&
                   sfb.stride(0) == 1 && sfb.stride(1) == kN,
               "sfb must be DeepGEMM MN-major INT32 [7168,16]");
-  TORCH_CHECK(symmetric_partials.dim() == 3 &&
-                  symmetric_partials.size(0) == 2 &&
-                  symmetric_partials.size(1) == kMMax &&
-                  symmetric_partials.size(2) == kN &&
-                  symmetric_partials.is_contiguous(),
-              "symmetric_partials must be contiguous BF16 [2,128,7168]");
-  TORCH_CHECK(
-      grid_done.numel() == kGridDoneElements && generation.numel() == 1,
-      "grid_done must contain ", kGridDoneElements,
-      " INT64 values and generation one INT32");
-  TORCH_CHECK(symmetric_ptrs.size() == 2, "exactly two symmetric pointers required");
-  TORCH_CHECK(signal_pad_ptrs.size() == 2,
-              "exactly two signal-pad pointers required");
-  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
 
   const CUtensorMap tensor_map_a = make_a_map<kBlockM>(a, m);
   const CUtensorMap tensor_map_b = make_b_map(b);
@@ -899,45 +354,25 @@ void launch_impl(
   const CUtensorMap tensor_map_sfb = make_scale_map(sfb, kN, kBlockN);
   const auto partials_view = wuda::tp2::make_symmetric_view(
       symmetric_ptrs, static_cast<uint32_t>(rank));
-  const auto signals = wuda::tp2::make_symmetric_view(
-      signal_pad_ptrs, static_cast<uint32_t>(rank));
   constexpr int64_t kSlotElements =
       static_cast<int64_t>(kMMax) * kN;
-  auto* local_slot = partials_view.local<KernelDType>() +
-                     (common_local_slot ? 0 : rank) * kSlotElements;
-  if constexpr (kVectorPeerStore) {
-    TORCH_CHECK(local_second_destination != nullptr,
-                "vector-store epilogue requires a local TMA destination");
-    local_slot = reinterpret_cast<KernelDType*>(local_second_destination);
-  }
-  auto* local_second_slot = local_second_destination == nullptr
-      ? local_slot
-      : reinterpret_cast<KernelDType*>(local_second_destination);
+  // The local partial stays outside the symmetric buffer: only the peer's copy
+  // travels, and it lands in this rank's slot of the peer's allocation.
+  auto* local_slot = reinterpret_cast<KernelDType*>(local_destination);
   auto* peer_slot = partials_view.peer_base<KernelDType>() +
                     rank * kSlotElements;
-  auto* vector_store_slot = kVectorPeerStore ? peer_slot : nullptr;
   const CUtensorMap tensor_map_local_cd = make_output_map(local_slot, m);
-  const CUtensorMap tensor_map_local_second_cd =
-      make_output_map(local_second_slot, m);
-  const CUtensorMap tensor_map_peer_cd = make_output_map(peer_slot, m);
 
-  auto kernel = kernel_ptr<
-      kLoadStages, kStoreStages, kBlockM, kRuntimeSelect, kTilePublish,
-      kStoreSecondDestination, kVectorPeerStore>();
+  auto kernel = kernel_ptr<kLoadStages, kStoreStages, kBlockM>();
   check_cuda(
       cudaFuncSetAttribute(
           kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
           kDynamicSmemBytes),
       "cudaFuncSetAttribute");
 
-  auto* grid_done_ptr = reinterpret_cast<uint64_t*>(grid_done.data_ptr<int64_t>());
-  auto* generation_ptr = reinterpret_cast<uint32_t*>(generation.data_ptr<int32_t>());
-  auto* local_ready = signals.local<uint32_t>();
-  auto* peer_ready = signals.peer_base<uint32_t>();
   uint32_t shape_m = static_cast<uint32_t>(m);
   uint32_t shape_n = kN;
   uint32_t shape_k = kK;
-  uint32_t rank_u32 = partials_view.rank;
   int* grouped_layout = nullptr;
 
   void* args[] = {
@@ -947,11 +382,7 @@ void launch_impl(
       const_cast<CUtensorMap*>(&tensor_map_sfa),
       const_cast<CUtensorMap*>(&tensor_map_sfb),
       const_cast<CUtensorMap*>(&tensor_map_local_cd),
-      const_cast<CUtensorMap*>(&tensor_map_local_second_cd),
-      const_cast<CUtensorMap*>(&tensor_map_peer_cd),
-      &grid_done_ptr, &generation_ptr, &local_ready, &peer_ready,
-      &rank_u32, &runtime_mode, &static_use_peer, &ready_offset,
-      &tile_generations, &vector_store_slot};
+      &peer_slot};
 
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(kNumSMs, 1, 1);
@@ -972,48 +403,11 @@ void launch_impl(
       "cudaLaunchKernelExC");
 }
 
-template <bool kRuntimeSelect, bool kTilePublish = false,
-          bool kStoreSecondDestination = true,
-          bool kVectorPeerStore = false>
-void launch_mode(
-    const torch::Tensor& a, const torch::Tensor& sfa,
-    const torch::Tensor& b, const torch::Tensor& sfb,
-    const torch::Tensor& symmetric_partials,
-    const torch::Tensor& grid_done,
-    const torch::Tensor& generation,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank,
-    bool static_use_peer,
-    void* local_second_destination,
-    const uint32_t* runtime_mode,
-    uint32_t ready_offset,
-    uint32_t* tile_generations = nullptr,
-    bool common_local_slot = false) {
-  if (a.size(0) <= 32) {
-    launch_impl<12, 2, 16, kRuntimeSelect, kTilePublish,
-                kStoreSecondDestination, kVectorPeerStore>(
-        a, sfa, b, sfb, symmetric_partials, grid_done, generation,
-        symmetric_ptrs, signal_pad_ptrs, rank,
-        static_use_peer, local_second_destination, runtime_mode, ready_offset,
-        tile_generations, common_local_slot);
-  } else {
-    launch_impl<10, 2, 64, kRuntimeSelect, kTilePublish,
-                kStoreSecondDestination, kVectorPeerStore>(
-        a, sfa, b, sfb, symmetric_partials, grid_done, generation,
-        symmetric_ptrs, signal_pad_ptrs, rank,
-        static_use_peer, local_second_destination, runtime_mode, ready_offset,
-        tile_generations, common_local_slot);
-  }
-}
-
 void launch(
     const torch::Tensor& a, const torch::Tensor& sfa,
     const torch::Tensor& b, const torch::Tensor& sfb,
     const torch::Tensor& symmetric_partials,
-    const torch::Tensor& grid_done,
-    const torch::Tensor& generation,
-    const torch::Tensor& tile_generations,
+    const torch::Tensor& block_generations,
     const std::vector<int64_t>& symmetric_ptrs,
     const std::vector<int64_t>& signal_pad_ptrs,
     const torch::Tensor& local_projected,
@@ -1025,11 +419,11 @@ void launch(
   const int m = static_cast<int>(a.size(0));
   validate_mhc_inputs(
       symmetric_partials, residual, post, comb, output, m);
-  validate_tensor(tile_generations, torch::kInt32, "tile_generations");
+  validate_tensor(block_generations, torch::kInt32, "block_generations");
   TORCH_CHECK(
-      tile_generations.is_contiguous() &&
-          tile_generations.numel() >= kMMax * 4,
-      "tile_generations must contain one generation per mHC CTA");
+      block_generations.is_contiguous() &&
+          block_generations.numel() >= kMMax * 4,
+      "block_generations must contain one generation per mHC CTA");
   TORCH_CHECK(symmetric_ptrs.size() == 2,
               "exactly two symmetric pointers required");
   TORCH_CHECK(signal_pad_ptrs.size() == 2,
@@ -1039,83 +433,32 @@ void launch(
   TORCH_CHECK(local_projected.sizes() == torch::IntArrayRef({m, kN}) &&
                   local_projected.is_contiguous(),
               "local_projected must be contiguous BF16 [M,7168]");
-  auto* tile_generation_ptr = reinterpret_cast<uint32_t*>(
-      tile_generations.data_ptr<int32_t>());
+  auto* block_generation_ptr = reinterpret_cast<uint32_t*>(
+      block_generations.data_ptr<int32_t>());
   const auto partials_view = wuda::tp2::make_symmetric_view(
       symmetric_ptrs, static_cast<uint32_t>(rank));
   const auto signals = wuda::tp2::make_symmetric_view(
       signal_pad_ptrs, static_cast<uint32_t>(rank));
-  launch_mode<false, false, false, true>(
-      a, sfa, b, sfb, symmetric_partials, grid_done, generation,
-      symmetric_ptrs, signal_pad_ptrs, rank, false,
-      local_projected.data_ptr<at::BFloat16>(), nullptr, 0,
-      tile_generation_ptr, false);
+  if (m <= 32) {
+    launch_impl<12, 2, 16>(
+        a, sfa, b, sfb, symmetric_ptrs, rank,
+        local_projected.data_ptr<at::BFloat16>());
+  } else {
+    launch_impl<10, 2, 64>(
+        a, sfa, b, sfb, symmetric_ptrs, rank,
+        local_projected.data_ptr<at::BFloat16>());
+  }
   const auto* local_partial = reinterpret_cast<const __nv_bfloat16*>(
       local_projected.data_ptr<at::BFloat16>());
   constexpr int64_t kSlotElements = static_cast<int64_t>(kMMax) * kN;
   const auto* peer_partial =
       partials_view.local<const __nv_bfloat16>() +
       partials_view.peer_rank() * kSlotElements;
-  launch_mhc_post_impl<true, false, true>(
+  launch_mhc_post_impl(
       local_partial, peer_partial,
-      nullptr, nullptr, nullptr,
-      tile_generation_ptr,
+      block_generation_ptr,
       signals.local<const uint32_t>(), signals.peer_base<uint32_t>(),
       residual, post, comb, output, m);
-}
-
-void launch_local_benchmark(
-    const torch::Tensor& a, const torch::Tensor& sfa,
-    const torch::Tensor& b, const torch::Tensor& sfb,
-    const torch::Tensor& symmetric_partials,
-    const torch::Tensor& local_second_output,
-    const torch::Tensor& grid_done,
-    const torch::Tensor& generation,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank) {
-  validate_tensor(
-      local_second_output, torch::kBFloat16, "local_second_output");
-  TORCH_CHECK(
-      local_second_output.sizes() == torch::IntArrayRef({kMMax, kN}) &&
-          local_second_output.is_contiguous(),
-      "local_second_output must be contiguous BF16 [128,7168]");
-  constexpr uint32_t kLocalBenchmarkReadyOffset = 2;
-  launch_mode<false>(
-      a, sfa, b, sfb, symmetric_partials, grid_done, generation,
-      symmetric_ptrs, signal_pad_ptrs, rank, false,
-      local_second_output.data_ptr<at::BFloat16>(),
-      nullptr,
-      kLocalBenchmarkReadyOffset);
-}
-
-void launch_select_benchmark(
-    const torch::Tensor& a, const torch::Tensor& sfa,
-    const torch::Tensor& b, const torch::Tensor& sfb,
-    const torch::Tensor& symmetric_partials,
-    const torch::Tensor& local_second_output,
-    const torch::Tensor& grid_done,
-    const torch::Tensor& generation,
-    const torch::Tensor& runtime_mode,
-    const std::vector<int64_t>& symmetric_ptrs,
-    const std::vector<int64_t>& signal_pad_ptrs,
-    int64_t rank) {
-  validate_tensor(
-      local_second_output, torch::kBFloat16, "local_second_output");
-  validate_tensor(runtime_mode, torch::kInt32, "runtime_mode");
-  TORCH_CHECK(
-      local_second_output.sizes() == torch::IntArrayRef({kMMax, kN}) &&
-          local_second_output.is_contiguous(),
-      "local_second_output must be contiguous BF16 [128,7168]");
-  TORCH_CHECK(runtime_mode.numel() == 1,
-              "runtime_mode must contain one INT32");
-  constexpr uint32_t kSelectBenchmarkReadyOffset = 4;
-  launch_mode<true>(
-      a, sfa, b, sfb, symmetric_partials, grid_done, generation,
-      symmetric_ptrs, signal_pad_ptrs, rank, true,
-      local_second_output.data_ptr<at::BFloat16>(),
-      reinterpret_cast<const uint32_t*>(runtime_mode.data_ptr<int32_t>()),
-      kSelectBenchmarkReadyOffset);
 }
 
 }  // namespace
@@ -1124,42 +467,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "o_proj_b", &launch,
       "TP2 local O-proj B with vector peer publication and fused mHC post");
-  m.def(
-      "o_proj_b_local", &launch_local_benchmark,
-      "Benchmark-only O-proj B with two local destinations");
-  m.def(
-      "o_proj_b_select", &launch_select_benchmark,
-      "Benchmark-only O-proj B with device-selected second destination");
-  m.def(
-      "mhc_post", &launch_mhc_post,
-      "mHC post with fused BF16 pairwise reduction");
-  m.def(
-      "mhc_post_rank_ready", &launch_mhc_post_rank_ready,
-      "TP2 mHC post with producer-published rank readiness");
-  m.def(
-      "mhc_post_one_shot", &launch_mhc_post_one_shot,
-      "TP2 one-shot peer reduction fused into mHC post");
-  m.def(
-      "mhc_post_peer", &launch_mhc_post_peer,
-      "TP2 peer reduction in the full-grid mHC post");
-  m.def(
-      "copy_partial_peer", &launch_peer_copy,
-      "TP2 copy-engine partial push");
-  m.def(
-      "mhc_post_plain", &launch_mhc_post_plain,
-      "Benchmark-only mHC post over a pre-reduced input");
-  m.def(
-      "mhc_post_local", &launch_mhc_post_local_benchmark,
-      "Benchmark-only fused mHC post over two local partials");
-  m.def(
-      "mhc_post_select", &launch_mhc_post_select_benchmark,
-      "Benchmark-only off/signal/peer fused mHC post");
-  m.def(
-      "peer_handshake", &launch_peer_handshake,
-      "TP2 producer-completion peer barrier");
-  m.def(
-      "peer_handshake_select", &launch_peer_handshake_select,
-      "Benchmark-only peer barrier selector");
   m.def(
       "benchmark_barrier", &launch_benchmark_barrier,
       "Excluded TP2 device rendezvous for paired benchmarks");
