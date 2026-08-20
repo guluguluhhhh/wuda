@@ -245,3 +245,123 @@ softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免�
 ## Benchmark
 
 见 [bench.cu](../flash_attention/bench.cu)。正确性对 fp32 CPU 参考实现验证；性能测试配置 `B=1, H=32, D=128`，`N ∈ {512, 1024, 2048, 4096, 8192}`，指标 `TFLOPS = 4·B·H·N²·D / time`（QK 与 PV 各贡献 `2·B·H·N²·D`）。三个 kernel（`fa_v1` / `fa_v2` / `fa_perf`）同表对比，可直接编译运行复现每一步优化的增量收益。
+
+---
+
+## 面试手撕：Python 参考实现
+
+算法/通用岗的手撕首选。目标不是性能，而是把 **online softmax 的递推** 写对、能逐行解释。分块版就是 §2 FA2 的算法（延迟归一化）：
+
+```python
+import numpy as np
+
+def flash_attention(Q, K, V, Bc, causal=False):   # Q,K,V: [N, D]
+    N, D = Q.shape
+    scale = 1.0 / np.sqrt(D)
+    O = np.zeros((N, D))
+    m = np.full(N, -np.inf)              # running max, per row
+    l = np.zeros(N)                      # running sum, per row
+    for j in range(0, N, Bc):            # 遍历 KV 分块
+        Kj, Vj = K[j:j+Bc], V[j:j+Bc]
+        S = Q @ Kj.T * scale             # [N, Bc]，不落 HBM
+        if causal:                       # 只看 j..j+Bc 列：行 i 不能看未来
+            col = j + np.arange(S.shape[1])
+            S = np.where(np.arange(N)[:, None] >= col[None, :], S, -np.inf)
+        m_new = np.maximum(m, S.max(axis=1))     # 更新行最大
+        P = np.exp(S - m_new[:, None])           # 用新 max 重算本块概率
+        alpha = np.exp(m - m_new)                # 旧统计的修正因子
+        l = alpha * l + P.sum(axis=1)            # 修正旧和后累加
+        O = alpha[:, None] * O + P @ Vj          # 修正旧输出后累加
+        m = m_new
+    return O / l[:, None]                # 末尾一次性归一化
+
+# 验证：与直接 softmax 结果一致
+def ref(Q, K, V):
+    S = Q @ K.T / np.sqrt(Q.shape[1])
+    P = np.exp(S - S.max(1, keepdims=True))
+    return (P / P.sum(1, keepdims=True)) @ V
+
+Q, K, V = np.random.randn(3, 128, 64)
+assert np.allclose(flash_attention(Q, K, V, Bc=32), ref(Q, K, V), atol=1e-5)
+```
+
+口述要点（写完必说）：**减 max 防 exp 溢出**；`alpha` 是旧输出的追溯修正因子；S/P 不物化，HBM 从 $O(N^2)$ 降到 $O(ND)$。
+
+---
+
+## 面试手撕：CUDA 伪代码（FA2 基线）
+
+kernel 岗的手撕目标：写出 **循环骨架 + online softmax 用 shuffle 归约 + O 常驻不落 HBM**。Tensor Core / cp.async / bank conflict 那些（§3.x）留给追问，不写进骨架。
+
+```cpp
+// grid = (N/Br, B*H)：一个 block 独占一个 Q 行块，完全独立 → 沿序列维并行
+// block = Br 行 × （每行一组线程）；O/m/l 常驻片上
+template<int Br, int Bc, int D>
+__global__ void flash_attn(const half* Q, const half* K, const half* V,
+                           half* O, int N, float scale) {
+    int qblk = blockIdx.x, head = blockIdx.y;
+    int row  = threadIdx.y;                  // 本线程负责的 Q 行（0..Br-1）
+    int lane = threadIdx.x;                   // 行内协作归约的 lane
+
+    __shared__ half smemK[Bc][D], smemV[Bc][D], smemS[Br][Bc];
+
+    // Q 行常驻寄存器：整个 KV 循环不变，只读一次
+    float q[D];
+    load_q_row(Q, head, qblk, row, q);
+
+    float acc[D] = {0};                       // O 行，常驻寄存器，全程不落 HBM
+    float m = -INFINITY, l = 0.f;             // running max / sum
+
+    for (int j = 0; j < N; j += Bc) {         // 遍历 KV 分块
+        load_tile(K + kv_off(head,j), smemK); // GMEM → smem
+        load_tile(V + kv_off(head,j), smemV);
+        __syncthreads();
+
+        // 1) S = q · K^T · scale（本行 vs Bc 列）
+        for (int c = lane; c < Bc; c += WARP)
+            smemS[row][c] = dot(q, smemK[c], D) * scale;
+        __syncwarp();
+
+        // 2) online softmax：本块行最大 → shuffle 归约
+        float s_max = -INFINITY;
+        for (int c = lane; c < Bc; c += WARP) s_max = fmaxf(s_max, smemS[row][c]);
+        s_max = warp_reduce_max(s_max);       // __shfl_xor 蝶形
+        float m_new = fmaxf(m, s_max);
+
+        float s_sum = 0.f;
+        for (int c = lane; c < Bc; c += WARP) {
+            float p = __expf(smemS[row][c] - m_new);
+            smemS[row][c] = p;                // 原地覆盖 S → P
+            s_sum += p;
+        }
+        s_sum = warp_reduce_sum(s_sum);
+
+        float alpha = __expf(m - m_new);      // 旧统计修正因子
+        l = alpha * l + s_sum;
+        m = m_new;
+
+        // 3) O = alpha·O + P · V（先 rescale 旧 acc，再累加本块）
+        for (int d = lane; d < D; d += WARP) {
+            float pv = 0.f;
+            for (int c = 0; c < Bc; c++) pv += smemS[row][c] * smemV[c][d];
+            acc[d] = alpha * acc[d] + pv;
+        }
+        __syncthreads();                       // 下一轮覆写 smemK/V 前
+    }
+
+    // 末尾一次性归一化写回（延迟归一化）
+    for (int d = lane; d < D; d += WARP)
+        O[o_off(head,qblk,row,d)] = __float2half(acc[d] / l);
+}
+```
+
+相比 Python 版，白板上要额外讲清的四件事（对应 §2）：
+
+| 点 | 一句话 |
+|---|---|
+| grid 沿 Q 分块 | 不同 Q 行块完全独立，`grid.x = N/Br` 喷满 SM |
+| O/m/l 常驻片上 | 一个 block 全程只管固定 Q，统计量不进出 HBM（FA1 的痛点） |
+| 延迟归一化 | 循环内只 `acc = α·acc + PV`，`1/l` 推到末尾，省每步除法 |
+| shuffle 归约 | 行内 max/sum 走 `__shfl_xor` 而非串行/原子 |
+
+追问方向（都在 §3）：用 Tensor Core 取代 `dot`/`pv` 标量循环（MMA PTX）、Q/O 常驻寄存器、cp.async 预取 V 与 softmax 重叠、smem padding 消 bank conflict。

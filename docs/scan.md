@@ -163,4 +163,136 @@ Blocked read 时 `smem[tid * 32 ... tid * 32 + 31]`，同一 warp 内相邻线�
 | cooperative_groups | 25.805 ms | 620 GB/s | 35% |
 | single_pass | 10.543 ms | 1.52 TB/s | 85% |
 
+---
+
+## 面试手写版
+
+只写白板上真要写的骨架（`int4` 向量化、bank conflict padding 这些生产细节**口述**即可，见代码后的清单）。
+
+```cpp
+// ---- Warp 内 Scan：Kogge-Stone（5 轮 shfl_up，inclusive） ----
+__device__ int warp_scan(int val, int& warp_sum) {
+    int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int d = 1; d <= 16; d <<= 1) {            // 1, 2, 4, 8, 16
+        int other = __shfl_up_sync(0xffffffffu, val, d);
+        if (lane >= d) val += other;
+    }
+    warp_sum = __shfl_sync(0xffffffffu, val, 31);  // 总和广播给全 warp
+    return val;                                    // lane i = sum(0..i)
+}
+
+__device__ int warp_reduce_down(int v) {           // lane 0 拿到总和
+    for (int d = 16; d >= 1; d >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, d);
+    return v;
+}
+
+// ---- Block 内 Scan：scan_then_fan（三阶段） ----
+__device__ int block_scan(int val, int& block_sum) {
+    __shared__ int warp_prefix[NUM_WARPS];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+    int wsum;
+    int inclusive = warp_scan(val, wsum);          // P1: 各 warp 内扫
+    if (lane == 0) warp_prefix[warp] = wsum;
+    __syncthreads();
+
+    if (warp == 0) {                               // P2: warp0 扫 NUM_WARPS 个 warp_sum
+        int ws = (lane < NUM_WARPS) ? warp_prefix[lane] : 0;
+        int dummy;
+        ws = warp_scan(ws, dummy);
+        if (lane < NUM_WARPS) warp_prefix[lane] = ws;
+    }
+    __syncthreads();
+
+    block_sum = warp_prefix[NUM_WARPS - 1];        // P3: fan
+    return inclusive + (warp > 0 ? warp_prefix[warp - 1] : 0);
+}
+
+// ---- Single-pass Decoupled Lookback ----
+__global__ void single_pass_scan(const int* in, int* out, int N,
+                                 int* g_counter, volatile int* g_status,
+                                 volatile int* g_partial, volatile int* g_prefix) {
+    __shared__ int s_items[TILE_SIZE];             // +padding 消 bank conflict
+    __shared__ int s_my_id, s_prefix;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+    // ① 动态领号：调度顺序 ≠ blockIdx 顺序，按数据顺序领 id，lookback 才不会死锁
+    if (threadIdx.x == 0) s_my_id = atomicAdd(g_counter, 1);
+    __syncthreads();
+    int my_id = s_my_id, base = my_id * TILE_SIZE;
+
+    // ② 协作 load：交错访问 global（合并访存）→ padded smem → blocked 读寄存器
+    cooperative_load(in + base, N - base, s_items);   // 内部 int4 向量化
+    __syncthreads();
+    int items[ITEMS_PER_THREAD];
+    blocked_load(s_items, items);                     // 每线程取连续 ITEMS_PER_THREAD 个
+
+    // ③ 线程内串行扫 → block 内扫 → 得到块内 inclusive
+    for (int i = 1; i < ITEMS_PER_THREAD; ++i) items[i] += items[i - 1];
+    int sum = items[ITEMS_PER_THREAD - 1];
+    int inc = block_scan(sum, block_sum);
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) items[i] += inc - sum;
+
+    // ④ 发布 partial，32 线程并行 lookback
+    if (warp == NUM_WARPS - 1) {
+        if (lane == 0) {                             // 先数据后 status，否则对端读到旧值
+            g_partial[my_id] = block_sum;
+            __threadfence();
+            g_status[my_id] = 1;
+        }
+        int prefix = 0;
+        if (my_id > 0) {
+            int look = my_id - 1;
+            while (true) {
+                // 32 lane 各查一个前驱，ballot 找最近一个 status==2
+                int idx = look - lane;
+                int st, v;
+                if (idx >= 0) {
+                    do { st = g_status[idx]; } while (st == 0);   // 轮询 != 0
+                    __threadfence();
+                    v = (st == 2) ? g_prefix[idx] : g_partial[idx];
+                } else { st = 2; v = 0; }
+                unsigned hit = __ballot_sync(0xffffffffu, st == 2);
+                if (hit) {                        // 命中 prefix：只加到它为止
+                    int k = __ffs(hit) - 1;       // 最近的 prefix 在哪个 lane
+                    prefix += warp_reduce_down(lane <= k ? v : 0);
+                    break;
+                }
+                prefix += warp_reduce_down(v);    // 全是 partial：全加，再往前看
+                look -= 32;
+            }
+        }
+        if (lane == 0) {                             // 发布本 block 的全局前缀
+            g_prefix[my_id] = prefix + block_sum;
+            __threadfence();
+            g_status[my_id] = 2;
+            s_prefix = prefix;
+        }
+    }
+    __syncthreads();
+
+    // ⑤ 加全局前缀 → blocked 写 smem → 协作交错写回 global
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) items[i] += s_prefix;
+    __syncthreads();
+    blocked_store(s_items, items);
+    __syncthreads();
+    cooperative_store(out + base, N - base, s_items);
+}
+```
+
+**上面刻意不写、只口述的部分**：
+
+| 略掉的 | 一句话说法 |
+|---|---|
+| 协作 load vs blocked read | global 必须交错访问才能合并访存；每线程要的连续元素从 smem 里 blocked 取 |
+| int4 向量化 | 128-bit load/store，访存指令数 ÷4，配合 32 items/线程 |
+| padding | `SMEM_STRIDE = 33`：blocked 读相邻线程间距错开 32 bank，消 32 路 bank conflict |
+| `__threadfence` | 先让 partial/prefix 全局可见，再置 status；否则对端看到新 status 读到旧数据 |
+| `volatile` | status/partial/prefix 是 block 间通信，防止编译器缓存进寄存器 |
+| 不会死锁的证明 | block 0 跳过 lookback 直接发布 status=2，是链的锚点；每个 block 往前追最终一定命中它 |
+
+记忆主线：**decoupled lookback 把“全局屏障”换成“每个 block 只往前追到最近的 status==2”**；warp 内 Kogge-Stone 5 轮、block 内 scan_then_fan 三阶段、块间 32 线程并行 lookback（ballot 找锚点 + shfl_down 归约）。
+
 

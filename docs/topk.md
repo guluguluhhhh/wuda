@@ -176,3 +176,131 @@ Pass 1 kernel：每个 warp 用 grid-stride loop 扫描数据，维护自己的 
 | warp_select | 1 遍 | 6.024 ms | 1.33 TB/s |
 
 warp_select 快 4 倍，核心优势是只需扫描一遍数据。radix_select 每轮都要遍历全部元素做统计，而 warp_select 用寄存器队列在线淘汰，数据读一次就够了。
+
+
+```
+// ============================================================
+// Warp 层：warp 内 shuffle 归约求和
+// ============================================================
+__device__ int warp_reduce_sum(int val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// ============================================================
+// Block 层：归约每个线程的局部计数，得到 block 总和
+// ============================================================
+__device__ int block_reduce_sum(int val, int* smem) {
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp = threadIdx.x / WARP_SIZE;
+
+    val = warp_reduce_sum(val);
+
+    if (lane == 0) {
+        smem[warp] = val;
+    }
+    __syncthreads();
+
+    int total = 0;
+    if (warp == 0) {
+        int v = (lane < WARPS_PER_BLOCK) ? smem[lane] : 0;
+        total = warp_reduce_sum(v);
+    }
+    __syncthreads();
+    return total;
+}
+
+// ============================================================
+// Grid 级共享状态
+// ============================================================
+struct RadixState {
+    int hist[NUM_BUCKETS];
+    unsigned int desired;
+    unsigned int desired_mask;
+    int remaining_k;
+    int write_pos;
+};
+
+// ============================================================
+// 单 Kernel：cooperative groups grid.sync() 实现跨 block 同步
+// ============================================================
+__global__ void radix_select_kernel(const unsigned int* data,
+                                    int n,
+                                    int k,
+                                    RadixState* state,
+                                    unsigned int* d_output,
+                                    int* d_output_idx) {
+    __shared__ int smem_hist[NUM_BUCKETS];
+
+    cg::grid_group grid = cg::this_grid();
+
+    int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    unsigned int desired = 0;
+    unsigned int desired_mask = 0;
+
+    for (int pass = 0; pass < NUM_PASSES; ++pass) {
+        int shift = 32 - (pass + 1) * BITS_PER_PASS;
+
+        for (int i = threadIdx.x; i < NUM_BUCKETS; i += blockDim.x)
+            smem_hist[i] = 0;
+        __syncthreads();
+
+        for (int i = global_tid; i < n; i += stride) {
+            unsigned int val = data[i];
+            if ((val & desired_mask) == desired) {
+                int digit = (val >> shift) & (NUM_BUCKETS - 1);
+                atomicAdd(&smem_hist[digit], 1);
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x < NUM_BUCKETS) {
+            atomicAdd(&state->hist[threadIdx.x], smem_hist[threadIdx.x]);
+        }
+
+        grid.sync();
+
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            int remaining_k = state->remaining_k;
+            int cumsum = 0;
+            int chosen_bucket = 0;
+
+            for (int b = NUM_BUCKETS - 1; b >= 0; --b) {
+                cumsum += state->hist[b];
+                if (cumsum >= remaining_k) {
+                    chosen_bucket = b;
+                    break;
+                }
+            }
+
+            int count_above = cumsum - state->hist[chosen_bucket];
+            state->remaining_k = remaining_k - count_above;
+            state->desired = desired | ((unsigned int)chosen_bucket << shift);
+            state->desired_mask = desired_mask | (((unsigned int)(NUM_BUCKETS - 1)) << shift);
+
+            for (int b = 0; b < NUM_BUCKETS; b++)
+                state->hist[b] = 0;
+        }
+
+        grid.sync();
+
+        desired = state->desired;
+        desired_mask = state->desired_mask;
+    }
+
+    for (int i = global_tid; i < n; i += stride) {
+        unsigned int val = data[i];
+        if (val >= desired) {
+            int pos = atomicAdd(&state->write_pos, 1);
+            if (pos < k) {
+                d_output[pos] = val;
+                d_output_idx[pos] = i;
+            }
+        }
+    }
+}
+```
