@@ -12,7 +12,7 @@ O = P @ V                     O:     [N, D]
 
 ---
 
-## 为什么需要 FlashAttention
+为什么需要 FlashAttention
 
 朴素实现分三个 kernel：`S=QK^T` → `P=softmax(S)` → `O=PV`。中间矩阵 `S`、`P` 都是 `[N, N]`，必须落回 HBM 再读回：
 
@@ -21,7 +21,7 @@ O = P @ V                     O:     [N, D]
 
 **FlashAttention 的核心**：把 `S`、`P` 永远留在片上（smem / 寄存器），用 **tiling + online softmax** 分块流式计算，中间结果不落 HBM。HBM 上只读 Q/K/V、写 O，访存量从 `O(N²)` 降到 `O(N·D)`。
 
-### Online Softmax（算法基石）
+Online Softmax（算法基石）
 
 softmax 需要「先求整行最大值和总和，再归一化」，天然要求看到整行——这与分块流式冲突。**online softmax** 用「运行时最大值 + 运行时和 + 追溯修正」解决：每来一个新分块，就地更新统计量，并把已累加的输出按比例修正。
 
@@ -42,7 +42,7 @@ O_new = α·O_old + P_t @ V_t                修正旧输出后累加
 
 ---
 
-## 1. FlashAttention-1：O/m/l 常驻 HBM  [`1a25bc8`](https://github.com/guluguluhhhh/wuda/commit/1a25bc8)
+1. FlashAttention-1：O/m/l 常驻 HBM  [`1a25bc8`](https://github.com/guluguluhhhh/wuda/commit/1a25bc8)
 
 对应论文 Algorithm 1，见 [flash_attention_v1.cu](../flash_attention/flash_attention_v1.cu)。
 
@@ -73,11 +73,11 @@ FA1 在本仓库仅作对照基线，用来凸显 FA2 的循环顺序改进。
 
 ---
 
-## 2. FlashAttention-2：交换循环，O 常驻片上  [`3acf45b`](https://github.com/guluguluhhhh/wuda/commit/3acf45b)
+2. FlashAttention-2：交换循环，O 常驻片上  [`3acf45b`](https://github.com/guluguluhhhh/wuda/commit/3acf45b)
 
 见 [flash_attention_v2.cu](../flash_attention/flash_attention_v2.cu)。FA2 相对 FA1 做了三处结构性改动：
 
-### (1) 交换循环顺序，Q 上并行
+(1) 交换循环顺序，Q 上并行
 
 ```
 grid = (N/Br, B*H)               一个 block 独占一个 Q 行块 [Br, D]
@@ -86,7 +86,7 @@ grid = (N/Br, B*H)               一个 block 独占一个 Q 行块 [Br, D]
 
 一个 block 全程只负责固定的 `Q_i`，O/m/l 的运行统计**常驻 smem**，不再进出 HBM。不同 Q 行块之间完全独立 → 天然沿序列维并行，`grid.x = N/Br` 直接喂满 SM（FA1 的 grid 只有 `B*H`，长序列下 SM 利用率低）。
 
-### (2) 延迟归一化
+(2) 延迟归一化
 
 FA2 循环内**只**做 `O ← α·O + P@V`（不除 l），把 `1/l` 归一化推迟到最后一次性完成。省掉每步的除法，减少非 matmul FLOP：
 
@@ -95,7 +95,7 @@ FA2 循环内**只**做 `O ← α·O + P@V`（不除 l），把 `1/l` 归一化�
 末尾:   O *= 1/l
 ```
 
-### (3) Split-Q：warp 间分行、共享 KV
+(3) Split-Q：warp 间分行、共享 KV
 
 ```
 TPB = WarpCountM · 32           沿 Br 切 WarpCountM 个 warp
@@ -120,21 +120,21 @@ KV 在所有 warp 间共享
 
 ---
 
-## 3. 性能优化：从 WMMA 基线到寄存器驻留 + 流水
+3. 性能优化：从 WMMA 基线到寄存器驻留 + 流水
 
 见 [flash_attention_performance.cu](../flash_attention/flash_attention_performance.cu)。下面按提交顺序拆解每一步优化的动机与手段。
 
-### 3.1 MMA PTX 替换 WMMA  [`50ef078`](https://github.com/guluguluhhhh/wuda/commit/50ef078)
+3.1 MMA PTX 替换 WMMA  [`50ef078`](https://github.com/guluguluhhhh/wuda/commit/50ef078)
 
 WMMA API 是黑盒，fragment 的寄存器布局不可见，无法在寄存器上直接操作累加器。换成手写 PTX（`ldmatrix.sync.m8n8.x4` + `mma.sync.m16n8k16.f16`，见 [mma_ptx.cuh](../gemm/warp/mma_ptx.cuh)）后能精确掌控每个 lane 持有哪些元素——这是后续「O 常驻寄存器」「按行 rescale 累加器」的前提。
 
 此步先把 QK 用 `WarpHMMA_f16`（B col-major）、PV 用 `WarpHMMA_Trans_f16`（B row-major，`ldmatrix.trans`）搭起来，O 仍落 fp16 smem，功能与基线等价。
 
-### 3.2 Warp 协作 softmax  [`5af305d`](https://github.com/guluguluhhhh/wuda/commit/5af305d)
+3.2 Warp 协作 softmax  [`5af305d`](https://github.com/guluguluhhhh/wuda/commit/5af305d)
 
 基线 softmax 只有 `lane < 16` 干活、其余 16 个 lane 空转，且串行遍历整行。改为**全 32 lane 协作处理一行**：每 lane 取 `Bc/32` 个元素求局部 max/sum，再用 `__shfl_xor_sync` butterfly 归约得到行 max/sum。消除半个 warp 的空转，行内归约走寄存器 shuffle 而非串行。
 
-### 3.3 O 累加器常驻寄存器  [`c6fbb9c`](https://github.com/guluguluhhhh/wuda/commit/c6fbb9c)
+3.3 O 累加器常驻寄存器  [`c6fbb9c`](https://github.com/guluguluhhhh/wuda/commit/c6fbb9c)
 
 基线每个 KV 步都：`load_C`(smem→reg) → `mma` → `stmatrix`(reg→smem)，softmax 里再逐元素 rescale smem 上的 O。O 在 smem ↔ reg 之间反复搬运。
 
@@ -148,13 +148,13 @@ WMMA API 是黑盒，fragment 的寄存器布局不可见，无法在寄存器�
 
 α 由 softmax 算出后写入 `smem_alpha`（`__syncwarp` 保证 lane 0 写齐），rescale 再从 `smem_alpha` 按行读回。
 
-### 3.4 Q 常驻寄存器  [`d90c8b3`](https://github.com/guluguluhhhh/wuda/commit/d90c8b3)
+3.4 Q 常驻寄存器  [`d90c8b3`](https://github.com/guluguluhhhh/wuda/commit/d90c8b3)
 
 `Q_i` 在整个 KV 循环里不变，却每步都要作为 mma 的 A 操作数从 smem `ldmatrix` 一次。优化：kernel 开头一次性 `load_full_A` 把整块 Q 的所有 K-iter fragment 读进 per-lane 寄存器 `frag_Q`，之后 `forward_with_A` 每步只 `ldmatrix` K，不再读 Q。
 
 副作用：`smem_Q` 可删——Q 只在初始化时借 `smem_KV` 暂存、`ldmatrix` 进寄存器后，`smem_KV` 立刻能被 K/V 覆写。至此 **Q 常驻寄存器、O 常驻寄存器**，smem 只剩 KV staging + S/P。
 
-### 3.5 向量化 + `exp2f` + 树形归约 softmax  [`acc0fa9`](https://github.com/guluguluhhhh/wuda/commit/acc0fa9)
+3.5 向量化 + `exp2f` + 树形归约 softmax  [`acc0fa9`](https://github.com/guluguluhhhh/wuda/commit/acc0fa9)
 
 softmax 是 attention 里唯一的非 matmul 热点，逐 fp16 访存 + `expf` 依赖链很贵。四管齐下：
 
@@ -163,11 +163,11 @@ softmax 是 attention 里唯一的非 matmul 热点，逐 fp16 访存 + `expf` �
 - **树形归约**：8 个元素的 local max/sum 用平衡树（依赖链深度 3 而非 8），butterfly 只需 `off ≤ 8`（threadgroup 内自治，不跨 lane16 边界）。
 - **指令级并行**：`STS.128` 写 P、`exp2f` 算 α（SFU pipe）、`__shfl` 求和（MIO pipe）走不同硬件端口，可重叠发射。
 
-### 3.6 D=128 + 动态 smem  [`c5eb97f`](https://github.com/guluguluhhhh/wuda/commit/c5eb97f)
+3.6 D=128 + 动态 smem  [`c5eb97f`](https://github.com/guluguluhhhh/wuda/commit/c5eb97f)
 
 把 head dim 提到实用的 `D=128`。此时静态 smem（`smem_KV` + `smem_SP`）已顶到 48 KB 静态上限，于是把小而杂的 `m/l/alpha`（各 `Br` 个 float）挪到 **dynamic shared memory**（`extern __shared__` + `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` 显式 opt-in），给静态区腾地方。
 
-### 3.7 Split-N：加一维 warp 切分提 TLP  [`cb3c45b`](https://github.com/guluguluhhhh/wuda/commit/cb3c45b)
+3.7 Split-N：加一维 warp 切分提 TLP  [`cb3c45b`](https://github.com/guluguluhhhh/wuda/commit/cb3c45b)
 
 原本只沿 Br 切 warp（`WarpCountM`），warp 数偏少、并行度不足。新增 `WarpCountN` 维，把 warp grid 变成 `WarpCountM × WarpCountN`：
 
@@ -177,7 +177,7 @@ softmax 是 attention 里唯一的非 matmul 热点，逐 fp16 访存 + `expf` �
 
 warp 数 ×`WarpCountN` → TLP 翻倍、每 warp 的 `frag_C` 减半（寄存器压力降低，利于 occupancy）。**代价**：同一 M-group 的 N-warps 持有相同 Q 行，`frag_Q` 在寄存器里重复（smem 是 broadcast 读，不额外耗带宽）。α rescale 后改用 `__syncthreads`（M-group 内所有 N-warp 都要读 α）。默认 `WarpCountM=4, WarpCountN=2`，8 warp/block。
 
-### 3.8 cp.async 预取 V，与 softmax 重叠  [`d4dcc15`](https://github.com/guluguluhhhh/wuda/commit/d4dcc15)
+3.8 cp.async 预取 V，与 softmax 重叠  [`d4dcc15`](https://github.com/guluguluhhhh/wuda/commit/d4dcc15)
 
 用 `cp.async`（SM80+ 异步拷贝，GMEM→SMEM 绕过寄存器，见 [prelogue.cuh](../gemm/block/prelogue.cuh) 的 `block_mma_prelogue_f16_async`）做计算/访存重叠。
 
@@ -194,7 +194,7 @@ O += P @ V
 
 softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免费」掩盖。
 
-### 3.9 Padding 消除 bank conflict（约 2×）  [`d625baf`](https://github.com/guluguluhhhh/wuda/commit/d625baf)
+3.9 Padding 消除 bank conflict（约 2×）  [`d625baf`](https://github.com/guluguluhhhh/wuda/commit/d625baf)
 
 `D = Bc = 128` half 的行 stride 恰好是 32 个 bank 的整数倍。`ldmatrix`/`LDS.128` 同时访问多行同一列时，不同行的同一列落进**同一 bank**，访问被串行化。
 
@@ -202,7 +202,7 @@ softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免�
 
 > O 写回的 staging 段仍用 `stride=D`（无 padding）——staging 只被 `stmatrix` 顺序写、`eplogue` 顺序读，无跨行同列冲突，不必浪费 smem。`SP_ELEMS = Br·max(SP_STRIDE, D)` 取二者较大者。
 
-### 3.10 Adaptive Bc + occupancy  [`9a18ae4`](https://github.com/guluguluhhhh/wuda/commit/9a18ae4)
+3.10 Adaptive Bc + occupancy  [`9a18ae4`](https://github.com/guluguluhhhh/wuda/commit/9a18ae4)
 
 前面 softmax 硬编码「一个 warp 算 2 行、16 lane/行」，绑死 `Bc=128`。泛化 `warp_online_softmax`：`kLanesPerRow = Bc/8`、`kRowsPerWarp = 32/kLanesPerRow`，每 lane 始终吃 8 fp16，归约范围随 Bc 自适应（`Bc=64` → 8 lane/行、4 行/warp）。
 
@@ -210,7 +210,7 @@ softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免�
 
 ---
 
-## 优化路径总览
+优化路径总览
 
 | # | 优化 | 手段 | 消除的瓶颈 |
 |---|---|---|---|
@@ -230,7 +230,7 @@ softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免�
 
 ---
 
-## 关键实现细节（深入）
+关键实现细节（深入）
 
 **三块矩阵乘的 layout**：QK 是 `Q[Br,D] @ K^T`，K row-major 作为 col-major B 加载即天然取到 `K^T`（TN，用 `WarpHMMA_f16`）；PV 是 `P[Br,Bc] @ V[Bc,D]`，P、V 都 row-major（NN，用 `WarpHMMA_Trans_f16`，B 走 `ldmatrix.trans` 转置）。
 
@@ -242,13 +242,13 @@ softmax/rescale 阶段完全不碰 `smem_KV`，V 的搬运被这段计算「免�
 
 ---
 
-## Benchmark
+Benchmark
 
 见 [bench.cu](../flash_attention/bench.cu)。正确性对 fp32 CPU 参考实现验证；性能测试配置 `B=1, H=32, D=128`，`N ∈ {512, 1024, 2048, 4096, 8192}`，指标 `TFLOPS = 4·B·H·N²·D / time`（QK 与 PV 各贡献 `2·B·H·N²·D`）。三个 kernel（`fa_v1` / `fa_v2` / `fa_perf`）同表对比，可直接编译运行复现每一步优化的增量收益。
 
 ---
 
-## 面试手撕：Python 参考实现
+面试手撕：Python 参考实现
 
 算法/通用岗的手撕首选。目标不是性能，而是把 **online softmax 的递推** 写对、能逐行解释。分块版就是 §2 FA2 的算法（延迟归一化）：
 
@@ -289,7 +289,7 @@ assert np.allclose(flash_attention(Q, K, V, Bc=32), ref(Q, K, V), atol=1e-5)
 
 ---
 
-## 面试手撕：CUDA 伪代码（FA2 基线）
+面试手撕：CUDA 伪代码（FA2 基线）
 
 kernel 岗的手撕目标：写出 **循环骨架 + online softmax 用 shuffle 归约 + O 常驻不落 HBM**。Tensor Core / cp.async / bank conflict 那些（§3.x）留给追问，不写进骨架。
 

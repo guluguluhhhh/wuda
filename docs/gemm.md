@@ -1,10 +1,10 @@
 # GEMM (Half-Precision Matrix Multiplication)
 
-## 问题定义与任务分解
+问题定义与任务分解
 
 计算 C[M, N] = A[M, K] × B^T[N, K]（TN layout：A row-major, B row-major 即 B 转置后参与计算）。
 
-### 核心思想：分块换数据复用
+核心思想：分块换数据复用
 
 GEMM 是**计算密集 (compute bound)** 型算子：`M=N=K` 时算 `2N³` FLOP，只读 `3N²` 数据，算术强度随 N 增长。瓶颈不在 HBM 带宽，而在能否**喂饱 Tensor Core**——为此必须靠分块把数据搬到片上反复复用：
 
@@ -14,7 +14,7 @@ HBM (慢, 大) → SMEM (每 block 复用一个 tile) → 寄存器 (每 warp/�
 
 每个 C tile 的一个元素要累加 K 个乘积，把 A/B 的 tile 提到 smem 后，`BlockM × BlockN` 个输出共享同一份 smem 数据，HBM 读取量降为 `1/BlockN + 1/BlockM`。因此优化主线有二：**① 让搬运不阻塞计算**（double buffering / cp.async / TMA / warp specialize），**② 消除片上访存开销**（bank conflict → padding / swizzle，ldmatrix 直取 mma 布局）。
 
-### 分层并行结构
+分层并行结构
 
 ```
 Grid 级：每个 block 负责 C 上一个 [BlockM, BlockN] 的输出 tile
@@ -35,9 +35,9 @@ Epilogue: 累加器写回 smem → 全 block 协同写回 global C
 
 ---
 
-## 实现与优化过程
+实现与优化过程
 
-### 1. Warp MMA 封装 — WMMA API [`b5cf1b2`](https://github.com/guluguluhhhh/wuda/commit/b5cf1b2)
+1. Warp MMA 封装 — WMMA API [`b5cf1b2`](https://github.com/guluguluhhhh/wuda/commit/b5cf1b2)
 
 先实现 warp 级计算单元 `WarpHMMA_f16<WarpM, WarpN, WarpK>`：
 
@@ -48,7 +48,7 @@ Epilogue: 累加器写回 smem → 全 block 协同写回 global C
 
 Warp tile 的分法：block 内 `WarpCountM × WarpCountN` 个 warp 网格状瓜分 `[BlockM, BlockN]`，每个 warp 负责 `[WarpM, WarpN] = [BlockM/WarpCountM, BlockN/WarpCountN]`。
 
-### 2. Basic Block GEMM [`b579c7b`](https://github.com/guluguluhhhh/wuda/commit/b579c7b)
+2. Basic Block GEMM [`b579c7b`](https://github.com/guluguluhhhh/wuda/commit/b579c7b)
 
 组装完整 kernel：
 
@@ -62,13 +62,13 @@ Grid: dim3{M/BlockM, N/BlockN}
 - **MMA**：各 warp 调用 `forward()` 累加
 - **Epilogue**：累加器 → smem → 全 block 向量化写回 global
 
-### 3. Padding 消除 Bank Conflict [`0fbb990`](https://github.com/guluguluhhhh/wuda/commit/0fbb990)
+3. Padding 消除 Bank Conflict [`0fbb990`](https://github.com/guluguluhhhh/wuda/commit/0fbb990)
 
 smem 布局从 `[BlockM, WarpK]` 改为 `[BlockM, WarpK + 8]`（PAD=8）。
 
 **原因**：`wmma::load_matrix_sync` 内部多线程同时访问 smem，若 stride 恰好是 bank 数的倍数（32 half = 64B = 32 banks），不同行的同一列落在同一 bank，产生冲突。PAD 8 个 half 使 stride 变为 40，错开 bank 映射。
 
-### 4. Double Buffering — cp.async [`08f9cf2`](https://github.com/guluguluhhhh/wuda/commit/08f9cf2)
+4. Double Buffering — cp.async [`08f9cf2`](https://github.com/guluguluhhhh/wuda/commit/08f9cf2)
 
 基础版每个 K 步都要 `__syncthreads()` 等拷贝完才能算，计算和访存完全串行。
 
@@ -85,13 +85,13 @@ while (load_kidx < t_tile_max || mma_kidx < t_tile_max):
 
 同时引入 **smem A/C 别名复用**：mainloop 用 smem_A + smem_B，epilogue 用 smem_C，两者生命期不重叠，共享同一块物理 shared memory，节省 smem 用量。
 
-### 5. Block Swizzle [`eeb4061`](https://github.com/guluguluhhhh/wuda/commit/eeb4061)
+5. Block Swizzle [`eeb4061`](https://github.com/guluguluhhhh/wuda/commit/eeb4061)
 
 默认的 `blockIdx.x/y` 线性映射下，相邻 block 可能访问相距很远的 B 列，L2 cache 命中率低。
 
 Block swizzle 重映射 block → tile 的对应关系：N 方向按 `swizzle_stride` 分段，段内 block 访问相邻的 B 列，通过 `gridDim.z` 实现分段。效果：相邻被调度的 block 共享 B 的 L2 cache line。
 
-### 6. MMA PTX 替换 WMMA [`47899bd`](https://github.com/guluguluhhhh/wuda/commit/47899bd)
+6. MMA PTX 替换 WMMA [`47899bd`](https://github.com/guluguluhhhh/wuda/commit/47899bd)
 
 WMMA API 是黑盒，无法控制寄存器布局。替换为手写 PTX：
 
@@ -105,11 +105,11 @@ WMMA API 是黑盒，无法控制寄存器布局。替换为手写 PTX：
 
 **fragment 布局（面试常考）**：`ldmatrix.x4` 一条指令让 32 个 lane 协同从 smem 取一个 8×8×4 的块，直接摆成 mma 需要的寄存器分布——lane `t` 负责 `row = t%16, col = (t/16)*8`，省去手写 shuffle。`mma.m16n8k16` 的累加器每个 lane 持 2 行（`row0 = lane>>2` 与 `row0+8`），两条拼成 m16n16 即 4 个 uint32/lane。掌握这套 per-lane 布局，才能像 FlashAttention 那样直接在累加器寄存器上做 per-row rescale（见 [flash_attention.md](flash_attention.md) §3.3）。
 
-### 7. Reuse A smem for C [`a3398ad`](https://github.com/guluguluhhhh/wuda/commit/a3398ad)
+7. Reuse A smem for C [`a3398ad`](https://github.com/guluguluhhhh/wuda/commit/a3398ad)
 
 扩大 tile 为 `BlockM=128, BlockN=128, WarpM=64, WarpN=64`（4 warp × 128 TPB），提升计算密度。smem_C 直接别名到 smem_A 起始地址，`__syncthreads()` 保证 mainloop 结束后才写 epilogue。
 
-### 8. TMA — Tensor Memory Accelerator [`c18753d`](https://github.com/guluguluhhhh/wuda/commit/c18753d)
+8. TMA — Tensor Memory Accelerator [`c18753d`](https://github.com/guluguluhhhh/wuda/commit/c18753d)
 
 SM90+ 硬件 DMA 引擎，特点：
 - **单线程发起**：thread 0 一条指令启动整块数据搬运，无需全 block 参与
@@ -125,7 +125,7 @@ Device:
 
 相比 cp.async（全 block 协同 + 显式地址计算），TMA 代码更简洁，硬件自动处理 2D 地址和对齐。
 
-### 9. SMEM Swizzle [`2be4d6b`](https://github.com/guluguluhhhh/wuda/commit/2be4d6b)
+9. SMEM Swizzle [`2be4d6b`](https://github.com/guluguluhhhh/wuda/commit/2be4d6b)
 
 TMA 硬件支持在写入 smem 时自动做 swizzle 重排。使用 `CU_TENSOR_MAP_SWIZZLE_64B`：
 
@@ -137,7 +137,7 @@ TMA 硬件支持在写入 smem 时自动做 swizzle 重排。使用 `CU_TENSOR_M
 
 **效果**：消除 bank conflict（无需 padding），同时 ldmatrix 地址计算需适配 swizzle 规则 → 新增 `WarpHMMA_f16_sw64` 结构体，`sw_atom()` 函数计算物理 atom 偏移。
 
-### 10. Warp Specialize [`59f3c92`](https://github.com/guluguluhhhh/wuda/commit/59f3c92)
+10. Warp Specialize [`59f3c92`](https://github.com/guluguluhhhh/wuda/commit/59f3c92)
 
 将 block 内线程分为两个角色：
 
@@ -162,7 +162,7 @@ TPB 从 128 变为 160（5 warps = 4 consumer + 1 producer）。
 
 ---
 
-## Benchmark（RTX 5090, M=N=K, fp16, TFLOPS）
+Benchmark（RTX 5090, M=N=K, fp16, TFLOPS）
 
 | MNK | cuBLAS | basic | db+big_tile | tma | tma_ws |
 |---|---|---|---|---|---|
@@ -174,7 +174,7 @@ TPB 从 128 变为 160（5 warps = 4 consumer + 1 producer）。
 
 （括号内为 cuBLAS 百分比）
 
-### 关键结论
+关键结论
 
 1. **Basic → db+big_tile**：小矩阵反而变慢（tile 过大 occupancy 下降），大矩阵 58% → 91%，double buffering 隐藏访存延迟 + 大 tile 提升计算密度。
 2. **db → tma**：TMA + swizzle 消除 bank conflict + 硬件搬运，大矩阵达到 100%+ cuBLAS。

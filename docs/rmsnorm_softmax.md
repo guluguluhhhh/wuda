@@ -32,7 +32,7 @@ __device__ float block_reduce(float v, float init, Op op) {
 
 ---
 
-## 1. RMSNorm
+1. RMSNorm
 
 $$y_i = \frac{x_i}{\sqrt{\frac{1}{N}\sum_j x_j^2 + \epsilon}} \cdot \gamma_i$$
 
@@ -61,7 +61,7 @@ __global__ void rmsnorm(const float* x, const float* gamma, float* y,
 }
 ```
 
-### 要点
+要点
 
 - **读两遍 x**：第一遍算平方和，第二遍缩放。N 不大时可把 x 暂存寄存器/smem 省第二遍 HBM 读。
 - `eps` 加在 **mean 之内**（`ss/N + eps`），不是加在 sqrt 之外。
@@ -70,9 +70,9 @@ __global__ void rmsnorm(const float* x, const float* gamma, float* y,
 
 ---
 
-## 2. Softmax
+2. Softmax
 
-### Safe Softmax（减 max 防溢出）
+Safe Softmax（减 max 防溢出）
 
 $$y_i = \frac{e^{x_i - \max_j x_j}}{\sum_j e^{x_j - \max_j x_j}}$$
 
@@ -102,7 +102,7 @@ __global__ void softmax(const float* x, float* y, int N) {
 }
 ```
 
-### 要点
+要点
 
 - **减 max 是为了数值稳定**，不是为了正确性；不减会 `exp` 溢出成 inf/nan。
 - 减 max 不改变结果：分子分母同乘 $e^{-\max}$ 抵消。
@@ -111,7 +111,7 @@ __global__ void softmax(const float* x, float* y, int N) {
 
 ---
 
-## 对比
+对比
 
 | | 归约算子 | 遍数 | 关键陷阱 |
 |---|---|---|---|

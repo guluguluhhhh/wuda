@@ -1,8 +1,8 @@
 # TopK
 
-## topk_radix_select — Radix Select
+topk_radix_select — Radix Select
 
-### 算法思想
+算法思想
 
 不排序，逐 bit 缩小候选范围，确定第 K 大的值。
 
@@ -18,7 +18,7 @@
 
 32 轮后精确确定第 K 大的值（`desired`），最后收集所有 ≥ desired 的元素。
 
-### V0：基础版本 [`633a251`](https://github.com/guluguluhhhh/wuda/commit/633a251)
+V0：基础版本 [`633a251`](https://github.com/guluguluhhhh/wuda/commit/633a251)
 
 每线程处理 1 个元素，每轮用 `__ballot_sync` + `__popc` 统计 warp 内满足条件且当前 bit 为 1 的数量，block reduce 后 atomicAdd 到全局 `state->count`。
 
@@ -34,13 +34,13 @@ block 间同步采用 **Last Block 决策模式**：
 
 **为什么是 Last Block**：只有最后一个 block 能确保全局 count 已完整汇总。
 
-### 优化 1：Grid-stride loop [`8b194c7`](https://github.com/guluguluhhhh/wuda/commit/8b194c7)
+优化 1：Grid-stride loop [`8b194c7`](https://github.com/guluguluhhhh/wuda/commit/8b194c7)
 
 基础版本每线程只处理 1 个元素，需要 N/1024 个 block。改为 grid-stride loop：固定 block 数，每线程循环处理多个元素，本地累加 count 后再做一次 block reduce。
 
 减少了 block 数，降低了 atomicAdd 和 block 间同步的压力。
 
-### 优化 2：8-bit 分桶 [`67f1aff`](https://github.com/guluguluhhhh/wuda/commit/67f1aff)
+优化 2：8-bit 分桶 [`67f1aff`](https://github.com/guluguluhhhh/wuda/commit/67f1aff)
 
 从每轮 1 bit 改为每轮 8 bit，32 轮变 4 轮，数据只需扫描 4 遍。
 
@@ -48,7 +48,7 @@ block 间同步采用 **Last Block 决策模式**：
 
 代价是需要 256 个桶的 smem atomicAdd（有竞争），但总遍历次数从 32 降到 4。
 
-### Benchmark（RTX 5090, K=1000）
+Benchmark（RTX 5090, K=1000）
 
 | N | Blocks | Time (ms) | 带宽 |
 |---|---|---|---|
@@ -57,19 +57,19 @@ block 间同步采用 **Last Block 决策模式**：
 | 1G | 170 | 12.122 | 330 GB/s |
 | 2G | 170 | 24.125 | 332 GB/s |
 
-### 分析
+分析
 
 有效带宽 ~330 GB/s（峰值 18%），但实际 4 轮各扫描一遍全部数据（条件过滤无法跳过读取），有效读取量约 4×N×4B。修正后实际带宽约 1.3 TB/s，接近峰值的 73%。
 
 ---
 
-## topk_radix_select_cg — Cooperative Groups 版本
+topk_radix_select_cg — Cooperative Groups 版本
 
 原版 block 间同步逻辑：每个 block 计数完后 `atomicAdd(&block_finished, 1)`，最后一个完成的 block 检测到自己是 last block，负责决策并递增 `generation`；其他 block 用 `while (generation < ...)` 忙等（`generation` 是全局计数器，记录已完成几轮 pass，本质是手写的屏障信号）。需要手写 `block_finished` 计数、last block 判断、`generation` 轮询，逻辑分散且容易出错。
 
 CG 版本直接用 `grid.sync()` 替代整套同步逻辑：所有 block 计数完 → `grid.sync()` → block 0 决策 → `grid.sync()` → 进入下一轮。不需要 `block_finished`、`generation` 字段，代码更直观。
 
-### 性能对比（RTX 5090, K=1000, N=2G）
+性能对比（RTX 5090, K=1000, N=2G）
 
 | 版本 | Time | 带宽 |
 |---|---|---|
@@ -80,11 +80,11 @@ CG 版本略慢约 16%。但 radix select 本身就需要全局同步（所有 b
 
 ---
 
-## topk_warp_select — WarpSelect
+topk_warp_select — WarpSelect
 
 参考论文：[Billion-scale similarity search with GPUs (Johnson et al., 2017)](https://arxiv.org/pdf/1702.08734)
 
-### 算法思想
+算法思想
 
 与 radix select 完全不同的思路：不做全局统计，而是**流式扫描数据，用一个固定大小的有序队列持续淘汰**。只需扫描一遍数据，且队列维护和淘汰在寄存器中完成。
 
@@ -109,7 +109,7 @@ CG 版本略慢约 16%。但 radix select 本身就需要全局同步（所有 b
 4. 扫描完所有数据后 finalize，得到 top-K
 ```
 
-### 问题拆分
+问题拆分
 
 WarpSelect 的核心计算是在 warp 内用 shuffle 做排序和合并。数据以 **lane-stride** 方式分布在 32 个 lane 的寄存器中（element i 在 lane `i%32` 的第 `i/32` 个寄存器），所有操作通过 `__shfl_xor_sync` / `__shfl_sync` 跨 lane 交换数据。
 
@@ -120,7 +120,7 @@ merge_odd_continue  →  merge_odd  →  sort_odd  →  WarpSelect
 （子问题排序）         （合并两段）    （全排序）      （流式选择）
 ```
 
-### 实现 1：merge_odd_continue [`0e19739`](https://github.com/guluguluhhhh/wuda/commit/0e19739)
+实现 1：merge_odd_continue [`0e19739`](https://github.com/guluguluhhhh/wuda/commit/0e19739)
 
 论文 Algorithm 1 的递归部分。对一个长度为 LEN（32 的倍数）的 lane-stride 数组做 odd-size bitonic merge。
 ![mc](pic/warp_select_merge_odd_continue.png)
@@ -133,7 +133,7 @@ merge_odd_continue  →  merge_odd  →  sort_odd  →  WarpSelect
 
 `IsLeft` 模板参数标记 dummy 元素（因为 LEN 不是 2 的幂，会有填充）在左边还是右边，影响递归拆分方式。
 
-### 实现 2：merge_odd + sort_odd [`918e035`](https://github.com/guluguluhhhh/wuda/commit/918e035)
+实现 2：merge_odd + sort_odd [`918e035`](https://github.com/guluguluhhhh/wuda/commit/918e035)
 
 **merge_odd**（Algorithm 1 完整版）：合并两个已排序的 lane-stride 数组 L 和 R。
 
@@ -147,19 +147,19 @@ merge_odd_continue  →  merge_odd  →  sort_odd  →  WarpSelect
 **sort_odd**（Algorithm 2）：对 lane-stride 数组做全排序。递归二分 → sort 左半 → sort 右半 → merge_odd 合并。基础情况 LEN=32 用标准 bitonic sort。
 ![so](pic/warp_select_sort_odd.png)
 
-### 实现 3：WarpSelect + first pass [`d90c25d`](https://github.com/guluguluhhhh/wuda/commit/d90c25d)
+实现 3：WarpSelect + first pass [`d90c25d`](https://github.com/guluguluhhhh/wuda/commit/d90c25d)
 
 将排序原语组装成 WarpSelect 结构体，实现 `add()` / `restore()` / `finalize()` 接口。
 
 Pass 1 kernel：每个 warp 用 grid-stride loop 扫描数据，维护自己的 WarpSelect。扫描完后 block 内各 warp 结果写入 smem，warp 0 做二次选择，输出每个 block 的 top-K。
 
-### 实现 4：two-pass + deadlock fix [`8d6d571`](https://github.com/guluguluhhhh/wuda/commit/8d6d571)
+实现 4：two-pass + deadlock fix [`8d6d571`](https://github.com/guluguluhhhh/wuda/commit/8d6d571)
 
 添加 Pass 2 kernel：单 warp 对所有 block 的 top-K 结果做最终选择。
 
 修复死锁：`add()` 中的 `__any_sync` 要求 warp 内所有 lane 参与，但 grid-stride loop 的边界条件可能导致部分 lane 不进入循环。改为 `i - lane_id < n`（整个 warp 统一进退）。
 
-### Benchmark（RTX 5090, K=64）
+Benchmark（RTX 5090, K=64）
 
 | N | Blocks | Time (ms) | 带宽 |
 |---|---|---|---|
@@ -168,7 +168,7 @@ Pass 1 kernel：每个 warp 用 grid-stride loop 扫描数据，维护自己的 
 | 1G | 128 | 3.086 | 1.30 TB/s |
 | 2G | 128 | 6.024 | 1.33 TB/s |
 
-### 对比 radix_select（N=2G）
+对比 radix_select（N=2G）
 
 | 版本 | 遍历次数 | Time | 带宽 |
 |---|---|---|---|
