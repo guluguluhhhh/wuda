@@ -15,18 +15,21 @@ __device__ float warp_reduce_max(float v) {
     return v;
 }
 
-// block 内两级归约：warp 内 shfl → 每 warp 写 smem → warp0 再归约 → 广播
+// block 内两级归约：warp 内 shfl → 每 warp 写 smem → **每个 warp 都再归约一遍**
+// （各 warp 读的是同一份 s[0..nwarp-1]，算出来必然相同 → 全 block 拿到同一个值）
+// 切忌：不能写 if (warp == 0) v = op(v)，那样只有 warp0 对；__shfl_sync 只能
+// 在 warp 内广播，跨不了 warp。而 RMSNorm/Softmax 的缩放阶段**所有线程**都要用。
 template <class Op>
 __device__ float block_reduce(float v, float init, Op op) {
     __shared__ float s[32];                 // 最多 32 个 warp
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
-    v = op(v);                              // warp_reduce_sum / _max
+    v = op(v);                              // 第一级：xor 蝶形 → warp 内全 lane 得和
     if (lane == 0) s[warp] = v;
     __syncthreads();
-    v = (lane < nwarp) ? s[lane] : init;    // warp0 收集各 warp 结果
-    if (warp == 0) v = op(v);
-    __syncthreads();                         // 复用 smem 前的保护
-    return __shfl_sync(0xffffffff, v, 0);   // 只有 warp0 lane0 有效，广播给全 block
+    v = (lane < nwarp) ? s[lane] : init;    // 每个 warp 都读全部 partial
+    v = op(v);                              // 第二级：各 warp 冗余归约一遍，结果一致
+    __syncthreads();                        // 下一次复用 s[] 前的保护
+    return v;                               // 全 block 每个线程都拿到总结果
 }
 ```
 

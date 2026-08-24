@@ -80,12 +80,14 @@ Benchmark 分析（RTX 5090, 理论带宽 ~1.79 TB/s）
 四个变体**只有 load 部分不同，归约尾部完全一致**，所以白板只写最终版（Vec4+Stride）+ 归约框架即可。
 
 ```cpp
-// ---- Warp Reduce：shfl_down 5 轮，全 warp 拿到 warp_sum ----
+// ---- Warp Reduce：shfl_down 5 轮。注意：**只有 lane 0 拿到正确的和** ----
+// （lane i 读 lane i+d，i+d>=32 时返回自己的值 → 上半部分 lane 在累加垃圾）
+// 要让全 warp 都拿到和，改用 __shfl_xor_sync 蝶形归约。下面两处调用都只取 lane 0。
 __device__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int d = 16; d >= 1; d >>= 1)          // 16, 8, 4, 2, 1
         val += __shfl_down_sync(0xffffffffu, val, d);
-    return val;
+    return val;                                // 仅 lane 0 有效
 }
 
 // ---- Vec4 + Stride（最终版）：线程局部累加 → warp → block → atomicAdd ----

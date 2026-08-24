@@ -181,6 +181,7 @@ warp_select 快 4 倍，核心优势是只需扫描一遍数据。radix_select �
 ```cpp
 // ============================================================
 // Warp 层：warp 内 shuffle 归约求和
+// 仅 lane 0 拿到正确和（shfl_down 在越界时返回自身值，上半 lane 在累垃圾）
 // ============================================================
 __device__ int warp_reduce_sum(int val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -191,112 +192,129 @@ __device__ int warp_reduce_sum(int val) {
 
 // ============================================================
 // Block 层：归约每个线程的局部计数，得到 block 总和
+// 第一级：warp 内归约 → 每 warp lane0 写 smem
+// 第二级：warp0 再归约各 warp 的 partial → 仅 warp0 lane0 拿到 block 总和
 // ============================================================
 __device__ int block_reduce_sum(int val, int* smem) {
     int lane = threadIdx.x % WARP_SIZE;
     int warp = threadIdx.x / WARP_SIZE;
 
-    val = warp_reduce_sum(val);
+    val = warp_reduce_sum(val);              // ① 每个 warp 内，全 lane 归约到 lane0
 
     if (lane == 0) {
-        smem[warp] = val;
+        smem[warp] = val;                    // ② 每个 warp 的 lane0 把 partial 写入 smem
     }
-    __syncthreads();
+    __syncthreads();                         // ③ 确保所有 warp 的 partial 都落位
 
     int total = 0;
     if (warp == 0) {
-        int v = (lane < WARPS_PER_BLOCK) ? smem[lane] : 0;
-        total = warp_reduce_sum(v);
+        int v = (lane < WARPS_PER_BLOCK) ? smem[lane] : 0;  // ④ warp0 收集各 warp 的 partial
+        total = warp_reduce_sum(v);          // ⑤ warp0 再归约一次 → 得到 block 总和
     }
-    __syncthreads();
-    return total;
+    __syncthreads();                         // ⑥ 复用 smem 前的保护
+    return total;                            // 注意：只有 warp0 lane0 拿到正确值
 }
 
 // ============================================================
-// Grid 级共享状态
+// Grid 级共享状态：所有 block 共同维护的全局数据结构
+//   hist[256]：8-bit 分桶的直方图（各 block 贡献用 atomicAdd 合并）
+//   desired / desired_mask：已确定的第 K 大值的 bit 前缀和掩码
+//   remaining_k：当前剩余要找的 top 数
+//   write_pos：收集阶段原子写出的位置
 // ============================================================
 struct RadixState {
-    int hist[NUM_BUCKETS];
-    unsigned int desired;
-    unsigned int desired_mask;
-    int remaining_k;
-    int write_pos;
+    int hist[NUM_BUCKETS];              // 256 个桶的计数
+    unsigned int desired;               // 当前已确定的第 K 大值的 bit 前缀
+    unsigned int desired_mask;          // 哪些 bit 已确定（0xFF000000 等）
+    int remaining_k;                    // 还有多少个元素要收集
+    int write_pos;                      // 收集阶段的原子写指针
 };
 
 // ============================================================
 // 单 Kernel：cooperative groups grid.sync() 实现跨 block 同步
+// 每 pass 处理 8 bit（256 个桶），4 pass 覆盖 32 bit → 只扫描 4 遍数据
 // ============================================================
 __global__ void radix_select_kernel(const unsigned int* data,
                                     int n,
                                     int k,
-                                    RadixState* state,
-                                    unsigned int* d_output,
-                                    int* d_output_idx) {
-    __shared__ int smem_hist[NUM_BUCKETS];
+                                    RadixState* state,          // 全局共享状态
+                                    unsigned int* d_output,     // 输出值
+                                    int* d_output_idx) {        // 输出在原数组的索引
+    __shared__ int smem_hist[NUM_BUCKETS];  // 每 block 的局部直方图
 
-    cg::grid_group grid = cg::this_grid();
+    cg::grid_group grid = cg::this_grid();  // cooperative groups 全局句柄
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
+    int stride = blockDim.x * gridDim.x;    // grid-stride loop
 
-    unsigned int desired = 0;
-    unsigned int desired_mask = 0;
+    unsigned int desired = 0;               // 寄存器：已确定的 bit 前缀
+    unsigned int desired_mask = 0;          // 寄存器：已确定的 bit 掩码
 
     for (int pass = 0; pass < NUM_PASSES; ++pass) {
+        // pass 0: shift 24 (最高 8 bit) → pass 1: 16 → pass 2: 8 → pass 3: 0
         int shift = 32 - (pass + 1) * BITS_PER_PASS;
 
+        // ① 清零局部直方图
         for (int i = threadIdx.x; i < NUM_BUCKETS; i += blockDim.x)
             smem_hist[i] = 0;
         __syncthreads();
 
+        // ② grid-stride 扫描数据：过滤已匹配前缀的元素，统计当前 8 bit 的桶分布
         for (int i = global_tid; i < n; i += stride) {
             unsigned int val = data[i];
-            if ((val & desired_mask) == desired) {
-                int digit = (val >> shift) & (NUM_BUCKETS - 1);
-                atomicAdd(&smem_hist[digit], 1);
+            if ((val & desired_mask) == desired) {   // 只有匹配前缀的元素才可能进 top-K
+                int digit = (val >> shift) & (NUM_BUCKETS - 1);  // 抽出当前 8 bit
+                atomicAdd(&smem_hist[digit], 1);                 // 局部直方图 +1
             }
         }
         __syncthreads();
 
+        // ③ 256 个线程把局部直方图原子加到全局
         if (threadIdx.x < NUM_BUCKETS) {
             atomicAdd(&state->hist[threadIdx.x], smem_hist[threadIdx.x]);
         }
 
-        grid.sync();
+        grid.sync();  // ★ 全局屏障：确保所有 block 的直方图贡献全部可见
 
+        // ④ block 0 的 thread 0 做决策：从高桶往低累计，找到第 K 大落在哪个桶
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             int remaining_k = state->remaining_k;
             int cumsum = 0;
             int chosen_bucket = 0;
 
+            // 从桶 255 往下累计：cumsum(b) = 第 b-255 桶的元素总数
             for (int b = NUM_BUCKETS - 1; b >= 0; --b) {
                 cumsum += state->hist[b];
-                if (cumsum >= remaining_k) {
+                if (cumsum >= remaining_k) {      // 累计到第 K 大的桶
                     chosen_bucket = b;
                     break;
                 }
             }
 
+            // 严格高于该桶的元素个数 = cumsum - 该桶自身
             int count_above = cumsum - state->hist[chosen_bucket];
-            state->remaining_k = remaining_k - count_above;
+            state->remaining_k = remaining_k - count_above;  // 扣掉，继续找
             state->desired = desired | ((unsigned int)chosen_bucket << shift);
             state->desired_mask = desired_mask | (((unsigned int)(NUM_BUCKETS - 1)) << shift);
 
+            // 重置直方图，为下一 pass 准备
             for (int b = 0; b < NUM_BUCKETS; b++)
                 state->hist[b] = 0;
         }
 
-        grid.sync();
+        grid.sync();  // ★ 全局屏障：确保 desired / desired_mask / hist 清零对全部 block 可见
 
+        // ⑤ 所有 block 读回新的前缀，下一 pass 只过滤匹配前缀的元素
         desired = state->desired;
         desired_mask = state->desired_mask;
     }
 
+    // 4 pass 后 desired 已是第 K 大值的全 32 bit → 最后一遍扫描：收集所有 >= desired 的元素
     for (int i = global_tid; i < n; i += stride) {
         unsigned int val = data[i];
-        if (val >= desired) {
-            int pos = atomicAdd(&state->write_pos, 1);
-            if (pos < k) {
+        if (val >= desired) {                          // 阈值判断
+            int pos = atomicAdd(&state->write_pos, 1);  // 原子自增，分配写位置
+            if (pos < k) {                              // 只取前 K 个（平局任意裁决）
                 d_output[pos] = val;
                 d_output_idx[pos] = i;
             }
