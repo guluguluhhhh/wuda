@@ -3,55 +3,20 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cutlass/arch/barrier.h>
-#include <cuda_bf16.h>
 
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/sm100_store_cd.cuh>
+#include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
-#include "sm100_store_cd_swap_ab_dual.cuh"
 #include "tp2_symmetric.cuh"
 
 namespace deep_gemm {
-
-namespace o_proj_b_tp2_symm {
-
-using wuda::tp2::fence_acq_rel_sys;
-using wuda::tp2::fence_acquire_sys;
-using wuda::tp2::load_relaxed_sys;
-using wuda::tp2::spin_pause;
-using wuda::tp2::store_relaxed_sys;
-
-CUTLASS_DEVICE uint32_t load_relaxed_gpu(const uint32_t* ptr) {
-    uint32_t value;
-    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
-                 : "=r"(value) : "l"(ptr) : "memory");
-    return value;
-}
-
-CUTLASS_DEVICE void store_relaxed_gpu(uint32_t* ptr, uint32_t value) {
-    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
-}
-
-CUTLASS_DEVICE void check_spin_timeout(
-        uint64_t start, uint32_t spins, const char* stage,
-        uint64_t expected, uint64_t actual, uint32_t rank) {
-    constexpr uint64_t kTimeoutNs = 10'000'000'000ull;
-    if ((spins & 1023u) == 0u and
-            wuda::tp2::globaltimer() - start > kTimeoutNs) {
-        printf("TP2 O-proj timeout stage=%s rank=%u expected=%llu actual=%llu\n",
-               stage, rank,
-               static_cast<unsigned long long>(expected),
-               static_cast<unsigned long long>(actual));
-        asm volatile("trap;");
-    }
-}
-
-}  // namespace o_proj_b_tp2_symm
 
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kGranKA, uint32_t kGranKB, uint32_t kKAlignment,
@@ -59,7 +24,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups,
           uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleCDMode,
-          uint32_t kNumStages, uint32_t kNumStoreStages,
+          uint32_t kNumStages,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
@@ -67,22 +32,27 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
           typename epilogue_type_t>
-CUTLASS_GLOBAL void __launch_bounds__(
-    kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-o_proj_b_tp2_symm_impl(int* grouped_layout,
+CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
+sm100_fp8_fp4_gemm_1d1d_tp2_overlap_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_a_local,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_a_remote,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa_local,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa_remote,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_local_cd,
-                             cd_dtype_t* vector_store_cd) {
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                             const uint32_t* __restrict__ peer_ready,
+                             const uint64_t* __restrict__ grid_done,
+                             uint32_t rank,
+                             uint32_t local_start,
+                             uint32_t remote_start) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "TP2 fused O-proj B requires BF16 output");
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
 
     // MMA Configs
     constexpr uint32_t LAYOUT_AD_M = 128;
@@ -111,9 +81,7 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
     // Epilogue configs
     // Always enable pipeline for better performance
     constexpr uint32_t kNumEpilogueStages = 2;
-    constexpr uint32_t kNumTMAStoreStages = kNumStoreStages;
-    DG_STATIC_ASSERT(kNumTMAStoreStages >= 2 and kNumTMAStoreStages <= 8,
-                     "TMA store stages must be in [2,8]");
+    constexpr uint32_t kNumTMAStoreStages = 2;
     // NOTES: To maximize epilogue threads utilization, process an entire BLOCK_N
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
@@ -153,11 +121,13 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
-        cute::prefetch_tma_descriptor(&tensor_map_a);
+        cute::prefetch_tma_descriptor(&tensor_map_a_local);
+        cute::prefetch_tma_descriptor(&tensor_map_a_remote);
         cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_sfa);
+        cute::prefetch_tma_descriptor(&tensor_map_sfa_local);
+        cute::prefetch_tma_descriptor(&tensor_map_sfa_remote);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        cute::prefetch_tma_descriptor(&tensor_map_local_cd);
+        cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
 
     // Overwrite shape constants if the compiler gives
@@ -232,7 +202,38 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
         shape_m, shape_n, shape_k, grouped_layout);
+    // The producer/consumer handoff can reorder M blocks to visit the local
+    // token half first.  Every role uses the same physical index; otherwise
+    // the loader and epilogue would associate a completed accumulator with a
+    // different global token block.
+    auto remap_m_block_idx = [&](uint32_t logical_m_block_idx) {
+        uint32_t physical_m_block_idx = logical_m_block_idx;
+        if constexpr (kGemmType == GemmType::Batched) {
+            if (rank == 1u && shape_m == 2u * BLOCK_M) {
+                physical_m_block_idx ^= 1u;
+            }
+        }
+        return physical_m_block_idx;
+    };
 
+    // The producer stores each rank's token half in the normal symmetric
+    // allocation. The host passes descriptors whose bases point at each half,
+    // so the TMA loader can wait and consume one source without a copy. Only
+    // the loader needs to wait: other warps naturally stop at the stage barrier
+    // while a remote M block is being published. The generation is written
+    // before the producer's PDL trigger, so it is stable after the grid
+    // dependency synchronize above.
+    bool remote_ready = false;
+    auto wait_remote_once = [&]() {
+        if (remote_ready) return;
+        auto* generation = reinterpret_cast<const uint32_t*>(grid_done + 1);
+        const uint32_t remote_generation = *generation;
+        const auto* flag = peer_ready + 48u + (rank ^ 1u);
+        while (wuda::tp2::load_relaxed_sys(flag) < remote_generation)
+            wuda::tp2::spin_pause();
+        wuda::tp2::fence_acquire_sys();
+        remote_ready = true;
+    };
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -259,8 +260,19 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
 
                 // Compute offsets
                 // NOTES: the group is always concatenated with the outer dimension
-                uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), sched::IndexType::MN> (
-                    shape_m, BLOCK_M, m_block_idx);
+                // The fused TP2 handoff has exactly two M blocks: one local
+                // token half and one peer token half.  The symmetric layout is
+                // rank-invariant (rank 0 owns block 0, rank 1 owns block 1),
+                // but the scheduler otherwise visits block 0 first on both
+                // ranks.  Reorder only rank 1 so each rank computes its local
+                // half before the first remote wait.  The remapped index is
+                // used for the physical output and source selection; group/N
+                // scheduling remains owned by the original scheduler state.
+                const uint32_t physical_m_block_idx =
+                    remap_m_block_idx(m_block_idx);
+                const uint32_t block_m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), sched::IndexType::MN> (
+                    shape_m, BLOCK_M, physical_m_block_idx);
+                uint32_t m_idx = block_m_idx;
                 uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), sched::IndexType::MN> (
                     shape_n, BLOCK_N, n_block_idx, m_block_idx);
 
@@ -280,15 +292,34 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
                     n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
                 }
 
+                // Fused MLA scatter/ WoA consumption: local rows use the local
+                // compact slot, remote rows use the peer-published slot.  The
+                // benchmarked TP2 shapes split on a BLOCK_M boundary, so a
+                // cluster never straddles the two descriptors.
+                const bool use_remote = rank == 0
+                    ? block_m_idx >= remote_start
+                    : block_m_idx < local_start;
+                const uint32_t source_block_m_idx = use_remote
+                    ? block_m_idx - remote_start : block_m_idx - local_start;
+                const uint32_t source_m_idx = source_block_m_idx +
+                    (kIsMulticastOnA ? cute::block_rank_in_cluster() * load_block_m : 0);
+                if (use_remote) {
+                    wait_remote_once();
+                }
+                const auto* tensor_map_a = use_remote
+                    ? &tensor_map_a_remote : &tensor_map_a_local;
+                const auto* tensor_map_sfa = use_remote
+                    ? &tensor_map_sfa_remote : &tensor_map_sfa_local;
+
                 // Issue TMAs
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
                 if constexpr (kMajorA == cute::UMMA::Major::K)
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_a_idx, m_idx, 1, batch_idx);
+                        tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_a_idx, source_m_idx, 1, batch_idx);
                 if constexpr (kMajorA == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_a_idx, 1, batch_idx);
+                        tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], source_m_idx, k_a_idx, 1, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_b_idx, n_idx, 1, batch_idx);
@@ -301,10 +332,10 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
                 // Issue SFA and SFB TMAs at certain stages
                 // No swizzling, so one TMA for one SF is enough
                 if (k_block_idx % kNumSFAStagesPerLoad == 0) {
-                    uint32_t sfa_m_idx = m_block_idx * BLOCK_M;
                     uint32_t sfa_k_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::SF_K>(
                         shape_sfa_k, 1, math::ceil_div(k_idx, BLOCK_K * kNumSFAStagesPerLoad));
-                    tma::copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx);
+                    const uint32_t source_sfa_m_idx = source_block_m_idx;
+                    tma::copy<BLOCK_M, 1, 0>(tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], source_sfa_m_idx, sfa_k_idx);
                     num_arrival_bytes += BLOCK_M * sizeof(uint32_t);
                 }
                 if (k_block_idx % kNumSFBStagesPerLoad == 0) {
@@ -511,8 +542,6 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
         // Epilogue warp groups
         const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
-        DG_STATIC_ASSERT(kNumUMMAStoreThreads == 128,
-                         "TP2 symmetric O-proj requires four epilogue warps");
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -521,8 +550,6 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
 
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
-        DG_STATIC_ASSERT(kSwapAB,
-                         "TP2 symmetric O-proj requires swap-AB");
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -532,34 +559,45 @@ o_proj_b_tp2_symm_impl(int* grouped_layout,
             // Wait UMMA arrival
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
+
             const auto tmem_base_addr = accum_stage_idx * UMMA_N;
-            const auto base_m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+            const auto base_m_idx = scheduler.template get_global_idx<
+                (not is_m_grouped_contiguous(kGemmType)), sched::IndexType::MN>(
+                    shape_m, BLOCK_M, remap_m_block_idx(m_block_idx));
             const auto base_n_idx = n_block_idx * BLOCK_N;
 
-            const auto effective_m =
-                scheduler.get_aligned_effective_m_in_block(m_block_idx);
-            epilogue::sm100_store_cd_swap_ab_dual<
-                BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
-                kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
-                kGemmType, kWithAccumulation,
-                cd_dtype_t, epilogue_type_t>
-            (smem_cd, tma_stage_idx, tmem_base_addr,
-             base_m_idx, base_n_idx, scheduler.current_group_idx,
-             effective_m,
-             epilogue_warp_idx, lane_idx,
-             tmem_empty_barriers[accum_stage_idx],
-             tensor_map_local_cd,
-             vector_store_cd, shape_m, shape_n);
+            if constexpr (kSwapAB) {
+                const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
+                epilogue::sm100_store_cd_swap_ab<
+                    BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    kGemmType, kWithAccumulation,
+                    cd_dtype_t, epilogue_type_t>
+                (smem_cd, tma_stage_idx, tmem_base_addr,
+                 base_m_idx, base_n_idx, scheduler.current_group_idx,
+                 effective_m,
+                 epilogue_warp_idx, lane_idx,
+                 tmem_empty_barriers[accum_stage_idx],
+                 tensor_map_cd);
+            } else {
+                epilogue::sm100_store_cd<
+                    BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                    kGemmType, kWithAccumulation,
+                    cd_dtype_t, epilogue_type_t>
+                (smem_cd, tma_stage_idx, tmem_base_addr,
+                 base_m_idx, base_n_idx, scheduler.current_group_idx,
+                 epilogue_warp_idx, lane_idx,
+                 tmem_empty_barriers[accum_stage_idx],
+                 tensor_map_cd);
+            }
         }
-
-        // Drain the local TMA group before the CTA exits.
-        if (epilogue_warp_idx == 0 and cute::elect_one_sync())
-            cute::tma_store_wait<0>();
     }
 
+    // TODO: Remove redundant synchronization
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
-    // Deallocate tensor memory.
+    // Deallocate tensor memory
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
 

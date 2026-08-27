@@ -16,6 +16,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import threading
 from typing import Any, Iterator
 
@@ -77,6 +78,9 @@ HIDDEN_DIM = 7168        # hidden_size
 QUANT_GROUP_SIZE = 128
 FP8_MAX = 448.0
 VALID_GEOMETRIES = ((HEADS, N_GROUPS), (TP2_HEADS, TP2_GROUPS))
+# WoA Wuda is the TP2-only grouped batched kernel.  Set WUDA_WOA=0 to keep
+# the DeepGEMM fp8_einsum reference path for an A/B comparison.
+WUDA_WOA = os.environ.get("WUDA_WOA", "1").lower() not in ("0", "false", "off")
 
 
 @triton.jit
@@ -108,8 +112,8 @@ class OProjWorkspace:
     projected: torch.Tensor   # BF16 full output or no-comm TP partial
     mhc_output: torch.Tensor  # BF16 [M,4,7168]
     quant_module: Any
+    wo_a_module: Any | None = None
     tp2_comm: Any | None = None
-    tp2_no_comm: bool = False
 
 
 class TP2Comm:
@@ -145,8 +149,11 @@ class TP2Comm:
             self.mla_o_scale_base, group=group)
         self.mla_o_scale_peer_base = self.mla_o_scale_handle.get_buffer(
             rank ^ 1, self.mla_o_scale_base.shape, torch.int32)
-        self.mla_grid_done = torch.zeros(1, device=device, dtype=torch.int64)
-        # One CUDA-graph-safe generation counter per fused mHC-post CTA.
+        # Slot 0 is the producer grid-join counter; slot 1 is the graph-stable
+        # generation consumed by the fused WoA loader.
+        self.mla_grid_done = torch.zeros(2, device=device, dtype=torch.int64)
+        # One CUDA-graph-safe generation per possible mHC consumer CTA. The
+        # kernel selects per-CTA or one-grid-flag signalling by geometry.
         self.mhc_block_generations = torch.zeros(
             128 * 4, device=device, dtype=torch.int32)
         self.benchmark_generation = torch.zeros(
@@ -168,9 +175,8 @@ class TP2Comm:
     def mla_signal_pad_pointers(self) -> list[int]:
         return [int(value) for value in self.mla_o_fp8_handle.signal_pad_ptrs]
 
-
 def load_tp2_comm_module() -> Any:
-    """Build the production symmetric ProjB + reduce/mHC-post extension."""
+    """Build the TP2 extension (WoA, symmetric ProjB, and fused post)."""
 
     import deep_gemm
     from torch.utils.cpp_extension import load
@@ -221,6 +227,7 @@ def load_mla_o_quant_module() -> Any:
             "-O3", "-std=c++17", "-lineinfo",
             f"-gencode=arch=compute_{sm}a,code=sm_{sm}a",
         ] + host_compiler_flag,
+        extra_ldflags=["-lcuda"],
         verbose=False,
     )
 
@@ -319,7 +326,6 @@ def _quant_o_lora_kernel(
     QUANT_GROUP_SIZE_T: tl.constexpr,
     FP8_MAX_T: tl.constexpr,
     TRIGGER_PDL: tl.constexpr,
-    launch_pdl: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     packed_block = tl.program_id(1).to(tl.int64)
@@ -378,19 +384,18 @@ def prepare_o_proj_workspace(
     heads: int = HEADS,
     groups: int = N_GROUPS,
     quant_module: Any,
+    wo_a_module: Any | None = None,
     tp2_comm: TP2Comm | None = None,
-    tp2_no_comm: bool = False,
 ) -> OProjWorkspace:
     _require(1 <= m <= 128, "O projection requires M in [1,128]")
     _require(quant_module is not None, "MLA O-projection quant module is required")
     heads_per_group, intermediate_dim = _geometry(heads, groups)
     if groups == TP2_GROUPS:
-        _require((tp2_comm is not None) != tp2_no_comm,
-                 "TP2 geometry requires exactly one of symmetric communication "
-                 "or the benchmark-only no-communication path")
+        _require(tp2_comm is not None,
+                 "TP2 geometry requires symmetric communication")
     else:
-        _require(tp2_comm is None and not tp2_no_comm,
-                 "full-rank geometry cannot use TP2 communication modes")
+        _require(tp2_comm is None,
+                 "full-rank geometry cannot use TP2 communication")
     d = heads_per_group * HEAD_DIM
     aligned_m = _align(m, 4)
 
@@ -438,8 +443,85 @@ def prepare_o_proj_workspace(
             (m, 4, HIDDEN_DIM), device=device, dtype=torch.bfloat16
         ),
         quant_module=quant_module,
+        wo_a_module=wo_a_module,
         tp2_comm=tp2_comm,
-        tp2_no_comm=tp2_no_comm,
+    )
+
+
+def _run_wo_a(
+    module: Any | None,
+    input_fp8: torch.Tensor,
+    input_scale: torch.Tensor,
+    weights: OProjWeights,
+    output: torch.Tensor,
+) -> None:
+    """Run TP2 WoA through the static Wuda batched kernel when available."""
+
+    # Wuda's fixed batched instance is intentionally TP2-only (8 groups). The
+    # full-rank 16-group path stays on DeepGEMM until a separate instance is
+    # worthwhile; this keeps the migration independent of the full model path.
+    if (WUDA_WOA and module is not None and
+            weights.wo_a.size(0) == TP2_GROUPS):
+        module.o_proj_a(
+            input_fp8.permute(1, 0, 2),
+            input_scale.permute(1, 0, 2),
+            weights.wo_a,
+            weights.wo_a_scale,
+            output.permute(1, 0, 2),
+        )
+        return
+    import deep_gemm
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (input_fp8, input_scale),
+        (weights.wo_a, weights.wo_a_scale),
+        output,
+        recipe=(1, 1, 128),
+    )
+
+
+def _run_wo_a_tp2_overlap(
+    module: Any,
+    tp2_comm: Any,
+    weights: OProjWeights,
+    output: torch.Tensor,
+) -> None:
+    """Consume both symmetric MLA halves in one guarded WoA launch."""
+
+    _require(module is not None and hasattr(module, "o_proj_a_tp2_overlap"),
+             "fused TP2 WoA extension is unavailable")
+    rank = tp2_comm.rank
+    batch = output.size(0)
+    split = batch // 2
+    local_start = 0 if rank == 0 else split
+    remote_start = split if rank == 0 else 0
+    # Consume both halves directly from the normal symmetric allocation. The
+    # views retain the global-M stride, while the extension's
+    # TMA descriptors use each half's base offset as a compact logical origin.
+    global_fp8 = tp2_comm.mla_o_fp8_base.view(
+        torch.float8_e4m3fn).permute(1, 0, 2)
+    local_fp8 = global_fp8.narrow(0, local_start, split).permute(1, 0, 2)
+    remote_fp8 = global_fp8.narrow(0, remote_start, split).permute(1, 0, 2)
+    scale_storage = tp2_comm.mla_o_scale_base
+    aligned_batch = (batch + 3) // 4 * 4
+    heads_per_group = TP2_HEADS // TP2_GROUPS
+    scale_global = scale_storage.as_strided(
+        (batch, TP2_GROUPS, heads_per_group),
+        (1, heads_per_group * aligned_batch, aligned_batch),
+    )
+    local_scale = scale_global.narrow(0, local_start, split).permute(1, 0, 2)
+    remote_scale = scale_global.narrow(0, remote_start, split).permute(1, 0, 2)
+    module.o_proj_a_tp2_overlap(
+        local_fp8,
+        remote_fp8,
+        local_scale,
+        remote_scale,
+        weights.wo_a,
+        weights.wo_a_scale,
+        output.permute(1, 0, 2),
+        tp2_comm.mla_signal_pad_pointers,
+        tp2_comm.mla_grid_done,
+        rank,
     )
 
 
@@ -546,14 +628,14 @@ def run_o_proj_mhc_post(
              workspace.mhc_output.is_contiguous(),
              "workspace.mhc_output must be contiguous BF16 [M,4,7168]")
     if num_groups == TP2_GROUPS:
-        _require((tp2_comm is not None) != workspace.tp2_no_comm,
-                 "TP2 workspace has an invalid communication mode")
+        _require(tp2_comm is not None,
+                 "TP2 workspace requires symmetric communication")
     else:
-        _require(tp2_comm is None and not workspace.tp2_no_comm,
-                 "full-rank workspace cannot use TP2 communication modes")
-    _require(run_mhc_post or num_groups == N_GROUPS or workspace.tp2_no_comm,
+        _require(tp2_comm is None,
+                 "full-rank workspace cannot use TP2 communication")
+    _require(tp2_comm is None or run_mhc_post,
              "the symmetric TP2 producer and fused post must run together")
-    _require(not (run_mhc_post and tp2_comm is None)
+    _require(tp2_comm is not None or not run_mhc_post
              or mhc_post_module is not None,
              "the ordinary mHC post module is required")
     _validate_workspace_aliases(
@@ -583,6 +665,9 @@ def run_o_proj_mhc_post(
     # This producer/consumer pair did not show stable overlap in E2E traces.
     # Enable it only for the force-all ablation mode.
     pdl_quant_to_wo_b = use_pdl and force_pdl
+    wo_a_module = workspace.wo_a_module
+    if wo_a_module is None and tp2_comm is not None:
+        wo_a_module = tp2_comm.module
 
     # Serialize the process-wide DeepGEMM PDL setting and all affected enqueues.
     assert device.index is not None
@@ -591,6 +676,15 @@ def run_o_proj_mhc_post(
             deep_gemm, False, device.index
         ):
             if tpdp_mla_scatter:
+                half_m = m // 2
+                fused_block_m = (16 if half_m <= 16 else
+                                 32 if half_m <= 32 else 64)
+                _require(
+                    WUDA_WOA and m % 2 == 0 and
+                    half_m % fused_block_m == 0,
+                    "TPDP MLA scatter supports only the fused PDL WoA shapes "
+                    "B=32,64,128",
+                )
                 workspace.quant_module.inv_rope_quant_tp2(
                     mla_out,
                     positions,
@@ -603,6 +697,10 @@ def run_o_proj_mhc_post(
                     tp2_comm.mla_signal_pad_pointers,
                     tp2_comm.rank,
                 )
+                # The dependent WoA consumes local rows first and waits for the
+                # peer generation only when its TMA loader reaches remote rows.
+                _run_wo_a_tp2_overlap(
+                    wo_a_module, tp2_comm, weights, workspace.z)
             else:
                 workspace.quant_module.inv_rope_quant(
                     mla_out,
@@ -611,13 +709,13 @@ def run_o_proj_mhc_post(
                     workspace.o_fp8,
                     workspace.o_scale,
                 )
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (workspace.o_fp8, workspace.o_scale),
-                (weights.wo_a, weights.wo_a_scale),
-                workspace.z,
-                recipe=(1, 1, 128),
-            )
+                _run_wo_a(
+                    wo_a_module,
+                    workspace.o_fp8,
+                    workspace.o_scale,
+                    weights,
+                    workspace.z,
+                )
 
         with deepgemm_pdl_enqueue_scope(
             deep_gemm, pdl_quant_to_wo_b, device.index
@@ -633,7 +731,6 @@ def run_o_proj_mhc_post(
                 QUANT_GROUP_SIZE_T=QUANT_GROUP_SIZE,
                 FP8_MAX_T=FP8_MAX,
                 TRIGGER_PDL=pdl_quant_to_wo_b,
-                launch_pdl=False,
                 num_warps=4,
                 num_stages=1,
             )

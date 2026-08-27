@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TP2 / DP2 三处融合通信：最终实现</title>
+  <style>
+    :root {
+      --ink: #17201d;
+      --muted: #5e6a65;
+      --paper: #ffffff;
+      --canvas: #f4f5f1;
+      --line: #d8ddd8;
+      --green: #087f5b;
+      --green-soft: #e7f5ef;
+      --blue: #1864ab;
+      --blue-soft: #e8f1fa;
+      --coral: #c2412d;
+      --coral-soft: #faece8;
+      --gold-soft: #fff4d6;
+      --code: #111714;
+      --code-text: #e9f1ed;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 15px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: inherit; }
+    header {
+      color: #fff;
+      background: #173c32;
+      border-bottom: 5px solid #ee9b5f;
+    }
+    .hero { max-width: 1160px; margin: 0 auto; padding: 54px 28px 44px; }
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #bce6d5;
+      font: 700 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      font-size: 42px;
+      line-height: 1.16;
+      letter-spacing: 0;
+    }
+    .hero p { max-width: 850px; margin: 18px 0 0; color: #d9e8e2; font-size: 17px; }
+    .hero-facts {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin-top: 32px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.24);
+    }
+    .hero-facts div { min-height: 82px; padding: 14px 16px; background: #214b40; }
+    .hero-facts b { display: block; margin-bottom: 3px; color: #fff; font-size: 20px; }
+    .hero-facts span { color: #cfe2da; font-size: 13px; }
+    .shell {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      gap: 34px;
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 32px 28px 70px;
+    }
+    nav {
+      position: sticky;
+      top: 18px;
+      align-self: start;
+      padding: 16px 0;
+      border-top: 2px solid var(--ink);
+      border-bottom: 1px solid var(--line);
+    }
+    nav strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    nav a {
+      display: block;
+      padding: 5px 0;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+    }
+    nav a:hover { color: var(--green); }
+    main { min-width: 0; }
+    section { padding: 28px 0 36px; border-bottom: 1px solid var(--line); }
+    section:first-child { padding-top: 0; }
+    h2 { margin: 0 0 16px; font-size: 28px; line-height: 1.24; letter-spacing: 0; }
+    h3 { margin: 28px 0 10px; font-size: 19px; line-height: 1.35; letter-spacing: 0; }
+    p { margin: 10px 0; }
+    code {
+      padding: 1px 5px;
+      border: 1px solid #d6ddd8;
+      border-radius: 4px;
+      background: #eef1ee;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9em;
+    }
+    pre {
+      margin: 14px 0 18px;
+      overflow: auto;
+      border: 1px solid #29332e;
+      border-radius: 6px;
+      background: var(--code);
+      color: var(--code-text);
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      tab-size: 2;
+    }
+    pre code {
+      display: block;
+      min-width: max-content;
+      padding: 18px;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+    .kw { color: #74c0fc; }
+    .fn { color: #8ce99a; }
+    .cm { color: #9aa7a0; }
+    .num { color: #ffd43b; }
+    .summary { padding: 18px 20px; border-left: 4px solid var(--green); background: var(--green-soft); }
+    .summary strong { color: #075f46; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      align-items: stretch;
+      gap: 7px;
+      margin: 22px 0;
+    }
+    .flow .node {
+      display: flex;
+      min-height: 84px;
+      flex-direction: column;
+      justify-content: center;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--paper);
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .flow .node b { font-size: 14px; }
+    .flow .comm-q { border-color: #7eb3de; background: var(--blue-soft); }
+    .flow .comm-mla { border-color: #e7a18e; background: var(--coral-soft); }
+    .flow .comm-op { border-color: #e1ba56; background: var(--gold-soft); }
+    .arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 20px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 18px; }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 3px 9px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--paper);
+      color: var(--muted);
+      font: 700 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .tag.blue { color: var(--blue); border-color: #9ec5e5; }
+    .tag.coral { color: var(--coral); border-color: #e8ad9f; }
+    .tag.green { color: var(--green); border-color: #9fd8c3; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      margin: 18px 0;
+    }
+    .rank {
+      min-height: 172px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--paper);
+    }
+    .rank h4 { margin: 0 0 10px; font-size: 15px; }
+    .slot {
+      margin-top: 7px;
+      padding: 8px 10px;
+      border-left: 3px solid var(--green);
+      background: #f4f7f5;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .exchange { color: var(--coral); text-align: center; font-size: 22px; font-weight: 800; }
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 16px 0 20px;
+      counter-reset: step;
+    }
+    .step {
+      min-height: 126px;
+      padding: 14px;
+      border-top: 3px solid var(--green);
+      background: var(--paper);
+      box-shadow: 0 1px 0 rgba(23, 32, 29, 0.08);
+      counter-increment: step;
+    }
+    .step::before {
+      content: counter(step, decimal-leading-zero);
+      display: block;
+      margin-bottom: 7px;
+      color: var(--green);
+      font: 800 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .step b { display: block; margin-bottom: 4px; }
+    .step span { color: var(--muted); font-size: 13px; }
+    table { width: 100%; margin: 16px 0 22px; border-collapse: collapse; background: var(--paper); font-size: 13px; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #e9ece8; }
+    td.good { color: #06724f; font-weight: 800; }
+    .note, .warning { margin: 18px 0; padding: 14px 16px; border-left: 4px solid var(--blue); background: var(--blue-soft); }
+    .warning { border-left-color: var(--coral); background: var(--coral-soft); }
+    .signal-map td:first-child, .signal-map td:nth-child(2) {
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    footer { padding: 26px 28px 38px; color: var(--muted); text-align: center; font-size: 12px; }
+    @media (max-width: 900px) {
+      .hero-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .shell { grid-template-columns: 1fr; }
+      nav { position: static; display: none; }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { min-height: 20px; transform: rotate(90deg); }
+      .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .hero { padding: 36px 18px 30px; }
+      h1 { font-size: 32px; }
+      .hero p { font-size: 15px; }
+      .hero-facts { grid-template-columns: 1fr; }
+      .shell { padding: 24px 16px 50px; }
+      h2 { font-size: 24px; }
+      .layout { grid-template-columns: 1fr; }
+      .exchange { transform: rotate(90deg); }
+      .steps { grid-template-columns: 1fr; }
+      th, td { padding: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <p class="eyebrow">Production implementation / TP2 + request DP2</p>
+      <h1>三处融合通信，如何把 TP 布局和 DP 布局接起来</h1>
+      <p>这条 decode 链没有 NCCL collective，也没有独立通信 kernel。三处跨 GPU 数据交换都由已有计算 kernel
+        直接写对端 symmetric memory，并把等待放到最接近真实消费者的位置。</p>
+      <div class="hero-facts">
+        <div><b>3</b><span>Q gather / MLA scatter / O-proj reduce</span></div>
+        <div><b>0</b><span>热路径中的独立通信 kernel</span></div>
+        <div><b>Push</b><span>生产者直接写 peer allocation</span></div>
+        <div><b>Graph-safe</b><span>generation 单调递增，不逐轮清零</span></div>
+      </div>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav aria-label="目录">
+      <strong>目录</strong>
+      <a href="#overview">1. 全链路</a>
+      <a href="#foundation">2. 共同基础</a>
+      <a href="#query">3. Q head-gather</a>
+      <a href="#mla">4. MLA 输出重分布</a>
+      <a href="#oproj">5. O-proj partial reduce</a>
+      <a href="#compare">6. 横向对比</a>
+      <a href="#performance">7. 当前性能</a>
+      <a href="#invariants">8. 正确性边界</a>
+    </nav>
+
+    <main>
+      <section id="overview">
+        <h2>1. 全链路：为什么正好有三处通信</h2>
+        <div class="summary"><strong>核心矛盾：</strong>线性层按 head 做 TP2，而 attention 按 request 做 DP2。每次计算所有权从
+          “head shard” 切到 “request shard”，或从 “request shard” 切回 “head shard”，都需要一次布局交换。</div>
+        <div class="flow" aria-label="decode 通信流程">
+          <div class="node"><b>WQ_B</b>每 rank<br>所有 B 请求 × 64 heads</div><div class="arrow">→</div>
+          <div class="node comm-q"><b>① Q gather</b>TP2 → DP2<br>BF16 Q heads</div><div class="arrow">→</div>
+          <div class="node"><b>FlashMLA</b>每 rank<br>B/2 请求 × 128 heads</div><div class="arrow">→</div>
+          <div class="node comm-mla"><b>② MLA scatter</b>DP2 → TP2<br>FP8 + UE8M0</div>
+        </div>
+        <div class="flow" aria-label="O-projection 通信流程">
+          <div class="node"><b>WoA / WoB</b>每 rank<br>所有 B 请求 × 1 TP shard</div><div class="arrow">→</div>
+          <div class="node comm-op"><b>③ partial reduce</b>TP2 → replicated<br>BF16 partial</div><div class="arrow">→</div>
+          <div class="node"><b>mHC post</b>两份 partial 求和<br>并融合 residual mixing</div><div class="arrow">→</div>
+          <div class="node"><b>下一层</b>每 rank 得到相同<br>完整 hidden state</div>
+        </div>
+        <table>
+          <thead><tr><th>位置</th><th>通信前布局</th><th>通信后布局</th><th>真正消费者</th></tr></thead>
+          <tbody>
+            <tr><td>① Query</td><td>所有请求，64-head TP shard</td><td>半数请求，完整 128 heads</td><td>FlashMLA</td></tr>
+            <tr><td>② MLA output</td><td>半数请求，完整 128 heads</td><td>所有请求，64-head TP shard</td><td>WoA TMA loader</td></tr>
+            <tr><td>③ WoB output</td><td>所有请求，一份 TP partial</td><td>两份 partial 在本地可读</td><td>fused mHC post</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="foundation">
+        <h2>2. 共同基础：symmetric allocation + 单调 generation</h2>
+        <p>两个 rank 以相同顺序创建相同形状的 symmetric allocation，并在初始化阶段完成 rendezvous。每个 rank 因而同时持有本地基址和对端基址；热路径只做地址选择，不再分配、不交换指针。</p>
+        <pre><code><span class="kw">struct</span> SymmetricView {
+    uintptr_t local_base;
+    uintptr_t remote_base;
+    uint32_t rank;
+
+    <span class="kw">template</span> &lt;<span class="kw">typename</span> T&gt;
+    T* <span class="fn">local</span>() { <span class="kw">return</span> reinterpret_cast&lt;T*&gt;(local_base); }
+
+    <span class="kw">template</span> &lt;<span class="kw">typename</span> T&gt;
+    T* <span class="fn">peer_base</span>() { <span class="kw">return</span> reinterpret_cast&lt;T*&gt;(remote_base); }
+
+    uint32_t <span class="fn">peer_rank</span>() { <span class="kw">return</span> rank ^ <span class="num">1u</span>; }
+};</code></pre>
+        <div class="legend">
+          <span class="tag blue">payload: peer direct store</span>
+          <span class="tag coral">signal: signal pad</span>
+          <span class="tag green">state: monotonic generation</span>
+        </div>
+        <table class="signal-map">
+          <thead><tr><th>通信</th><th>signal offset</th><th>generation</th><th>作用域</th></tr></thead>
+          <tbody>
+            <tr><td>Q gather</td><td>32 + producer_rank</td><td>每轮 +1</td><td>跨 GPU payload 完成</td></tr>
+            <tr><td>MLA scatter</td><td>48 + producer_rank</td><td>publisher 到达数 / publisher 数</td><td>跨 GPU FP8/scale 完成</td></tr>
+            <tr><td>O-proj reduce</td><td>64 + cta 或 grid slot</td><td>每 consumer CTA 每轮 +1</td><td>对端 WoB kernel 已退休</td></tr>
+          </tbody>
+        </table>
+        <p>三处都不在 graph replay 前清零 flag。消费者等待 <code>expected</code> 或更大的 generation，避免额外 memset，也避免 host 参与每轮同步。用于性能测试的 rank barrier 只排除 host enqueue 偏差，不属于模型的第四处通信。</p>
+      </section>
+
+      <section id="query">
+        <h2>3. 通信一：Q head-gather（TP2 → request DP2）</h2>
+        <div class="layout">
+          <div class="rank"><h4>Rank 0 生产</h4><div class="slot">输入：B × heads[0:64]</div><div class="slot">本地保留：request 前半 × heads[0:64]</div><div class="slot">推给 peer：request 后半 × heads[0:64]</div></div>
+          <div class="exchange">⇄</div>
+          <div class="rank"><h4>Rank 1 生产</h4><div class="slot">输入：B × heads[64:128]</div><div class="slot">本地保留：request 后半 × heads[64:128]</div><div class="slot">推给 peer：request 前半 × heads[64:128]</div></div>
+        </div>
+        <h3>3.1 Payload 融在 MQA 尾部的 Query RMSNorm + RoPE</h3>
+        <p>每个 producer rank 都遍历全局 B 个请求和自己的 64 个 head。目标请求属于本 rank 时写本地 symmetric allocation，否则直接写 peer allocation。目标位置包含 <code>producer_rank * 64</code> 的 head 偏移，两个 rank 的写入天然拼成完整 128 heads，不需要后处理拷贝。</p>
+        <pre><code><span class="kw">const</span> uint32_t owner = batch &gt;= rank0_batch;
+<span class="kw">const</span> uint32_t owner_row = owner == <span class="num">0</span>
+    ? batch : batch - rank0_batch;
+<span class="kw">const</span> uint32_t full_head = producer_rank * <span class="num">64</span> + input_head;
+
+nv_bfloat16* destination = owner == producer_rank
+    ? symmetric_output.<span class="fn">local</span>&lt;nv_bfloat16&gt;()
+    : symmetric_output.<span class="fn">peer_base</span>&lt;nv_bfloat16&gt;();
+
+output = destination
+    + (owner_row * <span class="num">128</span> + full_head) * head_dim;</code></pre>
+        <p>通信调度采用 <strong>peer-first</strong>。Rank 1 的 peer-owned 请求本来就在队列前缀；Rank 0 将自己的 peer-owned 后缀旋转到队首。这样两边都优先发 NVLink store，剩余本地 query 计算可以覆盖传输尾部。</p>
+        <pre><code><span class="kw">const</span> uint32_t claim_rotate =
+    tp2 &amp;&amp; producer_rank == <span class="num">0</span>
+        ? rank0_batch * input_heads : <span class="num">0</span>;
+<span class="kw">const</span> uint32_t rotated = claim + claim_rotate;
+<span class="kw">const</span> uint32_t output_row = rotated &gt;= output_rows
+    ? rotated - output_rows : rotated;</code></pre>
+        <h3>3.2 同步融在 TopK，不新增通信 kernel</h3>
+        <p>MQA kernel 完成后，同一 stream 启动 TopK。TopK grid 额外带一个 rendezvous CTA；它与真正的 TopK CTA 并行。因为 payload 已在前一个 MQA kernel 中写完，flag thread 本身没有 payload 要 release，当前实现用 volatile system-visible store 发布 generation，然后等待 peer 的 generation，最后做一次 system acquire。</p>
+        <pre><code><span class="kw">const</span> uint32_t expected = query_generation + <span class="num">1</span>;
+
+<span class="cm">// 写对端 signal pad：宣布本 rank 的 64-head shard 已完成。</span>
+asm <span class="kw">volatile</span>(<span class="cm">"st.volatile.global.u32 [%0], %1;"</span>
+             :: <span class="cm">"l"</span>(peer_flag), <span class="cm">"r"</span>(expected) : <span class="cm">"memory"</span>);
+
+<span class="kw">while</span> (<span class="fn">load_relaxed_sys</span>(local_peer_flag) &lt; expected)
+    <span class="fn">spin_pause</span>();
+
+<span class="fn">fence_acquire_sys</span>();
+query_generation = expected;</code></pre>
+        <div class="steps">
+          <div class="step"><b>先发 peer rows</b><span>在 MQA 尾部尽早启动跨卡 BF16 写。</span></div>
+          <div class="step"><b>继续本地计算</b><span>剩余 local rows 和 attention 尾部覆盖通信。</span></div>
+          <div class="step"><b>TopK CTA 握手</b><span>通信等待与 TopK 主工作并行。</span></div>
+          <div class="step"><b>FlashMLA 消费</b><span>TopK 返回时，owner buffer 已有完整 128 heads。</span></div>
+        </div>
+      </section>
+
+      <section id="mla">
+        <h2>4. 通信二：MLA 输出重分布（request DP2 → TP2）</h2>
+        <div class="layout">
+          <div class="rank"><h4>FlashMLA Rank 0</h4><div class="slot">输入：request 前半 × 128 heads × BF16</div><div class="slot">本地输出：全部 B × heads[0:64] × FP8</div><div class="slot">peer 输出：前半 requests × heads[64:128]</div></div>
+          <div class="exchange">⇄</div>
+          <div class="rank"><h4>FlashMLA Rank 1</h4><div class="slot">输入：request 后半 × 128 heads × BF16</div><div class="slot">本地输出：全部 B × heads[64:128] × FP8</div><div class="slot">peer 输出：后半 requests × heads[0:64]</div></div>
+        </div>
+        <p>这里不是先生成 BF16 再通信。生产 kernel 同时完成 inverse RoPE、FP8 E4M3 量化、UE8M0 scale 生成和 head shard 路由。一个 warp 的 32 lanes 正好覆盖一个 512-byte head，量化结果从寄存器直接以 <code>uint4</code> 写本地或 peer，省掉 shared-memory staging 和第二次读写。</p>
+        <pre><code><span class="kw">const</span> int destination_rank = source_head / <span class="num">64</span>;
+<span class="kw">const</span> int destination_head = source_head % <span class="num">64</span>;
+<span class="kw">const</span> bool remote = destination_rank != rank;
+
+uint8_t* fp8_output = remote ? peer_fp8 : local_fp8;
+uint32_t* scale_output = remote ? peer_scale : local_scale;
+
+*reinterpret_cast&lt;uint4*&gt;(fp8_address) = packed_fp8;
+<span class="kw">if</span> (lane == <span class="num">0</span>)
+    remote ? <span class="fn">store_peer_u32</span>(scale_address, packed_scale)
+           : *scale_address = packed_scale;</code></pre>
+        <h3>4.1 为什么需要两级 release</h3>
+        <p>和 Q 不同，WoA 通过 PDL 与 producer 重叠启动，不能等 producer 整个 kernel 结束。因此必须在 kernel 内证明“所有写 peer 的 CTA 都完成”。CTA parity 被设计成在 task stride 下保持 destination rank 不变，所以恰好一半 CTA 是 remote publisher。</p>
+        <pre><code><span class="cm">// 每个 remote publisher 用 GPU-scope release 汇入 grid counter。</span>
+<span class="kw">const</span> uint64_t arrived = <span class="fn">atomicAdd_release_gpu</span>(grid_done, <span class="num">1</span>);
+
+<span class="kw">if</span> (arrived % publishers == <span class="num">0</span>) {
+    <span class="kw">while</span> (<span class="fn">load_acquire_gpu</span>(grid_done) &lt; arrived)
+        <span class="fn">spin_pause</span>();
+
+    <span class="kw">const</span> uint32_t generation = arrived / publishers;
+    <span class="cm">// 最后一个 publisher 用一次 SYS release 覆盖所有 peer stores。</span>
+    <span class="fn">store_release_sys</span>(peer_ready + <span class="num">48</span> + rank, generation);
+}</code></pre>
+        <p>第一层 <code>atom.release.gpu</code> 把同一 GPU 上多个 publisher CTA 的写聚合到一个 counter；最后一个 publisher 的 acquire 观察完整 join，再用唯一一次 <code>st.release.sys</code> 发布给对端。若每个 CTA 都做 system fence，会把大量并发写强制串行 drain，实测明显更慢。</p>
+        <h3>4.2 WoA 先算本地半边，只在 TMA loader 碰到远端块时等待</h3>
+        <p>dependent WoA 已经通过 PDL 启动。两张卡都重排 M block，使 scheduler 先访问本 rank 已经准备好的 token 半边。只有 TMA load warp 第一次遇到 remote block 时轮询 ready；其余 warp 自然停在既有 pipeline barrier，不增加一套全 kernel 同步。</p>
+        <pre><code><span class="kw">auto</span> <span class="fn">wait_remote_once</span> = [&amp;]() {
+    <span class="kw">if</span> (remote_ready) <span class="kw">return</span>;
+    <span class="kw">const</span> uint32_t expected = *producer_generation;
+    <span class="kw">const</span> uint32_t* flag = local_signal + <span class="num">48</span> + (rank ^ <span class="num">1</span>);
+
+    <span class="kw">while</span> (<span class="fn">load_relaxed_sys</span>(flag) &lt; expected)
+        <span class="fn">spin_pause</span>();
+    <span class="fn">fence_acquire_sys</span>();
+    remote_ready = <span class="kw">true</span>;
+};
+
+<span class="kw">if</span> (use_remote) <span class="fn">wait_remote_once</span>();
+<span class="fn">tma_copy</span>(use_remote ? remote_desc : local_desc, ...);</code></pre>
+        <div class="note"><strong>关键点：</strong>consumer wait 不是 MLA 通信的全部耗时。现在 payload store、publisher grid join、system release 和 WoA remote wait 分属不同阶段；本地 WoA block 可以覆盖前面三项的大部分延迟。</div>
+      </section>
+
+      <section id="oproj">
+        <h2>5. 通信三：O-proj partial reduce（TP2 → replicated output）</h2>
+        <p>每个 rank 的 WoB 都计算 <code>[B, 7168]</code> BF16 partial。完整结果是两份 partial 的 BF16 pairwise sum，随后立刻进入 mHC post。这里把 peer publish 融进 WoB epilogue，把 reduce 融进 mHC post，没有单独 all-reduce 或 reduction kernel。</p>
+        <h3>5.1 从同一块 epilogue shared memory 同时写本地和 peer</h3>
+        <p>accumulator 转成 BF16 并落到 epilogue staging buffer 后，128 个 epilogue threads 读取 swizzled tile：一路按原逻辑 TMA store 到普通本地 output；另一路以 16-byte system-scope vector store 直接写 peer 的 symmetric slot。通信没有重新读取本地 output。</p>
+        <pre><code><span class="kw">for</span> (uint32_t vector = epilogue_thread_idx;
+     vector &lt; total_vectors; vector += epilogue_threads) {
+    <span class="kw">const</span> uint4 bits = *<span class="fn">swizzled_smem_vector</span>(vector);
+    <span class="kw">if</span> (global_m &lt; shape_m) {
+        uint4* peer = peer_partial + global_m * hidden + global_n;
+        <span class="fn">store_relaxed_sys_v4_u32</span>(peer, bits);
+    }
+}
+<span class="fn">named_barrier_sync</span>();
+<span class="fn">tma_store_local_partial</span>(...);</code></pre>
+        <p>symmetric allocation 预留两个 slot。Rank 0 永远写对端 slot 0，Rank 1 永远写对端 slot 1；consumer 在本地 allocation 中读取“由 peer 写来的 slot”，而自己的 partial 直接读普通 output buffer。</p>
+        <h3>5.2 mHC post 起始 rendezvous</h3>
+        <p>flag 不在 WoB epilogue 内发布，而由同一 stream 中紧随 WoB 的 mHC post kernel 发布。此时前一个 WoB kernel 已完全退休，kernel completion 已覆盖本 rank 的所有 peer stores，因此无需在数百个 epilogue CTA 内各做一次 release fence。每个 mHC CTA 的 thread 0 先和 peer 对齐 generation，再让整个 CTA 开始读 partial。</p>
+        <pre><code><span class="kw">const</span> uint32_t cta = row * gridDim.x + blockIdx.x;
+<span class="kw">const</span> bool cta_flags = m * gridDim.x &lt; <span class="num">256</span>;
+<span class="kw">const</span> uint32_t next = block_generations[cta] + <span class="num">1</span>;
+
+<span class="kw">if</span> (cta_flags)
+    <span class="fn">volatile_store</span>(peer_ready + <span class="num">64</span> + cta, next);
+<span class="kw">else if</span> (cta == <span class="num">0</span>)
+    <span class="fn">volatile_store</span>(peer_grid_ready, next);
+
+<span class="kw">do</span> { ready = <span class="fn">volatile_load</span>(local_peer_flag); }
+<span class="kw">while</span> (cta_flags ? ready != next : ready &lt; next);
+
+block_generations[cta] = next;
+<span class="fn">__syncthreads</span>();
+
+uint4 sum = <span class="fn">add_bf16x8</span>(local_partial, peer_partial);
+<span class="fn">mhc_mix_and_store</span>(sum, residual, post, comb);</code></pre>
+        <h3>5.3 为什么有两种 flag 粒度</h3>
+        <table>
+          <thead><tr><th>consumer CTA 数</th><th>策略</th><th>原因</th></tr></thead>
+          <tbody>
+            <tr><td><code>M × gridDim.x &lt; 256</code></td><td>每 CTA 一个 flag</td><td>CTA 少时，分散 peer flag store 的代价小，避免大量 CTA 争读同一地址。</td></tr>
+            <tr><td><code>M × gridDim.x ≥ 256</code></td><td>整个 grid 一个 flag</td><td>CTA 多时只让 CTA 0 发布，减少跨卡 flag store；所有 CTA 等同一完成事实。</td></tr>
+          </tbody>
+        </table>
+        <div class="warning">这个无显式 release/acquire 的协议依赖一个不可随意改变的边界：payload 必须在前一个 WoB kernel，flag 必须在后一个同 stream kernel。如果把 flag 移回 WoB epilogue，或让两个 kernel 跨 stream 乱序，就必须重新建立覆盖全部 publisher 的 system-scope release/acquire 链。</div>
+      </section>
+
+      <section id="compare">
+        <h2>6. 三处协议横向对比</h2>
+        <table>
+          <thead><tr><th>项目</th><th>Q gather</th><th>MLA scatter</th><th>O-proj reduce</th></tr></thead>
+          <tbody>
+            <tr><td>payload 类型</td><td>BF16 Q heads</td><td>FP8 activation + UE8M0 scale</td><td>BF16 WoB partial</td></tr>
+            <tr><td>payload producer</td><td>MQA 尾部 query warp</td><td>inverse-RoPE quant kernel</td><td>WoB epilogue warpgroup</td></tr>
+            <tr><td>consumer wait</td><td>TopK rendezvous CTA</td><td>WoA TMA load warp</td><td>mHC post 每 CTA thread 0</td></tr>
+            <tr><td>release 边界</td><td>前一个 MQA kernel completion</td><td>GPU join + 单次 SYS release</td><td>前一个 WoB kernel completion</td></tr>
+            <tr><td>acquire</td><td>等待后一次 SYS acquire</td><td>等待后一次 SYS acquire</td><td>后继 kernel 内 volatile rendezvous</td></tr>
+            <tr><td>主要隐藏位置</td><td>本地 query + TopK</td><td>本地半边 WoA</td><td>WoB epilogue 内顺带发送</td></tr>
+          </tbody>
+        </table>
+        <p>三处代码不能机械地统一成同一种 fence 模板。真正决定协议的是 flag 发出时 payload 位于哪里：Q 和 O-proj 的 payload 已经过 kernel completion；MLA 为了 producer/consumer overlap，在 producer 尚未退出时就允许 WoA 消费，因此必须显式构造跨 CTA、跨 GPU 的 release 链。</p>
+      </section>
+
+      <section id="performance">
+        <h2>7. 当前端到端效果</h2>
+        <p>以下是 8K context 的冷测结果。每次 graph replay 前用 8 GB memset 驱逐 L2，驱逐不计时；Perfetto 取一次 replay 中有效 GPU kernel 的首尾跨度，并对 30 个 paired samples 先取 cross-rank max，再报告 mean。纯 DP 是完全不初始化 distributed、没有 peer payload、flag、wait 或 generation 的单卡 <code>B/2</code> 场景。</p>
+        <table>
+          <thead><tr><th>全局 batch</th><th>纯 DP，local B/2</th><th>TPDP</th><th>TPDP 收益</th></tr></thead>
+          <tbody>
+            <tr><td>32</td><td>142.46 us</td><td>131.8 us</td><td class="good">+10.7 us</td></tr>
+            <tr><td>64</td><td>151.73 us</td><td>144.1 us</td><td class="good">+7.6 us</td></tr>
+            <tr><td>128</td><td>164.75 us</td><td>161.4 us</td><td class="good">+3.4 us</td></tr>
+          </tbody>
+        </table>
+        <p>生产代码只保留上述唯一协议，不再携带 runtime communication mode、no-communication workspace、stream-wait 备选协议或 globaltimer 消融埋点。这样不仅减少接口和分支，也避免诊断代码改变 kernel 寄存器、指令和关键路径。</p>
+      </section>
+
+      <section id="invariants">
+        <h2>8. 修改时必须守住的正确性边界</h2>
+        <table>
+          <thead><tr><th>约束</th><th>原因</th></tr></thead>
+          <tbody>
+            <tr><td>两个 rank 必须按相同顺序 rendezvous 相同形状的 allocation</td><td>peer base 和 signal pad 映射依赖完全一致的 symmetric allocation 顺序。</td></tr>
+            <tr><td>Q 的 owner 分界固定为 <code>ceil(B/2)</code></td><td>它同时决定输出 row、peer-first rotation 和 FlashMLA request ownership。</td></tr>
+            <tr><td>MLA remote publisher CTA 数必须与 join divisor 一致</td><td>最后 publisher 的 SYS release 必须覆盖所有 remote stores，少算会提前发布，多算会死等。</td></tr>
+            <tr><td>WoA 必须先访问本地 M block</td><td>否则 dependent launch 一开始就等待 peer，MLA/WoA overlap 会退化成串行。</td></tr>
+            <tr><td>O-proj 的 flag 必须位于 WoB 之后的同一 stream</td><td>当前最小同步依赖 kernel completion；改变边界必须重新设计内存序。</td></tr>
+            <tr><td>两个 rank 每轮 graph replay 次数必须一致</td><td>generation 单调推进；任一 rank 跳轮会让精确 generation 协议失配。</td></tr>
+          </tbody>
+        </table>
+        <div class="summary"><strong>一句话总结：</strong>Q 用“提前推送 + 后继 TopK 握手”，MLA 用“producer 内 grid join + WoA 按需等待”，O-proj 用“epilogue 双写 + 后继 mHC rendezvous”。三处都把通信放在已有计算里，但 release 边界根据 producer 是否已经退出而不同。</div>
+      </section>
+    </main>
+  </div>
+  <footer>TP2 / DP2 fused communication implementation note</footer>
+</body>
+</html>

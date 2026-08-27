@@ -1,6 +1,6 @@
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda.h>
@@ -8,7 +8,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
+
 #include "o_proj_b_tp2_symm.cuh"
+#include "o_proj_a_tp2_overlap.cuh"
 
 namespace {
 
@@ -26,7 +29,26 @@ constexpr int kValuesPerVector = 8;
 constexpr int kVectorsPerRow = kN / kValuesPerVector;
 constexpr int kBenchmarkReadyOffset = 16;
 constexpr int kMhcReadyOffset = 64;
+constexpr int kMhcGridReadyOffset = 64 + kMMax * 4;
+// Measured crossover of the two start-barrier flag schemes; see mhc_post_kernel.
+constexpr int kMhcSingleFlagMinCtas = 256;
 constexpr uint64_t kBenchmarkEnqueueGraceNs = 1'000'000;
+
+// WoA is the grouped batched GEMM between the MLA output and the per-group
+// [1024, 4096] weights.  These values match the DeepGEMM heuristic for
+// GemmType::Batched on SM100 (G=8, N=1024, K=4096).  The heuristic selects
+// swap-AB with a 2-CTA cluster and N tiles of 128; the M tile is 16/32/64 as
+// M crosses 32/64/128.
+constexpr int kWoAGroups = 8;
+constexpr int kWoAMax = 128;
+constexpr int kWoAN = 1024;
+constexpr int kWoAK = 4096;
+constexpr int kWoABlockN = 128;
+constexpr int kWoABlockK = 128;
+constexpr int kWoAClusterSize = 2;
+constexpr int kWoANumSMs = 148;
+constexpr int kWoAThreads = 256;
+constexpr int kWoADynamicSmemBytes = 230188;
 
 using KernelDType = cutlass::bfloat16_t;
 
@@ -65,6 +87,29 @@ CUtensorMap make_2d_map(
           CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
       "cuTensorMapEncodeTiled");
+  return result;
+}
+
+CUtensorMap make_3d_map(
+    void* ptr, CUtensorMapDataType dtype, int element_bytes,
+    uint64_t inner_dim, uint64_t outer_dim, uint64_t batch_dim,
+    uint64_t outer_stride_elements, uint64_t batch_stride_elements,
+    uint32_t box_inner, uint32_t box_outer, uint32_t box_batch,
+    CUtensorMapSwizzle swizzle) {
+  CUtensorMap result{};
+  const cuuint64_t global_dims[3] = {inner_dim, outer_dim, batch_dim};
+  const cuuint64_t global_strides[2] = {
+      outer_stride_elements * static_cast<uint64_t>(element_bytes),
+      batch_stride_elements * static_cast<uint64_t>(element_bytes)};
+  const cuuint32_t box_dims[3] = {box_inner, box_outer, box_batch};
+  const cuuint32_t element_strides[3] = {1, 1, 1};
+  check_driver(
+      cuTensorMapEncodeTiled(
+          &result, dtype, 3, ptr, global_dims, global_strides, box_dims,
+          element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+          CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+      "cuTensorMapEncodeTiled(3D)");
   return result;
 }
 
@@ -120,6 +165,44 @@ auto kernel_ptr() {
       deep_gemm::epilogue::transform::EpilogueIdentity>;
 }
 
+template <uint32_t kStages, uint32_t kBlockM>
+auto wo_a_kernel_ptr() {
+  return &deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<
+      cute::UMMA::Major::K, cute::UMMA::Major::K,
+      128, 128, 128,
+      0, kWoAN, kWoAK,
+      kBlockM, kWoABlockN, kWoABlockK,
+      kWoAGroups,
+      128, 128, 128,
+      kStages,
+      128, 128,
+      kWoAClusterSize, true,
+      kWoANumSMs,
+      true, true,
+      deep_gemm::GemmType::Batched, false,
+      cutlass::float_e4m3_t, cutlass::float_e4m3_t, KernelDType,
+      deep_gemm::epilogue::transform::EpilogueIdentity>;
+}
+
+template <uint32_t kStages, uint32_t kBlockM>
+auto wo_a_overlap_kernel_ptr() {
+  return &deep_gemm::sm100_fp8_fp4_gemm_1d1d_tp2_overlap_impl<
+      cute::UMMA::Major::K, cute::UMMA::Major::K,
+      128, 128, 128,
+      0, kWoAN, kWoAK,
+      kBlockM, kWoABlockN, kWoABlockK,
+      kWoAGroups,
+      128, 128, 128,
+      kStages,
+      128, 128,
+      kWoAClusterSize, true,
+      kWoANumSMs,
+      true, true,
+      deep_gemm::GemmType::Batched, false,
+      cutlass::float_e4m3_t, cutlass::float_e4m3_t, KernelDType,
+      deep_gemm::epilogue::transform::EpilogueIdentity>;
+}
+
 void validate_tensor(
     const torch::Tensor& tensor, at::ScalarType dtype,
     const char* name) {
@@ -159,43 +242,58 @@ __global__ void mhc_post_kernel(
 
   if (threadIdx.x < 4) mix[threadIdx.x] = post[row * 4 + threadIdx.x];
   if (threadIdx.x < 16) mix[4 + threadIdx.x] = comb[row * 16 + threadIdx.x];
+  // Start barrier. Every CTA of a rank waits on the same fact -- that the
+  // peer's GEMM retired, and with it the peer's pushes into this rank's
+  // partial slot -- so either one flag per grid or one per CTA carries it.
+  // Measured: the single flag wins by 0.1..0.5 us from 256 CTAs up, and loses
+  // by 0.15..0.30 us below that, where few enough CTAs poll it that its remote
+  // stores no longer pay for themselves.
+  const uint32_t cta = row * gridDim.x + blockIdx.x;
+  const bool cta_flags =
+      static_cast<uint32_t>(m) * gridDim.x < kMhcSingleFlagMinCtas;
   if (threadIdx.x == 0) {
-    const uint32_t cta = row * gridDim.x + blockIdx.x;
     const uint32_t next = block_generations[cta] + 1;
-    // This is a start barrier: the preceding GEMM kernel boundary already
-    // completed the local partial, so no release fence is required here.
-    asm volatile("st.volatile.global.u32 [%0], %1;" ::
-                 "l"(peer_ready + kMhcReadyOffset + cta), "r"(next)
-                 : "memory");
+    // The preceding GEMM kernel boundary already completed the local partial
+    // and made the peer's stores visible, so no release fence is required.
+    if (cta_flags) {
+      asm volatile("st.volatile.global.u32 [%0], %1;" ::
+                   "l"(peer_ready + kMhcReadyOffset + cta), "r"(next)
+                   : "memory");
+    } else if (cta == 0) {
+      asm volatile("st.volatile.global.u32 [%0], %1;" ::
+                   "l"(peer_ready + kMhcGridReadyOffset), "r"(next)
+                   : "memory");
+    }
+    const uint32_t* flag = cta_flags
+        ? local_ready + kMhcReadyOffset + cta
+        : local_ready + kMhcGridReadyOffset;
     uint32_t ready;
     do {
       asm volatile("ld.volatile.global.u32 %0, [%1];"
-                   : "=r"(ready)
-                   : "l"(local_ready + kMhcReadyOffset + cta)
-                   : "memory");
-    } while (ready != next);
+                   : "=r"(ready) : "l"(flag) : "memory");
+    } while (cta_flags ? ready != next : ready < next);
     block_generations[cta] = next;
   }
+
   __syncthreads();
 
-  for (int vector = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-       vector < kVectorsPerRow;
-       vector += static_cast<int>(gridDim.x) * blockDim.x) {
-    const int dim = vector * kValuesPerVector;
-    const auto* x0_ptr = partial0 + row * kN + dim;
-    const auto* x1_ptr = partial1 + row * kN + dim;
-    uint4 x_bits = add_bf16x8(
-        *reinterpret_cast<const uint4*>(x0_ptr),
-        *reinterpret_cast<const uint4*>(x1_ptr));
-
+  // One vector per thread: the launch sizes the grid to cover a whole row, so
+  // there is no stride loop to carry.
+  const int vector = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int dim = vector * kValuesPerVector;
+  if (vector < kVectorsPerRow) {
     alignas(16) __nv_bfloat16 x[8];
     alignas(16) __nv_bfloat16 r[4][8];
-    *reinterpret_cast<uint4*>(x) = x_bits;
+    *reinterpret_cast<uint4*>(x) =
+        *reinterpret_cast<const uint4*>(partial0 + row * kN + dim);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       *reinterpret_cast<uint4*>(r[i]) = *reinterpret_cast<const uint4*>(
           residual + (row * 4 + i) * kN + dim);
     }
+    *reinterpret_cast<uint4*>(x) = add_bf16x8(
+        *reinterpret_cast<const uint4*>(x),
+        *reinterpret_cast<const uint4*>(partial1 + row * kN + dim));
 
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -259,6 +357,8 @@ void launch_mhc_post_impl(
   const dim3 block(kMhcThreads);
   constexpr int kMaxGridX =
       (kVectorsPerRow + kMhcThreads - 1) / kMhcThreads;
+  static_assert(kMaxGridX * kMhcThreads >= kVectorsPerRow,
+                "the mHC post grid must cover a whole row in one pass");
   const int grid_x = kMaxGridX;
   const dim3 grid(grid_x, m);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -283,7 +383,7 @@ __global__ void benchmark_barrier_kernel(
   store_relaxed_sys(peer_ready + kBenchmarkReadyOffset + rank, next);
   store_relaxed_sys(local_ready + kBenchmarkReadyOffset + rank, next);
 
-  const uint64_t wait_start = globaltimer();
+  const uint64_t wait_start = wuda::tp2::globaltimer();
   uint32_t spins = 0;
   auto ready0 = load_relaxed_sys(local_ready + kBenchmarkReadyOffset);
   auto ready1 = load_relaxed_sys(local_ready + kBenchmarkReadyOffset + 1);
@@ -301,8 +401,11 @@ __global__ void benchmark_barrier_kernel(
   // to enqueue start-event -> graph -> end-event behind it. Otherwise the
   // faster host can release the barrier before the peer has submitted its
   // graph, and that host-launch skew appears as communication wait time.
-  const uint64_t release = globaltimer();
-  while (globaltimer() - release < kBenchmarkEnqueueGraceNs) spin_pause();
+  const uint64_t release = wuda::tp2::globaltimer();
+  while (wuda::tp2::globaltimer() - release <
+         kBenchmarkEnqueueGraceNs) {
+    spin_pause();
+  }
 }
 
 void launch_benchmark_barrier(
@@ -403,6 +506,307 @@ void launch_impl(
       "cudaLaunchKernelExC");
 }
 
+template <uint32_t kStages, uint32_t kBlockM>
+void launch_wo_a_impl(
+    const torch::Tensor& a, const torch::Tensor& sfa,
+    const torch::Tensor& b, const torch::Tensor& sfb,
+    const torch::Tensor& d) {
+  const int m = static_cast<int>(a.size(1));
+  const int aligned_m = (m + 3) / 4 * 4;
+
+  // The batched DeepGEMM kernel sees [G,M,K] @ [G,N,K]^T.  The Python side
+  // passes permuted views, so all three TMA descriptors can use the native
+  // grouped strides without a staging copy.
+  const CUtensorMap tensor_map_a = make_3d_map(
+      const_cast<void*>(a.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+      kWoAK, m, kWoAGroups,
+      static_cast<uint64_t>(a.stride(1)),
+      static_cast<uint64_t>(a.stride(0)),
+      kWoABlockK, kBlockM / kWoAClusterSize, 1,
+      CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap tensor_map_b = make_3d_map(
+      const_cast<void*>(b.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+      kWoAK, kWoAN, kWoAGroups,
+      static_cast<uint64_t>(b.stride(1)),
+      static_cast<uint64_t>(b.stride(0)),
+      kWoABlockK, kWoABlockN, 1, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap tensor_map_d = make_3d_map(
+      const_cast<void*>(d.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
+      kWoAN, m, kWoAGroups,
+      static_cast<uint64_t>(d.stride(1)),
+      static_cast<uint64_t>(d.stride(0)),
+      // 128B swizzle is measured in bytes; BF16 therefore uses 64
+      // elements in the TMA box (the same convention as make_output_map).
+      kWoABlockN / 2, 16, 1, CU_TENSOR_MAP_SWIZZLE_128B);
+
+  // Packed UE8M0 scales are stored as [G,M,ceil(K/512)] and [G,N,8] with
+  // MN-major strides.  DeepGEMM's SF descriptor flattens the group and K
+  // dimensions into the second TMA dimension; the outer stride is the
+  // TMA-aligned MN extent, exactly as in its fp8_bmm implementation.
+  constexpr int kScaleK = kWoAK / (128 * 4);
+  const CUtensorMap tensor_map_sfa = make_2d_map(
+      const_cast<void*>(sfa.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_INT32, 4,
+      aligned_m, static_cast<uint64_t>(kScaleK * kWoAGroups), aligned_m,
+      kBlockM, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+  const CUtensorMap tensor_map_sfb = make_2d_map(
+      const_cast<void*>(sfb.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_INT32, 4,
+      kWoAN, static_cast<uint64_t>(kScaleK * kWoAGroups), kWoAN,
+      kWoABlockN, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+
+  auto kernel = wo_a_kernel_ptr<kStages, kBlockM>();
+  check_cuda(
+      cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          kWoADynamicSmemBytes),
+      "cudaFuncSetAttribute(WoA)");
+
+  uint32_t shape_m = static_cast<uint32_t>(m);
+  uint32_t shape_n = kWoAN;
+  uint32_t shape_k = kWoAK;
+  int* grouped_layout = nullptr;
+  void* args[] = {
+      &grouped_layout, &shape_m, &shape_n, &shape_k,
+      const_cast<CUtensorMap*>(&tensor_map_a),
+      const_cast<CUtensorMap*>(&tensor_map_b),
+      const_cast<CUtensorMap*>(&tensor_map_sfa),
+      const_cast<CUtensorMap*>(&tensor_map_sfb),
+      const_cast<CUtensorMap*>(&tensor_map_d)};
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(kWoANumSMs, 1, 1);
+  config.blockDim = dim3(kWoAThreads, 1, 1);
+  config.dynamicSmemBytes = kWoADynamicSmemBytes;
+  config.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeClusterDimension;
+  attribute.val.clusterDim.x = kWoAClusterSize;
+  attribute.val.clusterDim.y = 1;
+  attribute.val.clusterDim.z = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  check_cuda(
+      cudaLaunchKernelExC(
+          &config, reinterpret_cast<void*>(kernel), args),
+      "cudaLaunchKernelExC(WoA)");
+}
+
+template <uint32_t kStages, uint32_t kBlockM>
+void launch_wo_a_tp2_overlap_impl(
+    const torch::Tensor& local_a, const torch::Tensor& remote_a,
+    const torch::Tensor& local_sfa, const torch::Tensor& remote_sfa,
+    const torch::Tensor& b, const torch::Tensor& sfb,
+    const torch::Tensor& d, const std::vector<int64_t>& signal_pad_ptrs,
+    const torch::Tensor& grid_done, int64_t rank) {
+  const int m = static_cast<int>(d.size(1));
+  const int half_m = m / 2;
+  const int aligned_half_m = (half_m + 3) / 4 * 4;
+  const int scale_m_stride = static_cast<int>(local_sfa.stride(2));
+  const int split = m / 2;
+  TORCH_CHECK(m % 2 == 0 && half_m >= 1,
+              "fused TP2 WoA requires an even global M");
+
+  // Each descriptor addresses one compact producer slot.  The output remains
+  // global-M, so the epilogue writes directly into the normal z workspace.
+  const CUtensorMap tensor_map_a_local = make_3d_map(
+      const_cast<void*>(local_a.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+      kWoAK, half_m, kWoAGroups,
+      static_cast<uint64_t>(local_a.stride(1)),
+      static_cast<uint64_t>(local_a.stride(0)),
+      kWoABlockK, kBlockM / kWoAClusterSize, 1,
+      CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap tensor_map_a_remote = make_3d_map(
+      const_cast<void*>(remote_a.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+      kWoAK, half_m, kWoAGroups,
+      static_cast<uint64_t>(remote_a.stride(1)),
+      static_cast<uint64_t>(remote_a.stride(0)),
+      kWoABlockK, kBlockM / kWoAClusterSize, 1,
+      CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap tensor_map_b = make_3d_map(
+      const_cast<void*>(b.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+      kWoAK, kWoAN, kWoAGroups,
+      static_cast<uint64_t>(b.stride(1)),
+      static_cast<uint64_t>(b.stride(0)),
+      kWoABlockK, kWoABlockN, 1, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap tensor_map_sfa_local = make_2d_map(
+      const_cast<void*>(local_sfa.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_INT32,
+      4, aligned_half_m, static_cast<uint64_t>(8 * kWoAGroups),
+      scale_m_stride, kBlockM, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+  const CUtensorMap tensor_map_sfa_remote = make_2d_map(
+      const_cast<void*>(remote_sfa.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_INT32,
+      4, aligned_half_m, static_cast<uint64_t>(8 * kWoAGroups),
+      scale_m_stride, kBlockM, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+  const CUtensorMap tensor_map_sfb = make_2d_map(
+      const_cast<void*>(sfb.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_INT32, 4,
+      kWoAN, static_cast<uint64_t>(8 * kWoAGroups), kWoAN,
+      kWoABlockN, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
+  const CUtensorMap tensor_map_d = make_3d_map(
+      const_cast<void*>(d.data_ptr()), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
+      kWoAN, m, kWoAGroups,
+      static_cast<uint64_t>(d.stride(1)),
+      static_cast<uint64_t>(d.stride(0)),
+      kWoABlockN / 2, 16, 1, CU_TENSOR_MAP_SWIZZLE_128B);
+
+  auto kernel = wo_a_overlap_kernel_ptr<kStages, kBlockM>();
+  check_cuda(
+      cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          kWoADynamicSmemBytes),
+      "cudaFuncSetAttribute(fused WoA)");
+
+  const auto signals = wuda::tp2::make_symmetric_view(signal_pad_ptrs,
+                                                       static_cast<uint32_t>(rank));
+  const uint32_t* peer_ready = signals.local<const uint32_t>();
+  const uint64_t* grid_done_ptr =
+      reinterpret_cast<const uint64_t*>(grid_done.data_ptr<int64_t>());
+  uint32_t rank_u = static_cast<uint32_t>(rank);
+  uint32_t local_start = rank == 0 ? 0u : static_cast<uint32_t>(split);
+  uint32_t remote_start = rank == 0 ? static_cast<uint32_t>(split) : 0u;
+  uint32_t shape_m = static_cast<uint32_t>(m);
+  uint32_t shape_n = kWoAN;
+  uint32_t shape_k = kWoAK;
+  int* grouped_layout = nullptr;
+  void* args[] = {
+      &grouped_layout, &shape_m, &shape_n, &shape_k,
+      const_cast<CUtensorMap*>(&tensor_map_a_local),
+      const_cast<CUtensorMap*>(&tensor_map_a_remote),
+      const_cast<CUtensorMap*>(&tensor_map_b),
+      const_cast<CUtensorMap*>(&tensor_map_sfa_local),
+      const_cast<CUtensorMap*>(&tensor_map_sfa_remote),
+      const_cast<CUtensorMap*>(&tensor_map_sfb),
+      const_cast<CUtensorMap*>(&tensor_map_d),
+      &peer_ready, &grid_done_ptr, &rank_u, &local_start, &remote_start};
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(kWoANumSMs, 1, 1);
+  config.blockDim = dim3(kWoAThreads, 1, 1);
+  config.dynamicSmemBytes = kWoADynamicSmemBytes;
+  config.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attributes[2]{};
+  attributes[0].id = cudaLaunchAttributeClusterDimension;
+  attributes[0].val.clusterDim.x = kWoAClusterSize;
+  attributes[0].val.clusterDim.y = 1;
+  attributes[0].val.clusterDim.z = 1;
+  attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[1].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attributes;
+  config.numAttrs = 2;
+  check_cuda(
+      cudaLaunchKernelExC(
+          &config, reinterpret_cast<void*>(kernel), args),
+      "cudaLaunchKernelExC(fused WoA)");
+}
+
+void launch_wo_a_tp2_overlap(
+    const torch::Tensor& local_a, const torch::Tensor& remote_a,
+    const torch::Tensor& local_sfa, const torch::Tensor& remote_sfa,
+    const torch::Tensor& b, const torch::Tensor& sfb,
+    const torch::Tensor& d, const std::vector<int64_t>& signal_pad_ptrs,
+    const torch::Tensor& grid_done, int64_t rank) {
+  validate_tensor(local_a, torch::kFloat8_e4m3fn, "fused_wo_a_local_input");
+  validate_tensor(remote_a, torch::kFloat8_e4m3fn, "fused_wo_a_remote_input");
+  validate_tensor(local_sfa, torch::kInt32, "fused_wo_a_local_scale");
+  validate_tensor(remote_sfa, torch::kInt32, "fused_wo_a_remote_scale");
+  validate_tensor(b, torch::kFloat8_e4m3fn, "fused_wo_a_weight");
+  validate_tensor(sfb, torch::kInt32, "fused_wo_a_weight_scale");
+  validate_tensor(d, torch::kBFloat16, "fused_wo_a_output");
+  TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
+  TORCH_CHECK(local_a.dim() == 3 && remote_a.sizes() == local_a.sizes() &&
+                  local_a.size(0) == kWoAGroups && local_a.size(2) == kWoAK &&
+                  local_a.stride(2) == 1,
+              "fused WoA inputs must be matching [8,M/2,4096] tensors");
+  const int half_m = static_cast<int>(local_a.size(1));
+  const int m = half_m * 2;
+  TORCH_CHECK(m >= 2 && m <= kWoAMax,
+              "fused TP2 WoA global M must be in [2,128]");
+  TORCH_CHECK(d.sizes() == torch::IntArrayRef({kWoAGroups, m, kWoAN}) &&
+                  d.stride(2) == 1,
+              "fused WoA output must be [8,M,1024]");
+  constexpr int kScaleK = kWoAK / (128 * 4);
+  const int aligned_half_m = (half_m + 3) / 4 * 4;
+  TORCH_CHECK(
+      local_sfa.sizes() == torch::IntArrayRef({kWoAGroups, half_m, kScaleK}) &&
+          remote_sfa.sizes() == local_sfa.sizes() &&
+          local_sfa.stride(1) == 1 && local_sfa.stride(2) >= aligned_half_m &&
+          local_sfa.stride(0) == kScaleK * local_sfa.stride(2) &&
+          remote_sfa.stride(0) == local_sfa.stride(0) &&
+          remote_sfa.stride(1) == local_sfa.stride(1) &&
+          remote_sfa.stride(2) == local_sfa.stride(2),
+      "fused WoA scales must have grouped MN-major layout");
+  TORCH_CHECK(b.sizes() == torch::IntArrayRef({kWoAGroups, kWoAN, kWoAK}) &&
+                  b.is_contiguous(),
+              "fused WoA weight must be contiguous [8,1024,4096]");
+  TORCH_CHECK(
+      sfb.sizes() == torch::IntArrayRef({kWoAGroups, kWoAN, kScaleK}) &&
+          sfb.stride(1) == 1 && sfb.stride(2) == kWoAN &&
+          sfb.stride(0) == kScaleK * kWoAN,
+      "fused WoA weight scales have the wrong layout");
+  TORCH_CHECK(grid_done.is_cuda() && grid_done.scalar_type() == torch::kInt64 &&
+                  grid_done.is_contiguous() && grid_done.numel() >= 2 &&
+                  signal_pad_ptrs.size() == 2,
+              "fused WoA requires TP2 generation and signal storage");
+  const int fused_block_m =
+      half_m <= 16 ? 16 : (half_m <= 32 ? 32 : 64);
+  TORCH_CHECK(half_m % fused_block_m == 0,
+              "fused WoA requires each token half to align to its M tile");
+
+  if (half_m <= 16) {
+    launch_wo_a_tp2_overlap_impl<12, 16>(
+        local_a, remote_a, local_sfa, remote_sfa, b, sfb, d,
+        signal_pad_ptrs, grid_done, rank);
+  } else if (half_m <= 32) {
+    launch_wo_a_tp2_overlap_impl<11, 32>(
+        local_a, remote_a, local_sfa, remote_sfa, b, sfb, d,
+        signal_pad_ptrs, grid_done, rank);
+  } else {
+    launch_wo_a_tp2_overlap_impl<10, 64>(
+        local_a, remote_a, local_sfa, remote_sfa, b, sfb, d,
+        signal_pad_ptrs, grid_done, rank);
+  }
+}
+
+void launch_wo_a(
+    const torch::Tensor& a, const torch::Tensor& sfa,
+    const torch::Tensor& b, const torch::Tensor& sfb,
+    const torch::Tensor& d) {
+  validate_tensor(a, torch::kFloat8_e4m3fn, "wo_a_input");
+  validate_tensor(sfa, torch::kInt32, "wo_a_input_scale");
+  validate_tensor(b, torch::kFloat8_e4m3fn, "wo_a_weight");
+  validate_tensor(sfb, torch::kInt32, "wo_a_weight_scale");
+  validate_tensor(d, torch::kBFloat16, "wo_a_output");
+
+  TORCH_CHECK(a.dim() == 3 && a.size(0) == kWoAGroups &&
+                  a.size(2) == kWoAK && a.stride(2) == 1,
+              "wo_a_input must be [8,M,4096] with K contiguous");
+  const int m = static_cast<int>(a.size(1));
+  TORCH_CHECK(m >= 1 && m <= kWoAMax, "WoA M must be in [1,128]");
+  TORCH_CHECK(b.sizes() == torch::IntArrayRef({kWoAGroups, kWoAN, kWoAK}) &&
+                  b.is_contiguous(),
+              "wo_a_weight must be contiguous [8,1024,4096]");
+  TORCH_CHECK(d.sizes() == torch::IntArrayRef({kWoAGroups, m, kWoAN}) &&
+                  d.stride(2) == 1,
+              "wo_a_output must be [8,M,1024] with N contiguous");
+  const int aligned_m = (m + 3) / 4 * 4;
+  constexpr int kScaleK = kWoAK / (128 * 4);
+  TORCH_CHECK(
+      sfa.sizes() == torch::IntArrayRef({kWoAGroups, m, kScaleK}) &&
+          sfa.stride(1) == 1 && sfa.stride(2) == aligned_m &&
+          sfa.stride(0) == kScaleK * aligned_m,
+      "wo_a_input_scale has the wrong grouped MN-major layout");
+  TORCH_CHECK(
+      sfb.sizes() == torch::IntArrayRef({kWoAGroups, kWoAN, kScaleK}) &&
+          sfb.stride(1) == 1 && sfb.stride(2) == kWoAN &&
+          sfb.stride(0) == kScaleK * kWoAN,
+      "wo_a_weight_scale has the wrong grouped MN-major layout");
+
+  if (m <= 32) {
+    launch_wo_a_impl<12, 16>(a, sfa, b, sfb, d);
+  } else if (m <= 64) {
+    launch_wo_a_impl<11, 32>(a, sfa, b, sfb, d);
+  } else {
+    launch_wo_a_impl<10, 64>(a, sfa, b, sfb, d);
+  }
+}
+
 void launch(
     const torch::Tensor& a, const torch::Tensor& sfa,
     const torch::Tensor& b, const torch::Tensor& sfb,
@@ -465,8 +869,27 @@ void launch(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
+      "o_proj_a", &launch_wo_a,
+      "Wuda grouped batched FP8 WoA GEMM",
+      py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
+      py::arg("d"));
+  m.def(
+      "o_proj_a_tp2_overlap", &launch_wo_a_tp2_overlap,
+      "Wuda WoA consuming compact TP2 MLA slots with an in-kernel peer wait",
+      py::arg("local_a"), py::arg("remote_a"),
+      py::arg("local_sfa"), py::arg("remote_sfa"),
+      py::arg("b"), py::arg("sfb"), py::arg("d"),
+      py::arg("signal_pad_ptrs"), py::arg("grid_done"),
+      py::arg("rank"));
+  m.def(
       "o_proj_b", &launch,
-      "TP2 local O-proj B with vector peer publication and fused mHC post");
+      "TP2 local O-proj B with vector peer publication and fused mHC post",
+      py::arg("a"), py::arg("sfa"), py::arg("b"), py::arg("sfb"),
+      py::arg("symmetric_partials"), py::arg("block_generations"),
+      py::arg("symmetric_ptrs"),
+      py::arg("signal_pad_ptrs"), py::arg("local_projected"),
+      py::arg("residual"), py::arg("post"), py::arg("comb"),
+      py::arg("output"), py::arg("rank"));
   m.def(
       "benchmark_barrier", &launch_benchmark_barrier,
       "Excluded TP2 device rendezvous for paired benchmarks");

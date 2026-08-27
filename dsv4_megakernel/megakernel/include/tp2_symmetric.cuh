@@ -7,6 +7,12 @@
 
 namespace wuda::tp2 {
 
+__device__ __forceinline__ uint64_t globaltimer() {
+    uint64_t value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    return value;
+}
+
 // Compact TP2 specialization of DeepGEMM's SymBuffer address mapping.
 struct SymmetricView {
     uintptr_t local_base = 0;

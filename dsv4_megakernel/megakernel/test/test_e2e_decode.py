@@ -36,7 +36,7 @@ main-Q TP2 with replicated index-Q, a symmetric TP-head gather into request-DP2
 MQA/TopK/FlashMLA, and the global-B TP2 O-proj shard (64 heads, 8 groups).
 """
 import argparse
-import json, os, sys, math, tempfile, warnings, torch
+import json, os, sys, math, warnings, torch
 import torch.distributed as dist
 warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
 
@@ -109,7 +109,6 @@ PDL_MODE = "on"
 Q_RMS_MAX_BLOCKS = 1024
 Q_RMS_ABLATION = False
 FUSE_QUERY_RMS = True
-
 
 def configure_geometry(tpdp=False):
     global WQ_HEADS, TPDP_MODE, MLA_DP_MODE
@@ -242,7 +241,6 @@ def load_query_rms_rope():
 
 
 _OPROJ_WS = {}
-_OPROJ_NO_COMM_WS = {}
 _QUERY_TP2_WS = {}
 
 
@@ -259,11 +257,8 @@ class QueryTP2Comm:
             device=torch.device("cuda", torch.cuda.current_device()))
         self.handle = symm_mem.rendezvous(
             self.buffer, group=dist.group.WORLD)
-        self.local_second_output = torch.empty_like(self.buffer)
         self.generation = torch.zeros(
             1, device=DEV, dtype=torch.int32)
-        self.comm_mode = torch.full(
-            (1,), 2, device=DEV, dtype=torch.int32)
         dist.barrier()
         torch.cuda.synchronize()
 
@@ -299,20 +294,9 @@ def oproj_ws(B):
         _OPROJ_WS[key] = o_proj_csa.prepare_o_proj_workspace(
             B, DEV, heads=oproj_heads(), groups=local_o_groups(),
             quant_module=MLA_O_QUANT_MODULE,
+            wo_a_module=TP2_COMM_MODULE,
             tp2_comm=tp2_comm)
     return _OPROJ_WS[key]
-
-
-def oproj_no_comm_ws(B):
-    """Benchmark-only TP2 workspace with the communication producer removed."""
-    assert TPDP_MODE
-    key = (B, oproj_heads(), local_o_groups())
-    if key not in _OPROJ_NO_COMM_WS:
-        _OPROJ_NO_COMM_WS[key] = o_proj_csa.prepare_o_proj_workspace(
-            B, DEV, heads=oproj_heads(), groups=local_o_groups(),
-            quant_module=MLA_O_QUANT_MODULE,
-            tp2_no_comm=True)
-    return _OPROJ_NO_COMM_WS[key]
 
 
 # ==================== weights (one-time, layer constants) ====================
@@ -667,9 +651,6 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
             query_symmetric_ptrs=(query_comm.pointers if query_comm else []),
             query_tp_rank=TP_RANK,
             query_batch_total=B if query_comm else 0,
-            query_local_second_out=(query_comm.local_second_output
-                                    if query_comm else None),
-            query_comm_mode=(query_comm.comm_mode if query_comm else None),
             pdl=pdl_enabled())
         if INDEXER_FP8:
             mq8m.mqa_logits_fp8_decode_out(
@@ -757,8 +738,7 @@ def decode_step(mods, w, mgr, slots, hidden, logits_buf, stats, dbg=None):
         tkm.topk_v2_transform(
             logits[:, :L], ncmp[owned], cmp_bt, page_idx, PAGE,
             topk_meta, None, query_comm.generation,
-            query_comm.signal_pad_pointers, TP_RANK, QUERY_READY_OFFSET,
-            query_comm.comm_mode)
+            query_comm.signal_pad_pointers, TP_RANK, QUERY_READY_OFFSET)
     for b in range(B_local):
         global_b = (owned.start or 0) + b
         n = int(ncmp[global_b])
@@ -952,8 +932,8 @@ def probe_kernel_names(fn):
     return tuple(names)
 
 
-def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
-              query_tp_overhead_only=False):
+def benchmark(mods, w, ncmp=2048, batches=None,
+              pure_dp_baseline_only=False, results_json=None):
     """COLD-L2 measurement, ONE full CSA layer per call: an 8GB memset (the
     bench_utils.bench_kineto flusher, i.e. what every single-operator test in
     this tree already uses) runs before EVERY chain call, so a layer starts
@@ -994,10 +974,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
     if PDL_MODE != "on":
         trace_mode += f"_pdl-{PDL_MODE}"
     print("\n" + "=" * 76)
-    title = ("Paired query TP-head communication overhead"
-             if query_tp_overhead_only else
-             "Static TPDP communication ablation"
-             if tp2_overhead_only else "Per-operator latency")
+    title = ("Pure-DP B/2 communication-study baseline"
+             if pure_dp_baseline_only else "Per-operator latency")
     print(f"{title} (us) -- compress-row step, ncmp={ncmp} "
           f"compressed tokens ({ncmp * RATIO} ctx)")
     print("=" * 76)
@@ -1010,27 +988,22 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             (["mla", "o_proj"] if post_attn_enabled() else []) +
             (["mhc_post"] if mhc_post_enabled() and not TPDP_MODE else []) +
             ["stages", "perfetto"])
-    l2_bytes = int(getattr(torch.cuda.get_device_properties(DEV),
-                           "L2_cache_size", 128 << 20))
-    flush_bytes = max(2 * l2_bytes, 64 << 20)
-    print(f"  cold L2 ({flush_bytes / (1 << 20):.0f} MiB memset per layer "
-          "call, excluded from every number); all reported values are device us")
-    if query_tp_overhead_only:
-        print("  one CUDA graph uses device modes: off=no peer payload/signal/wait, "
-              "signal=local payload plus peer handshake, comm=peer payload plus handshake")
-        print("  every replay keeps identical RMSNorm+RoPE compute and query-payload store volume")
-        print("  modes rotate order and report the slower TP rank; deltas are paired per repetition")
-        print("  an excluded device rendezvous removes cross-process graph-launch "
-              "skew before every timed replay")
-    elif tp2_overhead_only:
-        print("  off is a separately captured static graph with no symmetric "
-              "pointers, generation, ready wait, dual-store ProjB, handshake, "
-              "or two-partial reduction")
-        print("  on is the unmodified production graph with MQA head gather, "
-              "MLA-to-O-proj handoff, and symmetric ProjB publication")
-        print("  cold Perfetto samples alternate graph order, use first-to-last "
-              "GPU kernel span, and report the slower TP rank")
-    if tp2_overhead_only or query_tp_overhead_only:
+    # Match DeepGEMM bench_kineto exactly: an excessive 8 GB stream operation
+    # evicts L2 and keeps the device out of the low-clock idle state.
+    flush_bytes = int(8e9)
+    graph_perfetto_samples = 30
+    graph_clock_sleep_cycles = int(2e7)
+    print("  L2 policy: memset eviction "
+          f"({flush_bytes / 1e9:.0f} GB, excluded from every number); "
+          "all reported values are device us")
+    if pure_dp_baseline_only:
+        print("  --bench-batches denotes global B; this process runs full-model "
+              "pure DP at local B/2 with no distributed initialization, peer "
+              "access, communication flag, or communication wait")
+        print("  perfetto follows DeepGEMM bench_kineto: one warmup phase and "
+              f"one active phase of {graph_perfetto_samples} cold graph replays; "
+              "the active-sample mean is primary")
+    if pure_dp_baseline_only:
         pass
     elif Q_RMS_ABLATION:
         print("  one CUDA graph and identical PDL/grid; only the RMSNorm+RoPE "
@@ -1053,13 +1026,14 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                   "Use perfetto for end-to-end latency")
         print("  operator columns are 30 cold eager-chain Kineto means; stages sums "
               "kernel durations and includes overlap")
+        print("  perfetto follows DeepGEMM bench_kineto: one warmup phase and "
+              f"one active phase of {graph_perfetto_samples} cold graph replays")
         if TPDP_MODE:
-            print("  perfetto is the slower-rank median first-to-last GPU kernel "
-                  "span over 5 cold replays")
-            print("  the selected Perfetto timeline is saved per rank for inspection")
+            print("  every active sample first takes the cross-rank maximum; "
+                  "perfetto reports the mean of those paired samples")
         else:
-            print("  perfetto is the median of 5 cold Perfetto replays; the saved "
-                  "timeline is the replay selected for that median")
+            print("  perfetto reports the active-sample mean; the complete active "
+                  "timeline is saved for inspection")
     if not fused_query_rms():
         print(f"  q_rms persistent grid cap = {Q_RMS_MAX_BLOCKS} CTAs")
     if TPDP_MODE:
@@ -1069,21 +1043,20 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
               "includes the MLA handoff, symmetric ProjB publication, and fused "
               "BF16 reduce+mHC post")
     col_width = 13 if Q_RMS_ABLATION else 9
-    if not (tp2_overhead_only or query_tp_overhead_only):
+    if not pure_dp_baseline_only:
         print(f"  {'B':<5}" + "".join(f"{c:>{col_width}}" for c in cols))
         print("  " + "-" * (5 + col_width * len(cols)))
     bw_rows = []    # (B, [(stage, us)]) for the bandwidth table
-    tp2_off_rows = []
-    tp2_perfetto_rows = []
-    # Streaming twice the physical L2 capacity evicts prior layer data without
-    # consuming the multi-GB headroom needed by the B128 paged KV pools.
+    communication_study_rows = []
+    # Keep the DeepGEMM-sized buffer stable across samples. Reusing the storage
+    # has the same device memset behavior without allocator events in the loop.
     flush_buf = torch.empty((flush_bytes + 3) // 4,
                             dtype=torch.int, device=DEV)
 
     def flush_l2(drain=True):
         """Evict L2.
         drain=True (wall path): also drain before returning.
-        drain=False (event path): leave the memset IN FLIGHT and enqueue
+        drain=False (event path): leave the eviction IN FLIGHT and enqueue
           behind it. An event recorded next is still stream-ordered AFTER the
           flush, so the flush stays out of the window, but the device stays
           busy ~1ms while the host submits the replay -- otherwise the host's
@@ -1092,6 +1065,121 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         flush_buf.zero_()
         if drain:
             torch.cuda.synchronize()
+
+    def graph_spans_from_trace(trace, expected_samples):
+        """Return one first-to-last graph-kernel span per cudaGraphLaunch."""
+        launches = [
+            event for event in trace["traceEvents"]
+            if event.get("ph") == "X"
+            and event.get("cat") == "cuda_runtime"
+            and event.get("name") == "cudaGraphLaunch"
+        ]
+        launches.sort(key=lambda event: event["ts"])
+        if len(launches) != expected_samples:
+            raise RuntimeError(
+                f"Perfetto trace contains {len(launches)} cudaGraphLaunch "
+                f"events, expected {expected_samples}")
+
+        kernels_by_correlation = {}
+        for event in trace["traceEvents"]:
+            if event.get("ph") != "X" or event.get("cat") != "kernel":
+                continue
+            correlation = event.get("args", {}).get("correlation")
+            kernels_by_correlation.setdefault(correlation, []).append(event)
+
+        spans = []
+        for launch in launches:
+            correlation = launch.get("args", {}).get("correlation")
+            kernels = kernels_by_correlation.get(correlation, ())
+            if not kernels:
+                raise RuntimeError(
+                    "Perfetto trace has no GPU kernels correlated with "
+                    f"cudaGraphLaunch {correlation}")
+            first = min(event["ts"] for event in kernels)
+            last = max(event["ts"] + event["dur"] for event in kernels)
+            spans.append(float(last - first))
+        return spans
+
+    def measure_graph_perfetto(graph, trace_label, batch,
+                               samples=graph_perfetto_samples):
+        """DeepGEMM-style cold graph sampling with exact graph envelopes.
+
+        Conditioning work is stream-ordered before cudaGraphLaunch and then
+        excluded by correlation ID. In TPDP, corresponding rank samples are
+        reduced before statistics are computed.
+        """
+        import statistics
+        from torch.profiler import profile as _trace_profile
+        from torch.profiler import ProfilerActivity
+
+        trace_path = os.path.join(
+            trace_dir, f"e2e_{trace_label}_B{batch}.json")
+
+        # DeepGEMM performs one untimed call before opening Kineto.
+        tp_host_barrier()
+        torch.cuda._sleep(graph_clock_sleep_cycles)
+        if TPDP_MODE:
+            tp_device_barrier(ows.tp2_comm)
+        graph.replay()
+        torch.cuda.synchronize()
+        tp_host_barrier()
+
+        schedule = torch.profiler.schedule(
+            wait=0, warmup=1, active=1, repeat=1)
+        profiler_args = {
+            "activities": [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            "schedule": schedule,
+            "acc_events": True,
+        }
+        try:
+            trace_prof = _trace_profile(**profiler_args)
+        except TypeError:
+            profiler_args.pop("acc_events")
+            trace_prof = _trace_profile(**profiler_args)
+
+        with trace_prof:
+            for _ in range(2):
+                tp_host_barrier()
+                for _ in range(samples):
+                    flush_l2(drain=False)
+                    # DeepGEMM uses this before distributed barriers to avoid
+                    # clock and host-launch imbalance. Apply it on both paths
+                    # so pure-DP and TPDP enter their graphs identically.
+                    torch.cuda._sleep(graph_clock_sleep_cycles)
+                    if TPDP_MODE:
+                        tp_device_barrier(ows.tp2_comm)
+                    graph.replay()
+                torch.cuda.synchronize()
+                tp_host_barrier()
+                trace_prof.step()
+
+        trace_prof.export_chrome_trace(trace_path)
+        with open(trace_path, "r", encoding="utf-8") as trace_file:
+            trace = json.load(trace_file)
+        local_spans = graph_spans_from_trace(trace, samples)
+
+        paired_spans = local_spans
+        rank_samples = None
+        if TPDP_MODE:
+            local_tensor = torch.tensor(
+                local_spans, device=DEV, dtype=torch.float64)
+            gathered = [torch.empty_like(local_tensor) for _ in range(2)]
+            dist.all_gather(gathered, local_tensor)
+            rank_samples = [values.cpu().tolist() for values in gathered]
+            paired_spans = torch.stack(gathered).amax(dim=0).cpu().tolist()
+
+        return {
+            "mean_us": float(statistics.mean(paired_spans)),
+            "median_us": float(statistics.median(paired_spans)),
+            "min_us": float(min(paired_spans)),
+            "max_us": float(max(paired_spans)),
+            "samples_us": [float(span) for span in paired_spans],
+            "rank_samples_us": rank_samples,
+            "sample_aggregation": (
+                "per-replay cross-rank max, then statistics"
+                if TPDP_MODE else "per-replay statistics"),
+            "trace_path": trace_path,
+        }
 
     def measure_eager_stage_chain(stage_functions, chain_fn, reps=30):
         """Bucket eager-chain CUDA kernel time by the probed stage names."""
@@ -1130,7 +1218,16 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
 
     if batches is None:
         batches = (2, 16, 32, 48, 64, 80, 96, 112, 128)
-    for B in batches:
+    if pure_dp_baseline_only:
+        if any(global_b <= 0 or global_b % 2 for global_b in batches):
+            raise ValueError(
+                "pure-DP baseline global batches must be positive and even")
+        batch_cases = tuple((global_b, global_b // 2)
+                            for global_b in batches)
+    else:
+        batch_cases = tuple((batch, batch) for batch in batches)
+
+    for reported_B, B in batch_cases:
         mgr = KVCacheManager(capacity=B + 2, pages_per_pool=(ncmp // PAGE) * B
                              + 4 * B, max_pages_per_req=ncmp // PAGE,
                              indexer_fp8=INDEXER_FP8)
@@ -1296,11 +1393,6 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                                           if query_workspace else []),
                     query_tp_rank=(TP_RANK if query_workspace else -1),
                     query_batch_total=B if query_workspace else 0,
-                    query_local_second_out=(
-                        query_workspace.local_second_output
-                        if query_workspace else None),
-                    query_comm_mode=(query_workspace.comm_mode
-                                     if query_workspace else None),
                     pdl=pdl_enabled())
                 hold["logits"] = logits[owned]
             elif fused_query_rms():
@@ -1325,11 +1417,6 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                                           if query_workspace else []),
                     query_tp_rank=(TP_RANK if query_workspace else -1),
                     query_batch_total=B if query_workspace else 0,
-                    query_local_second_out=(
-                        query_workspace.local_second_output
-                        if query_workspace else None),
-                    query_comm_mode=(query_workspace.comm_mode
-                                     if query_workspace else None),
                     pdl=pdl_enabled())
                 hold["logits"] = logits[owned]
 
@@ -1386,8 +1473,7 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
                 (query_workspace.signal_pad_pointers
                  if query_workspace else []),
                 TP_RANK if query_workspace else -1,
-                QUERY_READY_OFFSET if query_workspace else 0,
-                query_workspace.comm_mode if query_workspace else None)
+                QUERY_READY_OFFSET if query_workspace else 0)
 
         def run_topk():
             return run_topk_for(query_comm)
@@ -1463,154 +1549,6 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             for f in chain_fns:
                 f()
 
-        def measure_tp2_graph_modes(graph, mode_values, reps=7, cycles=12,
-                                    split_event=None, mode_tensor=None):
-            """Measure device-selected modes of one graph on both TP ranks."""
-            modes = tuple(mode_values)
-            mode_reps = {mode: [] for mode in modes}
-            rank_reps = {
-                mode: [[[], [], []] for _ in range(2)]
-                for mode in modes
-            }
-            critical_counts = {mode: [0, 0] for mode in modes}
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            end.record()
-            end.synchronize()
-            for rep in range(reps):
-                samples = {mode: [] for mode in modes}
-                rank_samples = {
-                    mode: [[[], [], []] for _ in range(2)]
-                    for mode in modes
-                }
-                for sample_idx in range(cycles):
-                    sequence = rep + sample_idx
-                    shift = sequence % len(modes)
-                    order = modes[shift:] + modes[:shift]
-                    if (sequence // len(modes)) & 1:
-                        order = order[::-1]
-                    for mode in order:
-                        if mode_tensor is not None:
-                            mode_tensor.fill_(mode_values[mode])
-                        # Keep the cold-L2 memset in flight while both hosts
-                        # enqueue the rendezvous, events, and graph replay. The
-                        # rendezvous sits after the memset and before `start`,
-                        # so neither operation enters the measured window.
-                        flush_l2(drain=False)
-                        tp_host_barrier()
-                        tp_device_barrier(ows.tp2_comm)
-                        start.record()
-                        graph.replay()
-                        end.record()
-                        end.synchronize()
-                        total_us = start.elapsed_time(end) * 1e3
-                        if split_event is None:
-                            prefix_us, tail_us = 0.0, total_us
-                        else:
-                            prefix_us = start.elapsed_time(split_event) * 1e3
-                            tail_us = split_event.elapsed_time(end) * 1e3
-                        local_times = torch.tensor(
-                            [total_us, prefix_us, tail_us], dtype=torch.float64)
-                        rank_times = [torch.empty_like(local_times)
-                                      for _ in range(2)]
-                        dist.all_gather(rank_times, local_times,
-                                        group=TP_SYNC_GROUP)
-                        values = [times.tolist() for times in rank_times]
-                        critical_rank = max(range(2),
-                                            key=lambda r: values[r][0])
-                        critical_counts[mode][critical_rank] += 1
-                        samples[mode].append(values[critical_rank][0])
-                        for measured_rank in range(2):
-                            for metric in range(3):
-                                rank_samples[mode][measured_rank][metric].append(
-                                    values[measured_rank][metric])
-                for mode in modes:
-                    mode_reps[mode].append(
-                        sum(samples[mode]) / len(samples[mode]))
-                    for measured_rank in range(2):
-                        for metric in range(3):
-                            values = rank_samples[mode][measured_rank][metric]
-                            rank_reps[mode][measured_rank][metric].append(
-                                sum(values) / len(values))
-            import statistics
-            rank_medians = {mode: [] for mode in modes}
-            for measured_rank in range(2):
-                for mode in modes:
-                    rank_medians[mode].append(tuple(
-                        statistics.median(
-                            rank_reps[mode][measured_rank][metric])
-                        for metric in range(3)
-                    ))
-            medians = {
-                mode: statistics.median(mode_reps[mode]) for mode in modes
-            }
-            return medians, mode_reps, rank_reps, rank_medians, critical_counts
-
-        def measure_tp2_perfetto_modes(graphs, samples=11):
-            """Measure static graphs by slower-rank first-to-last GPU span."""
-            from torch.profiler import profile as _trace_profile
-            from torch.profiler import ProfilerActivity
-            modes = tuple(graphs)
-            spans = {mode: [] for mode in modes}
-            keep_traces = os.environ.get("TP2_KEEP_ABLATION_TRACES") == "1"
-            for sample_idx in range(samples):
-                order = modes if sample_idx % 2 == 0 else modes[::-1]
-                for mode in order:
-                    tp_host_barrier()
-                    flush_l2()
-                    tp_host_barrier()
-                    with _trace_profile(
-                        activities=[ProfilerActivity.CPU,
-                                    ProfilerActivity.CUDA]
-                    ) as trace_prof:
-                        tp_host_barrier()
-                        tp_device_barrier(ows.tp2_comm)
-                        graphs[mode].replay()
-                        torch.cuda.synchronize()
-                    fd, trace_path = tempfile.mkstemp(
-                        prefix=(f"tpdp_{mode}_rank{TP_RANK}_"
-                                f"{sample_idx}_"),
-                        suffix=".json", dir=trace_dir)
-                    os.close(fd)
-                    try:
-                        trace_prof.export_chrome_trace(trace_path)
-                        with open(trace_path, "r",
-                                  encoding="utf-8") as trace_file:
-                            trace = json.load(trace_file)
-                        kernels = [
-                            event for event in trace["traceEvents"]
-                            if event.get("ph") == "X"
-                            and event.get("cat") == "kernel"
-                            and "benchmark_barrier_kernel" not in
-                                event.get("name", "")
-                        ]
-                        if not kernels:
-                            raise RuntimeError(
-                                "Perfetto trace contains no GPU kernels")
-                        first = min(event["ts"] for event in kernels)
-                        last = max(
-                            event["ts"] + event["dur"] for event in kernels)
-                        slower_rank = torch.tensor(
-                            last - first, dtype=torch.float64)
-                        dist.all_reduce(slower_rank, op=dist.ReduceOp.MAX,
-                                        group=TP_SYNC_GROUP)
-                        spans[mode].append(float(slower_rank.item()))
-                    finally:
-                        if keep_traces and os.path.exists(trace_path):
-                            kept_path = os.path.join(
-                                trace_dir,
-                                f"tpdp_ablation_{mode}_rank{TP_RANK}_"
-                                f"sample{sample_idx}.json",
-                            )
-                            os.replace(trace_path, kept_path)
-                        elif os.path.exists(trace_path):
-                            os.unlink(trace_path)
-            import statistics
-            return {
-                mode: statistics.median(spans[mode]) for mode in modes
-            }
-
         def capture_tp2_graph(fn):
             torch.cuda.synchronize()
             tp_host_barrier()
@@ -1620,6 +1558,31 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             torch.cuda.synchronize()
             tp_host_barrier()
             return graph
+
+        if pure_dp_baseline_only:
+            assert not TPDP_MODE and post_attn_enabled()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                chain(); chain()
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            graph = capture_tp2_graph(chain)
+            timing = measure_graph_perfetto(
+                graph, f"pure_dp_ctx{ncmp * RATIO}", reported_B)
+            row = {
+                "global_batch": reported_B,
+                "local_batch": B,
+                "timing": timing,
+            }
+            communication_study_rows.append(row)
+            print(f"  global B={reported_B:<3} local B={B:<3} "
+                  f"pure-DP(perfetto mean)={timing['mean_us']:.2f} us "
+                  f"[median {timing['median_us']:.2f}, "
+                  f"range {timing['min_us']:.2f}..{timing['max_us']:.2f}]")
+            del graph, mgr
+            torch.cuda.empty_cache()
+            continue
 
         # ---- per-layer COLD measurement ---------------------------------
         def cold_graph_rms_ablation(f, flag, warmup=6, iters=40, reps=9):
@@ -1658,204 +1621,6 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
             return (statistics.median(rep_work), statistics.median(rep_relay),
                     statistics.median(rep_delta), min(rep_delta), max(rep_delta))
 
-        if query_tp_overhead_only:
-            assert TPDP_MODE and query_comm is not None
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                query_comm.comm_mode.fill_(2)
-                chain(); chain()
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            select_g = capture_tp2_graph(chain)
-
-            peer_heads = slice((TP_RANK ^ 1) * WQ_HEADS,
-                               (TP_RANK ^ 1) * WQ_HEADS + WQ_HEADS)
-
-            def probe_query_mode(mode, sentinel):
-                peer_view = query_ready()[:, :, peer_heads, :]
-                peer_view.fill_(sentinel)
-                query_comm.comm_mode.fill_(mode)
-                torch.cuda.synchronize()
-                generation_before = int(query_comm.generation.item())
-                tp_host_barrier()
-                tp_device_barrier(ows.tp2_comm)
-                select_g.replay()
-                torch.cuda.synchronize()
-                tp_host_barrier()
-                unchanged = bool((peer_view == sentinel).all().item())
-                generation_after = int(query_comm.generation.item())
-                return unchanged, generation_after - generation_before
-
-            off_probe = probe_query_mode(0, -7.0)
-            signal_probe = probe_query_mode(1, -9.0)
-            comm_probe = probe_query_mode(2, -11.0)
-            if off_probe != (True, 0):
-                raise RuntimeError(f"query off-mode control failed: {off_probe}")
-            if signal_probe != (True, 1):
-                raise RuntimeError(
-                    f"query signal-mode control failed: {signal_probe}")
-            if comm_probe != (False, 1):
-                raise RuntimeError(f"query comm-mode control failed: {comm_probe}")
-            if TP_RANK == 0:
-                print("  control gate: off=no peer payload/generation; "
-                      "signal=no peer payload+generation; comm=peer payload+generation")
-
-            result = measure_tp2_graph_modes(
-                select_g, {"off": 0, "signal": 1, "comm": 2},
-                reps=9, cycles=18, mode_tensor=query_comm.comm_mode)
-            if TP_RANK == 0:
-                import statistics
-                medians, mode_reps, rank_reps, _, critical = result
-
-                def paired_delta(high, low):
-                    values = [h - l for h, l in zip(
-                        mode_reps[high], mode_reps[low])]
-                    return (statistics.median(values), min(values), max(values))
-
-                sync = paired_delta("signal", "off")
-                payload = paired_delta("comm", "signal")
-                total = paired_delta("comm", "off")
-                rank_total = []
-                for rank in range(2):
-                    values = [comm - off for comm, off in zip(
-                        rank_reps["comm"][rank][0],
-                        rank_reps["off"][rank][0])]
-                    rank_total.append(statistics.median(values))
-                print(f"  B={B} query TP-head E2E modes: "
-                      f"off={medians['off']:.2f} us, "
-                      f"signal={medians['signal']:.2f} us, "
-                      f"comm={medians['comm']:.2f} us")
-                print(f"    total comm-off={total[0]:+.2f} us "
-                      f"(rep range {total[1]:+.2f}..{total[2]:+.2f})")
-                print(f"    sync signal-off={sync[0]:+.2f} us; "
-                      f"payload comm-signal={payload[0]:+.2f} us")
-                print("    rank total deltas: " + ", ".join(
-                    f"r{rank}={delta:+.2f} us"
-                    for rank, delta in enumerate(rank_total))
-                    + "; critical " + ", ".join(
-                        f"{mode}={critical[mode]}"
-                        for mode in ("off", "signal", "comm")))
-            del select_g, mgr
-            torch.cuda.empty_cache()
-            continue
-
-        if tp2_overhead_only:
-            assert (TPDP_MODE and query_comm is not None
-                    and fused_query_rms() and post_attn_enabled())
-            # Fabricate a global-B/64-head input only for the static
-            # no-communication control. Production consumes FlashMLA directly.
-            mla_o = hold["mla"]
-            mla3 = (mla_o[:, 0] if mla_o.dim() == 4 else mla_o).contiguous()
-            head_begin = TP_RANK * WQ_HEADS
-            local_heads = mla3[:, head_begin:head_begin + WQ_HEADS]
-            repeats = (B + local_heads.size(0) - 1) // local_heads.size(0)
-            mla_tp_control = local_heads.repeat(repeats, 1, 1)[:B].contiguous()
-            mla_tp_control[owned_slice(B)].copy_(local_heads)
-            q_ready_no_comm = torch.empty(
-                B_mla, 1, attention_heads(), Q_DIM,
-                device=DEV, dtype=torch.bfloat16)
-            ows_no_comm = oproj_no_comm_ws(B)
-
-            def run_mqa_no_comm():
-                return run_mqa_for(None, q_ready_no_comm)
-
-            def run_topk_no_comm():
-                return run_topk_for(None)
-
-            def run_mla_no_comm():
-                return run_mla_for(q_ready_no_comm)
-
-            def run_oproj_no_comm():
-                return o_proj_csa.run_o_proj_mhc_post(
-                    mla_tp_control, pos64, cos_sin_l, hidden, post_b, comb_b,
-                    w["o_proj"], ows_no_comm, mpm, use_pdl=pdl_enabled(),
-                    force_pdl=pdl_forced(), run_mhc_post=False)
-
-            def run_mhcpost_no_comm():
-                mpm.mhc_post_out(
-                    ows_no_comm.projected, hidden, post_b, comb_b,
-                    ows_no_comm.mhc_output)
-
-            def run_oproj_post_no_comm():
-                run_oproj_no_comm()
-                run_mhcpost_no_comm()
-
-            def chain_no_comm():
-                run_hc()
-                run_front()
-                run_wqb()
-                run_mqa_no_comm()
-                run_topk_no_comm()
-                run_mla_no_comm()
-                run_oproj_post_no_comm()
-
-            def chain_query_only():
-                run_hc()
-                run_front()
-                run_wqb()
-                run_mqa()
-                run_topk()
-                run_mla()
-                run_oproj_post_no_comm()
-
-            def chain_oproj_only():
-                run_hc()
-                run_front()
-                run_wqb()
-                run_mqa_no_comm()
-                run_topk_no_comm()
-                run_mla_no_comm()
-                run_oproj()
-
-            tp_host_barrier()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                chain(); chain()
-                chain_no_comm(); chain_no_comm()
-                chain_query_only(); chain_query_only()
-                chain_oproj_only(); chain_oproj_only()
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            tp_host_barrier()
-
-            comm_on_g = capture_tp2_graph(chain)
-            no_comm_g = capture_tp2_graph(chain_no_comm)
-            query_only_g = capture_tp2_graph(chain_query_only)
-            oproj_only_g = capture_tp2_graph(chain_oproj_only)
-            perfetto = measure_tp2_perfetto_modes({
-                "off": no_comm_g,
-                "query": query_only_g,
-                "oproj": oproj_only_g,
-                "on": comm_on_g,
-            })
-
-            # The communication-off chain has no peer signal, wait, or remote
-            # access, so its eager Kineto buckets remain useful operator
-            # diagnostics.  O-proj and mHC post are separate kernels here and
-            # can therefore be reported independently.
-            off_stage_fns = [
-                ("mhc", run_hc),
-                ("front", run_front),
-                ("wq_b", run_wqb),
-                ("mqa", run_mqa_no_comm),
-                ("topk", run_topk_no_comm),
-                ("mla", run_mla_no_comm),
-                ("o_proj", run_oproj_no_comm),
-                ("mhc_post", run_mhcpost_no_comm),
-            ]
-            off_ts = measure_eager_stage_chain(
-                off_stage_fns, chain_no_comm)
-            rank_times = torch.tensor(
-                off_ts, device=DEV, dtype=torch.float64)
-            dist.all_reduce(rank_times, op=dist.ReduceOp.MAX)
-            tp2_off_rows.append((B, rank_times.tolist(), perfetto["off"]))
-            tp2_perfetto_rows.append((B, perfetto))
-            del comm_on_g, no_comm_g, query_only_g, oproj_only_g, mgr
-            torch.cuda.empty_cache()
-            continue
-
         # In strict ablation mode the graph is captured below, then the exact
         # same executable is replayed with a device flag. Skip per-stage
         # profiling because only the end-to-end graph span answers this test.
@@ -1892,8 +1657,8 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         # legacy; wq_b wall-vs-kineto gap = PDL pair double-count.)
 
         # ---- End-to-end: exact Perfetto GPU-kernel span -------------------
-        from torch.profiler import profile as _prof, ProfilerActivity
         t_perfetto = float("nan")
+        perfetto_timing = None
         g = None
         try:
             side = torch.cuda.Stream()
@@ -1909,103 +1674,56 @@ def benchmark(mods, w, ncmp=2048, batches=None, tp2_overhead_only=False,
         except Exception as err:
             print(f"  (graph capture failed at B={B}: {err})")
 
-        # Profile five cold replays, select the median first-to-last-kernel
-        # envelope, and retain that exact replay as the Perfetto timeline.
-        # This excludes CPU launch/sync spans and CUDA-event scheduling margins
-        # while avoiding a single CUPTI replay outlier.
+        # DeepGEMM-style warmup/active phases. Conditioning kernels are outside
+        # the reported graph correlation, so the value remains the exact first
+        # to last kernel envelope of one layer graph.
         if g is not None:
-            keep_trace = B in (16, 64, 96, 112, 128)
-            trace_samples = []
-            trace_paths = []
             try:
-                for sample_idx in range(5):
-                    fd, sample_path = tempfile.mkstemp(
-                        prefix=f"e2e_{trace_mode}_B{B}_{sample_idx}_",
-                        suffix=".json", dir=trace_dir)
-                    os.close(fd)
-                    trace_paths.append(sample_path)
-                    flush_l2()
-                    with _prof(activities=[ProfilerActivity.CPU,
-                                           ProfilerActivity.CUDA]) as trace_prof:
-                        tp_host_barrier()
-                        tp_device_barrier(ows.tp2_comm)
-                        g.replay()
-                        torch.cuda.synchronize()
-                    trace_prof.export_chrome_trace(sample_path)
-                    with open(sample_path, "r", encoding="utf-8") as trace_file:
-                        trace = json.load(trace_file)
-                    kernels = [event for event in trace["traceEvents"]
-                               if event.get("ph") == "X"
-                               and event.get("cat") == "kernel"
-                               and "benchmark_barrier_kernel" not in
-                                   event.get("name", "")]
-                    if not kernels:
-                        raise RuntimeError(
-                            "Perfetto trace contains no GPU kernels")
-                    first = min(event["ts"] for event in kernels)
-                    last = max(event["ts"] + event["dur"] for event in kernels)
-                    trace_samples.append((last - first, sample_path))
-
-                trace_samples.sort(key=lambda sample: sample[0])
-                t_perfetto, selected_path = trace_samples[
-                    len(trace_samples) // 2]
-                if keep_trace:
-                    tp = os.path.join(
-                        trace_dir, f"e2e_{trace_mode}_B{B}.json")
-                    os.replace(selected_path, tp)
+                perfetto_timing = measure_graph_perfetto(
+                    g, f"{trace_mode}_ctx{ncmp * RATIO}", B)
+                t_perfetto = perfetto_timing["mean_us"]
             except Exception as err:
                 print(f"  (graph trace failed at B={B}: {err})")
-            finally:
-                for sample_path in trace_paths:
-                    if os.path.exists(sample_path):
-                        os.unlink(sample_path)
-                if 'trace_prof' in locals():
-                    del trace_prof
 
         if TPDP_MODE:
-            rank_times = torch.tensor(
-                ts + [t_perfetto], device=DEV, dtype=torch.float64)
+            rank_times = torch.tensor(ts, device=DEV, dtype=torch.float64)
             dist.all_reduce(rank_times, op=dist.ReduceOp.MAX)
-            ts = rank_times[:-1].tolist()
-            t_perfetto = float(rank_times[-1].item())
+            ts = rank_times.tolist()
 
         print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in ts)
               + f"{sum(ts):>9.1f}{t_perfetto:>9.1f}")
+        if perfetto_timing is not None:
+            print("       perfetto samples: "
+                  f"median={perfetto_timing['median_us']:.2f} us, "
+                  f"range={perfetto_timing['min_us']:.2f}.."
+                  f"{perfetto_timing['max_us']:.2f} us")
         bw_rows.append((B, [(sname, t) for (sname, _), t
                             in zip(stage_fns, ts)]))
         del mgr
         torch.cuda.empty_cache()
 
-    if tp2_overhead_only:
-        print("\n  Communication-off operator latency "
-              "(30 cold eager-chain Kineto means)")
-        print("  o_proj and mHC post are separate local stages; no symmetric "
-              "publication, peer wait, or reduction")
-        off_cols = ("mhc", "front", "wq_b", "mqa", "topk", "mla",
-                    "o_proj", "mhc_post", "stages", "perfetto")
-        print(f"  {'B':<5}" + "".join(f"{c:>9}" for c in off_cols))
-        print("  " + "-" * (5 + 9 * len(off_cols)))
-        for B, off_ts, off_perfetto in tp2_off_rows:
-            print(f"  {B:<5}" + "".join(f"{t:>9.1f}" for t in off_ts)
-                  + f"{sum(off_ts):>9.1f}{off_perfetto:>9.1f}")
-
-        print("\n  Static communication ablation (Perfetto)")
-        ablation_cols = ("off", "query", "oproj", "on", "on-off",
-                         "query-off", "oproj-off")
-        print(f"  {'B':<5}" + "".join(f"{c:>11}" for c in ablation_cols))
-        print("  " + "-" * (5 + 11 * len(ablation_cols)))
-        for B, perfetto in tp2_perfetto_rows:
-            absolute = (perfetto["off"], perfetto["query"],
-                        perfetto["oproj"], perfetto["on"])
-            deltas = (perfetto["on"] - perfetto["off"],
-                      perfetto["query"] - perfetto["off"],
-                      perfetto["oproj"] - perfetto["off"])
-            print(f"  {B:<5}" + "".join(f"{value:>11.2f}"
-                                         for value in absolute)
-                  + "".join(f"{value:>+11.2f}" for value in deltas))
+    if pure_dp_baseline_only:
+        payload = {
+            "schema": "tpdp-communication-study-v1",
+            "kind": "pure-dp-b-over-2",
+            "context_length": ncmp * RATIO,
+            "compressed_context_length": ncmp,
+            "l2_flush_mode": "write",
+            "l2_flush_bytes": flush_bytes,
+            "study_reps": graph_perfetto_samples,
+            "graph_perfetto_samples": graph_perfetto_samples,
+            "device": torch.cuda.get_device_name(),
+            "rows": communication_study_rows,
+        }
+        if results_json is not None and (not TPDP_MODE or TP_RANK == 0):
+            result_dir = os.path.dirname(os.path.abspath(results_json))
+            os.makedirs(result_dir, exist_ok=True)
+            with open(results_json, "w", encoding="utf-8") as result_file:
+                json.dump(payload, result_file, ensure_ascii=False, indent=2)
+            print(f"  wrote structured results: {results_json}")
         return
 
-    if Q_RMS_ABLATION or query_tp_overhead_only:
+    if Q_RMS_ABLATION:
         return
 
     # ---- Bandwidth table: per-operator traffic / stage time ------------
@@ -2154,16 +1872,15 @@ if __name__ == "__main__":
         "--q-rms-ablation", action="store_true",
         help="paired graph-only ablation of the RMSNorm+RoPE compute body")
     parser.add_argument(
-        "--tp2-overhead-only", action="store_true",
-        help="run static communication-off versus production-on Perfetto "
-             "graphs (requires --tpdp --bench-only)")
-    parser.add_argument(
-        "--query-tp-overhead-only", action="store_true",
-        help="three-mode graph-only off-vs-signal-vs-peer TP-head ablation "
-             "(requires --tpdp --bench-only)")
+        "--pure-dp-baseline-only", action="store_true",
+        help="run the strict no-distributed pure-DP baseline at B/2; "
+             "--bench-batches denotes global B (requires --bench-only)")
     parser.add_argument(
         "--separate-query-rms", action="store_true",
         help="use the original standalone query RMSNorm+RoPE kernel")
+    parser.add_argument(
+        "--results-json", default=None,
+        help="write communication-study samples and derived effects as JSON")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -2177,13 +1894,9 @@ if __name__ == "__main__":
     FUSE_QUERY_RMS = not args.separate_query_rms
     if Q_RMS_ABLATION and not fused_query_rms():
         parser.error("--q-rms-ablation requires the default fused query path")
-    if args.tp2_overhead_only and not (args.tpdp and args.bench_only):
-        parser.error("--tp2-overhead-only requires --tpdp --bench-only")
-    if args.query_tp_overhead_only and not (args.tpdp and args.bench_only):
+    if args.pure_dp_baseline_only and (args.tpdp or not args.bench_only):
         parser.error(
-            "--query-tp-overhead-only requires --tpdp --bench-only")
-    if args.query_tp_overhead_only and args.tp2_overhead_only:
-        parser.error("select only one TP2 communication ablation")
+            "--pure-dp-baseline-only requires --bench-only without --tpdp")
     context_granularity = RATIO * PAGE
     if (args.context_length <= 0
             or args.context_length % context_granularity != 0):
@@ -2201,8 +1914,8 @@ if __name__ == "__main__":
           f"merged={t_wq.N_MERGED}, "
           f"indexer={'fp8-rtp' if INDEXER_FP8 else 'fp4'}, PDL={PDL_MODE}")
     mqa_test = __import__("test_mqa_logits_fp4")
+    get_dg()  # Resolve the checkout before the extension imports headers.
     if args.tpdp:
-        get_dg()  # Resolve the checkout before the extension imports headers.
         # Compile once, then let the peer load the same cached extension.
         if TP_RANK == 0:
             MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
@@ -2214,6 +1927,12 @@ if __name__ == "__main__":
         dist.barrier()
     else:
         MLA_O_QUANT_MODULE = o_proj_csa.load_mla_o_quant_module()
+        # The strict pure-DP comparison uses the TP2 (8-group) WoA geometry
+        # without symmetric memory, so it still needs the Wuda extension.
+        # Ordinary full-rank runs keep the 16-group DeepGEMM reference path
+        # and avoid compiling an unused TP2 module.
+        if args.pure_dp_baseline_only:
+            TP2_COMM_MODULE = o_proj_csa.load_tp2_comm_module()
     mods = (t_hc.load_cuda_module(),
             t_fm_swap.load_module('front_mixed_gemm_csa_swapab',
                                   'front_mixed_gemm_csa_swapab.cu'),
@@ -2231,16 +1950,18 @@ if __name__ == "__main__":
 
     if args.bench_only:
         benchmark(mods, w, ncmp=bench_ncmp, batches=bench_batches,
-                  tp2_overhead_only=args.tp2_overhead_only,
-                  query_tp_overhead_only=args.query_tp_overhead_only)
+                  pure_dp_baseline_only=args.pure_dp_baseline_only,
+                  results_json=args.results_json)
         if dist.is_initialized():
             dist.destroy_process_group()
         sys.exit(0)
 
     sim_name = "TPDP two-rank E2E decode" if args.tpdp else "E2E decode"
-    print(f"\n{sim_name} simulation (global B=16, 8 steps, slot reuse at step 5):")
-    stats, snap1 = run_sim(mods, w)
-    _, snap2 = run_sim(mods, w)                # determinism gate
+    sim_batch = 32 if args.tpdp else 16
+    print(f"\n{sim_name} simulation (global B={sim_batch}, 8 steps, "
+          "slot reuse at step 5):")
+    stats, snap1 = run_sim(mods, w, B=sim_batch)
+    _, snap2 = run_sim(mods, w, B=sim_batch)    # determinism gate
     det = True
     for name, a, b in zip(("finals", "swa_pool", "cmp_pool", "idx_pool",
                            "main_state", "idx_state", "y_q", "win_y2",

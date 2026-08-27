@@ -124,39 +124,36 @@ sm100_store_cd_swap_ab_dual(const utils::PatternVisitor<pattern_cd_t>& smem_cd, 
 
         // Publish this stage to the peer rank straight out of the staging
         // buffer, so the push costs no extra pass over local memory.
-        {
-            DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
-                             "vector peer epilogue currently requires BF16");
-            constexpr uint32_t kValuesPerVector = 16 / sizeof(cd_dtype_t);
-            constexpr uint32_t kVectorsPerRow = STORE_BLOCK_N / kValuesPerVector;
-            constexpr uint32_t kTotalVectors = STORE_BLOCK_M * kVectorsPerRow;
-            const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-            auto* stage_bytes = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
-            #pragma unroll
-            for (uint32_t vector = epilogue_thread_idx;
-                 vector < kTotalVectors; vector += kNumUMMAStoreThreads) {
-                const uint32_t row = vector / kVectorsPerRow;
-                const uint32_t vector_in_row = vector % kVectorsPerRow;
-                const uint32_t n_atom = vector_in_row / 8;
-                const uint32_t bank_group = vector_in_row % 8;
-                const uint32_t swizzled_group = bank_group ^ (row % 8);
-                const auto* smem_ptr = reinterpret_cast<const uint4*>(
-                    stage_bytes + n_atom * STORE_BLOCK_M * kSwizzleCDMode +
-                    row * kSwizzleCDMode + swizzled_group * 16);
-                const uint4 bits = *smem_ptr;
-                const uint32_t global_m =
-                    base_m_idx + s * STORE_BLOCK_M + row;
-                const uint32_t global_n =
-                    epilogue_type_t::apply_index_n<kValuesPerVector>(
-                        base_n_idx + vector_in_row * kValuesPerVector);
-                if (global_m < shape_m) {
-                    auto* global_ptr = vector_store_cd +
-                        static_cast<uint64_t>(global_m) * shape_n + global_n;
-                    wuda::tp2::store_relaxed_sys_v4_u32(global_ptr, bits);
-                }
+        DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
+                         "vector peer epilogue currently requires BF16");
+        constexpr uint32_t kValuesPerVector = 16 / sizeof(cd_dtype_t);
+        constexpr uint32_t kVectorsPerRow = STORE_BLOCK_N / kValuesPerVector;
+        constexpr uint32_t kTotalVectors = STORE_BLOCK_M * kVectorsPerRow;
+        const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
+        auto* stage_bytes = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
+        #pragma unroll
+        for (uint32_t vector = epilogue_thread_idx;
+             vector < kTotalVectors; vector += kNumUMMAStoreThreads) {
+            const uint32_t row = vector / kVectorsPerRow;
+            const uint32_t vector_in_row = vector % kVectorsPerRow;
+            const uint32_t n_atom = vector_in_row / 8;
+            const uint32_t bank_group = vector_in_row % 8;
+            const uint32_t swizzled_group = bank_group ^ (row % 8);
+            const auto* smem_ptr = reinterpret_cast<const uint4*>(
+                stage_bytes + n_atom * STORE_BLOCK_M * kSwizzleCDMode +
+                row * kSwizzleCDMode + swizzled_group * 16);
+            const uint4 bits = *smem_ptr;
+            const uint32_t global_m = base_m_idx + s * STORE_BLOCK_M + row;
+            const uint32_t global_n =
+                epilogue_type_t::apply_index_n<kValuesPerVector>(
+                    base_n_idx + vector_in_row * kValuesPerVector);
+            if (global_m < shape_m) {
+                auto* global_ptr = vector_store_cd +
+                    static_cast<uint64_t>(global_m) * shape_n + global_n;
+                wuda::tp2::store_relaxed_sys_v4_u32(global_ptr, bits);
             }
-            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
         }
+        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
         if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
             #pragma unroll
             for (uint32_t i = 0; i < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ i) {

@@ -699,9 +699,6 @@ struct QueryRmsRopeArgs {
     uint32_t output_rows = 0;
     float eps = 1e-6f;
     wuda::tp2::SymmetricView symmetric_output;
-    nv_bfloat16* local_second_out = nullptr;
-    const uint32_t* comm_mode = nullptr;
-    uint32_t batch_total = 0;
     uint32_t rank0_batch = 0;
     bool wait_primary = false;
 };
@@ -712,16 +709,27 @@ __device__ __forceinline__ void run_query_rms_rope(
     if (query.work_flag != nullptr && *query.work_flag == 0)
         return;
 
+    const bool tp2 = static_cast<bool>(query.symmetric_output);
+    // Keep FP4's queue order identical to the FP8 implementation. The rank-0
+    // suffix owns the peer batches; rotating it to the front lets the remote
+    // BF16 stores overlap the MQA/TopK work that follows.
+    const uint32_t claim_rotate =
+        (tp2 && query.symmetric_output.rank == 0u)
+            ? query.rank0_batch * static_cast<uint32_t>(query.input_heads)
+            : 0u;
+
     while (true) {
         uint32_t item = 0;
         if (lane == 0)
             item = atomicAdd(next, 1u);
         item = __shfl_sync(0xffffffffu, item, 0);
-        const uint32_t output_row = blockIdx.x + item * gridDim.x;
-        if (output_row >= query.output_rows)
+        const uint32_t claim = blockIdx.x + item * gridDim.x;
+        if (claim >= query.output_rows)
             break;
 
-        const bool tp2 = static_cast<bool>(query.symmetric_output);
+        const uint32_t rotated = claim + claim_rotate;
+        const uint32_t output_row = rotated >= query.output_rows
+            ? rotated - query.output_rows : rotated;
         const uint32_t batch = tp2
             ? output_row / static_cast<uint32_t>(query.input_heads)
             : output_row >> 7;
@@ -739,16 +747,9 @@ __device__ __forceinline__ void run_query_rms_rope(
                 ? batch : batch - query.rank0_batch;
             const uint32_t full_head =
                 query.symmetric_output.rank * 64 + input_head;
-            nv_bfloat16* destination;
-            if (owner == query.symmetric_output.rank) {
-                destination = query.out;
-            } else {
-                const bool remote = query.comm_mode == nullptr
-                    || *query.comm_mode >= 2;
-                destination = remote
-                    ? query.symmetric_output.peer_base<nv_bfloat16>()
-                    : query.local_second_out;
-            }
+            nv_bfloat16* destination = owner == query.symmetric_output.rank
+                ? query.out
+                : query.symmetric_output.peer_base<nv_bfloat16>();
             output = reinterpret_cast<uint4*>(
                 destination
                 + (static_cast<uint64_t>(owner_row) * 128 + full_head) * kHidden)

@@ -45,12 +45,6 @@ __device__ __forceinline__ uint64_t load_grid_acquire(
   return value;
 }
 
-__device__ __forceinline__ uint64_t globaltimer() {
-  uint64_t value;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
-  return value;
-}
-
 __device__ __forceinline__ uint32_t ceil_ue8m0(float value) {
   const uint32_t bits = __float_as_uint(value);
   const uint32_t biased_exponent = (bits >> 23) & 0xffu;
@@ -72,21 +66,6 @@ __device__ __forceinline__ void store_peer_u32(
                "l"(pointer), "r"(value) : "memory");
 }
 
-__device__ __forceinline__ void start_peer_bulk_store(
-    void* destination, const void* source, uint32_t bytes) {
-  const uint32_t shared_address =
-      static_cast<uint32_t>(__cvta_generic_to_shared(source));
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-  asm volatile(
-      "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-      :: "l"(destination), "r"(shared_address), "r"(bytes) : "memory");
-  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-
-__device__ __forceinline__ void wait_peer_bulk_store() {
-  asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-}
-
 template <int kHeadsPerCta, int kInputHeads, bool kTp2,
           bool kBatch128 = false>
 __global__ void inv_rope_quant_kernel(
@@ -98,7 +77,6 @@ __global__ void inv_rope_quant_kernel(
     uint32_t* __restrict__ local_scale,
     uint32_t* __restrict__ peer_scale,
     uint64_t* __restrict__ grid_done,
-    const uint32_t* __restrict__ local_ready,
     uint32_t* __restrict__ peer_ready,
     int input_m,
     int global_m,
@@ -117,8 +95,6 @@ __global__ void inv_rope_quant_kernel(
   constexpr uint32_t kFullMask = 0xffffffffu;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
-  __shared__ __align__(16) uint8_t peer_staging[
-      kTp2 ? kHeadsPerCta * kHeadDim : 16];
   constexpr int kHeadTiles = kInputHeads / kHeadsPerCta;
   const int effective_global_m = kBatch128 ? 128 : global_m;
   const int effective_input_m = kBatch128 ? 64 : input_m;
@@ -129,6 +105,23 @@ __global__ void inv_rope_quant_kernel(
       : effective_aligned_m;
   const int total_tiles = work_m * kHeadTiles;
 
+  if constexpr (kTp2) {
+    // Reserve the generation before any CTA releases the dependent fused WoA.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      atomicAdd(reinterpret_cast<uint32_t*>(grid_done + 1), 1u);
+    }
+  }
+
+  // With the TP2 head interleave, every CTA's task stride preserves the
+  // destination parity. Remote CTAs can therefore release the PDL dependent
+  // immediately, while local CTAs release it after their only task pass.
+  const bool pdl_remote_cta = kTp2 &&
+      ((static_cast<int>(blockIdx.x) & 1) != static_cast<int>(rank));
+  if constexpr (kTp2) {
+    if (pdl_remote_cta && threadIdx.x == 0) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+  }
   for (int task = blockIdx.x; task < total_tiles; task += gridDim.x) {
     const int local_token = task / kHeadTiles;
     const int logical_head_tile = task % kHeadTiles;
@@ -237,17 +230,11 @@ __global__ void inv_rope_quant_kernel(
     auto* fp8_address = fp8_output + group * fp8_group_stride +
                         global_token * fp8_token_stride +
                         head_in_group * kHeadDim + element;
-    if (remote) {
-      auto* warp_staging = peer_staging + warp * kHeadDim;
-      *reinterpret_cast<uint4*>(warp_staging + element) = packed_fp8;
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        start_peer_bulk_store(
-            fp8_address, peer_staging, kHeadsPerCta * kHeadDim);
-      }
-    } else {
-      *reinterpret_cast<uint4*>(fp8_address) = packed_fp8;
-    }
+    // A warp's 32 lanes cover 512 contiguous bytes, so a peer tile needs no
+    // shared-memory staging: storing straight from registers is one coalesced
+    // transaction per warp and saves 0.3 us over a TMA bulk copy plus its two
+    // barriers and its drain.
+    *reinterpret_cast<uint4*>(fp8_address) = packed_fp8;
 
     uint32_t packed_scale = lane_in_group == 0
         ? exponent << (quant_group * 8)
@@ -256,52 +243,54 @@ __global__ void inv_rope_quant_kernel(
     packed_scale |= __shfl_xor_sync(kFullMask, packed_scale, 8);
     if (lane == 0) {
       auto* scale_address = scale_output + group * scale_group_stride +
-                            global_token +
-                            head_in_group * scale_head_stride;
+                            global_token + head_in_group * scale_head_stride;
       if (remote) {
         store_peer_u32(scale_address, packed_scale);
       } else {
         *scale_address = packed_scale;
       }
     }
-    if (remote) {
-      if (threadIdx.x == 0) {
-        wait_peer_bulk_store();
-      }
+  }
+  if constexpr (kTp2) {
+    if (!pdl_remote_cta) {
+      // Every local CTA has completed its only task pass. A threadfence supplies
+      // the global-memory ordering that PDL itself does not provide; the
+      // dependent WoA can now consume local rows while remote CTAs continue
+      // their NVLink stores.
       __syncthreads();
+      if (threadIdx.x == 0) {
+        __threadfence();
+        cudaTriggerProgrammaticLaunchCompletion();
+      }
     }
   }
 
   if constexpr (kTp2) {
-    const bool remote_block = (blockIdx.x & 1u) != rank;
+    // gridDim.x and kHeadTiles are both even, so a CTA's tiles all land on the
+    // same destination rank: the CTAs that publish to the peer are exactly the
+    // odd/even half that this predicate selects. Local work needs no release,
+    // being ordered by the kernel boundary itself, so it stays out of the join
+    // and the peer can be told the moment its payload is complete.
+    const bool publisher = (blockIdx.x & 1u) != rank;
+    // bar.sync is what lets thread 0's release below order the peer stores that
+    // the CTA's other threads issued.
     __syncthreads();
-    if (threadIdx.x == 0 && remote_block) {
-      // Only the CTAs that publish to the peer join this release sequence.
-      // Local work is ordered by normal kernel completion, while the peer can
-      // publish readiness as soon as the payload needed by the other WoA is done.
+    if (threadIdx.x == 0 && publisher) {
+      // The gpu-scope release here is what chains every publisher's peer stores
+      // onto the single sys-scope release that follows. Fencing them per CTA
+      // instead costs 5.6 us -- hundreds of concurrent fence.acq_rel.sys are
+      // far worse than one serialized drain -- and publishing halfway through
+      // the kernel buys nothing, so the cost is in the count, not the placing.
+      const uint32_t publishers = static_cast<uint32_t>(gridDim.x / 2);
       const uint64_t arrived = arrive_grid(grid_done);
-      const uint32_t remote_blocks = gridDim.x / 2;
-      if (arrived % remote_blocks == 0) {
+      if (arrived % publishers == 0) {
         while (load_grid_acquire(grid_done) < arrived) {
           wuda::tp2::spin_pause();
         }
         const uint32_t generation =
-            static_cast<uint32_t>(arrived / remote_blocks);
-        wuda::tp2::store_release_sys(
-            peer_ready + kMlaReadyOffset + rank, generation);
-        const uint32_t peer_rank = rank ^ 1u;
-        const uint64_t start = globaltimer();
-        uint32_t spins = 0;
-        while (wuda::tp2::load_acquire_sys(
-                   local_ready + kMlaReadyOffset + peer_rank) < generation) {
-          wuda::tp2::spin_pause();
-          if ((++spins & 1023u) == 0u &&
-              globaltimer() - start > 10'000'000'000ull) {
-            printf("TP2 MLA quant barrier timeout rank=%u generation=%u\n",
-                   rank, generation);
-            asm volatile("trap;");
-          }
-        }
+            static_cast<uint32_t>(arrived / publishers);
+        auto* flag = peer_ready + kMlaReadyOffset + rank;
+        wuda::tp2::store_release_sys(flag, generation);
       }
     }
   }
@@ -368,10 +357,10 @@ void launch_kernel(
     const std::vector<int64_t>& signal_pad_ptrs,
     int global_m,
     uint32_t rank) {
-  const int input_m = static_cast<int>(input.size(0));
+  int input_m = static_cast<int>(input.size(0));
   const int effective_global_m = kBatch128 ? 128 : global_m;
   const int effective_input_m = kBatch128 ? 64 : input_m;
-  const int aligned_m = (effective_global_m + 3) / 4 * 4;
+  int aligned_m = (effective_global_m + 3) / 4 * 4;
   const int padding = aligned_m - effective_global_m;
   const int work_m = kTp2
       ? effective_input_m + (rank == 1 ? padding : 0)
@@ -383,7 +372,8 @@ void launch_kernel(
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &blocks_per_sm,
           inv_rope_quant_kernel<
-              kHeadsPerCta, kInputHeads, kTp2, kBatch128>, threads, 0),
+              kHeadsPerCta, kInputHeads, kTp2, kBatch128>,
+          threads, 0),
       "MLA inverse-RoPE quant occupancy");
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   int blocks = std::min(
@@ -394,18 +384,53 @@ void launch_kernel(
   TORCH_CHECK(!kTp2 || (blocks >= 2 && blocks % 2 == 0),
               "TP2 quant launch requires an even CTA count");
 
-  const uint32_t* local_ready = nullptr;
   uint32_t* peer_ready = nullptr;
   uint64_t* grid_done_ptr = nullptr;
   if constexpr (kTp2) {
     const auto signals = wuda::tp2::make_symmetric_view(signal_pad_ptrs, rank);
-    local_ready = signals.local<const uint32_t>();
     peer_ready = signals.peer_base<uint32_t>();
     grid_done_ptr = reinterpret_cast<uint64_t*>(grid_done.data_ptr<int64_t>());
   }
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  inv_rope_quant_kernel<kHeadsPerCta, kInputHeads, kTp2, kBatch128>
-      <<<blocks, threads, 0, stream>>>(
+  auto kernel = inv_rope_quant_kernel<
+      kHeadsPerCta, kInputHeads, kTp2, kBatch128>;
+  const __nv_bfloat16* input_ptr =
+      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>());
+  const int64_t* positions_ptr = positions.data_ptr<int64_t>();
+  const float* cos_sin_ptr = cos_sin.data_ptr<float>();
+  uint8_t* local_fp8_ptr = reinterpret_cast<uint8_t*>(local_fp8.data_ptr());
+  uint8_t* peer_fp8_ptr =
+      kTp2 ? reinterpret_cast<uint8_t*>(peer_fp8.data_ptr()) : nullptr;
+  uint32_t* local_scale_ptr =
+      reinterpret_cast<uint32_t*>(local_scale.data_ptr<int32_t>());
+  uint32_t* peer_scale_ptr =
+      kTp2 ? reinterpret_cast<uint32_t*>(peer_scale.data_ptr<int32_t>()) : nullptr;
+  int fp8_group_stride = static_cast<int>(local_fp8.stride(1));
+  int fp8_token_stride = static_cast<int>(local_fp8.stride(0));
+  int scale_group_stride = static_cast<int>(local_scale.stride(1));
+  int scale_head_stride = static_cast<int>(local_scale.stride(2));
+  int cache_stride = static_cast<int>(cos_sin.stride(0));
+  void* args[] = {
+      &input_ptr, &positions_ptr, &cos_sin_ptr, &local_fp8_ptr,
+      &peer_fp8_ptr, &local_scale_ptr, &peer_scale_ptr, &grid_done_ptr,
+      &peer_ready,
+      &input_m, &global_m, &aligned_m, &fp8_group_stride,
+      &fp8_token_stride, &scale_group_stride, &scale_head_stride,
+      &cache_stride, &rank};
+  if constexpr (kTp2) {
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(blocks, 1, 1);
+    config.blockDim = dim3(threads, 1, 1);
+    config.stream = stream;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed = 1;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    check_cuda(cudaLaunchKernelExC(&config, reinterpret_cast<void*>(kernel), args),
+               "MLA inverse-RoPE quant PDL launch");
+  } else {
+    kernel<<<blocks, threads, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<at::BFloat16>()),
       positions.data_ptr<int64_t>(),
       cos_sin.data_ptr<float>(),
@@ -414,7 +439,6 @@ void launch_kernel(
       reinterpret_cast<uint32_t*>(local_scale.data_ptr<int32_t>()),
       kTp2 ? reinterpret_cast<uint32_t*>(peer_scale.data_ptr<int32_t>()) : nullptr,
       grid_done_ptr,
-      local_ready,
       peer_ready,
       input_m,
       global_m,
@@ -425,7 +449,8 @@ void launch_kernel(
       static_cast<int>(local_scale.stride(2)),
       static_cast<int>(cos_sin.stride(0)),
       rank);
-  check_cuda(cudaGetLastError(), "MLA inverse-RoPE quant launch");
+    check_cuda(cudaGetLastError(), "MLA inverse-RoPE quant launch");
+  }
 }
 
 template <int kInputHeads, bool kTp2>
@@ -445,30 +470,36 @@ void dispatch(
   if (local_m <= 2) {
     launch_kernel<1, kInputHeads, kTp2>(
         input, positions, cos_sin, local_fp8, peer_fp8,
-        local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+        local_scale, peer_scale, grid_done, signal_pad_ptrs,
+        global_m, rank);
   } else if (local_m <= 8) {
     launch_kernel<2, kInputHeads, kTp2>(
         input, positions, cos_sin, local_fp8, peer_fp8,
-        local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+        local_scale, peer_scale, grid_done, signal_pad_ptrs,
+        global_m, rank);
   } else if (local_m <= 32) {
     launch_kernel<4, kInputHeads, kTp2>(
         input, positions, cos_sin, local_fp8, peer_fp8,
-        local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+        local_scale, peer_scale, grid_done, signal_pad_ptrs,
+        global_m, rank);
   } else {
     if constexpr (kTp2) {
       if (global_m == 128) {
         launch_kernel<8, kInputHeads, kTp2, true>(
             input, positions, cos_sin, local_fp8, peer_fp8,
-            local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+            local_scale, peer_scale, grid_done, signal_pad_ptrs,
+            global_m, rank);
       } else {
         launch_kernel<8, kInputHeads, kTp2>(
             input, positions, cos_sin, local_fp8, peer_fp8,
-            local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+            local_scale, peer_scale, grid_done, signal_pad_ptrs,
+            global_m, rank);
       }
     } else {
       launch_kernel<8, kInputHeads, kTp2>(
           input, positions, cos_sin, local_fp8, peer_fp8,
-          local_scale, peer_scale, grid_done, signal_pad_ptrs, global_m, rank);
+          local_scale, peer_scale, grid_done, signal_pad_ptrs,
+          global_m, rank);
     }
   }
 }
@@ -508,6 +539,8 @@ void launch_tp2(
     int64_t rank) {
   TORCH_CHECK(rank == 0 || rank == 1, "rank must be 0 or 1");
   const int global_m = static_cast<int>(positions.size(0));
+  TORCH_CHECK(global_m == 32 || global_m == 64 || global_m == 128,
+              "fused TP2 MLA handoff supports global M 32, 64, or 128");
   const int expected_local_m = rank == 0 ? (global_m + 1) / 2 : global_m / 2;
   TORCH_CHECK(input.size(0) == expected_local_m && input.size(1) == kFullHeads,
               "TP2 input must be the rank-local [M,128,512] FlashMLA output");
@@ -522,8 +555,8 @@ void launch_tp2(
                       kTpHeads * ((global_m + 3) / 4 * 4),
               "peer_scale must cover the symmetric scale allocation");
   TORCH_CHECK(grid_done.is_cuda() && grid_done.scalar_type() == torch::kInt64 &&
-                  grid_done.numel() == 1,
-              "grid_done must be one CUDA int64");
+                  grid_done.numel() >= 2,
+              "grid_done must contain the join counter and wait generation");
   TORCH_CHECK(signal_pad_ptrs.size() == 2,
               "exactly two signal-pad pointers are required");
   dispatch<kFullHeads, true>(
@@ -538,5 +571,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("inv_rope_quant", &launch_local,
         "Single-kernel inverse-RoPE and FP8 quantization");
   m.def("inv_rope_quant_tp2", &launch_tp2,
-        "Single-kernel TP2 inverse-RoPE, FP8 quantization, and exchange");
+        "Single-kernel TP2 inverse-RoPE, FP8 quantization, and exchange",
+        py::arg("input"), py::arg("positions"), py::arg("cos_sin"),
+        py::arg("local_fp8"), py::arg("peer_fp8"),
+        py::arg("local_scale"), py::arg("peer_scale"),
+        py::arg("grid_done"), py::arg("signal_pad_ptrs"), py::arg("rank"));
 }

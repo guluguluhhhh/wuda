@@ -90,7 +90,6 @@ struct TopKLaunchParams {
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
   uint32_t* __restrict__ query_generation;
   wuda::tp2::SymmetricView query_signals;
-  const uint32_t* __restrict__ query_comm_mode;
   uint32_t query_ready_offset;
 
   SGL_DEVICE const GlobalMetadata& global() const {
@@ -124,21 +123,20 @@ struct TopKLaunchParams {
 
 SGL_DEVICE void rendezvous_query_heads(const TopKLaunchParams& params) {
   if (params.query_generation == nullptr || threadIdx.x != 0) return;
-  if (params.query_comm_mode != nullptr) {
-    // 0 and the ablation-only local controls (3 dense, 4 clustered) publish
-    // nothing; only the handshake modes (1/2/5) advance the generation.
-    const uint32_t mode = *params.query_comm_mode;
-    if (mode == 0u || mode == 3u || mode == 4u) return;
-  }
+  // The flag needs no release fence: this thread wrote nothing, so
+  // `st.release.sys` here would order none of the payload -- the MQA kernel
+  // boundary is what does that, exactly as the mHC start barrier in
+  // o_proj_b_tp2_symm.cu relies on the preceding GEMM boundary.
   const auto* local_ready = params.query_signals.local<const uint32_t>();
   auto* peer_ready = params.query_signals.peer_base<uint32_t>();
   uint32_t current;
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];"
                : "=r"(current) : "l"(params.query_generation) : "memory");
   const uint32_t expected = current + 1;
-  wuda::tp2::store_release_sys(
-      peer_ready + params.query_ready_offset + params.query_signals.rank,
-      expected);
+  auto* flag = peer_ready + params.query_ready_offset
+      + params.query_signals.rank;
+  asm volatile("st.volatile.global.u32 [%0], %1;" ::
+               "l"(flag), "r"(expected) : "memory");
   const uint32_t peer_rank = params.query_signals.peer_rank();
   auto ready = wuda::tp2::load_relaxed_sys(
       local_ready + params.query_ready_offset + peer_rank);
@@ -402,8 +400,7 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
                               c10::optional<torch::Tensor> query_generation,
                               std::vector<int64_t> query_signal_pad_ptrs,
                               int64_t query_tp_rank,
-                              int64_t query_ready_offset,
-                              c10::optional<torch::Tensor> query_comm_mode) {
+                              int64_t query_ready_offset) {
     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == torch::kFloat &&
                 scores.dim() == 2 && scores.stride(1) == 1,
                 "scores must be CUDA fp32 [B, L] row-major");
@@ -455,7 +452,6 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
     params.cluster_floor     = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor;
     params.query_generation  = nullptr;
     params.query_signals     = {};
-    params.query_comm_mode   = nullptr;
     params.query_ready_offset = static_cast<uint32_t>(query_ready_offset);
     if (query_generation.has_value()) {
         TORCH_CHECK(query_generation->is_cuda()
@@ -471,15 +467,6 @@ static void topk_v2_transform(torch::Tensor scores, torch::Tensor seq_lens,
             query_generation->data_ptr<int>());
         params.query_signals = wuda::tp2::make_symmetric_view(
             query_signal_pad_ptrs, static_cast<uint32_t>(query_tp_rank));
-        if (query_comm_mode.has_value()) {
-            TORCH_CHECK(query_comm_mode->is_cuda()
-                        && query_comm_mode->is_contiguous()
-                        && query_comm_mode->scalar_type() == torch::kInt32
-                        && query_comm_mode->numel() == 1,
-                        "query_comm_mode must be a contiguous CUDA int32 scalar");
-            params.query_comm_mode = reinterpret_cast<const uint32_t*>(
-                query_comm_mode->data_ptr<int>());
-        }
     }
 
     constexpr bool kUsePDL = false;
@@ -520,8 +507,7 @@ static torch::Tensor topk_v2(torch::Tensor scores, torch::Tensor seq_lens,
     if ((uint64_t)scores.size(1) > 32768)   // plan needed only for possible cluster routing
         topk_v2_plan(seq_lens, metadata, /*static_cluster_threshold=*/0);
     topk_v2_transform(scores, seq_lens, page_table, page_indices, page_size,
-                      metadata, raw_indices, c10::nullopt, {}, -1, 0,
-                      c10::nullopt);
+                      metadata, raw_indices, c10::nullopt, {}, -1, 0);
     return page_indices;
 }
 
@@ -538,8 +524,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("query_generation") = c10::nullopt,
           py::arg("query_signal_pad_ptrs") = std::vector<int64_t>{},
           py::arg("query_tp_rank") = -1,
-          py::arg("query_ready_offset") = 0,
-          py::arg("query_comm_mode") = c10::nullopt);
+          py::arg("query_ready_offset") = 0);
     m.def("topk_v2", &topk_v2,
           "one-shot convenience (alloc + plan + transform) -> page_indices [B, topk] i32",
           py::arg("scores"), py::arg("seq_lens"), py::arg("page_table"),
