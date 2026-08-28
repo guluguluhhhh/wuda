@@ -18,20 +18,20 @@
 - **persistent + M 相关深流水**：`SwapDims<M>` 根据 SMEM 预算决定 `NUM_STAGES`；M 越小，activation stage 和 TMEM accumulator 越小，可放更多 stage。每个 stage 有 `full/empty/with_sf_full` 三类 barrier，TMEM accumulator 另有双缓冲 `tmem_full/tmem_empty`。所有 barrier 都只靠 `(stage, parity)` 对齐、不存任何 tile 信息：`full/with_sf_full/tmem_full` 等 `wait(ph)`，`empty/tmem_empty` 等 `wait(ph ^ 1)`——后者利用 `try_wait.parity` 查询“上一个 phase”会立即通过，使所有 stage 初始天然是空的，不需要 warmup arrive。
 - **SF 通道**：激活 scale 是 1×128，权重 scale 是 128×128；warp2 把连续 4 个 K128 的 UE8M0 字节作为一个对齐 u32 写入 SMEM，warp1 每组只做一次 UTCCP，MMA 用 `sf_id=0..3` 选择组内字节。
 - **merged 特有的 indexer overlap**：N 的前 8192 列先被 epilogue drain；indexer 不走 main-q 的 TMA store，而是写 `iq_scratch` 后释放 TMEM。512-thread fused 版本的 warps 8..15 依次执行 ready-flag handshake、无依赖的 window/compressor chain、跨 CTA 的 SPREAD；plain/mock 版本可只启动 256-thread GEMM。
-- **main-q epilogue**：TMEM FP32 先转 BF16，经 32×32 shared-memory transpose 和 128B swizzled TMA store 写 `y`；可选 `head_ssq` 在 epilogue 中用 `red.relaxed.global.add.f32` 累加，避免额外的 SSQ kernel。
+- **main-q epilogue**：TMEM FP32 先转 BF16，经 32×32 shared-memory transpose 和 128B swizzled TMA store 写 `y`；可选 `head_ssq` 在 epilogue 中用 `red.relaxed.gpu.global.add.f32` 累加（取 TMEM 里舍入前的 FP32 值），避免额外的 SSQ kernel。
 - **PDL 与非对齐 M**：前置 qnorm/quant producer 写 `x_fp8/x_sf`，GEMM 在 barrier/TMEM prologue 后做 `cudaGridDependencySynchronize`；TMA descriptor 的 globalDim 用真实 M，box 用 M_pad，OOB 行零填/裁剪。
 
 
 ### §1 形态的面试手撕版（persistent FP8 GEMM 骨架）
 
-只写面试需要表达的结构；`tma`、`mma`、`mbarrier`、`tmem` 都用短函数代表底层 PTX。
+只写面试需要表达的结构；helper 后的行尾注释是它包的**真实 PTX**（面试时能叫出指令名就够，不用默写全部约束）。
 
 ```cpp
 template<int M_TILE>
 __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
                                   int M, int num_gemm_clusters) {
     constexpr int K = 1536, BK = 128, NTILE = 288;
-    int warp = threadIdx.x / 32, rank = cluster_rank();
+    int warp = threadIdx.x / 32, rank = cluster_rank();  // mov.u32 %0, %cluster_ctarank
     int cluster = blockIdx.x / 2;
     bool leader = rank == 0, fused_post = blockDim.x == 512;
     int first_tile = cluster < num_gemm_clusters ? cluster : NTILE;
@@ -41,23 +41,37 @@ __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
     // arrive 计数：full/empty/tmem_full 都是 1（TMA 只有一个 elected lane；commit 的
     // multicast 给两个 CTA 各投一次），sf_ready = 2*32、tmem_empty = 2*128（两个 CTA
     // 的 warp2 / store 线程都远程 arrive 到 rank0 那一份）。
-    if (warp == 1) init_barriers_and_double_tmem(s);
-    cluster_sync();
-    cudaGridDependencySynchronize();
+    if (warp == 1 && elect_one_sync()) {          // elect.sync _|p, 0xffffffff
+        for (int i = 0; i < NSTAGE; ++i) {
+            s.full[i].init(1);                    // mbarrier.init.shared::cta.b64 [addr], 1
+            s.empty[i].init(1);
+            s.sf_ready[i].init(2 * 32);           // 两 CTA 的 warp2 全部汇聚到 rank0
+        }
+        for (int i = 0; i < NUM_EPI; ++i) {
+            s.tmem_full[i].init(1);
+            s.tmem_empty[i].init(2 * 128);        // 两 CTA 的 store 线程全部汇聚到 rank0
+        }
+        fence_barrier_init();                     // fence.mbarrier_init.release.cluster
+    }
+    if (warp == 2) tmem_alloc_2sm(NUM_TMEM_COLS); // tcgen05.alloc.cta_group::2.sync.aligned
+                                                  //   .shared::cta.b32 [smem], num_cols
+    cluster_sync();                    // barrier.cluster.arrive.relaxed + barrier.cluster.wait
+    cudaGridDependencySynchronize();   // griddepcontrol.wait
 
-    // (stage, phase) 就地从单调递增的 iter 算：st = iter % NSTAGE，
-    // ph = (iter / NSTAGE) & 1（走完一圈 NSTAGE 翻一次 parity）。iter 跨 tile
-    // 连续、不在 tile 边界重置——K-stage 环本就横跨 tile。barrier 里不存
-    // tile 信息，各角色靠“iter 走得一样多”自动对齐。
     // 等“满”用 wait(ph)，等“空”用 wait(ph ^ 1)：try_wait.parity 查上一个 phase
     // 立即通过，所以第 0 圈 NSTAGE 个 stage 天然全空，不需要任何 warmup arrive。
     if (warp == 0)                      // 持久化 TMA 生产者
         for (int tile = first_tile, iter = 0; tile < NTILE; tile += num_gemm_clusters)
             for (int k = 0; k < K / BK; ++k, ++iter) {
                 int st = iter % NSTAGE, ph = (iter / NSTAGE) & 1;
-                s.empty[st].wait(ph ^ 1);
+                s.empty[st].wait(ph ^ 1);   // LAB_WAIT: mbarrier.try_wait.parity.shared::cta.b64
+                                            //   → @P1 BRA DONE / BRA LAB_WAIT（自旋）
                 tma_load_XW(tile, k, rank, s.a[st], s.b[st]);
-                s.full[st].arrive_expect_tx();  // 一个 barrier 收两条 TMA，按字节总数计
+                          // cp.async.bulk.tensor.2d.shared::cluster.global
+                          //   .mbarrier::complete_tx::bytes.L2::cache_hint（per-CTA，非 multicast）
+                s.full[st].arrive_expect_tx(SA + SB);
+                          // mbarrier.arrive.expect_tx.shared::cta.b64 _, [bar], bytes
+                          // 一个 barrier 收两条 TMA：1 次 arrival + N 字节（引擎 complete_tx 递减）
             }
 
     if (warp == 2)                      // scale 生产者
@@ -66,9 +80,13 @@ __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
                 int st = iter % NSTAGE, ph = (iter / NSTAGE) & 1;
                 s.full[st].wait(ph);            // 只等本 CTA 的 TMA
                 if ((k & 3) == 0) pack_four_ue8m0(tile, k, s.sf[st]);
-                fence_proxy_async_shared();     // st.shared -> UTCCP 的异步代理可见
+                          // 4 个 K128 的 UE8M0 字节 = 一个对齐 u32 → st.shared.v4.b32
+                fence_proxy_async_shared();     // fence.proxy.async.shared::cta
+                          // 普通 st.shared → UTCCP 异步代理读，跳代理必须 fence
                 // 两 CTA x 32 lane 汇聚到 rank0：把 per-CTA 的 full 中继成 cluster 级就绪
                 s.sf_ready[st].arrive(/*to=*/0);
+                          // mapa.shared::cluster.u32 算出 rank0 那份的地址
+                          //   + mbarrier.arrive.shared::cluster.b64（唯一用 cluster 地址空间的一条）
             }
 
     if (warp == 1 && leader) {          // 2SM MMA 消费者
@@ -76,14 +94,24 @@ __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
         for (int tile = first_tile; tile < NTILE; tile += num_gemm_clusters, ++it) {
             int acc = it % NUM_EPI, acc_ph = (it / NUM_EPI) & 1;  // accum 环深 NUM_EPI
             s.tmem_empty[acc].wait(acc_ph ^ 1);   // 同理：两个 accum 初始都是空的
+            tmem_fence_after_sync();              // tcgen05.fence::after_thread_sync
             for (int k = 0; k < K / BK; ++k, ++iter) {
                 int st = iter % NSTAGE, ph = (iter / NSTAGE) & 1;
                 s.sf_ready[st].wait(ph);          // 等两个 CTA 的 operands + SF
                 if ((k & 3) == 0) utccp_sf(s.sf[st]);
-                mma_2sm_fp8(acc, s.a[st], s.b[st], /*sf_id=*/k & 3);
-                commit_2sm(s.empty[st]);          // MMA 退休才投递，两 CTA 各收 1 次
+                          // tcgen05.cp.cta_group::2.32x128b.warpx4 [tmem_col], sf_desc
+                          // 每组只搬一次；SF 必须驻 TMEM（block_scale MMA 只能从 TMEM 读 SF）
+                for (int kk = 0; kk < 4; ++kk)    // 一个 K128 = 4 条 K32 MMA
+                    mma_2sm_fp8(acc, s.a[st], s.b[st], /*sf_id=*/k & 3);
+                          // tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale
+                          //   [tmem_c], a_desc, b_desc, idesc, [tmem_sfa], [tmem_sfb], p
+                          // A/B 直接用 SMEM 描述符，不过寄存器也不进 TMEM
+                commit_2sm(s.empty[st]);
+                          // tcgen05.commit.cta_group::2.mbarrier::arrive::one
+                          //   .shared::cluster.multicast::cluster.b64 [bar], 0b11
+                          // ★ 异步 MMA 退休时硬件代投，multicast 给两 CTA 各 1 次
             }
-            commit_2sm(s.tmem_full[acc]);
+            commit_2sm(s.tmem_full[acc]);         // 末次 commit 累积语义→涵盖整轮 48 条 MMA
         }
         // 末个 accum 的 release 没有下一轮 wait 去消费；显式收口后才能安全 dealloc TMEM。
         if (it > 0) s.tmem_empty[(it - 1) % NUM_EPI].wait(((it - 1) / NUM_EPI) & 1);
@@ -94,14 +122,37 @@ __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
         for (int tile = first_tile; tile < NTILE; tile += num_gemm_clusters, ++it) {
             int acc = it % NUM_EPI, acc_ph = (it / NUM_EPI) & 1;
             s.tmem_full[acc].wait(acc_ph);
+            tmem_fence_after_sync();              // tcgen05.fence::after_thread_sync
             if (tile < 8192 / 256) {
                 drain_indexer_to_scratch(acc, tile, rank, iq_scratch);
+                          // tcgen05.ld.sync.aligned.32x32b.x8.b32 {8 个 reg}, [tmem]
+                          //   + tcgen05.wait::ld.sync.aligned（等结果落寄存器）
+                tmem_fence_before_sync();         // tcgen05.fence::before_thread_sync
                 s.tmem_empty[acc].arrive(/*to=*/0);  // drain-first：先释放 accum
                 if (fused_post) publish_iq_ready(tile, rank, iq_ready);
+                          // 只发 bar.sync 1, 384（128 store + 256 xform 线程）；
+                          // 全局 release flag 是 barrier 另一侧的 xform 组发的，见下文
             } else {
                 tmem_to_bf16_smem(acc);           // 32x32 transpose
+                          // tcgen05.ld...16dp256b.x1 ×2（stmatrix.trans 要求的寄存器布局）
+                          //   + stmatrix.sync.aligned.x4.m8n8.shared.b16.trans
+                          // ★ 顺路用同一批 FP32 寄存器算 Σq²（舍入成 bf16 之前，比先
+                          //   舍入再平方精度好）：16dp256b 下 lane = a + 4b 管 (2a, 2a+1)
+                          //   两行 × 4 列 → 同 a 的 8 个 lane 用 __shfl_xor 4/8/16 收口，
+                          //   6 条 shuffle 出 8 个行和（32dp32b 那种布局要 16 条）；
+                          //   落 s.ssq[4][M] 的 per-warp 槽位，免 atomic 也免预清零
+                tmem_fence_before_sync();
                 s.tmem_empty[acc].arrive(/*to=*/0);  // 不等 store，尽早放走下个 tile 的 MMA
-                tma_store_main_q(tile, rank, M);  // 大输出走 TMA store
+                tma_store_fence();                // fence.proxy.async.shared::cta
+                tma_store_main_q(tile, rank, M);
+                          // cp.async.bulk.tensor.2d.global.shared::cta.bulk_group
+                if (kSsq && row < M) {            // tile 末尾一次折叠：线程 r 只管第 r 行
+                    float v = s.ssq[0][row] + s.ssq[1][row]
+                            + s.ssq[2][row] + s.ssq[3][row];
+                    red_add(&head_ssq[row][head_of(tile)], v);
+                          // red.relaxed.gpu.global.add.f32 [dst], v
+                          // ★ RED 不是 ATOM：不要返回值 → fire-and-forget，不等全局往返
+                }
             }
         }
     }
@@ -112,12 +163,17 @@ __global__ void persistent_merged(/* X/W/SF/output/indexer 参数 */,
         run_window_and_compressor_without_dependency();
         for (int head = worker_head(); head < IDX_NUM_HEADS; head += worker_stride()) {
             wait_acquire(iq_ready[head]);
+                          // ld.relaxed.gpu.global.u32 自旋（== seq 跳出）+ 一条 ld.acquire.gpu
+                          // 超时用 mov.u64 %0, %%globaltimer（非 clock64）→ __trap()
             run_indexer_rope_hadamard_quant(iq_scratch, head);
+                          // FWHT-128：线程内 stride 1..8 + __shfl_xor_sync 跨 lane stride 16/32/64
+                          // 量化：mul.rn.bf16x2（2 的幂 scale 无损）
+                          //   + cvt.rn.satfinite.e2m1x2.bf16x2（一条转两个 FP4）
         }
     }
 
     cluster_sync();
-    if (warp == 0) tmem_free();
+    if (warp == 0) tmem_free();         // tcgen05.dealloc.cta_group::2.sync.aligned.b32
 }
 
 // M_pad 只取 {32,64,96,128}；2-CTA cluster，persistent grid 约占满全部 SM。
@@ -186,7 +242,18 @@ __global__ void wq_b_bf16_rmsnorm(/* A/B/D descriptor */, int num_blocks, float 
     Shared s;
 
     // 比 §1 多一类 dsmem barrier（跨 CTA 推平方和）。EPI = (2*SUB*M <= 512) ? 2 : 1。
-    if (warp == 1) init_barriers(s);   // full=2, empty=1, tmem_full=1, tmem_empty=2*128, dsmem=1
+    if (warp == 1 && elect_one_sync()) {
+        for (int i = 0; i < NS; ++i) {
+            s.full[i].init(2);                    // 2SM TMA：leader expect 双倍，follower 补 1
+            s.empty[i].init(1);
+        }
+        for (int i = 0; i < EPI; ++i) {
+            s.tmem_full[i].init(1);               // 每 head 末次 commit multicast
+            s.tmem_empty[i].init(2 * 128);        // 两 CTA 的 store 线程全体
+            s.dsmem[i].init(1);                   // 本地 1 次 arrive + M*4B tx（对端推过来）
+        }
+        fence_barrier_init();
+    }
     if (warp == 2) tmem_alloc_2sm(pow2(EPI * SUB * M));
     cluster_sync();
     cudaGridDependencySynchronize();
@@ -200,8 +267,15 @@ __global__ void wq_b_bf16_rmsnorm(/* A/B/D descriptor */, int num_blocks, float 
                     s.empty[st].wait(ph ^ 1);
                     tma_load_2sm(A, h, sub, k, rank, s, st);   // 内部算 m_base / n_base
                     tma_load_2sm(B, h, sub, k, rank, s, st);
+                          // cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global
+                          //   .mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint
+                          // ★ barrier 地址 &= TMA_2SM_PEER_MASK 抹掉 rank 位
+                          //   → 两 CTA 的 tx 全部计入 rank0 那一份
                     if (leader) s.full[st].arrive_expect_tx(2 * (act + wgt));
-                    else        s.full[st].arrive(0);          // 2SM TMA 把 tx 全计到 leader
+                          // mbarrier.arrive.expect_tx.shared::cta.b64（本地一份，双倍字节）
+                    else        s.full[st].arrive(0);
+                          // ★ arrive(0) = 往 cta_id 0 投：mapa.shared::cluster.u32
+                          //   + @p mbarrier.arrive.shared::cluster.b64（所以 full 计数是 2）
                 }
 
     if (warp == 1 && leader) {                         // MMA：一个 head 两个 accumulator
@@ -209,13 +283,16 @@ __global__ void wq_b_bf16_rmsnorm(/* A/B/D descriptor */, int num_blocks, float 
         for (int h = cluster; h < HEADS; h += nclu, ++it) {
             int acc = it % EPI, acc_ph = (it / EPI) & 1;
             s.tmem_empty[acc].wait(acc_ph ^ 1);
+            tmem_fence_after_sync();                   // tcgen05.fence::after_thread_sync
             for (int sub = 0; sub < SUB; ++sub) {
                 int tmem_c = acc * (SUB * M) + sub * M;         // 两份 accum 并存
                 for (int k = 0; k < NK; ++k, ++iter) {
                     int st = iter % NS, ph = (iter / NS) & 1;
                     s.full[st].wait(ph);
-                    for (int j = 0; j < BK / 16; ++j)           // BF16：K16 一条 kind::f16
+                    for (int j = 0; j < BK / 16; ++j)           // BF16：每 K16 一条
                         mma_2sm_bf16(tmem_c, s, st, j, /*accum=*/k || j);
+                          // tcgen05.mma.cta_group::2.kind::f16
+                          //   [tmem_c], a_desc, b_desc, idesc, p（无 block_scale）
                     commit_2sm(s.empty[st]);
                     // 只有整个 head 算完才发布，epilogue 靠这一下拿到全 512 列
                     if (sub == SUB - 1 && k == NK - 1) commit_2sm(s.tmem_full[acc]);
@@ -229,6 +306,7 @@ __global__ void wq_b_bf16_rmsnorm(/* A/B/D descriptor */, int num_blocks, float 
         for (int h = cluster, it = 0; h < HEADS; h += nclu, ++it) {
             int acc = it % EPI, acc_ph = (it / EPI) & 1;
             s.tmem_full[acc].wait(acc_ph);
+            tmem_fence_after_sync();
 
             // ---- PASS 1：head_dim 平方和（本 CTA 的 256 列）----
             for (int st = 0; st < M / 16; ++st)
@@ -236,38 +314,52 @@ __global__ void wq_b_bf16_rmsnorm(/* A/B/D descriptor */, int num_blocks, float 
                     float sq[8] = {0};
                     for (int sub = 0; sub < SUB; ++sub)         // 两个 sub-tile 一起累
                         accumulate_squares(sq, acc, sub, st, i);
+                          // tcgen05.ld.sync.aligned.32x32b.x8.b32（算平方和方便）
+                          //   + tcgen05.wait::ld.sync.aligned
                     for (int r = 0; r < 8; ++r) {
-                        float v = warp_reduce_sum32(sq[r]);     // 沿 32 个 N lane
+                        float v = warp_reduce_sum32(sq[r]);     // __shfl_down_sync ×5 轮
                         if (lane == 0) s.warp_sq[warp - 4][row(st,i,r)] = v;
                     }
                 }
-            named_barrier(128, 0);                             // #1：4 个 warp 的槽位可见
+            named_barrier(128, 0);                     // bar.sync 0, 128：4 warp 的槽位可见
 
             // ---- 跨 CTA：DSMEM 对称互推，两边各自算 rms（不过 HBM）----
             if (tid_in_wg == 0) s.dsmem[acc].arrive_expect_tx(M * 4);
             for (int m = tid_in_wg; m < M; m += 128)
-                store_shared_remote(sum4(s.warp_sq, m),         // 写对端 smem + 计入对端 barrier
+                store_shared_remote(sum4(s.warp_sq, m),
                                     &s.peer_sq[acc][m], &s.dsmem[acc], rank ^ 1);
+                          // cute::store_shared_remote → mapa.shared::cluster 算对端地址
+                          //   + st.async.shared::cluster.mbarrier::complete_tx::bytes
+                          // ★ 写对端 smem 同时把字节数计入对端 barrier
             s.dsmem[acc].wait(acc_ph);
             for (int m = tid_in_wg; m < M; m += 128)
                 s.rms[m] = rsqrtf((sum4(s.warp_sq, m) + s.peer_sq[acc][m]) / 512.f + eps);
-            named_barrier(128, 0);                             // #2：rms 可见
+                          // rsqrt.approx.f32（比 1/sqrt 快）
+            named_barrier(128, 0);                     // #2：rms 可见
 
             // ---- PASS 2：重读 TMEM × rms → bf16，两个 sub-tile 合并 store ----
             for (int st = 0; st < M / 16; ++st) {
-                if (epi_warp == 0) tma_store_wait<1>();
+                if (epi_warp == 0) tma_store_wait<1>();  // cp.async.bulk.wait_group.read 1
                 named_barrier(128, 0);
                 for (int sub = 0; sub < SUB; ++sub)
-                    tmem_scale_bf16_stmatrix(acc, sub, st, s.rms, s.cd);  // 16dp256b + trans
-                if (st == M / 16 - 1) s.tmem_empty[acc].arrive(0);  // 两趟都读完才释放
-                tma_store_fence(); named_barrier(128, 0);
+                    tmem_scale_bf16_stmatrix(acc, sub, st, s.rms, s.cd);
+                          // tcgen05.ld...16dp256b.x1 ×2（stmatrix.trans 要求的布局）
+                          //   ×rms → cvt 成 bf16x2
+                          //   + stmatrix.sync.aligned.x4.m8n8.shared.b16.trans
+                if (st == M / 16 - 1) {
+                    tmem_fence_before_sync();          // tcgen05.fence::before_thread_sync
+                    s.tmem_empty[acc].arrive(0);       // 两趟都读完才释放
+                }
+                tma_store_fence();                     // fence.proxy.async.shared::cta
+                named_barrier(128, 0);
                 if (epi_warp == 0) tma_store_both_subtiles(D, h, st, rank);
+                          // cp.async.bulk.tensor.2d.global.shared::cta.bulk_group ×2
             }
         }
     }
 
     cluster_sync();
-    if (warp == 0) tmem_free_2sm();
+    if (warp == 0) tmem_free_2sm();     // tcgen05.dealloc.cta_group::2.sync.aligned.b32
 }
 
 // persistent：枚举 128 个 head（不是 N tile），M 只取 32 的倍数。
@@ -311,60 +403,120 @@ launch<M><<<num_clusters * 2, 256>>>(...);
 
 ### 2.1 算子一：DeepGEMM `tf32_hc_prenorm_gemm`
 
-DeepGEMM 的真实调用约定是 `A/B` K-major、`D` N-major；`B` 的逻辑形状为 `[24,28672]`，但计算含义仍是 `X @ W^T`。当前 SM100 配置固定 `BLOCK_M=64`、`BLOCK_K=64`、`BLOCK_N=align(24,16)=32`，一个 block 负责一个 `(m_tile, k_split)`。
+DeepGEMM 的真实调用约定是 `A/B` K-major、`D` N-major；`B` 的逻辑形状为 `[24,28672]`，但计算含义仍是 `X @ W^T`。当前 SM100 配置固定 `BLOCK_M=64`、`BLOCK_K=64`、`BLOCK_N=align(24,16)=32`，一个 block 负责一个 `(m_tile, k_split)`。下面骨架同样把真实 PTX 标在行尾（对应 `sm100_tf32_hc_prenorm_gemm.cuh`）。
 
 ```cpp
-// grid=ceil(M/64)*S；BLOCK=64x32x64；输出 ws[S,M,24]、sq[S,M]。
+// grid=ceil(M/64)*S，block=128(MMA 组)+128(cast 组)；BLOCK=64x32x64。
+// NSTAGE 从 12 起按 smem 容量往下退，一个 stage = 64*64*2 + 32*64*4 = 16KB → 12 挡成立。
+// 输出 ws[S,M,24]、sq[S,M]。★ 全程 cta_group::1：N=24 已经要 pad 到 32，2SM 会再翻一倍。
 __global__ void splitk_tf32(int M, int S, float* ws, float* sq) {
     int m0 = (blockIdx.x / S) * 64;
     int split = blockIdx.x % S;
     int k0 = split_k_begin(split), nk = split_k_blocks(split);
-    int warp = threadIdx.x / 32;
+    int warp = threadIdx.x / 32, lane = lane_id();
     Shared s;
 
+    if (warp == 0 && elect_one_sync()) prefetch_descs();   // prefetch.tensormap ×3
     // TMA<->cast: full/empty；cast<->MMA: full_cast/empty_cast。phase 约定同 §1：
     // 等“满”wait(ph)，等“空”wait(ph ^ 1)；tmem_full 一个 split 只用一次，只有 phase 0。
-    if (warp == 1) init_barriers_and_tmem(s);
-    __syncthreads();
-    cudaGridDependencySynchronize();
+    if (warp == 1 && elect_one_sync()) {
+        for (int i = 0; i < NSTAGE; ++i) {
+            s.full[i].init(1);            // TMA 的 elected lane
+            s.empty[i].init(1);           // MMA commit
+            s.full_cast[i].init(128);     // ★ 唯一非 1 的计数：cast 组 128 线程各写一段 TMEM，
+                                          //   全体 arrive 才算这一片 A cast 完
+            s.empty_cast[i].init(1);      // MMA commit
+        }
+        s.tmem_full.init(1);
+        fence_barrier_init();             // fence.mbarrier_init.release.cluster
+    } else if (warp == 2)
+        tmem_alloc_1sm(256);   // tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32
+                               // 列数 = BK*2（cast 双缓冲的 A）+ BN = 160 → 对齐到 256
+    __syncthreads();                      // bar.sync 0（不是 named barrier）
+    cudaGridDependencySynchronize();      // griddepcontrol.wait
 
-    if (warp == 0)                      // TMA 生产者
+    if (warp == 0 && elect_one_sync())    // TMA 生产者
         for (int k = 0; k < nk; ++k) {
             int st = k % NSTAGE, ph = (k / NSTAGE) & 1;
-            s.empty[st].wait(ph ^ 1);
+            s.empty[st].wait(ph ^ 1);     // mbarrier.try_wait.parity.shared::cta.b64 + 自旋
             tma_load_XW(s.a[st], s.b[st], m0, k0 + k * 64);
-            s.full[st].arrive_expect_tx();
+                      // cp.async.bulk.tensor.2d.shared::cluster.global
+                      //   .mbarrier::complete_tx::bytes.L2::cache_hint
+                      // ★ 一轮发 3 条：A 是 bf16，K64=128B 刚好一个 swizzle atom → 1 条；
+                      //   B 是 fp32，K64=256B 是 2 个 atom → 2 条。三条共用一个 barrier
+            s.full[st].arrive_expect_tx(64*64*2 + 32*64*4);
+                      // mbarrier.arrive.expect_tx.shared::cta.b64（一次 expect 全部字节）
         }
 
-    if (warp >= 4) {                    // BF16->TF32 cast + Σx²
-        float ssq = 0.f;
+    if (warp >= 4) {                      // BF16->TF32 cast + Σx²（128 线程一组）
+        float2 ssq[2] = {};               // 一个 lane 管 2 行（upper/lower）
         for (int k = 0; k < nk; ++k) {
             int st = k % NSTAGE, ph = (k / NSTAGE) & 1;   // TMA 流水
             int cs = k % 2,      cph = (k / 2) & 1;       // cast 换手是 2 深环
             s.full[st].wait(ph);
-            auto a = bf16_to_tf32(ldmatrix(s.a[st]));
-            ssq += dot(a, a);
-            s.empty_cast[cs].wait(cph ^ 1); tcgen05_st(/*TMEM A*/, a);
-            s.full_cast[cs].arrive();
+            uint32_t uv[2][8] = ldmatrix_bk64(s.a[st], lane);
+                      // 4 条 ldmatrix.sync.aligned.x4.m8n8.shared.b16 {4 reg}, [smem] 铺满 BK=64
+                      // 地址算 128B swizzle：col ^= row % 8（16B 一个 bank group，共 8 组）
+            s.empty_cast[cs].wait(cph ^ 1);   // ★ 故意放在 ldmatrix 之后：读 smem 与上一轮
+                                              //   MMA 占着 TMEM-A 的时间重叠
+            for (int i = 0; i < 8; ++i) {
+                float2 up = bf16x2_to_f32x2(uv[0][i]);   // 只补零位，无舍入
+                float2 lo = bf16x2_to_f32x2(uv[1][i]);
+                ssq[0] = ffma2(up, up, ssq[0]);          // ★ fma.rn.f32x2：SM100 打包 FP32，
+                ssq[1] = ffma2(lo, lo, ssq[1]);          //   一条指令两个 FMA
+                tcgen05_st_16dp256b(a_tmem + i * 8, up, lo);
+                      // tcgen05.st.sync.aligned.16x256b.x1.b32 [tmem], {up.x,up.y,lo.x,lo.y}
+                      // ★ 平方和和写 TMEM 用的是同一份寄存器 —— Σx² 真的是“白捡”
+            }
+            tmem_store_fence();          // tcgen05.wait::st.sync.aligned（等 TMEM 写落地）
+            tmem_fence_before_sync();    // tcgen05.fence::before_thread_sync
+            s.full_cast[cs].arrive();    // mbarrier.arrive.shared::cta.b64 ×128 线程
         }
-        write_sq_without_atomic(sq, split, m0, warp_reduce(ssq));
+        // 4 个 lane 共享一个 bank group = 同一行 → 只归约 4 路，lane%4==0 直写，无 atomic
+        for (int u = 0; u < 2; ++u)       // m = m0 + (warp-4)*16 + lane/4 + u*8
+            write_sq(sq, split, m_row(m0, warp, lane, u),
+                     warp_reduce_sum4(ssq[u].x + ssq[u].y));
+                      // __shfl_xor_sync(v,2) 再 (v,1) → shfl.sync.bfly.b32；st.global.f32
     }
 
-    if (warp == 1) {                    // TS-MMA: A=TMEM, B=SMEM
+    if (warp == 1) {                      // TS-MMA: A=TMEM, B=SMEM
+        // ★ NSTAGE 个 B 描述符低位预先摊在 lane 0..NSTAGE-1，用时 shuffle 取，省得每轮重算
+        uint32_t b_lo = lane < NSTAGE ? b_desc.lo + lane * B_STAGE_BYTES / 16 : 0;
         for (int k = 0; k < nk; ++k) {
             int st = k % NSTAGE, cs = k % 2, cph = (k / 2) & 1;
-            s.full_cast[cs].wait(cph);
-            tcgen05_mma_tf32_ts(/*TMEM A*/, s.b[st], /*TMEM C*/);
-            tcgen05_commit(s.empty_cast[cs], s.empty[st]);   // 两条 commit：还 TMEM-A、还 smem-B
+            s.full_cast[cs].wait(cph);    // 等 A 已 cast 进 TMEM（顺带保证 B 的 smem 就绪）
+            tmem_fence_after_sync();      // tcgen05.fence::after_thread_sync
+            uint32_t base = __shfl_sync(~0u, b_lo, st);   // shfl.sync.idx.b32
+            for (int kk = 0; kk < 64 / 8; ++kk)   // ★ tf32 的 UMMA_K = 32B/4B = 8，
+                                                  //   所以一个 BK64 要发 8 条（FP8 是 32、BF16 是 16）
+                tcgen05_mma_tf32_ts(C_TMEM, A_TMEM + cs * 64 + kk * 8,
+                                    advance_b(base, kk), /*accum=*/k || kk);
+                      // tcgen05.mma.cta_group::1.kind::tf32
+                      //   [tmem_c], [tmem_a], desc_b, idesc, {0,0,0,0}, p
+                      // ★ A 带方括号 = TMEM 地址（这就是 TS 的 T）；只有 B 走 smem 描述符
+            tcgen05_commit(s.empty_cast[cs]);   // tcgen05.commit.cta_group::1
+            tcgen05_commit(s.empty[st]);        //   .mbarrier::arrive::one.shared::cluster.b64
+                      // 两条：还 TMEM-A 给 cast、还 smem-B 给 TMA。1SM 没有 multicast 后缀
         }
-        s.tmem_full.arrive();
+        tcgen05_commit(s.tmem_full);            // C 就绪 → epilogue
     }
 
-    if (warp < 4) {                     // TMEM -> workspace
+    if (warp < 4) {                     // TMEM -> workspace（复用 MMA 组那 128 个线程）
         s.tmem_full.wait(0);            // 一次性 accum：没有 parity 翻转
-        tmem_to_smem(); named_barrier_sync(128);
-        if (warp == 0) tma_store(ws[split][m0]);
-        if (warp == 1) tmem_free();
+        tmem_fence_after_sync();
+        for (int i = 0; i < 32 / 4; ++i) {      // BN=32，一次搬 4 个 float
+            auto v = tmem_ld_32dp32b_x4(C_TMEM + i * 4);
+                      // tcgen05.ld.sync.aligned.32x32b.x4.b32 {4 reg}, [tmem]
+                      //   + tcgen05.wait::ld.sync.aligned
+            if (lane < 16) st_shared_v4(smem_cd + swz(i, lane), v);
+                      // st.shared.v4.u32；M=64 是 Layout F：4 warp x 16 lane 铺满 64 行
+        }
+        tma_store_fence();              // fence.proxy.async.shared::cta
+        named_barrier(128, 0);          // bar.sync 0, 128
+        if (warp == 0 && elect_one_sync()) tma_store_3d(ws, m0, split);
+                      // cp.async.bulk.tensor.3d.global.shared::cta.bulk_group
+                      // ★ 用 3D descriptor：ws 是 [S,M,24]，split 直接当第三维坐标
+        if (warp == 1) tmem_free_1sm(); // tcgen05.dealloc.cta_group::1（warp0 还在等 TMA store）
     }
 }
 ```
@@ -383,20 +535,24 @@ __global__ void reduce_fuse(/* hidden, ws, sq, gate 与输出指针 */, int M, i
     int warp = tid / 32, lane = tid % 32;
     Shared s;                         // rms、mix[24]、pre、warp_ssq[8]
 
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;");   // 先放走下游 front 的 prologue
     init_shared(s);
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");   // 再等上游 GEMM 的 ws/sq 可见
 
     // reduce_split：lane 沿 split 走并做 warp_sum；8 warp 各负责 3 列。
     if (warp == 0) {
         float v = reduce_split(sq, m, lane, S);
-        if (lane == 0) s.rms = rsqrtf(v / 28672.f + rms_eps);
+        if (lane == 0) s.rms = rsqrtf(v / 28672.f + rms_eps);   // rsqrt.approx.f32
     }
     for (int c = warp * 3; c < min(warp * 3 + 3, 24); ++c) {
         float v = reduce_split(ws, m, c, lane, S);
+                  // ld.global.nc.f32：lane = split，地址相隔 M*24*4B
+                  // ★ 这里刻意不追求合并：总量只有 S*24 个 float，纯 latency-bound，
+                  //   一次甩出 32 个互不依赖的请求把访存延迟盖住才是要点
+                  // 收口 __shfl_down_sync ×5 → shfl.sync.down.b32，全程不碰 smem atomic
         if (lane == 0) s.mix[c] = v;
     }
-    __syncthreads();
+    __syncthreads();                  // bar.sync 0
 
     // 第一次 norm：RMSNorm(X) @ W 等价于 (X @ W) * rms。
     if (tid < 24) {
@@ -405,11 +561,14 @@ __global__ void reduce_fuse(/* hidden, ws, sq, gate 与输出指针 */, int M, i
     }
     if (tid < 4)
         s.pre[tid] = sigmoid(s.mix[tid] * scale[0] + base[tid]) + hc_eps;
+                  // __expf → mul.f32(log2e) + ex2.approx.f32
     __syncthreads();
 
     if constexpr (FULL) {
         // warp0: post + 4x4 softmax/Sinkhorn；warp1..7: 直接 collapse。
         if (warp == 0) sinkhorn_4x4(s.mix + 4, post[m], comb[m], base, scale);
+                  // 4x4 矩阵铺在 lane 0..15：行和 __shfl_xor(1),(2)、列和 __shfl_xor(4),(8)
+                  //   → 全是 shfl.sync.bfly.b32；20 轮交替行/列归一化，首轮 softmax 带 max 稳定
         if (warp > 0)
             collapse_bf16(hidden[m], s.pre, collapsed[m], tid - 32, 224);
         return;
@@ -421,10 +580,13 @@ __global__ void reduce_fuse(/* hidden, ws, sq, gate 与输出指针 */, int M, i
     int seg = 0;
     for (int d = tid * 8; d < 7168; d += 256 * 8, ++seg) {
         float x[8] = collapse4(hidden[m], s.pre, d);
-        keep[seg] = bf16_round(x);    // 必须先按 BF16 materialize
+                  // 4 个 head 各一条 ld.global.nc.v4.b32（int4 = 16B = 8 个 bf16）
+                  // hidden 从 L2 重读；16B/线程保证是宽合并事务而不是 2B/线程
+        keep[seg] = bf16_round(x);    // cvt.rn.bf16x2.f32 —— 必须先按 BF16 materialize，
+                                      //   才能和「独立 norm kernel 读 bf16」逐位一致
         local_ssq += dot(keep[seg], keep[seg]);
     }
-    block_reduce_to_shared(local_ssq, s.warp_ssq); // warp shuffle + 8 个 partial
+    block_reduce_to_shared(local_ssq, s.warp_ssq); // __shfl_down_sync ×5 + 8 个 partial
     __syncthreads();
     if (tid == 0) s.r2 = rsqrtf(sum8(s.warp_ssq) / 7168.f + attn_eps);
     __syncthreads();
@@ -432,12 +594,19 @@ __global__ void reduce_fuse(/* hidden, ws, sq, gate 与输出指针 */, int M, i
     seg = 0;
     for (int d = tid * 8; d < 7168; d += 256 * 8, ++seg) {
         bf16 out[8] = bf16_round((float(keep[seg]) * s.r2) * gamma[d:d+8]);
-        collapsed[m][d:d+8] = out;
+                  // gamma 存 bf16（checkpoint 原始 dtype），加宽到 fp32 是无损的：
+                  //   14KB/CTA 而不是 28KB，结果和官方 fp32 链逐位相同
+        collapsed[m][d:d+8] = out;    // st.global.v4.b32
 
         // 16 个线程覆盖连续 128 元素，直接发 FP8 + UE8M0 scale。
         float amax = max_16_threads(max_abs(out));
+                  // __shfl_xor_sync 8/4/2/1 → 宽度 16 的 bfly 归约
+                  //（试过换 redux.sync.max.abs.f32 + 静态展开，B300 实测无收益，回退）
         int e = ceil_log2(max(amax / 448.f, 1e-4f));
-        xq_out[m][d:d+8] = fp8(out * exp2f(-e));
+                  // 纯位操作：取 exp 段 -127，尾数非零就 +1。不走 lg2.approx → 逐位可复现
+        xq_out[m][d:d+8] = fp8(out * __int_as_float((127 - e) << 23));
+                  // 乘的是位拼出来的精确 2^-e（不是 exp2f），所以量化无额外误差；
+                  //   cvt.rn.satfinite.e4m3x2.f32 一条转两个 → st.global.v2.b32
         if ((tid & 15) == 0) xsf_out[m][d / 128] = e + 127;
     }
 }
@@ -497,7 +666,14 @@ __global__ void mixed_swapab(/* X/W/SF/out 参数 */, int M) {
     bool fp8 = nt < 16, leader = rank == 0;   // fp8 是 CTA-uniform：两条流水静态分流
     Shared s;                                 // 两种精度 stage 存储互斥复用
 
-    if (warp == 1) init_barriers(s);          // full/empty[NS] + 单个 tmem_full，均 init(1)
+    if (warp == 1 && elect_one_sync()) {          // 一次性网格：每个 barrier 只有一个 phase
+        for (int i = 0; i < MAX_STAGES; ++i) {
+            s.full[i].init(1);                    // full/empty 都 init(1)，两种精度互斥复用
+            s.empty[i].init(1);
+        }
+        s.tmem_full.init(1);                      // 单 accumulator，只用到 phase 0
+        fence_barrier_init();
+    }
     if (warp == 2) tmem_alloc_2sm(NUM_TMEM_COLS<BatchN>());
     if (warp == 3 && fp8) preload_scales(s.sf, batch_tile, nt, M);  // K 单遍 => scale 常驻 smem
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -510,33 +686,60 @@ __global__ void mixed_swapab(/* X/W/SF/out 参数 */, int M) {
             int st = k % NS, ph = (k / NS) & 1;
             s.empty[st].wait(ph ^ 1);
             if (leader) s.full[st].arrive_expect_tx(2 * (act + wgt));  // 汇聚到 rank0
-            tma_load_2sm(fp8, batch_tile, nt, k, /*mask=*/1 << rank, s, st);  // 内部算 w_row/x_row
+            for (int sub = 0; sub < BK / tma_k(fp8); ++sub)   // FP8 按 K128、BF16 按 K64
+                tma_load_2sm(fp8, batch_tile, nt, k, sub, /*mask=*/1 << rank, s, st);
+                      // cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global
+                      //   .mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint
+                      // 两套 descriptor（desc_w8 / desc_w16）静态选
         }
 
     if (warp == 5) hc_tail_run(hc);           // 主循环期间空闲，用来藏 HC/Sinkhorn 尾巴
+                      // 4x4 矩阵铺在 lane 0-15：行和 __shfl_xor(1,2)、列和 __shfl_xor(4,8)
+                      // 20 轮交替行/列归一化，首轮 softmax 带 max 稳定
 
     if (warp == 1 && leader)                  // rank0 发 2SM MMA，单 accumulator
         for (int k = 0; k < K / BK; ++k) {
             int st = k % NS, ph = (k / NS) & 1;
             s.full[st].wait(ph);
             if (fp8) {
-                if ((k & 3) == 0) utccp_scales(s.sf, k / 4);   // 每 4 个 scale 一组
-                mma_2sm_fp8(s, st, /*sf_id=*/k & 3);
+                for (int h = 0; h < BK / 128; ++h) {         // 每个 K128 子块
+                    int sft = k * (BK / 128) + h;
+                    if ((sft & 3) == 0) {                    // 每 4 个 scale 一组只搬一次
+                        utccp_wgt(SF_WGT_COL, s.sf_w + sft / 4);
+                      // tcgen05.cp.cta_group::2.32x128b.warpx4
+                      // ★ 一个 cluster 只对应一个 128-feature scale block，两个
+                      //   64-feature CTA 读同一行 → 广播到四个 subpartition
+                        utccp_act(SF_ACT_COL, s.sf_a + sft / 4);
+                      // tcgen05.cp.cta_group::2.64x128b.warpx2::01_23
+                      // ★ M128 的 2x2 datapath：两个 BatchN/2 半区必须保持不同 pattern
+                      //   → warp 对 (0,1) 和 (2,3) 各搬各的，所以 sf_act 的 smem 是两倍
+                    }
+                    for (int kk = 0; kk < 4; ++kk)           // 一个 K128 = 4 条 K32
+                        mma_2sm_fp8(s, st, h, kk, /*sf_id=*/sft & 3);
+                      // tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale
+                }
             } else {
-                mma_2sm_bf16(s, st);
+                for (int kk = 0; kk < BK / 16; ++kk)         // BF16：每 K16 一条
+                    mma_2sm_bf16(s, st, kk);
+                      // tcgen05.mma.cta_group::2.kind::f16（无 SF，不需 UTCCP）
             }
             commit_2sm(s.empty[st]);
+                      // tcgen05.commit.cta_group::2.mbarrier::arrive::one
+                      //   .shared::cluster.multicast::cluster.b64 [bar], 0b11
             if (k == K / BK - 1) commit_2sm(s.tmem_full);
         }
 
     if (warp == 0) s.tmem_full.wait(0);       // K 单遍 => 只有 phase 0
-    if (warp == 0 || warp >= 4) named_barrier(160, /*TMEM ready=*/0);
+    if (warp == 0 || warp >= 4) named_barrier(160, /*TMEM ready=*/0);   // bar.sync 0, 160
 
     if (warp >= 4)                            // 4 个输出 warp 各 drain 一个 2x2 象限
-        store_tile(out, batch_tile, nt, fp8, rank, warp - 4, M); // 内部算列/行 + production 分流
+        store_tile(out, batch_tile, nt, fp8, rank, warp - 4, M);
+                      // tcgen05.ld.sync.aligned.32x32b.x8.b32 + tcgen05.wait::ld
+                      // production 路径：stmatrix...trans 做 32x32 转置（借已死 pipeline smem）
+                      //   → 按 state_row 写 + 可选叠 APE
 
-    if (warp == 2 || warp >= 4) named_barrier(160, /*store done=*/1);
-    if (warp == 2) tmem_free_2sm();
+    if (warp == 2 || warp >= 4) named_barrier(160, /*store done=*/1);  // bar.sync 1, 160
+    if (warp == 2) tmem_free_2sm();           // tcgen05.dealloc.cta_group::2.sync.aligned.b32
 }
 
 // M<=48 只一片（37 cluster/74 SM），M>48 用两片凑成 74 cluster/148 CTA 填满 B300。
@@ -575,7 +778,7 @@ launch<BatchN><<<ceil_div(M, BatchN) * 37 * 2, 256>>>(...);
 1. **小 M 一律 swap-AB**：大维（N/特征）放 A/M 侧吃满 128/256 档，小 batch 放 B/N 侧按模板取 {16..128}；模板化 M 的红利是 smem/TMEM 随 M 缩小、流水深度自动加深。
 2. **cluster 大小由 tile 大小定**：256 宽的大 tile 用 2SM 劈半（TMA 流量与 smem 减半）；64×32 的小 tile 用 1SM——2SM 不是默认答案。
 3. **非对齐 M/N 交给 TMA OOB 语义**：真实尺寸进 globalDim、padded 尺寸进 box，加载零填、store 裁剪，host 侧零 pad。
-4. **低精度输入 × 高精度 MMA 用 cast 警组**：操作数必须过 CUDA-core 寄存器时（如 bf16→tf32 进 TMEM 的 TS-MMA），把 cast 做成独立 warpgroup、与 MMA 双 barrier 换手，cast 藏进上一 tile 的 MMA 影子。
+4. **低精度输入 × 高精度 MMA 用 cast warp 组**：操作数必须过 CUDA-core 寄存器时（如 bf16→tf32 进 TMEM 的 TS-MMA，`tcgen05.mma...kind::tf32 [tmem_c], [tmem_a], desc_b`，A 是 TMEM 地址），把 cast 做成独立 warpgroup、与 MMA 双 barrier 换手，cast 藏进上一 tile 的 MMA 影子；顺路把 `Σx²` 用 `fma.rn.f32x2` 白捡出来，省掉一趟对 K=28672 的重扫。
 5. **FP8 block-scale 的 SF 通道单独设计**：UE8M0 按 4 打包成 u32、UTCCP 按组摊销、`sf_id` 选字节；K 单遍 → 常驻 smem，K 多遍 → per-stage 流水 + 专职 warp。
 6. **混合精度按 N 分段**：同 kernel 两套指令描述符/TMA 描述符，任务 id 静态分流，两条流水线互斥复用同一块 smem。
 7. **流水深度不拍脑袋**：`(smem 容量 − 常驻开销) / 每 stage 字节` 编译期推导 + clamp + static_assert。
