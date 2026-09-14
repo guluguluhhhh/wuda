@@ -46,8 +46,8 @@ $$y_i = \frac{x_i}{\sqrt{\frac{1}{N}\sum_j x_j^2 + \epsilon}} \cdot \gamma_i$$
 __global__ void rmsnorm(const float* x, const float* gamma, float* y,
                         int N, float eps) {
     int row = blockIdx.x;
-    const float* xr = x + (size_t)row * N;
-    float* yr = y + (size_t)row * N;
+    const float* xr = x + row * N;
+    float* yr = y + row * N;
 
     // 1) 局部平方和（grid-stride 覆盖 N > blockDim 的情况）
     float ss = 0.f;
@@ -71,6 +71,103 @@ __global__ void rmsnorm(const float* x, const float* gamma, float* y,
 - 精度：累加用 **fp32**，即使输入 bf16/fp16 也要先转 fp32 再平方，否则大 N 下平方和溢出/丢精度。
 - 归约维 = N（hidden dim），**天然在一个 block/rank 内**，所以 TP 下 per-head norm 不需要跨 rank 通信。
 
+```cpp
+// grid = 行数(token 数)，block = 256；一行长 N
+__global__ void rmsnorm_quant_i8(const half* x, int8_t* yq, float* ys,
+                                 int N, float eps) {
+    int row = blockIdx.x;
+    const half* xr = x  + row * N;
+    int8_t*     yr = yq + row * N;
+
+    // 1) 一遍访存喂两个归约：平方和 + max|x|
+    float ss = 0.f, amax = 0.f;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float v = __half2float(xr[i]);        // 累加一律先转 fp32
+        ss   = fmaf(v, v, ss);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    ss   = block_reduce(ss,   0.f, warp_reduce_sum);
+    amax = block_reduce(amax, 0.f, warp_reduce_max);
+
+    // 2) rstd 是全行相同的正标量 → max|y| = rstd · max|x|
+    //    所以不必先算完整个 y 再多读一遍求最大值
+    float rstd  = rsqrtf(ss / N + eps);
+    float scale = fmaxf(amax * rstd, 1e-12f) / 127.f;   // 防全零行出 scale=0
+    float inv   = 1.f / scale;                          // 每行一次除法，可忽略
+    if (threadIdx.x == 0) ys[row] = scale;              // 下游反量化要用
+
+    // 3) 第二遍：normalize + quant，中间 fp16 不落 HBM
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        int q = __float2int_rn(__half2float(xr[i]) * rstd * inv);
+        yr[i] = (int8_t)min(max(q, -127), 127);         // 截到 ±127 保对称
+    }
+}
+```
+
+
+```cpp
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <stdint.h>
+
+// q: [rows, hidden] INT8，按行对称量化，x = q * scale[row]
+// gamma: [hidden] FP16；y: [rows, hidden] FP16
+// y = x * rsqrt(mean(x^2) + eps) * gamma
+
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    return v;
+}
+
+// 固定使用 256 threads/block，每个 block 处理一行
+__global__ void dequant_rmsnorm(
+    const int8_t* __restrict__ q,
+    const float* __restrict__ scale,
+    const half* __restrict__ gamma,
+    half* __restrict__ y,
+    int hidden,
+    float eps)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const size_t base = (size_t)row * hidden;
+    const float s = scale[row];
+
+    __shared__ float partial[8];
+    __shared__ float inv_rms;
+
+    float sum = 0.0f;
+    for (int col = tid; col < hidden; col += 256) {
+        float x = float(q[base + col]) * s;
+        sum = fmaf(x, x, sum);
+    }
+
+    sum = warp_sum(sum);
+    if ((tid & 31) == 0)
+        partial[tid >> 5] = sum;
+    __syncthreads();
+
+    if (tid < 32) {
+        sum = (tid < 8) ? partial[tid] : 0.0f;
+        sum = warp_sum(sum);
+        if (tid == 0)
+            inv_rms = rsqrtf(sum / float(hidden) + eps);
+    }
+    __syncthreads();
+
+    for (int col = tid; col < hidden; col += 256) {
+        float x = float(q[base + col]) * s;
+        float g = __half2float(gamma[col]);
+        y[base + col] = __float2half_rn(x * inv_rms * g);
+    }
+}
+
+// 调用：rows > 0，hidden > 0
+// dequant_rmsnorm<<<rows, 256, 0, stream>>>(
+//     q, scale, gamma, y, hidden, eps);
+```
 ---
 
 2. Softmax
@@ -114,9 +211,91 @@ __global__ void softmax(const float* x, float* y, int N) {
 
 ---
 
+3. Online Softmax
+
+把「求 max」和「求 exp 和」压到**同一遍扫描**：维护一个 running pair $(m, d)$，$m$ 是已见元素的最大值，$d = \sum_{j \le i} e^{x_j - m}$。来一个新元素 $x$：
+
+$$m' = \max(m, x), \qquad d' = d \cdot e^{m - m'} + e^{x - m'}$$
+
+$d$ 乘上 $e^{m-m'}$ 就是把它从「以旧 $m$ 为基」换到「以新 $m$ 为基」。因为 $m' \ge m$，这个因子恒 $\le 1$，永不上溢。
+
+两个部分结果的合并（归约用的就是这个）：
+
+$$m = \max(m_1, m_2), \qquad d = d_1 e^{m_1 - m} + d_2 e^{m_2 - m}$$
+
+它**可结合、可交换**，所以能塞进任意归约树（shuffle / smem / 跨 block）——FlashAttention 能分块算 attention 就靠这条性质。
+
+(m, d) 的两级归约：要同时归约两个量，复用不了上面的 `block_reduce`，得自己写一套
+
+```cpp
+struct MD { float m, d; };
+
+// 切忌：init 用 -1e30f 而不是 -INFINITY。两个空 pair 合并时
+// -inf - (-inf) = nan，再 0 * nan = nan，整行被污染；而 N < blockDim.x
+// 时必然有线程是空的，一定会踩到。-1e30f 则 expf(-1e30f) 干净地给 0。
+__device__ MD md_merge(MD a, MD b) {
+    float m = fmaxf(a.m, b.m);
+    return { m, a.d * __expf(a.m - m) + b.d * __expf(b.m - m) };
+}
+
+__device__ MD warp_reduce_md(MD v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        MD u;
+        u.m = __shfl_xor_sync(0xffffffff, v.m, o);   // 两个量都要 shuffle
+        u.d = __shfl_xor_sync(0xffffffff, v.d, o);
+        v = md_merge(v, u);
+    }
+    return v;                                        // xor 蝶形 → 全 lane 一致
+}
+
+__device__ MD block_reduce_md(MD v) {
+    __shared__ float sm[32], sd[32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    v = warp_reduce_md(v);
+    if (lane == 0) { sm[warp] = v.m; sd[warp] = v.d; }
+    __syncthreads();
+    v = (lane < nwarp) ? MD{sm[lane], sd[lane]} : MD{-1e30f, 0.f};
+    v = warp_reduce_md(v);                           // 各 warp 冗余归约，结果一致
+    __syncthreads();
+    return v;
+}
+```
+
+```cpp
+// grid = 行数，block = 256；一行长 N
+__global__ void softmax_online(const float* x, float* y, int N) {
+    int row = blockIdx.x;
+    const float* xr = x + (size_t)row * N;
+    float* yr = y + (size_t)row * N;
+
+    // 1) 一遍扫描同时拿到 max 和 exp 和
+    MD v{-1e30f, 0.f};
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float xi = xr[i];
+        float m  = fmaxf(v.m, xi);
+        v.d = v.d * __expf(v.m - m) + __expf(xi - m);   // 换基 + 累加
+        v.m = m;
+    }
+
+    // 2) 合并全 block 的局部 (m, d)
+    v = block_reduce_md(v);
+    float inv = 1.f / v.d;
+
+    // 3) 归一化写回
+    for (int i = threadIdx.x; i < N; i += blockDim.x)
+        yr[i] = __expf(xr[i] - v.m) * inv;
+}
+```
+
+---
+
 对比
 
 | | 归约算子 | 遍数 | 关键陷阱 |
 |---|---|---|---|
 | RMSNorm | 1 个 sum(x²) | 2（算和 + 缩放） | eps 在 mean 内；fp32 累加 |
+| RMSNorm + quant | sum(x²) + max\|x\| | 2 | max\|y\| = rstd·max\|x\|，别为求 max 再读一遍 |
+| dequant + RMSNorm | 1 个 sum(q²)，int 域 | 2 | scale 被约掉，只通过 eps 起作用 |
 | Safe Softmax | max + sum | 3 | 必须减 max |
+| Online Softmax | (m, d) 融合归约 | 2 | init 不能用 -inf；全 mask 行 d=0 出 nan |
