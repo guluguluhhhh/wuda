@@ -228,63 +228,39 @@ $$m = \max(m_1, m_2), \qquad d = d_1 e^{m_1 - m} + d_2 e^{m_2 - m}$$
 (m, d) 的两级归约：要同时归约两个量，复用不了上面的 `block_reduce`，得自己写一套
 
 ```cpp
-struct MD { float m, d; };
+// grid = 行数，block = 256；N > 0，输入为有限值
+__global__ void online_softmax(const half* x, half* y, int N) {
+    size_t base = (size_t)blockIdx.x * N;
+    const half* xr = x + base;
+    half* yr = y + base;
 
-// 切忌：init 用 -1e30f 而不是 -INFINITY。两个空 pair 合并时
-// -inf - (-inf) = nan，再 0 * nan = nan，整行被污染；而 N < blockDim.x
-// 时必然有线程是空的，一定会踩到。-1e30f 则 expf(-1e30f) 干净地给 0。
-__device__ MD md_merge(MD a, MD b) {
-    float m = fmaxf(a.m, b.m);
-    return { m, a.d * __expf(a.m - m) + b.d * __expf(b.m - m) };
-}
+    // 1) 每个线程在线更新自己的 (m, s)
+    float m = -CUDART_INF_F;
+    float s = 0.f;
 
-__device__ MD warp_reduce_md(MD v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        MD u;
-        u.m = __shfl_xor_sync(0xffffffff, v.m, o);   // 两个量都要 shuffle
-        u.d = __shfl_xor_sync(0xffffffff, v.d, o);
-        v = md_merge(v, u);
-    }
-    return v;                                        // xor 蝶形 → 全 lane 一致
-}
-
-__device__ MD block_reduce_md(MD v) {
-    __shared__ float sm[32], sd[32];
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
-    v = warp_reduce_md(v);
-    if (lane == 0) { sm[warp] = v.m; sd[warp] = v.d; }
-    __syncthreads();
-    v = (lane < nwarp) ? MD{sm[lane], sd[lane]} : MD{-1e30f, 0.f};
-    v = warp_reduce_md(v);                           // 各 warp 冗余归约，结果一致
-    __syncthreads();
-    return v;
-}
-```
-
-```cpp
-// grid = 行数，block = 256；一行长 N
-__global__ void softmax_online(const float* x, float* y, int N) {
-    int row = blockIdx.x;
-    const float* xr = x + (size_t)row * N;
-    float* yr = y + (size_t)row * N;
-
-    // 1) 一遍扫描同时拿到 max 和 exp 和
-    MD v{-1e30f, 0.f};
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        float xi = xr[i];
-        float m  = fmaxf(v.m, xi);
-        v.d = v.d * __expf(v.m - m) + __expf(xi - m);   // 换基 + 累加
-        v.m = m;
+        float v = __half2float(xr[i]);
+        float next_m = fmaxf(m, v);
+
+        // 最大值变化时，将旧指数和换算到新的基准
+        s = s * __expf(m - next_m) + __expf(v - next_m);
+        m = next_m;
     }
 
-    // 2) 合并全 block 的局部 (m, d)
-    v = block_reduce_md(v);
-    float inv = 1.f / v.d;
+    // 2) 合并各线程的统计量
+    float M = block_reduce(m, -CUDART_INF_F, warp_reduce_max);
 
-    // 3) 归一化写回
-    for (int i = threadIdx.x; i < N; i += blockDim.x)
-        yr[i] = __expf(xr[i] - v.m) * inv;
+    // s 原来以局部 m 为基准，现在统一换算到全行 M
+    // 没有读到元素的线程：m = -inf，s = 0，贡献为 0
+    float local_s = s * __expf(m - M);
+    float S = block_reduce(local_s, 0.f, warp_reduce_sum);
+
+    // 3) 第二遍读取并输出
+    float inv_S = 1.f / S;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float v = __half2float(xr[i]);
+        yr[i] = __float2half_rn(__expf(v - M) * inv_S);
+    }
 }
 ```
 
