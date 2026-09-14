@@ -275,3 +275,61 @@ __global__ void online_softmax(const half* x, half* y, int N) {
 | dequant + RMSNorm | 1 个 sum(q²)，int 域 | 2 | scale 被约掉，只通过 eps 起作用 |
 | Safe Softmax | max + sum | 3 | 必须减 max |
 | Online Softmax | (m, d) 融合归约 | 2 | init 不能用 -inf；全 mask 行 d=0 出 nan |
+
+
+4. transpose
+```cpp
+// 输入 [M, N]，输出 [N, M]；输入输出不能重叠
+// block = (8, 8)，每个 block 处理 32×32
+__global__ void transpose_float4(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int M, int N)
+{
+    __shared__ float tile[32][33];
+
+    int tx = threadIdx.x * 4;
+    int ty = threadIdx.y;
+
+    int in_col = blockIdx.x * 32 + tx;
+    int in_row = blockIdx.y * 32 + ty;
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        if (in_col < N && in_row + j < M) {
+            float4 v = *reinterpret_cast<const float4*>(
+                src + (size_t)(in_row + j) * N + in_col);
+
+            tile[ty + j][tx    ] = v.x;
+            tile[ty + j][tx + 1] = v.y;
+            tile[ty + j][tx + 2] = v.z;
+            tile[ty + j][tx + 3] = v.w;
+        }
+    }
+
+    __syncthreads();
+
+    int out_col = blockIdx.y * 32 + tx;
+    int out_row = blockIdx.x * 32 + ty;
+
+    #pragma unroll
+    for (int j = 0; j < 32; j += 8) {
+        if (out_col < M && out_row + j < N) {
+            // 从 shared memory 的一列取出 4 个数，
+            // 拼成输出中连续的 4 个数
+            float4 v = make_float4(
+                tile[tx    ][ty + j],
+                tile[tx + 1][ty + j],
+                tile[tx + 2][ty + j],
+                tile[tx + 3][ty + j]);
+
+            *reinterpret_cast<float4*>(
+                dst + (size_t)(out_row + j) * M + out_col) = v;
+        }
+    }
+}
+
+// dim3 block(8, 8);
+// dim3 grid((N + 31) / 32, (M + 31) / 32);
+// transpose_float4<<<grid, block, 0, stream>>>(src, dst, M, N);
+```
