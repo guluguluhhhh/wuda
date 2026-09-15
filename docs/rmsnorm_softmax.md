@@ -333,3 +333,63 @@ __global__ void transpose_float4(
 // dim3 grid((N + 31) / 32, (M + 31) / 32);
 // transpose_float4<<<grid, block, 0, stream>>>(src, dst, M, N);
 ```
+
+
+quant
+```cpp
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cub/block/block_reduce.cuh>
+#include <stdint.h>
+
+template<bool E8M0>
+__device__ float encode_scale(float amax, uint8_t& bits) {
+    float t = amax > 0.f ? amax / 448.f : 1.f;
+
+    if constexpr (E8M0) {
+        int e;
+        float f = frexpf(t, &e);        // t = f * 2^e, f in [0.5, 1)
+        e -= (f == 0.5f);               // ceil(log2(t))
+        bits = static_cast<uint8_t>(e + 127);
+        return ldexpf(1.f, e);
+    } else {
+        __nv_fp8_e4m3 s(t);             // 默认最近偶数舍入
+        if (float(s) < t) ++s.__x;      // 正数编码递增，改为向上取整
+        bits = s.__x;
+        return float(s);
+    }
+}
+
+// 每个 block 处理一行中的 B 个元素，blockDim.x 必须等于 B
+// x: [M, N]；q: [Mp, Np]；sc: [Mp, Sp]，均为 row-major
+// Np 为 B 的倍数且 >= N；Mp >= M；Sp >= Np / B
+template<int B, bool E8M0>
+__global__ void quant_fp8(
+    const half* x, uint8_t* q, uint8_t* sc,
+    int M, int N, int Np, int Sp)
+{
+    __shared__ float s;
+
+    int row = blockIdx.y, g = blockIdx.x;
+    int col = g * B + threadIdx.x;
+
+    // padding 不读输入；补零也不会改变 amax
+    float v = (row < M && col < N)
+            ? __half2float(x[(size_t)row * N + col]) : 0.f;
+    float amax = block_max(fabsf(v));
+
+    if (threadIdx.x == 0) {
+        uint8_t bits;
+        s = encode_scale<E8M0>(amax, bits);
+        sc[(size_t)row * Sp + g] = bits;
+    }
+    __syncthreads();
+
+    if (col < Np)
+        q[(size_t)row * Np + col] = __nv_fp8_e4m3(v / s).__x;
+}
+
+// 例如 B = 32；grid = dim3(Sp, Mp)，block = B
+// quant_fp8<32, true ><<<grid, 32>>>(x, q, sc, M, N, Np, Sp); // UE8M0
+// quant_fp8<32, false><<<grid, 32>>>(x, q, sc, M, N, Np, Sp); // UE4M3
+```
