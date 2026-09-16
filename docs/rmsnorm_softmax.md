@@ -279,59 +279,53 @@ __global__ void online_softmax(const half* x, half* y, int N) {
 
 4. transpose
 ```cpp
-// 输入 [M, N]，输出 [N, M]；输入输出不能重叠
-// block = (8, 8)，每个 block 处理 32×32
-__global__ void transpose_float4(
-    const float* __restrict__ src,
-    float* __restrict__ dst,
-    int M, int N)
-{
-    __shared__ float tile[32][33];
+template<int Bm, int Bn>
+__global__ void transposeShared(float* A, float* B, const int M, const int N) {
+  __shared__ float tile[Bm][Bn];
 
-    int tx = threadIdx.x * 4;
-    int ty = threadIdx.y;
+  /* -------- 读取阶段 -------- */
+  // (r0, c0) 表示 tile 内左上角元素在 matrixA 中的坐标
+  int r0 = blockIdx.y * Bm;
+  int c0 = blockIdx.x * Bn;
 
-    int in_col = blockIdx.x * 32 + tx;
-    int in_row = blockIdx.y * 32 + ty;
+  // thread y 方向负责：矩阵 A 的行，shared memory 的行
+  // thread x 方向负责：矩阵 A 的列，shared memory 的列
+  // shared memory 中的元素 tile[y][x] = A[r0 + y, c0 + x]
+#pragma unroll
+  for (int y = threadIdx.y; y < Bm; y += blockDim.y) {  // 在 y 方向，每次跨度为 blockDim.y
+    int r = r0 + y;
+    if (r >= M) break;
 
-    #pragma unroll
-    for (int j = 0; j < 32; j += 8) {
-        if (in_col < N && in_row + j < M) {
-            float4 v = *reinterpret_cast<const float4*>(
-                src + (size_t)(in_row + j) * N + in_col);
-
-            tile[ty + j][tx    ] = v.x;
-            tile[ty + j][tx + 1] = v.y;
-            tile[ty + j][tx + 2] = v.z;
-            tile[ty + j][tx + 3] = v.w;
-        }
+#pragma unroll
+    for (int x = threadIdx.x; x < Bn; x += blockDim.x) {  // 在 x 方向，每次跨度为 blockDim.x
+      int c = c0 + x;
+      if (c < N) {
+        tile[y][x] = A[r * N + c];  // 将 A[r0 + y, c0 + x] 写入 tile[y][x]
+        //tile[y][x ^ y] = A[r * N + c];
+      }
     }
+  }
 
-    __syncthreads();
+  __syncthreads();  // 同步线程块
 
-    int out_col = blockIdx.y * 32 + tx;
-    int out_row = blockIdx.x * 32 + ty;
+/* -------- 写入阶段 -------- */
+// (c0, r0) 表示 tile 内左上角元素在 matrixB 中的坐标
+// thread y 方向负责：矩阵 B 的行，shared memory 的列
+// thread x 方向负责：矩阵 B 的列，shared memory 的行
+// shared memory 中的元素 tile[x][y] = B[c0 + y, r0 + x]
+#pragma unroll
+  for (int y = threadIdx.y; y < Bn; y += blockDim.y) {  // 在 y 方向，每次跨度为 blockDim.y
+    int c = c0 + y;
+    if (c >= N) break;
 
-    #pragma unroll
-    for (int j = 0; j < 32; j += 8) {
-        if (out_col < M && out_row + j < N) {
-            // 从 shared memory 的一列取出 4 个数，
-            // 拼成输出中连续的 4 个数
-            float4 v = make_float4(
-                tile[tx    ][ty + j],
-                tile[tx + 1][ty + j],
-                tile[tx + 2][ty + j],
-                tile[tx + 3][ty + j]);
-
-            *reinterpret_cast<float4*>(
-                dst + (size_t)(out_row + j) * M + out_col) = v;
-        }
+#pragma unroll
+    for (int x = threadIdx.x; x < Bm; x += blockDim.x) {  // 在 x 方向，每次跨度为 blockDim.x
+      int r = r0 + x;
+      if (r < M) { B[c * M + r] = tile[x][y]; }  // 将 tile[x][y] 写入 B[c0 + y, r0 + x]
+      //if (r < M) { B[c * M + r] = tile[x][x ^ y]; }
     }
+  }
 }
-
-// dim3 block(8, 8);
-// dim3 grid((N + 31) / 32, (M + 31) / 32);
-// transpose_float4<<<grid, block, 0, stream>>>(src, dst, M, N);
 ```
 
 
